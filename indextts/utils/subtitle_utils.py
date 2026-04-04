@@ -5,6 +5,7 @@ import os
 import re
 from typing import List, Sequence, Tuple
 
+import librosa
 import numpy as np
 
 
@@ -25,6 +26,19 @@ class SubtitleCue:
     start_ms: int
     end_ms: int
     text: str
+
+    @property
+    def duration_ms(self) -> int:
+        return self.end_ms - self.start_ms
+
+
+@dataclass(frozen=True)
+class SubtitleRenderUnit:
+    index: int
+    start_ms: int
+    end_ms: int
+    text: str
+    cue_indices: Tuple[int, ...]
 
     @property
     def duration_ms(self) -> int:
@@ -215,6 +229,53 @@ def subtitle_cues_to_text(cues: Sequence[SubtitleCue]) -> str:
     return "\n\n".join(cue.text for cue in cues)
 
 
+def normalize_subtitle_text(text: str) -> str:
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def build_subtitle_render_units(cues: Sequence[SubtitleCue]) -> List[SubtitleRenderUnit]:
+    if not cues:
+        return []
+
+    units: List[SubtitleRenderUnit] = []
+    current_group: List[SubtitleCue] = []
+    current_end_ms = -1
+
+    def flush_group() -> None:
+        if not current_group:
+            return
+
+        normalized_parts = [normalize_subtitle_text(cue.text) for cue in current_group]
+        text = " ".join(part for part in normalized_parts if part).strip()
+        units.append(
+            SubtitleRenderUnit(
+                index=len(units) + 1,
+                start_ms=current_group[0].start_ms,
+                end_ms=max(cue.end_ms for cue in current_group),
+                text=text,
+                cue_indices=tuple(cue.index for cue in current_group),
+            )
+        )
+
+    for cue in cues:
+        if not current_group:
+            current_group = [cue]
+            current_end_ms = cue.end_ms
+            continue
+
+        if cue.start_ms < current_end_ms:
+            current_group.append(cue)
+            current_end_ms = max(current_end_ms, cue.end_ms)
+            continue
+
+        flush_group()
+        current_group = [cue]
+        current_end_ms = cue.end_ms
+
+    flush_group()
+    return units
+
+
 def ensure_audio_matrix(audio: np.ndarray) -> np.ndarray:
     matrix = np.asarray(audio)
     if matrix.ndim == 1:
@@ -234,6 +295,46 @@ def samples_to_ms(sample_count: int, sampling_rate: int) -> int:
 
 def ms_to_samples(value_ms: int, sampling_rate: int) -> int:
     return int(round(value_ms * sampling_rate / 1000.0))
+
+
+def fit_audio_to_duration(
+    audio: np.ndarray,
+    sampling_rate: int,
+    target_duration_ms: int,
+) -> np.ndarray:
+    matrix = ensure_audio_matrix(audio)
+    target_samples = max(0, ms_to_samples(target_duration_ms, sampling_rate))
+
+    if matrix.shape[0] == target_samples:
+        return matrix
+
+    if target_samples == 0:
+        return np.zeros((0, matrix.shape[1]), dtype=np.int16)
+
+    if matrix.shape[0] == 0:
+        return np.zeros((target_samples, matrix.shape[1]), dtype=np.int16)
+
+    stretch_rate = matrix.shape[0] / float(target_samples)
+    stretched_channels: List[np.ndarray] = []
+
+    for channel_idx in range(matrix.shape[1]):
+        samples = matrix[:, channel_idx].astype(np.float32) / 32768.0
+        stretched = librosa.effects.time_stretch(samples, rate=stretch_rate)
+        stretched_channels.append(stretched)
+
+    max_len = max(channel.shape[0] for channel in stretched_channels)
+    stretched_matrix = np.zeros((max_len, len(stretched_channels)), dtype=np.float32)
+    for channel_idx, channel in enumerate(stretched_channels):
+        stretched_matrix[: channel.shape[0], channel_idx] = channel
+
+    if stretched_matrix.shape[0] > target_samples:
+        stretched_matrix = stretched_matrix[:target_samples]
+    elif stretched_matrix.shape[0] < target_samples:
+        padding = np.zeros((target_samples - stretched_matrix.shape[0], stretched_matrix.shape[1]), dtype=np.float32)
+        stretched_matrix = np.concatenate([stretched_matrix, padding], axis=0)
+
+    stretched_matrix = np.clip(stretched_matrix, -1.0, 1.0)
+    return (stretched_matrix * 32767.0).astype(np.int16)
 
 
 def assemble_subtitle_audio(

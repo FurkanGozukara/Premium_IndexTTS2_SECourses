@@ -7,7 +7,9 @@ import numpy as np
 from indextts.utils.subtitle_utils import (
     SUPPORTED_SUBTITLE_EXTENSIONS,
     SubtitleCue,
+    build_subtitle_render_units,
     assemble_subtitle_audio,
+    fit_audio_to_duration,
     format_srt_timestamp,
     get_subtitle_format_label,
     parse_sbv,
@@ -115,6 +117,31 @@ Third line
             ],
             issues,
         )
+
+    def test_build_subtitle_render_units_merges_overlapping_cues(self):
+        cues = [
+            SubtitleCue(index=1, start_ms=0, end_ms=1000, text="Hello"),
+            SubtitleCue(index=2, start_ms=500, end_ms=1500, text="world"),
+            SubtitleCue(index=3, start_ms=2000, end_ms=2500, text="Again"),
+        ]
+
+        units = build_subtitle_render_units(cues)
+
+        self.assertEqual(2, len(units))
+        self.assertEqual((1, 2), units[0].cue_indices)
+        self.assertEqual(0, units[0].start_ms)
+        self.assertEqual(1500, units[0].end_ms)
+        self.assertEqual("Hello world", units[0].text)
+        self.assertEqual((3,), units[1].cue_indices)
+
+    def test_fit_audio_to_duration_matches_target_sample_count(self):
+        audio = np.full((200, 1), 1000, dtype=np.int16)
+
+        fitted = fit_audio_to_duration(audio, sampling_rate=1000, target_duration_ms=350)
+
+        self.assertEqual((350, 1), fitted.shape)
+        self.assertEqual(np.int16, fitted.dtype)
+        self.assertNotEqual(0, int(np.abs(fitted).sum()))
 
     def test_parse_subtitle_file_uses_extension_to_pick_parser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
