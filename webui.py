@@ -9,8 +9,11 @@ import platform
 import subprocess
 import tempfile
 import shutil
+import wave
 
 import warnings
+
+import numpy as np
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -55,6 +58,18 @@ for file in [
 
 import gradio as gr
 from indextts.infer_v2 import IndexTTS2
+from indextts.utils.subtitle_utils import (
+    assemble_subtitle_audio,
+    format_srt_timestamp,
+    parse_srt,
+    read_srt_file,
+    subtitle_cues_to_text,
+)
+from indextts.utils.task_output_utils import (
+    build_segment_output_path,
+    create_task_output_layout,
+    write_metadata_file,
+)
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language="Auto")
@@ -80,6 +95,103 @@ os.makedirs("prompts",exist_ok=True)
 os.makedirs("outputs/used_audios",exist_ok=True)
 
 MAX_LENGTH_TO_USE_SPEED = 70
+APP_TITLE = "Index TTS2 Premium SECourses App"
+APP_ASSETS_DIR = os.path.join(current_dir, "ui_assets")
+APP_FAVICON_PATH = os.path.join(APP_ASSETS_DIR, "indextts_premium_favicon.svg")
+APP_HEAD = """
+<meta name="theme-color" content="#a11236">
+"""
+APP_CSS = """
+.speaker-reference-required-note > div {
+    margin-top: 0.55rem;
+    padding: 0.8rem 0.95rem;
+    border-radius: 14px;
+    border: 1px solid rgba(185, 28, 28, 0.2);
+    background: linear-gradient(180deg, rgba(255, 245, 245, 0.97), rgba(255, 236, 236, 0.94));
+    color: #991b1b;
+    font-weight: 700;
+    font-size: 0.93rem;
+}
+
+#generate-speech-button button {
+    position: relative;
+    overflow: hidden;
+    min-height: 52px;
+    border-radius: 16px !important;
+    border: 1px solid rgba(127, 29, 29, 0.34) !important;
+    color: #fff7f7 !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.02em;
+    text-shadow: 0 1px 1px rgba(85, 7, 28, 0.28);
+    background: linear-gradient(180deg, #ffabb8 0%, #ff7f95 14%, #e23a5e 52%, #a11436 100%) !important;
+    box-shadow:
+        0 14px 30px rgba(226, 58, 94, 0.26),
+        0 1px 0 rgba(255, 255, 255, 0.35) inset,
+        0 -3px 0 rgba(104, 10, 30, 0.32) inset !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease !important;
+    animation: premium-button-glow 2.8s ease-in-out infinite;
+}
+
+#generate-speech-button button::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(120deg, transparent 18%, rgba(255, 255, 255, 0.24) 38%, transparent 55%);
+    transform: translateX(-150%);
+    animation: premium-button-sheen 3.6s ease-in-out infinite;
+    pointer-events: none;
+}
+
+#generate-speech-button button:hover {
+    transform: translateY(-1px);
+    filter: saturate(1.08) brightness(1.03);
+    box-shadow:
+        0 18px 34px rgba(226, 58, 94, 0.34),
+        0 1px 0 rgba(255, 255, 255, 0.37) inset,
+        0 -3px 0 rgba(104, 10, 30, 0.36) inset !important;
+}
+
+#generate-speech-button button:active {
+    transform: translateY(1px);
+    animation-play-state: paused;
+}
+
+#generate-speech-button button:focus-visible {
+    outline: 2px solid rgba(255, 215, 223, 0.9);
+    outline-offset: 2px;
+}
+
+@keyframes premium-button-glow {
+    0%, 100% {
+        box-shadow:
+            0 14px 30px rgba(226, 58, 94, 0.26),
+            0 1px 0 rgba(255, 255, 255, 0.35) inset,
+            0 -3px 0 rgba(104, 10, 30, 0.32) inset;
+    }
+    50% {
+        box-shadow:
+            0 18px 38px rgba(226, 58, 94, 0.4),
+            0 1px 0 rgba(255, 255, 255, 0.38) inset,
+            0 -3px 0 rgba(104, 10, 30, 0.36) inset;
+    }
+}
+
+@keyframes premium-button-sheen {
+    0%, 100% {
+        transform: translateX(-150%);
+    }
+    45%, 55% {
+        transform: translateX(150%);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #generate-speech-button button,
+    #generate-speech-button button::before {
+        animation: none !important;
+    }
+}
+"""
 
 # Try to import pydub for MP3 export
 try:
@@ -343,7 +455,119 @@ def load_audio_from_path(audio_path):
     else:
         return None
 
-def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename,
+def save_pcm16_wav(audio_matrix, sampling_rate, output_path):
+    """Save a mono/stereo int16 numpy array as a WAV file."""
+    audio_matrix = np.asarray(audio_matrix)
+    if audio_matrix.ndim == 1:
+        audio_matrix = audio_matrix[:, np.newaxis]
+    if audio_matrix.ndim != 2:
+        raise ValueError(f"Expected audio shape [samples, channels], got {audio_matrix.shape}")
+
+    if audio_matrix.dtype != np.int16:
+        audio_matrix = audio_matrix.astype(np.int16)
+
+    if os.path.isfile(output_path):
+        os.remove(output_path)
+        print(">> remove old wav file:", output_path)
+    if os.path.dirname(output_path) != "":
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with wave.open(output_path, "wb") as wav_file:
+        wav_file.setnchannels(audio_matrix.shape[1])
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sampling_rate)
+        wav_file.writeframes(audio_matrix.tobytes())
+
+    print(">> wav file saved to:", output_path)
+    return output_path
+
+
+def parse_subtitle_file(subtitle_file):
+    if not subtitle_file:
+        return []
+    return parse_srt(read_srt_file(subtitle_file))
+
+
+def current_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def abs_path_or_none(path):
+    return os.path.abspath(path) if path else None
+
+
+def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling_rate=None,
+                                  task_folder=None, segments_dir=None):
+    if not cues:
+        return "No subtitle cues loaded."
+
+    message_parts = [
+        f"Loaded {len(cues)} subtitle cue(s).",
+        f"Timeline end: {format_srt_timestamp(cues[-1].end_ms)}.",
+        "When SRT timing is enabled, generation uses the uploaded caption file directly.",
+    ]
+
+    if sample_count is not None and sampling_rate:
+        message_parts.append(f"Generated output length: {sample_count / float(sampling_rate):.2f}s.")
+
+    if issues is not None:
+        late_starts = [issue["delta_ms"] for issue in issues if issue["type"] == "late_start"]
+        overruns = [issue["delta_ms"] for issue in issues if issue["type"] == "slot_overrun"]
+        if late_starts:
+            message_parts.append(
+                f"{len(late_starts)} cue(s) started late because earlier speech ran long. Max late start: {max(late_starts)}ms."
+            )
+        if overruns:
+            message_parts.append(
+                f"{len(overruns)} cue(s) exceeded their subtitle duration. Max overrun: {max(overruns)}ms."
+            )
+        if not late_starts and not overruns:
+            message_parts.append("All subtitle cue starts were preserved without timing overruns.")
+
+    if task_folder:
+        message_parts.append(f"Task folder: {os.path.abspath(task_folder)}.")
+    if segments_dir:
+        message_parts.append(f"Separate cue WAVs: {os.path.abspath(segments_dir)}.")
+
+    return " ".join(message_parts)
+
+
+def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
+    if subtitle_mode and subtitle_file:
+        try:
+            cues = parse_subtitle_file(subtitle_file)
+            data = []
+            for cue in cues:
+                details = f"{format_srt_timestamp(cue.start_ms)} -> {format_srt_timestamp(cue.end_ms)} ({cue.duration_ms} ms)"
+                data.append([cue.index, "SRT Cue", cue.text, details])
+            return data
+        except Exception as e:
+            return [[0, "SRT Error", str(e), ""]]
+
+    if not text:
+        return []
+
+    if not max_text_tokens_per_segment:
+        max_tokens = 120
+    else:
+        try:
+            max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
+            max_tokens = max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
+        except (ValueError, TypeError):
+            max_tokens = 120
+
+    text_tokens_list = tts.tokenizer.tokenize(text)
+    segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
+
+    data = []
+    for i, segment_tokens in enumerate(segments):
+        segment_str = ''.join(segment_tokens)
+        tokens_count = len(segment_tokens)
+        data.append([i, "Text Segment", segment_str, f"{tokens_count} tokens"])
+    return data
+
+
+def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, save_used_audio, output_filename,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
@@ -384,9 +608,15 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                emo_bias_surprise,
                emo_bias_calm,
                progress=gr.Progress()):
-    # Generate output path with sequential numbering or use custom filename
-    temp_wav_path = generate_output_path(filename=output_filename, save_as_mp3=False)  # Always generate WAV first
-    output_path = temp_wav_path
+    subtitle_mode = bool(subtitle_mode)
+    if not prompt:
+        raise gr.Error("Speaker reference audio is required before you can generate speech.")
+
+    task_layout = create_task_output_layout(output_root="outputs", filename=output_filename, subtitle_mode=subtitle_mode)
+    output_path = task_layout["final_wav_path"]
+    metadata_path = task_layout["metadata_path"]
+    task_folder = task_layout["task_folder"]
+
     # set gradio progress
     tts.gr_progress = progress
 
@@ -441,45 +671,193 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
             # Use default if conversion fails
             max_tokens = 120
 
-    # Pass new parameters to infer
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
-                       output_path=output_path,
-                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
-                       emo_vector=vec,
-                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
-                       verbose=cmd_args.verbose,
-                       max_text_tokens_per_segment=max_tokens,
-                       interval_silence=int(interval_silence),
-                       diffusion_steps=int(diffusion_steps),
-                       inference_cfg_rate=float(inference_cfg_rate),
-                       max_speaker_audio_length=float(max_speaker_audio_length),
-                       max_emotion_audio_length=float(max_emotion_audio_length),
-                       autoregressive_batch_size=int(autoregressive_batch_size),
-                       max_emotion_sum=float(max_emotion_sum),
-                       latent_multiplier=float(latent_multiplier),
-                       max_consecutive_silence=int(max_consecutive_silence),
-                       semantic_layer=int(semantic_layer),
-                       cfm_cache_length=int(cfm_cache_length),
-                       reset_beam_cache_per_segment=bool(prevent_vram_accumulation),
-                       **kwargs)
+    infer_kwargs = {
+        "emo_audio_prompt": emo_ref_path,
+        "emo_alpha": emo_weight,
+        "emo_vector": vec,
+        "use_emo_text": (emo_control_method == 3),
+        "emo_text": emo_text,
+        "use_random": emo_random,
+        "verbose": cmd_args.verbose,
+        "max_text_tokens_per_segment": max_tokens,
+        "interval_silence": int(interval_silence),
+        "diffusion_steps": int(diffusion_steps),
+        "inference_cfg_rate": float(inference_cfg_rate),
+        "max_speaker_audio_length": float(max_speaker_audio_length),
+        "max_emotion_audio_length": float(max_emotion_audio_length),
+        "autoregressive_batch_size": int(autoregressive_batch_size),
+        "max_emotion_sum": float(max_emotion_sum),
+        "latent_multiplier": float(latent_multiplier),
+        "max_consecutive_silence": int(max_consecutive_silence),
+        "semantic_layer": int(semantic_layer),
+        "cfm_cache_length": int(cfm_cache_length),
+        "reset_beam_cache_per_segment": bool(prevent_vram_accumulation),
+    }
+    infer_kwargs.update(kwargs)
 
-    # Save used audio if requested
-    if save_used_audio and prompt:
-        try:
-            # Extract base filename from output path
-            base_name = os.path.basename(output).rsplit('.', 1)[0]
-            used_audio_path = os.path.join("outputs/used_audios", f"{base_name}_reference.wav")
-            shutil.copy2(prompt, used_audio_path)
-            print(f"Saved used reference audio to: {used_audio_path}")
-        except Exception as e:
-            print(f"Error saving used audio: {e}")
+    subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
+    resolved_settings = {
+        "emotion_control_method_index": emo_control_method,
+        "emotion_control_method_label": EMO_CHOICES_ALL[emo_control_method] if 0 <= emo_control_method < len(EMO_CHOICES_ALL) else str(emo_control_method),
+        "save_used_audio": bool(save_used_audio),
+        "save_as_mp3_requested": bool(save_as_mp3),
+        "save_as_mp3_enabled": bool(save_as_mp3 and MP3_AVAILABLE),
+        "mp3_bitrate": mp3_bitrate,
+        "subtitle_mode": subtitle_mode,
+        "low_memory_mode": bool(low_memory_mode),
+        "prevent_vram_accumulation": bool(prevent_vram_accumulation),
+        "resolved_generation_kwargs": infer_kwargs,
+        "normalized_emotion_vector": vec,
+    }
 
-    # Convert to MP3 if requested
-    if save_as_mp3 and MP3_AVAILABLE:
-        mp3_path = output.replace('.wav', '.mp3')
-        output = convert_wav_to_mp3(output, mp3_path, bitrate=mp3_bitrate)
+    metadata = {
+        "status": "in_progress",
+        "created_at": current_timestamp(),
+        "updated_at": current_timestamp(),
+        "task": {
+            "id": task_layout["task_id"],
+            "folder": abs_path_or_none(task_folder),
+            "mode": "subtitle" if subtitle_mode else "text",
+            "requested_output_filename": output_filename or "",
+            "resolved_output_basename": task_layout["final_basename"],
+        },
+        "inputs": {
+            "text": text,
+            "speaker_reference_audio": abs_path_or_none(prompt),
+            "emotion_reference_audio": abs_path_or_none(emo_ref_path),
+            "subtitle_file": abs_path_or_none(subtitle_file),
+        },
+        "settings": resolved_settings,
+        "outputs": {
+            "final_audio_path": None,
+            "final_wav_path": abs_path_or_none(task_layout["final_wav_path"]),
+            "final_mp3_path": abs_path_or_none(task_layout["final_mp3_path"]) if save_as_mp3 and MP3_AVAILABLE else None,
+            "metadata_path": abs_path_or_none(metadata_path),
+            "segments_dir": abs_path_or_none(task_layout["segments_dir"]),
+            "speaker_reference_copy_path": None,
+            "subtitle_copy_path": None,
+        },
+        "subtitle": None,
+        "error": None,
+    }
 
-    return gr.update(value=output,visible=True)
+    if subtitle_mode:
+        metadata["subtitle"] = {
+            "cue_count": len(subtitle_cues),
+            "timeline_end_ms": subtitle_cues[-1].end_ms if subtitle_cues else 0,
+            "cues": [
+                {
+                    "index": cue.index,
+                    "start_ms": cue.start_ms,
+                    "end_ms": cue.end_ms,
+                    "duration_ms": cue.duration_ms,
+                    "text": cue.text,
+                    "segment_file": None,
+                    "generated_duration_ms": None,
+                }
+                for cue in subtitle_cues
+            ],
+            "timing_issues": [],
+        }
+
+    if subtitle_mode and subtitle_file and task_layout["subtitle_copy_path"]:
+        shutil.copy2(subtitle_file, task_layout["subtitle_copy_path"])
+        metadata["outputs"]["subtitle_copy_path"] = abs_path_or_none(task_layout["subtitle_copy_path"])
+
+    write_metadata_file(metadata_path, metadata)
+
+    subtitle_status_update = gr.update()
+    output = None
+
+    try:
+        if subtitle_mode:
+            if not subtitle_cues:
+                raise gr.Error("No subtitle cues were found in the selected .srt file.")
+
+            rendered_cues = []
+            original_progress = tts.gr_progress
+            sampling_rate = 22050
+
+            try:
+                tts.gr_progress = None
+                for cue_idx, cue in enumerate(subtitle_cues):
+                    progress(0.05 + 0.8 * cue_idx / max(len(subtitle_cues), 1),
+                             desc=f"subtitle cue {cue_idx + 1}/{len(subtitle_cues)}...")
+                    if cue.text.strip():
+                        sampling_rate, cue_audio = tts.infer(
+                            spk_audio_prompt=prompt,
+                            text=cue.text,
+                            output_path=None,
+                            **infer_kwargs,
+                        )
+                    else:
+                        cue_audio = np.zeros((0, 1), dtype=np.int16)
+
+                    segment_path = build_segment_output_path(task_layout["segments_dir"], cue_idx + 1)
+                    save_pcm16_wav(cue_audio, sampling_rate, segment_path)
+
+                    metadata["subtitle"]["cues"][cue_idx]["segment_file"] = abs_path_or_none(segment_path)
+                    metadata["subtitle"]["cues"][cue_idx]["generated_duration_ms"] = int(
+                        round(cue_audio.shape[0] * 1000.0 / sampling_rate)
+                    )
+                    metadata["updated_at"] = current_timestamp()
+                    write_metadata_file(metadata_path, metadata)
+
+                    rendered_cues.append((cue, cue_audio))
+            finally:
+                tts.gr_progress = original_progress
+
+            progress(0.92, desc="assembling subtitle timeline...")
+            combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_cues, sampling_rate=sampling_rate)
+            if combined_audio.shape[0] == 0:
+                raise gr.Error("The subtitle file does not contain any spoken text to synthesize.")
+
+            output = save_pcm16_wav(combined_audio, sampling_rate, output_path)
+            metadata["subtitle"]["timing_issues"] = subtitle_issues
+            subtitle_status_update = gr.update(
+                value=build_subtitle_status_message(
+                    subtitle_cues,
+                    issues=subtitle_issues,
+                    sample_count=combined_audio.shape[0],
+                    sampling_rate=sampling_rate,
+                    task_folder=task_folder,
+                    segments_dir=task_layout["segments_dir"],
+                ),
+                visible=True,
+            )
+        else:
+            output = tts.infer(spk_audio_prompt=prompt, text=text,
+                               output_path=output_path,
+                               **infer_kwargs)
+
+        if save_used_audio and prompt:
+            try:
+                shutil.copy2(prompt, task_layout["speaker_reference_copy_path"])
+                metadata["outputs"]["speaker_reference_copy_path"] = abs_path_or_none(
+                    task_layout["speaker_reference_copy_path"]
+                )
+                print(f"Saved used reference audio to: {task_layout['speaker_reference_copy_path']}")
+            except Exception as e:
+                print(f"Error saving used audio: {e}")
+
+        if save_as_mp3 and MP3_AVAILABLE:
+            output = convert_wav_to_mp3(output, task_layout["final_mp3_path"], bitrate=mp3_bitrate)
+
+        metadata["status"] = "completed"
+        metadata["updated_at"] = current_timestamp()
+        metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
+        metadata["outputs"]["final_wav_exists"] = bool(task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"]))
+        metadata["outputs"]["final_mp3_exists"] = bool(task_layout["final_mp3_path"] and os.path.exists(task_layout["final_mp3_path"]))
+        write_metadata_file(metadata_path, metadata)
+
+        return gr.update(value=output,visible=True), subtitle_status_update
+    except Exception as e:
+        metadata["status"] = "failed"
+        metadata["updated_at"] = current_timestamp()
+        metadata["error"] = str(e)
+        metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
+        write_metadata_file(metadata_path, metadata)
+        raise
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -488,9 +866,9 @@ def update_prompt_audio():
 
 theme = gr.themes.Soft()
 theme.font = [gr.themes.GoogleFont("Inter"), "Tahoma", "ui-sans-serif", "system-ui", "sans-serif"]
-with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
+with gr.Blocks(title=APP_TITLE) as demo:
     mutex = threading.Lock()
-    gr.Markdown("## SECourses Index TTS2 Premium App V3 : https://www.patreon.com/posts/139297407")
+    gr.Markdown("## Index TTS2 Premium SECourses App : https://www.patreon.com/posts/139297407")
 
     with gr.Tab("Audio Generation"):
         with gr.Row():
@@ -518,43 +896,74 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                         )
                         extract_button = gr.Button("Extract and Use Audio", variant="secondary")
 
-                # Speaker reference audio (initially hidden, shown after upload)
+                # Speaker reference audio
                 prompt_audio = gr.Audio(
-                    label="Speaker Reference Audio (3-90 seconds)",
+                    label="Speaker Reference Audio (Required, 3-90 seconds)",
                     key="prompt_audio",
                     sources=["upload","microphone"],
                     type="filepath",
-                    visible=False
+                    visible=True,
+                    elem_id="speaker-reference-audio"
                 )
+                gr.HTML(
+                    "<div>Speaker reference audio is mandatory. Upload, record, or extract it before clicking Generate Speech.</div>",
+                    elem_classes="speaker-reference-required-note"
+                )
+
+                with gr.Group(elem_classes="subtitle-controls-group"):
+                    with gr.Row():
+                        subtitle_file = gr.File(
+                            label="Caption File (.srt)",
+                            file_count="single",
+                            file_types=[".srt"],
+                            type="filepath"
+                        )
+                        subtitle_mode = gr.Checkbox(
+                            label="Use SRT Cue Timing",
+                            value=False,
+                            info="Generate each subtitle cue separately and preserve subtitle start-time gaps from the .srt file."
+                        )
+                    subtitle_status = gr.Textbox(
+                        label="Subtitle Status",
+                        value="",
+                        interactive=False,
+                        visible=False
+                    )
 
                 prompt_list = os.listdir("prompts")
                 default = ''
                 if prompt_list:
                     default = prompt_list[0]
 
-            # Middle column for text input
+            # Main workspace
             with gr.Column():
                 input_text_single = gr.TextArea(
                     label="Text to Synthesize",
                     key="input_text_single",
                     placeholder="Enter the text you want to convert to speech",
-                    info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts will be automatically segmented."
+                    info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts will be automatically segmented. Upload an .srt file to synthesize subtitle cues with preserved timing."
                 )
                 with gr.Row():
-                    gen_button = gr.Button("Generate Speech", key="gen_button", interactive=True, variant="primary")
+                    gen_button = gr.Button(
+                        "Generate Speech",
+                        key="gen_button",
+                        elem_id="generate-speech-button",
+                        interactive=True,
+                        variant="primary"
+                    )
                     open_outputs_button = gr.Button("📁 Open Outputs Folder", key="open_outputs_button")
 
                 # Output filename and save used audio options
                 with gr.Row():
                     output_filename = gr.Textbox(
                         label="Output Filename (optional)",
-                        placeholder="Leave empty for auto-numbering (e.g., 0001.wav)",
+                        placeholder="Optional final filename inside the numbered task folder",
                         value=""
                     )
                     save_used_audio = gr.Checkbox(
                         label="Save Used Reference Audio",
                         value=False,
-                        info="Save reference audio to outputs/used_audios"
+                        info="Copy the speaker reference audio into this generation's numbered task folder"
                     )
 
             # Right column for output and load from path
@@ -565,7 +974,6 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     key="output_audio"
                 )
 
-                # Load audio from path section
                 with gr.Group():
                     gr.Markdown("### Load Audio from Path")
                     with gr.Row():
@@ -735,7 +1143,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         with gr.Accordion("Preview Sentence Segmentation Results", open=True) as segments_settings:
             segments_preview = gr.Dataframe(
-                headers=["Index", "Segment Content", "Token Count"],
+                headers=["Index", "Type", "Content", "Details"],
                 key="segments_preview",
                 wrap=True,
             )
@@ -928,7 +1336,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
     def process_media_upload(media_file, time_ranges):
         """Process uploaded media file and extract audio."""
         if media_file is None:
-            return gr.update(visible=True), gr.update(visible=False), gr.update(value=None)
+            return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
 
         try:
             # Extract audio from media file
@@ -936,7 +1344,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             extracted_audio = extract_audio_from_media(media_file, temp_audio)
 
             if not extracted_audio:
-                return gr.update(visible=True), gr.update(visible=False), gr.update(value=None)
+                return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
 
             # If time ranges specified, extract and merge segments
             if time_ranges and time_ranges.strip():
@@ -953,7 +1361,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             )
         except Exception as e:
             print(f"Error processing media: {e}")
-            return gr.update(visible=True), gr.update(visible=False), gr.update(value=None)
+            return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
 
     def extract_audio_segments(media_file, time_ranges):
         """Extract specific time segments from uploaded media."""
@@ -987,16 +1395,16 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     def clear_reference_audio():
         """Clear reference audio and show upload panel again."""
-        return gr.update(visible=True), gr.update(visible=False, value=None)
+        return gr.update(visible=True), gr.update(visible=True, value=None)
 
     def load_audio_from_path_ui(audio_path):
         """Load audio from the specified file path."""
         if not audio_path:
-            return gr.update(value=None), gr.update(value="Please enter a file path", visible=True)
+            return gr.update(), gr.update(visible=True, value=None), gr.update(value="Please enter a file path", visible=True)
 
         audio_path = audio_path.strip()
         if not os.path.exists(audio_path):
-            return gr.update(value=None), gr.update(value=f"File not found: {audio_path}", visible=True)
+            return gr.update(), gr.update(visible=True, value=None), gr.update(value=f"File not found: {audio_path}", visible=True)
 
         try:
             # Convert to acceptable format if needed
@@ -1022,38 +1430,40 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(value=f"Error: {str(e)}", visible=True)
             )
 
-    def on_input_text_change(text, max_text_tokens_per_segment):
-        if text and len(text) > 0:
-            # Ensure max_text_tokens_per_segment is within valid range
-            # This prevents errors when users are typing values (now it's a string from Textbox)
-            if not max_text_tokens_per_segment:
-                max_tokens = 120
-            else:
-                try:
-                    # Convert string to int and clamp to valid range
-                    max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
-                    max_tokens = max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
-                except (ValueError, TypeError):
-                    # Use default if conversion fails
-                    max_tokens = 120
+    def load_subtitle_file(subtitle_file_path, current_text, subtitle_mode, max_text_tokens_per_segment):
+        if not subtitle_file_path:
+            preview_rows = get_preview_rows(current_text, max_text_tokens_per_segment, False, None)
+            return (
+                current_text,
+                gr.update(value=False),
+                gr.update(value="", visible=False),
+                gr.update(value=preview_rows, visible=True, type="array"),
+            )
 
-            text_tokens_list = tts.tokenizer.tokenize(text)
+        try:
+            cues = parse_subtitle_file(subtitle_file_path)
+            subtitle_text = subtitle_cues_to_text(cues)
+            preview_rows = get_preview_rows(subtitle_text, max_text_tokens_per_segment, True, subtitle_file_path)
+            return (
+                subtitle_text,
+                gr.update(value=True),
+                gr.update(value=build_subtitle_status_message(cues), visible=True),
+                gr.update(value=preview_rows, visible=True, type="array"),
+            )
+        except Exception as e:
+            preview_rows = [[0, "SRT Error", str(e), ""]]
+            return (
+                current_text,
+                gr.update(value=False),
+                gr.update(value=f"Failed to load subtitle file: {str(e)}", visible=True),
+                gr.update(value=preview_rows, visible=True, type="array"),
+            )
 
-            segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
-            data = []
-            for i, s in enumerate(segments):
-                segment_str = ''.join(s)
-                tokens_count = len(s)
-                data.append([i, segment_str, tokens_count])
-            return {
-                segments_preview: gr.update(value=data, visible=True, type="array"),
-            }
-        else:
-            # Return empty data with headers
-            empty_data = []
-            return {
-                segments_preview: gr.update(value=empty_data, visible=True),
-            }
+    def on_input_text_change(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path):
+        data = get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path)
+        return {
+            segments_preview: gr.update(value=data, visible=True, type="array"),
+        }
 
     def on_method_change(emo_control_method):
         if emo_control_method == 1:  # emotion reference audio
@@ -1097,14 +1507,26 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     input_text_single.change(
         on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment],
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
         outputs=[segments_preview]
     )
 
     max_text_tokens_per_segment.change(
         on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment],
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
         outputs=[segments_preview]
+    )
+
+    subtitle_mode.change(
+        on_input_text_change,
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
+        outputs=[segments_preview]
+    )
+
+    subtitle_file.change(
+        load_subtitle_file,
+        inputs=[subtitle_file, input_text_single, subtitle_mode, max_text_tokens_per_segment],
+        outputs=[input_text_single, subtitle_mode, subtitle_status, segments_preview]
     )
 
     prompt_audio.upload(update_prompt_audio,
@@ -1136,7 +1558,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
     )
 
     gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, save_used_audio, output_filename, emo_upload, emo_weight,
+                     inputs=[emo_control_method,prompt_audio, input_text_single, subtitle_mode, subtitle_file, save_used_audio, output_filename, emo_upload, emo_weight,
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
@@ -1145,7 +1567,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                              *advanced_params,
                              *model_params,
                      ],
-                     outputs=[output_audio])
+                     outputs=[output_audio, subtitle_status])
 
     open_outputs_button.click(open_outputs_folder)
 
@@ -1155,5 +1577,9 @@ if __name__ == "__main__":
     demo.queue(20)
     demo.launch(
         share=cmd_args.share,
-        inbrowser=True
+        inbrowser=True,
+        theme=theme,
+        css=APP_CSS,
+        head=APP_HEAD,
+        favicon_path=APP_FAVICON_PATH,
     )

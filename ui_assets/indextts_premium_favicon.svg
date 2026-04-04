@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Index TTS2 Premium SECourses App">
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7d0f26"/>
+      <stop offset="48%" stop-color="#be2348"/>
+      <stop offset="100%" stop-color="#ff7c72"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".42"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#fff7f5"/>
+      <stop offset="100%" stop-color="#ffe2cf"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#711127" flood-opacity=".28"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#panel)" filter="url(#shadow)"/>
+  <path d="M17 16h94c-5 20-21 30-47 30S22 36 17 16Z" fill="url(#gloss)"/>
+  <rect x="25" y="60" width="14" height="32" rx="7" fill="#fff6f4"/>
+  <rect x="89" y="60" width="14" height="32" rx="7" fill="#fff6f4"/>
+  <path d="M34 77c0-20 13.4-36 30-36s30 16 30 36" fill="none" stroke="#fff4f0" stroke-linecap="round" stroke-width="8"/>
+  <path d="M31 51h9v26h-9zM46 40h10v48H46zM62 33h10v62H62zM78 45h10v38H78z" fill="url(#wave)"/>
+  <circle cx="99" cy="29" r="12" fill="#fff0c4"/>
+  <path d="M99 19.5l2.4 5.4 5.9.5-4.4 4 1.3 5.8-5.2-3-5.2 3 1.2-5.8-4.3-4 5.9-.5z" fill="#b36300"/>
+</svg>
