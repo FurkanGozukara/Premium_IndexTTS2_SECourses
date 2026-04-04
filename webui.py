@@ -974,8 +974,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
             with gr.Column(scale=1, min_width=280):
                 with gr.Group(elem_classes="top-input-panel"):
-                    gr.Markdown("### Reference Media (Mandatory!)")
-                    gr.Markdown("#### Upload / Import Speaker Audio", elem_classes="reference-subsection-title")
+                    gr.Markdown("### Reference Media (Mandatory!) (Recommended 15 seconds)")
                     with gr.Group(elem_classes="reference-subsection"):
                         media_upload = gr.File(
                             label="Upload Speaker Reference / Audio / Video",
