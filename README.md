@@ -12,7 +12,11 @@
 
 - - Linux users please use Massed Compute installers
 
-- Now all models auto downloaded with our app 
+- Now all models auto downloaded with our app
+
+- How app has title on browser tabs and a custom favicon
+
+- <img width="371" height="98" alt="image" src="https://github.com/user-attachments/assets/b3f77604-c5cf-402c-8287-c123a997ecce" />
 
 - Interface completely upgraded
 
