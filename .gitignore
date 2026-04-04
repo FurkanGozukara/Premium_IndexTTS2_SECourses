@@ -32,3 +32,5 @@ desktop.ini
 !/checkpoints/*.yaml
 /outputs/
 indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
+a.png
+gradio/
