@@ -2,6 +2,8 @@
 
 ## This app is made only for SECourses Patreon users : https://www.patreon.com/posts/139297407
 
+### Download app from here > https://www.patreon.com/posts/139297407
+
 ## 5 March 2026 Update V4
 
 - This is a massive update of the app so please make a fresh install
