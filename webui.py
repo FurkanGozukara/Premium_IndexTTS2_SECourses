@@ -4,11 +4,13 @@ import os
 import sys
 import threading
 import time
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import glob
 from pathlib import Path
 import platform
+import signal
 import subprocess
 import tempfile
 import shutil
@@ -60,7 +62,8 @@ for file in [
         sys.exit(1)
 
 import gradio as gr
-from indextts.infer_v2 import IndexTTS2
+from omegaconf import OmegaConf
+from indextts.utils.front import TextNormalizer, TextTokenizer
 from indextts.utils.subtitle_utils import (
     SUPPORTED_SUBTITLE_EXTENSIONS,
     assemble_subtitle_audio,
@@ -82,15 +85,116 @@ from indextts.utils.task_output_utils import (
     write_metadata_file,
 )
 from tools.i18n.i18n import I18nAuto
+from webui_generation_runner import create_tts as create_generation_tts, run_generation_request
 
 i18n = I18nAuto(language="Auto")
 MODE = 'local'
-tts = IndexTTS2(model_dir=cmd_args.model_dir,
-                cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-                use_fp16=cmd_args.fp16,
-                use_deepspeed=cmd_args.deepspeed,
-                use_cuda_kernel=cmd_args.cuda_kernel,
-                )
+
+
+class LazyTTSProxy:
+    def __init__(self, factory):
+        self._factory = factory
+        self._instance = None
+        self._lock = threading.Lock()
+
+    def get_instance(self):
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    self._instance = self._factory()
+        return self._instance
+
+    def release_instance(self):
+        with self._lock:
+            instance = self._instance
+            self._instance = None
+        return instance
+
+    def is_loaded(self):
+        return self._instance is not None
+
+    def __getattr__(self, item):
+        return getattr(self.get_instance(), item)
+
+    def __setattr__(self, key, value):
+        if key in {"_factory", "_instance", "_lock"}:
+            object.__setattr__(self, key, value)
+            return
+        setattr(self.get_instance(), key, value)
+
+
+def _build_tts_runtime_options():
+    return {
+        "model_dir": cmd_args.model_dir,
+        "cfg_path": os.path.join(cmd_args.model_dir, "config.yaml"),
+        "use_fp16": bool(cmd_args.fp16),
+        "use_deepspeed": bool(cmd_args.deepspeed),
+        "use_cuda_kernel": bool(cmd_args.cuda_kernel),
+    }
+
+
+PREVIEW_CFG = OmegaConf.load(os.path.join(cmd_args.model_dir, "config.yaml"))
+PREVIEW_MAX_TEXT_TOKENS = int(PREVIEW_CFG.gpt.max_text_tokens)
+MODEL_VERSION = str(getattr(PREVIEW_CFG, "version", "1.0"))
+PREVIEW_BPE_PATH = os.path.join(cmd_args.model_dir, PREVIEW_CFG.dataset["bpe_model"])
+PREVIEW_TEXT_NORMALIZER = TextNormalizer()
+PREVIEW_TEXT_NORMALIZER.load()
+PREVIEW_TEXT_TOKENIZER = TextTokenizer(PREVIEW_BPE_PATH, PREVIEW_TEXT_NORMALIZER)
+
+
+def _create_inprocess_tts():
+    return create_generation_tts(_build_tts_runtime_options())
+
+
+tts = LazyTTSProxy(_create_inprocess_tts)
+
+
+def unload_inprocess_tts():
+    instance = tts.release_instance()
+    if instance is None:
+        return False
+
+    for attr in (
+        "qwen_emo",
+        "gpt",
+        "semantic_model",
+        "semantic_codec",
+        "s2mel",
+        "campplus_model",
+        "bigvgan",
+        "emo_matrix",
+        "spk_matrix",
+        "mel_fn",
+        "extract_features",
+        "semantic_mean",
+        "semantic_std",
+        "cache_spk_cond",
+        "cache_s2mel_style",
+        "cache_s2mel_prompt",
+        "cache_spk_audio_prompt",
+        "cache_spk_prompt_key",
+        "cache_emo_cond",
+        "cache_emo_audio_prompt",
+        "cache_emo_prompt_key",
+        "cache_mel",
+        "gr_progress",
+    ):
+        if hasattr(instance, attr):
+            setattr(instance, attr, None)
+
+    gc.collect()
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        try:
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
+                if hasattr(torch_module.cuda, "ipc_collect"):
+                    torch_module.cuda.ipc_collect()
+            elif hasattr(torch_module, "mps") and torch_module.backends.mps.is_available():
+                torch_module.mps.empty_cache()
+        except Exception:
+            pass
+    return True
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
@@ -872,13 +976,522 @@ def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling
     return " ".join(message_parts)
 
 
+def normalize_emo_vector(emo_vector, apply_bias=True, max_emotion_sum=0.8, custom_biases=None):
+    if apply_bias:
+        emo_bias = custom_biases or [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625]
+        emo_vector = [vec * bias for vec, bias in zip(emo_vector, emo_bias)]
+
+    emo_sum = sum(emo_vector)
+    if emo_sum > max_emotion_sum and emo_sum > 0:
+        scale_factor = max_emotion_sum / emo_sum
+        emo_vector = [vec * scale_factor for vec in emo_vector]
+
+    return emo_vector
+
+
+_SUBPROCESS_STATE_LOCK = threading.Lock()
+_SUBPROCESS_STATE = {
+    "process": None,
+    "request_file": None,
+    "result_file": None,
+    "metadata_path": None,
+    "task_id": None,
+    "canceled": False,
+    "cancel_reason": None,
+}
+
+
+def _clear_subprocess_state(expected_process=None):
+    with _SUBPROCESS_STATE_LOCK:
+        process = _SUBPROCESS_STATE.get("process")
+        if expected_process is not None and process is not expected_process:
+            return None
+
+        snapshot = dict(_SUBPROCESS_STATE)
+        _SUBPROCESS_STATE.update(
+            {
+                "process": None,
+                "request_file": None,
+                "result_file": None,
+                "metadata_path": None,
+                "task_id": None,
+                "canceled": False,
+                "cancel_reason": None,
+            }
+        )
+        return snapshot
+
+
+def _register_subprocess_state(process, request_file, result_file, metadata_path, task_id):
+    with _SUBPROCESS_STATE_LOCK:
+        current_process = _SUBPROCESS_STATE.get("process")
+        if current_process is not None and current_process.poll() is None:
+            _terminate_process_tree(process)
+            raise gr.Error("A subprocess generation is already running.")
+
+        _SUBPROCESS_STATE.update(
+            {
+                "process": process,
+                "request_file": request_file,
+                "result_file": result_file,
+                "metadata_path": metadata_path,
+                "task_id": task_id,
+                "canceled": False,
+                "cancel_reason": None,
+            }
+        )
+
+
+def _cleanup_temp_file(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _parse_started_at_timestamp(started_at):
+    if not started_at:
+        return None
+    try:
+        return datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return None
+
+
+def _mark_metadata_canceled(metadata_path, reason):
+    if not metadata_path or not os.path.exists(metadata_path):
+        return
+
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except Exception:
+        return
+
+    if metadata.get("status") == "completed":
+        return
+
+    now = current_timestamp()
+    metadata["status"] = "canceled"
+    metadata["updated_at"] = now
+    metadata["error"] = reason
+    metadata.setdefault("processing", {})
+    metadata["processing"]["ended_at"] = now
+    started_at = _parse_started_at_timestamp(metadata["processing"].get("started_at"))
+    if started_at is not None:
+        elapsed_seconds = max(0.0, (datetime.now(started_at.tzinfo) - started_at).total_seconds())
+        metadata["processing"]["elapsed_ms"] = int(round(elapsed_seconds * 1000.0))
+        metadata["processing"]["elapsed_seconds"] = round(elapsed_seconds, 3)
+        metadata["processing"]["elapsed_human"] = format_elapsed_duration(elapsed_seconds)
+    write_metadata_file(metadata_path, metadata)
+
+
+def _terminate_process_tree(process):
+    if process is None or process.poll() is not None:
+        return
+
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _prepare_generation_request(
+    emo_control_method,
+    prompt,
+    text,
+    subtitle_mode,
+    subtitle_file,
+    save_used_audio,
+    output_filename,
+    emo_ref_path,
+    emo_weight,
+    vec1,
+    vec2,
+    vec3,
+    vec4,
+    vec5,
+    vec6,
+    vec7,
+    vec8,
+    emo_text,
+    emo_random,
+    max_text_tokens_per_segment,
+    save_as_mp3,
+    diffusion_steps,
+    inference_cfg_rate,
+    interval_silence,
+    max_speaker_audio_length,
+    max_emotion_audio_length,
+    autoregressive_batch_size,
+    apply_emo_bias,
+    max_emotion_sum,
+    latent_multiplier,
+    max_consecutive_silence,
+    mp3_bitrate,
+    do_sample,
+    top_p,
+    top_k,
+    temperature,
+    length_penalty,
+    num_beams,
+    repetition_penalty,
+    max_mel_tokens,
+    low_memory_mode,
+    prevent_vram_accumulation,
+    semantic_layer,
+    cfm_cache_length,
+    emo_bias_joy,
+    emo_bias_anger,
+    emo_bias_sad,
+    emo_bias_fear,
+    emo_bias_disgust,
+    emo_bias_depression,
+    emo_bias_surprise,
+    emo_bias_calm,
+    use_subprocess_system,
+):
+    subtitle_mode = bool(subtitle_mode)
+    if not prompt:
+        raise gr.Error("Speaker reference audio is required before you can generate speech.")
+
+    processing_started_at = current_timestamp()
+    subtitle_extension = get_subtitle_extension(subtitle_file) if subtitle_mode else None
+    task_layout = create_task_output_layout(
+        output_root="outputs",
+        filename=output_filename,
+        subtitle_mode=subtitle_mode,
+        subtitle_extension=subtitle_extension,
+    )
+    metadata_path = task_layout["metadata_path"]
+    task_folder = task_layout["task_folder"]
+
+    if not isinstance(emo_control_method, int) and hasattr(emo_control_method, "value"):
+        emo_control_method = emo_control_method.value
+    emo_control_method = int(emo_control_method)
+
+    if emo_control_method == 0:
+        emo_ref_path = None
+    if emo_control_method == 2:
+        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+        custom_emo_biases = [
+            emo_bias_joy,
+            emo_bias_anger,
+            emo_bias_sad,
+            emo_bias_fear,
+            emo_bias_disgust,
+            emo_bias_depression,
+            emo_bias_surprise,
+            emo_bias_calm,
+        ]
+        vec = normalize_emo_vector(
+            vec,
+            apply_bias=apply_emo_bias,
+            max_emotion_sum=max_emotion_sum,
+            custom_biases=custom_emo_biases if apply_emo_bias else None,
+        )
+    else:
+        vec = None
+
+    if emo_text == "":
+        emo_text = None
+
+    print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
+
+    max_tokens = resolve_max_text_tokens(max_text_tokens_per_segment)
+    infer_kwargs = {
+        "do_sample": bool(do_sample),
+        "top_p": float(top_p),
+        "top_k": int(top_k) if int(top_k) > 0 else None,
+        "temperature": float(temperature),
+        "length_penalty": float(length_penalty),
+        "num_beams": int(num_beams),
+        "repetition_penalty": float(repetition_penalty),
+        "max_mel_tokens": int(max_mel_tokens),
+        "emo_audio_prompt": emo_ref_path,
+        "emo_alpha": float(emo_weight),
+        "emo_vector": vec,
+        "use_emo_text": (emo_control_method == 3),
+        "emo_text": emo_text,
+        "use_random": bool(emo_random),
+        "verbose": bool(cmd_args.verbose),
+        "max_text_tokens_per_segment": max_tokens,
+        "interval_silence": int(interval_silence),
+        "diffusion_steps": int(diffusion_steps),
+        "inference_cfg_rate": float(inference_cfg_rate),
+        "max_speaker_audio_length": float(max_speaker_audio_length),
+        "max_emotion_audio_length": float(max_emotion_audio_length),
+        "section_batch_size": int(autoregressive_batch_size),
+        "max_emotion_sum": float(max_emotion_sum),
+        "latent_multiplier": float(latent_multiplier),
+        "max_consecutive_silence": int(max_consecutive_silence),
+        "semantic_layer": int(semantic_layer),
+        "cfm_cache_length": int(cfm_cache_length),
+        "reset_beam_cache_per_segment": bool(prevent_vram_accumulation),
+    }
+
+    subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
+    subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
+    resolved_settings = {
+        "emotion_control_method_index": emo_control_method,
+        "emotion_control_method_label": EMO_CHOICES_ALL[emo_control_method]
+        if 0 <= emo_control_method < len(EMO_CHOICES_ALL)
+        else str(emo_control_method),
+        "save_used_audio": bool(save_used_audio),
+        "save_as_mp3_requested": bool(save_as_mp3),
+        "save_as_mp3_enabled": bool(save_as_mp3 and MP3_AVAILABLE),
+        "mp3_bitrate": mp3_bitrate,
+        "subtitle_mode": subtitle_mode,
+        "subtitle_format": get_subtitle_format_label(subtitle_file) if subtitle_mode and subtitle_file else None,
+        "low_memory_mode": bool(low_memory_mode),
+        "prevent_vram_accumulation": bool(prevent_vram_accumulation),
+        "use_subprocess_system": bool(use_subprocess_system),
+        "execution_mode": "subprocess" if use_subprocess_system else "main_process",
+        "resolved_generation_kwargs": infer_kwargs,
+        "subtitle_timing_overrides": (
+            {
+                "interval_silence": SUBTITLE_TIMING_INTERVAL_SILENCE_MS,
+                "ffmpeg_timing_fit_enabled": bool(FFMPEG_AVAILABLE),
+                "timing_fit_background_workers": max(1, min(4, os.cpu_count() or 1)),
+                "duration_retry_enabled": False,
+            }
+            if subtitle_mode
+            else None
+        ),
+        "normalized_emotion_vector": vec,
+    }
+
+    metadata = {
+        "status": "in_progress",
+        "created_at": processing_started_at,
+        "updated_at": processing_started_at,
+        "task": {
+            "id": task_layout["task_id"],
+            "folder": abs_path_or_none(task_folder),
+            "mode": "subtitle" if subtitle_mode else "text",
+            "requested_output_filename": output_filename or "",
+            "resolved_output_basename": task_layout["final_basename"],
+        },
+        "inputs": {
+            "text": text,
+            "speaker_reference_audio": abs_path_or_none(prompt),
+            "emotion_reference_audio": abs_path_or_none(emo_ref_path),
+            "subtitle_file": abs_path_or_none(subtitle_file),
+        },
+        "settings": resolved_settings,
+        "outputs": {
+            "final_audio_path": None,
+            "final_wav_path": abs_path_or_none(task_layout["final_wav_path"]),
+            "final_mp3_path": abs_path_or_none(task_layout["final_mp3_path"]) if save_as_mp3 and MP3_AVAILABLE else None,
+            "metadata_path": abs_path_or_none(metadata_path),
+            "segments_dir": abs_path_or_none(task_layout["segments_dir"]),
+            "speaker_reference_copy_path": None,
+            "subtitle_copy_path": None,
+        },
+        "processing": {
+            "started_at": processing_started_at,
+            "ended_at": None,
+            "elapsed_ms": None,
+            "elapsed_seconds": None,
+            "elapsed_human": None,
+        },
+        "subtitle": None,
+        "error": None,
+    }
+
+    if subtitle_mode:
+        metadata["subtitle"] = {
+            "format": get_subtitle_format_label(subtitle_file) if subtitle_file else None,
+            "cue_count": len(subtitle_cues),
+            "render_unit_count": len(subtitle_render_units),
+            "timeline_end_ms": subtitle_cues[-1].end_ms if subtitle_cues else 0,
+            "cues": [
+                {
+                    "index": cue.index,
+                    "start_ms": cue.start_ms,
+                    "end_ms": cue.end_ms,
+                    "duration_ms": cue.duration_ms,
+                    "text": cue.text,
+                    "segment_file": None,
+                    "generated_duration_ms": None,
+                }
+                for cue in subtitle_cues
+            ],
+            "render_units": [
+                {
+                    "index": unit.index,
+                    "start_ms": unit.start_ms,
+                    "end_ms": unit.end_ms,
+                    "duration_ms": unit.duration_ms,
+                    "text": unit.text,
+                    "source_cue_indices": list(unit.cue_indices),
+                    "segment_file": None,
+                    "natural_duration_ms": None,
+                    "generated_duration_ms": None,
+                    "duration_delta_before_fit_ms": None,
+                    "fit_method": None,
+                    "fit_stretch_rate": None,
+                    "selected_latent_multiplier": float(infer_kwargs["latent_multiplier"]),
+                    "retry_attempted": False,
+                    "retry_selected": False,
+                    "retry_latent_multiplier": None,
+                }
+                for unit in subtitle_render_units
+            ],
+            "timing_issues": [],
+        }
+
+    if subtitle_mode and subtitle_file and task_layout["subtitle_copy_path"]:
+        shutil.copy2(subtitle_file, task_layout["subtitle_copy_path"])
+        metadata["outputs"]["subtitle_copy_path"] = abs_path_or_none(task_layout["subtitle_copy_path"])
+
+    write_metadata_file(metadata_path, metadata)
+
+    return {
+        "runtime": _build_tts_runtime_options(),
+        "task_layout": task_layout,
+        "metadata_path": metadata_path,
+        "task_id": task_layout["task_id"],
+        "prompt": prompt,
+        "text": text,
+        "subtitle_mode": subtitle_mode,
+        "subtitle_file": subtitle_file,
+        "save_used_audio": bool(save_used_audio),
+        "save_as_mp3": bool(save_as_mp3),
+        "mp3_bitrate": mp3_bitrate,
+        "infer_kwargs": infer_kwargs,
+        "low_memory_mode": bool(low_memory_mode),
+        "max_text_tokens": max_tokens,
+    }
+
+
+def _run_generation_subprocess(request):
+    request_fd, request_path = tempfile.mkstemp(prefix="indextts_request_", suffix=".json")
+    os.close(request_fd)
+    result_fd, result_path = tempfile.mkstemp(prefix="indextts_result_", suffix=".json")
+    os.close(result_fd)
+
+    try:
+        with open(request_path, "w", encoding="utf-8") as handle:
+            json.dump(request, handle, indent=2, ensure_ascii=False)
+
+        cmd = [
+            sys.executable,
+            os.path.join(current_dir, "webui_subprocess_worker.py"),
+            "--request-file",
+            request_path,
+            "--result-file",
+            result_path,
+        ]
+        popen_kwargs = {
+            "cwd": current_dir,
+            "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        process = subprocess.Popen(cmd, **popen_kwargs)
+        _register_subprocess_state(
+            process,
+            request_path,
+            result_path,
+            request["metadata_path"],
+            request["task_id"],
+        )
+
+        return_code = process.wait()
+        state_snapshot = _clear_subprocess_state(process) or {}
+        canceled = bool(state_snapshot.get("canceled"))
+        cancel_reason = state_snapshot.get("cancel_reason") or "Generation was canceled."
+
+        if canceled:
+            raise gr.Error(cancel_reason)
+
+        if not os.path.exists(result_path):
+            if return_code != 0:
+                raise gr.Error("Generation subprocess exited unexpectedly. Check the console output.")
+            raise gr.Error("Generation subprocess finished without a result file.")
+
+        with open(result_path, "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+
+        if result.get("status") != "ok":
+            raise gr.Error(result.get("error") or "Generation subprocess failed.")
+
+        subtitle_status_message = result.get("subtitle_status") or ""
+        return (
+            gr.update(value=result["output_path"], visible=True),
+            gr.update(value=subtitle_status_message, visible=bool(subtitle_status_message)),
+        )
+    finally:
+        _cleanup_temp_file(request_path)
+        _cleanup_temp_file(result_path)
+
+
+def cancel_generation_process(use_subprocess_system, cancel_confirmed):
+    if not cancel_confirmed:
+        return gr.update()
+
+    with _SUBPROCESS_STATE_LOCK:
+        process = _SUBPROCESS_STATE.get("process")
+        metadata_path = _SUBPROCESS_STATE.get("metadata_path")
+        task_id = _SUBPROCESS_STATE.get("task_id")
+        if process is None or process.poll() is not None:
+            _SUBPROCESS_STATE.update(
+                {
+                    "process": None,
+                    "request_file": None,
+                    "result_file": None,
+                    "metadata_path": None,
+                    "task_id": None,
+                    "canceled": False,
+                    "cancel_reason": None,
+                }
+            )
+            message = (
+                "Subprocess mode is disabled and no subprocess generation is running."
+                if not use_subprocess_system
+                else "No subprocess generation is currently running."
+            )
+            return gr.update(value=message)
+
+        _SUBPROCESS_STATE["canceled"] = True
+        _SUBPROCESS_STATE["cancel_reason"] = "Generation canceled by user."
+
+    _mark_metadata_canceled(metadata_path, "Generation canceled by user.")
+    _terminate_process_tree(process)
+    task_label = f" task {task_id}" if task_id else ""
+    return gr.update(value=f"Cancel signal sent to subprocess for{task_label}.")
+
+
+def on_subprocess_mode_change(use_subprocess_system):
+    if use_subprocess_system:
+        unload_inprocess_tts()
+
+
 def resolve_max_text_tokens(max_text_tokens_per_segment):
     if not max_text_tokens_per_segment:
         return 120
 
     try:
         max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
-        return max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
+        return max(20, min(max_tokens, PREVIEW_MAX_TEXT_TOKENS))
     except (ValueError, TypeError):
         return 120
 
@@ -888,8 +1501,8 @@ def get_text_processing_sections(text, max_text_tokens_per_segment):
         return []
 
     max_tokens = resolve_max_text_tokens(max_text_tokens_per_segment)
-    text_tokens_list = tts.tokenizer.tokenize(text)
-    return tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
+    text_tokens_list = PREVIEW_TEXT_TOKENIZER.tokenize(text)
+    return PREVIEW_TEXT_TOKENIZER.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
 
 
 def build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
@@ -988,431 +1601,73 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
                emo_bias_depression,
                emo_bias_surprise,
                emo_bias_calm,
+               use_subprocess_system=True,
                progress=gr.Progress()):
-    subtitle_mode = bool(subtitle_mode)
-    if not prompt:
-        raise gr.Error("Speaker reference audio is required before you can generate speech.")
-    processing_started_at = current_timestamp()
-    processing_started_perf = time.perf_counter()
-
-    subtitle_extension = get_subtitle_extension(subtitle_file) if subtitle_mode else None
-    task_layout = create_task_output_layout(
-        output_root="outputs",
-        filename=output_filename,
-        subtitle_mode=subtitle_mode,
-        subtitle_extension=subtitle_extension,
+    request = _prepare_generation_request(
+        emo_control_method,
+        prompt,
+        text,
+        subtitle_mode,
+        subtitle_file,
+        save_used_audio,
+        output_filename,
+        emo_ref_path,
+        emo_weight,
+        vec1,
+        vec2,
+        vec3,
+        vec4,
+        vec5,
+        vec6,
+        vec7,
+        vec8,
+        emo_text,
+        emo_random,
+        max_text_tokens_per_segment,
+        save_as_mp3,
+        diffusion_steps,
+        inference_cfg_rate,
+        interval_silence,
+        max_speaker_audio_length,
+        max_emotion_audio_length,
+        autoregressive_batch_size,
+        apply_emo_bias,
+        max_emotion_sum,
+        latent_multiplier,
+        max_consecutive_silence,
+        mp3_bitrate,
+        do_sample,
+        top_p,
+        top_k,
+        temperature,
+        length_penalty,
+        num_beams,
+        repetition_penalty,
+        max_mel_tokens,
+        low_memory_mode,
+        prevent_vram_accumulation,
+        semantic_layer,
+        cfm_cache_length,
+        emo_bias_joy,
+        emo_bias_anger,
+        emo_bias_sad,
+        emo_bias_fear,
+        emo_bias_disgust,
+        emo_bias_depression,
+        emo_bias_surprise,
+        emo_bias_calm,
+        bool(use_subprocess_system),
     )
-    output_path = task_layout["final_wav_path"]
-    metadata_path = task_layout["metadata_path"]
-    task_folder = task_layout["task_folder"]
 
-    # set gradio progress
-    tts.gr_progress = progress
+    if use_subprocess_system:
+        return _run_generation_subprocess(request)
 
-    # Update the low memory mode setting
-    tts.hybrid_model_device = bool(low_memory_mode)
-
-    kwargs = {
-        "do_sample": bool(do_sample),
-        "top_p": float(top_p),
-        "top_k": int(top_k) if int(top_k) > 0 else None,
-        "temperature": float(temperature),
-        "length_penalty": float(length_penalty),
-        "num_beams": num_beams,
-        "repetition_penalty": float(repetition_penalty),
-        "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
-    }
-    if type(emo_control_method) is not int:
-        emo_control_method = emo_control_method.value
-    if emo_control_method == 0:  # emotion from speaker
-        emo_ref_path = None  # remove external reference audio
-    if emo_control_method == 1:  # emotion from reference audio
-        pass
-    if emo_control_method == 2:  # emotion from custom vectors
-        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        # Use custom emotion biases if provided
-        custom_emo_biases = [emo_bias_joy, emo_bias_anger, emo_bias_sad, emo_bias_fear,
-                            emo_bias_disgust, emo_bias_depression, emo_bias_surprise, emo_bias_calm]
-        vec = tts.normalize_emo_vec(vec, apply_bias=apply_emo_bias, max_emotion_sum=max_emotion_sum,
-                                   custom_biases=custom_emo_biases if apply_emo_bias else None)
-    else:
-        # don't use the emotion vector inputs for the other modes
-        vec = None
-
-    if emo_text == "":
-        # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
-        emo_text = None
-
-    print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
-
-    # Ensure max_text_tokens_per_segment is within valid range
-    # Handle all input types gracefully (now it's a string from Textbox)
-    if not max_text_tokens_per_segment:
-        max_tokens = 120
-    else:
-        try:
-            # Convert string to int and clamp to valid range
-            max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
-            max_tokens = max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
-        except (ValueError, TypeError):
-            # Use default if conversion fails
-            max_tokens = 120
-
-    infer_kwargs = {
-        "emo_audio_prompt": emo_ref_path,
-        "emo_alpha": emo_weight,
-        "emo_vector": vec,
-        "use_emo_text": (emo_control_method == 3),
-        "emo_text": emo_text,
-        "use_random": emo_random,
-        "verbose": cmd_args.verbose,
-        "max_text_tokens_per_segment": max_tokens,
-        "interval_silence": int(interval_silence),
-        "diffusion_steps": int(diffusion_steps),
-        "inference_cfg_rate": float(inference_cfg_rate),
-        "max_speaker_audio_length": float(max_speaker_audio_length),
-        "max_emotion_audio_length": float(max_emotion_audio_length),
-        "section_batch_size": int(autoregressive_batch_size),
-        "max_emotion_sum": float(max_emotion_sum),
-        "latent_multiplier": float(latent_multiplier),
-        "max_consecutive_silence": int(max_consecutive_silence),
-        "semantic_layer": int(semantic_layer),
-        "cfm_cache_length": int(cfm_cache_length),
-        "reset_beam_cache_per_segment": bool(prevent_vram_accumulation),
-    }
-    infer_kwargs.update(kwargs)
-
-    subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
-    subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
-    resolved_settings = {
-        "emotion_control_method_index": emo_control_method,
-        "emotion_control_method_label": EMO_CHOICES_ALL[emo_control_method] if 0 <= emo_control_method < len(EMO_CHOICES_ALL) else str(emo_control_method),
-        "save_used_audio": bool(save_used_audio),
-        "save_as_mp3_requested": bool(save_as_mp3),
-        "save_as_mp3_enabled": bool(save_as_mp3 and MP3_AVAILABLE),
-        "mp3_bitrate": mp3_bitrate,
-        "subtitle_mode": subtitle_mode,
-        "subtitle_format": get_subtitle_format_label(subtitle_file) if subtitle_mode and subtitle_file else None,
-        "low_memory_mode": bool(low_memory_mode),
-        "prevent_vram_accumulation": bool(prevent_vram_accumulation),
-        "resolved_generation_kwargs": infer_kwargs,
-        "subtitle_timing_overrides": (
-            {
-                "interval_silence": SUBTITLE_TIMING_INTERVAL_SILENCE_MS,
-                "ffmpeg_timing_fit_enabled": bool(FFMPEG_AVAILABLE),
-                "timing_fit_background_workers": max(1, min(4, os.cpu_count() or 1)),
-                "duration_retry_enabled": False,
-            }
-            if subtitle_mode
-            else None
-        ),
-        "normalized_emotion_vector": vec,
-    }
-
-    metadata = {
-        "status": "in_progress",
-        "created_at": current_timestamp(),
-        "updated_at": current_timestamp(),
-        "task": {
-            "id": task_layout["task_id"],
-            "folder": abs_path_or_none(task_folder),
-            "mode": "subtitle" if subtitle_mode else "text",
-            "requested_output_filename": output_filename or "",
-            "resolved_output_basename": task_layout["final_basename"],
-        },
-        "inputs": {
-            "text": text,
-            "speaker_reference_audio": abs_path_or_none(prompt),
-            "emotion_reference_audio": abs_path_or_none(emo_ref_path),
-            "subtitle_file": abs_path_or_none(subtitle_file),
-        },
-        "settings": resolved_settings,
-        "outputs": {
-            "final_audio_path": None,
-            "final_wav_path": abs_path_or_none(task_layout["final_wav_path"]),
-            "final_mp3_path": abs_path_or_none(task_layout["final_mp3_path"]) if save_as_mp3 and MP3_AVAILABLE else None,
-            "metadata_path": abs_path_or_none(metadata_path),
-            "segments_dir": abs_path_or_none(task_layout["segments_dir"]),
-            "speaker_reference_copy_path": None,
-            "subtitle_copy_path": None,
-        },
-        "processing": {
-            "started_at": processing_started_at,
-            "ended_at": None,
-            "elapsed_ms": None,
-            "elapsed_seconds": None,
-            "elapsed_human": None,
-        },
-        "subtitle": None,
-        "error": None,
-    }
-
-    if subtitle_mode:
-        metadata["subtitle"] = {
-            "format": get_subtitle_format_label(subtitle_file) if subtitle_file else None,
-            "cue_count": len(subtitle_cues),
-            "render_unit_count": len(subtitle_render_units),
-            "timeline_end_ms": subtitle_cues[-1].end_ms if subtitle_cues else 0,
-            "cues": [
-                {
-                    "index": cue.index,
-                    "start_ms": cue.start_ms,
-                    "end_ms": cue.end_ms,
-                    "duration_ms": cue.duration_ms,
-                    "text": cue.text,
-                    "segment_file": None,
-                    "generated_duration_ms": None,
-                }
-                for cue in subtitle_cues
-            ],
-            "render_units": [
-                {
-                    "index": unit.index,
-                    "start_ms": unit.start_ms,
-                    "end_ms": unit.end_ms,
-                    "duration_ms": unit.duration_ms,
-                    "text": unit.text,
-                    "source_cue_indices": list(unit.cue_indices),
-                    "segment_file": None,
-                    "natural_duration_ms": None,
-                    "generated_duration_ms": None,
-                    "duration_delta_before_fit_ms": None,
-                    "fit_method": None,
-                    "fit_stretch_rate": None,
-                    "selected_latent_multiplier": float(infer_kwargs["latent_multiplier"]),
-                    "retry_attempted": False,
-                    "retry_selected": False,
-                    "retry_latent_multiplier": None,
-                }
-                for unit in subtitle_render_units
-            ],
-            "timing_issues": [],
-        }
-
-    if subtitle_mode and subtitle_file and task_layout["subtitle_copy_path"]:
-        shutil.copy2(subtitle_file, task_layout["subtitle_copy_path"])
-        metadata["outputs"]["subtitle_copy_path"] = abs_path_or_none(task_layout["subtitle_copy_path"])
-
-    write_metadata_file(metadata_path, metadata)
-
-    subtitle_status_update = gr.update()
-    output = None
-
-    try:
-        if subtitle_mode:
-            if not subtitle_cues:
-                raise gr.Error("No caption cues were found in the selected file.")
-
-            rendered_units = []
-            original_progress = tts.gr_progress
-            sampling_rate = 22050
-            subtitle_console_started_at = time.perf_counter()
-            assembled_audio_seconds = 0.0
-            timing_executor = None
-            subtitle_temp_dir = os.path.join(task_folder, "_subtitle_timing_tmp")
-
-            try:
-                tts.gr_progress = None
-                non_empty_units = [unit for unit in subtitle_render_units if unit.text.strip()]
-                unit_render_metadata = {}
-                subtitle_infer_kwargs = dict(infer_kwargs)
-                subtitle_infer_kwargs["interval_silence"] = SUBTITLE_TIMING_INTERVAL_SILENCE_MS
-                subtitle_infer_kwargs["console_progress_enabled"] = True
-                subtitle_infer_kwargs["console_progress_label"] = "Subtitle synthesis"
-                subtitle_infer_kwargs["console_progress_item_label"] = "section"
-                base_latent_multiplier = float(subtitle_infer_kwargs["latent_multiplier"])
-                processing_sections = sum(
-                    len(get_text_processing_sections(unit.text, max_tokens))
-                    for unit in non_empty_units
-                )
-                unit_render_futures = {}
-                print(
-                    f">> Subtitle timing started | cues {len(subtitle_cues)} | "
-                    f"timing units {len(subtitle_render_units)} | sections {processing_sections} | "
-                    f"batch size {subtitle_infer_kwargs['section_batch_size']}"
-                )
-                if non_empty_units:
-                    worker_count = max(1, min(4, os.cpu_count() or 1))
-                    timing_executor = ThreadPoolExecutor(
-                        max_workers=worker_count,
-                        thread_name_prefix="subtitle_timing",
-                    )
-                    print(
-                        f">> Subtitle timing workers started | workers {worker_count} | "
-                        f"mode {'ffmpeg' if FFMPEG_AVAILABLE else 'python_fallback'}"
-                    )
-
-                    def schedule_subtitle_unit_timing(result_idx, result):
-                        unit = non_empty_units[result_idx]
-                        unit_sampling_rate, unit_audio = result
-                        segment_path = build_segment_output_path(task_layout["segments_dir"], unit.index)
-                        unit_render_futures[unit.index] = timing_executor.submit(
-                            finalize_subtitle_segment_audio,
-                            unit=unit,
-                            unit_audio=unit_audio,
-                            sampling_rate=unit_sampling_rate,
-                            segment_path=segment_path,
-                            temp_dir=subtitle_temp_dir,
-                        )
-
-                    tts.infer_texts(
-                        spk_audio_prompt=prompt,
-                        texts=[unit.text for unit in non_empty_units],
-                        on_text_complete=schedule_subtitle_unit_timing,
-                        **subtitle_infer_kwargs,
-                    )
-
-                for unit_idx, unit in enumerate(subtitle_render_units):
-                    progress(
-                        0.05 + 0.8 * unit_idx / max(len(subtitle_render_units), 1),
-                        desc=f"subtitle unit {unit_idx + 1}/{len(subtitle_render_units)}...",
-                    )
-                    if unit.text.strip():
-                        unit_result = unit_render_futures[unit.index].result()
-                        unit_audio = unit_result["audio"]
-                        segment_path = unit_result["segment_path"]
-                        fit_info = unit_result["fit_info"]
-                        natural_duration_ms = unit_result["natural_duration_ms"]
-                    else:
-                        unit_audio = np.zeros((0, 1), dtype=np.int16)
-                        segment_path = build_segment_output_path(task_layout["segments_dir"], unit_idx + 1)
-                        save_pcm16_wav(unit_audio, sampling_rate, segment_path)
-                        fit_info = {
-                            "method": "target_silence",
-                            "stretch_rate": 1.0,
-                            "output_duration_ms": 0,
-                        }
-                        natural_duration_ms = 0
-
-                    unit_render_metadata[unit.index] = {
-                        "natural_duration_ms": int(natural_duration_ms),
-                        "duration_delta_before_fit_ms": int(natural_duration_ms - unit.duration_ms),
-                        "fit_method": fit_info["method"],
-                        "fit_stretch_rate": float(fit_info["stretch_rate"]),
-                        "selected_latent_multiplier": float(base_latent_multiplier),
-                        "retry_attempted": False,
-                        "retry_selected": False,
-                        "retry_latent_multiplier": None,
-                    }
-
-                    metadata["subtitle"]["render_units"][unit_idx]["segment_file"] = abs_path_or_none(segment_path)
-                    metadata["subtitle"]["render_units"][unit_idx]["natural_duration_ms"] = (
-                        unit_render_metadata.get(unit.index, {}).get("natural_duration_ms")
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["generated_duration_ms"] = int(
-                        round(unit_audio.shape[0] * 1000.0 / sampling_rate)
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["duration_delta_before_fit_ms"] = (
-                        unit_render_metadata.get(unit.index, {}).get("duration_delta_before_fit_ms")
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["fit_method"] = (
-                        unit_render_metadata.get(unit.index, {}).get("fit_method")
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["fit_stretch_rate"] = (
-                        unit_render_metadata.get(unit.index, {}).get("fit_stretch_rate")
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["selected_latent_multiplier"] = (
-                        unit_render_metadata.get(unit.index, {}).get("selected_latent_multiplier")
-                        or float(base_latent_multiplier)
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["retry_attempted"] = (
-                        unit_render_metadata.get(unit.index, {}).get("retry_attempted", False)
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["retry_selected"] = (
-                        unit_render_metadata.get(unit.index, {}).get("retry_selected", False)
-                    )
-                    metadata["subtitle"]["render_units"][unit_idx]["retry_latent_multiplier"] = (
-                        unit_render_metadata.get(unit.index, {}).get("retry_latent_multiplier")
-                    )
-                    metadata["updated_at"] = current_timestamp()
-                    write_metadata_file(metadata_path, metadata)
-
-                    rendered_units.append((unit, unit_audio))
-                    assembled_audio_seconds += unit_audio.shape[0] / float(sampling_rate) if sampling_rate else 0.0
-                    print_console_progress(
-                        "Subtitle timeline",
-                        unit_idx + 1,
-                        len(subtitle_render_units),
-                        subtitle_console_started_at,
-                        processed_audio_seconds=assembled_audio_seconds,
-                        item_label="unit",
-                    )
-            finally:
-                if timing_executor is not None:
-                    timing_executor.shutdown(wait=True)
-                if os.path.isdir(subtitle_temp_dir):
-                    shutil.rmtree(subtitle_temp_dir, ignore_errors=True)
-                tts.gr_progress = original_progress
-
-            progress(0.92, desc="assembling subtitle timeline...")
-            print(">> Subtitle timeline assembly started")
-            combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_units, sampling_rate=sampling_rate)
-            if combined_audio.shape[0] == 0:
-                raise gr.Error("The caption file does not contain any spoken text to synthesize.")
-
-            print(
-                f">> Subtitle timeline complete | duration {combined_audio.shape[0] / float(sampling_rate):.2f}s | "
-                f"timing issues {len(subtitle_issues)}"
-            )
-            output = save_pcm16_wav(combined_audio, sampling_rate, output_path)
-            metadata["subtitle"]["timing_issues"] = subtitle_issues
-            subtitle_status_update = gr.update(
-                value=build_subtitle_status_message(
-                    subtitle_cues,
-                    issues=subtitle_issues,
-                    sample_count=combined_audio.shape[0],
-                    sampling_rate=sampling_rate,
-                    task_folder=task_folder,
-                    segments_dir=task_layout["segments_dir"],
-                    subtitle_file=subtitle_file,
-                ),
-                visible=True,
-            )
-        else:
-            output = tts.infer(spk_audio_prompt=prompt, text=text,
-                               output_path=output_path,
-                               **infer_kwargs)
-
-        if save_used_audio and prompt:
-            try:
-                shutil.copy2(prompt, task_layout["speaker_reference_copy_path"])
-                metadata["outputs"]["speaker_reference_copy_path"] = abs_path_or_none(
-                    task_layout["speaker_reference_copy_path"]
-                )
-                print(f"Saved used reference audio to: {task_layout['speaker_reference_copy_path']}")
-            except Exception as e:
-                print(f"Error saving used audio: {e}")
-
-        if save_as_mp3 and MP3_AVAILABLE:
-            output = convert_wav_to_mp3(output, task_layout["final_mp3_path"], bitrate=mp3_bitrate)
-
-        processing_elapsed_seconds = time.perf_counter() - processing_started_perf
-        metadata["status"] = "completed"
-        metadata["updated_at"] = current_timestamp()
-        metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
-        metadata["outputs"]["final_wav_exists"] = bool(task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"]))
-        metadata["outputs"]["final_mp3_exists"] = bool(task_layout["final_mp3_path"] and os.path.exists(task_layout["final_mp3_path"]))
-        metadata["processing"]["ended_at"] = metadata["updated_at"]
-        metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
-        metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
-        metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
-        write_metadata_file(metadata_path, metadata)
-
-        return gr.update(value=output,visible=True), subtitle_status_update
-    except Exception as e:
-        processing_elapsed_seconds = time.perf_counter() - processing_started_perf
-        metadata["status"] = "failed"
-        metadata["updated_at"] = current_timestamp()
-        metadata["error"] = str(e)
-        metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
-        metadata["processing"]["ended_at"] = metadata["updated_at"]
-        metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
-        metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
-        metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
-        write_metadata_file(metadata_path, metadata)
-        raise
+    result = run_generation_request(request, tts.get_instance(), progress_callback=progress)
+    subtitle_status_message = result.get("subtitle_status") or ""
+    return (
+        gr.update(value=result["output_path"], visible=True),
+        gr.update(value=subtitle_status_message, visible=bool(subtitle_status_message)),
+    )
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -1614,12 +1869,17 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     )
 
             with gr.Column(scale=1, min_width=300):
+                use_subprocess_system = gr.Checkbox(
+                    label="Use Subprocess System",
+                    value=True,
+                    info="When enabled, each generation runs in a separate process so the main UI can stay clean and releasing the child process frees its RAM and VRAM."
+                )
                 input_text_single = gr.TextArea(
                     label="Text to Synthesize",
                     key="input_text_single",
                     elem_id="input-text-source",
                     placeholder="Enter the text you want to convert to speech",
-                    info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts are automatically segmented. Upload a caption file (.srt/.vtt/.sbv) when you want cue-by-cue timing."
+                    info=f"Model v{MODEL_VERSION} | Supports multiple languages. Long texts are automatically segmented. Upload a caption file (.srt/.vtt/.sbv) when you want cue-by-cue timing."
                 )
                 section_count_refresh_signal = gr.Textbox(
                     value="",
@@ -1714,6 +1974,15 @@ with gr.Blocks(title=APP_TITLE) as demo:
                             elem_classes=["action-button"],
                         )
                     ui_preset_status = gr.Markdown("")
+                cancel_process_button = gr.Button(
+                    "Cancel Running Process",
+                    variant="stop",
+                    elem_id="cancel-generation-button",
+                    elem_classes=["action-button"],
+                )
+                cancel_process_note = gr.Markdown("Small note: works only when subprocess mode is enabled.")
+                cancel_confirm_signal = gr.Checkbox(value=False, visible=False)
+                cancel_process_status = gr.Markdown("")
 
         with gr.Accordion("Function Settings"):
             # 情感控制选项部分 - now showing ALL options including experimental
@@ -1839,13 +2108,13 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     step=1,
                     info="Explores multiple generation paths simultaneously. Higher (5-10) = better quality but slower. Lower (1-3) = faster but potentially worse quality. Default 3 balances speed and quality. Bigger also uses more VRAM."
                 )
-                initial_value = max(20, min(tts.cfg.gpt.max_text_tokens, cmd_args.gui_seg_tokens))
+                initial_value = max(20, min(PREVIEW_MAX_TEXT_TOKENS, cmd_args.gui_seg_tokens))
                 max_text_tokens_per_segment = gr.Textbox(
                     label="Max Tokens per Segment",
                     value=str(initial_value),
                     key="max_text_tokens_per_segment",
                     elem_id="max-tokens-segment-source",
-                    info=f"Splits long text into chunks for processing. Valid range: 20-{tts.cfg.gpt.max_text_tokens}. Smaller (80-120) = more natural pauses and consistent quality but slower. Larger (150-200) = faster but may have quality variations. Default: {initial_value}. Bigger value uses more VRAM."
+                    info=f"Splits long text into chunks for processing. Valid range: 20-{PREVIEW_MAX_TEXT_TOKENS}. Smaller (80-120) = more natural pauses and consistent quality but slower. Larger (150-200) = faster but may have quality variations. Default: {initial_value}. Bigger value uses more VRAM."
                 )
 
             # Row 5: Save as MP3 and Low Memory Mode
@@ -2054,6 +2323,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
             {"section": "audio_generation", "key": "autoregressive_batch_size", "component": autoregressive_batch_size, "default": 1, "kind": "int", "min": 1, "max": 8},
             {"section": "audio_generation", "key": "output_filename", "component": output_filename, "default": "", "kind": "str"},
             {"section": "audio_generation", "key": "save_used_audio", "component": save_used_audio, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "use_subprocess_system", "component": use_subprocess_system, "default": True, "kind": "bool"},
             {"section": "audio_generation", "key": "emo_control_method", "component": emo_control_method, "default": 0, "kind": "emotion_method"},
             {"section": "audio_generation", "key": "emo_random", "component": emo_random, "default": False, "kind": "bool"},
             {"section": "audio_generation", "key": "vec1", "component": vec1, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
@@ -2080,7 +2350,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 "default": str(initial_value),
                 "kind": "int_text",
                 "min": 20,
-                "max": tts.cfg.gpt.max_text_tokens,
+                "max": PREVIEW_MAX_TEXT_TOKENS,
             },
             {"section": "audio_generation", "key": "save_as_mp3", "component": save_as_mp3, "default": False, "kind": "bool"},
             {"section": "audio_generation", "key": "low_memory_mode", "component": low_memory_mode, "default": False, "kind": "bool"},
@@ -2629,19 +2899,41 @@ with gr.Blocks(title=APP_TITLE) as demo:
         show_progress="hidden"
     )
 
+    use_subprocess_system.change(
+        fn=on_subprocess_mode_change,
+        inputs=[use_subprocess_system],
+        queue=False,
+        show_progress="hidden",
+    )
+
     gen_button.click(gen_single,
                      inputs=[emo_control_method,prompt_audio, input_text_single, subtitle_mode, subtitle_file, save_used_audio, output_filename, emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             save_as_mp3,
-                             *expert_params,
-                             *advanced_params,
-                             *model_params,
-                     ],
-                     outputs=[output_audio, subtitle_status])
+                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                              emo_text,emo_random,
+                              max_text_tokens_per_segment,
+                              save_as_mp3,
+                              *expert_params,
+                              *advanced_params,
+                              *model_params,
+                              use_subprocess_system,
+                      ],
+                      outputs=[output_audio, subtitle_status])
 
     open_outputs_button.click(open_outputs_folder)
+
+    cancel_process_button.click(
+        fn=cancel_generation_process,
+        inputs=[use_subprocess_system, cancel_confirm_signal],
+        outputs=[cancel_process_status],
+        queue=False,
+        show_progress="hidden",
+        js="""
+        (use_subprocess_system, _signal) => [
+            use_subprocess_system,
+            window.confirm("Cancel the running generation subprocess?")
+        ]
+        """,
+    )
 
     ui_preset_save_btn.click(
         fn=_save_preset_ui,
