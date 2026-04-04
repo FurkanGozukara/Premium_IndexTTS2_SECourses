@@ -143,6 +143,34 @@ Third line
         self.assertEqual(np.int16, fitted.dtype)
         self.assertNotEqual(0, int(np.abs(fitted).sum()))
 
+    def test_fit_audio_to_duration_uses_padding_for_small_shortfall(self):
+        audio = np.full((1000, 1), 1000, dtype=np.int16)
+
+        fitted, info = fit_audio_to_duration(
+            audio,
+            sampling_rate=1000,
+            target_duration_ms=1080,
+            return_info=True,
+        )
+
+        self.assertEqual((1080, 1), fitted.shape)
+        self.assertEqual("pad_silence", info["method"])
+        self.assertEqual(1.0, info["stretch_rate"])
+
+    def test_fit_audio_to_duration_uses_trim_for_small_overrun(self):
+        audio = np.full((1000, 1), 1000, dtype=np.int16)
+
+        fitted, info = fit_audio_to_duration(
+            audio,
+            sampling_rate=1000,
+            target_duration_ms=920,
+            return_info=True,
+        )
+
+        self.assertEqual((920, 1), fitted.shape)
+        self.assertEqual("trim_tail", info["method"])
+        self.assertEqual(1.0, info["stretch_rate"])
+
     def test_parse_subtitle_file_uses_extension_to_pick_parser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             subtitle_path = os.path.join(temp_dir, "sample.vtt")

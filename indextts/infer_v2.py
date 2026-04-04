@@ -415,6 +415,54 @@ class IndexTTS2:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
+    @staticmethod
+    def _format_console_duration(seconds):
+        total_seconds = max(0, int(round(float(seconds))))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _count_audio_seconds(wavs, sampling_rate):
+        total_samples = 0
+        for wav in wavs:
+            if hasattr(wav, "shape") and len(wav.shape) >= 1:
+                total_samples += int(wav.shape[-1])
+        return total_samples / float(sampling_rate) if sampling_rate else 0.0
+
+    def _print_console_progress(
+        self,
+        label,
+        completed,
+        total,
+        started_at,
+        *,
+        generated_audio_seconds=None,
+        batch_size=None,
+        item_label="section",
+    ):
+        total = max(1, int(total))
+        completed = min(total, max(0, int(completed)))
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        eta_seconds = ((elapsed / completed) * (total - completed)) if completed else None
+        percent = 100.0 * completed / total
+        plural_label = item_label if completed == 1 else f"{item_label}s"
+        parts = [
+            f">> {label} {completed}/{total} {plural_label} ({percent:.1f}%)",
+            f"elapsed {self._format_console_duration(elapsed)}",
+        ]
+        if eta_seconds is not None:
+            parts.append(f"eta {self._format_console_duration(eta_seconds)}")
+        if generated_audio_seconds is not None and generated_audio_seconds > 0 and elapsed > 0:
+            realtime_speed = generated_audio_seconds / elapsed
+            parts.append(f"speed {realtime_speed:.2f}x RT")
+            parts.append(f"audio {generated_audio_seconds:.2f}s")
+        if batch_size is not None:
+            parts.append(f"batch {int(batch_size)}")
+        print(" | ".join(parts))
+
     def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
         if not sr:
             audio, sr = librosa.load(audio_path)
@@ -982,6 +1030,9 @@ class IndexTTS2:
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         interval_silence = int(generation_kwargs.pop("interval_silence", 200))
+        console_progress_enabled = bool(generation_kwargs.pop("console_progress_enabled", True))
+        console_progress_label = generation_kwargs.pop("console_progress_label", "Batch synthesis")
+        console_progress_item_label = generation_kwargs.pop("console_progress_item_label", "section")
         sampling_rate = 22050
 
         collected_segments = [[] for _ in texts]
@@ -997,6 +1048,13 @@ class IndexTTS2:
                 segment_items.append((idx, segment_idx, segment))
 
         micro_batch_size = max(1, int(section_batch_size))
+        progress_started_at = time.perf_counter()
+        generated_audio_seconds = 0.0
+        if console_progress_enabled and segment_items:
+            print(
+                f">> {console_progress_label} started | texts {len(texts)} | "
+                f"sections {len(segment_items)} | batch size {micro_batch_size}"
+            )
         for start_idx in range(0, len(segment_items), micro_batch_size):
             batch = segment_items[start_idx:start_idx + micro_batch_size]
             wavs, timings = self._synthesize_token_batch(
@@ -1018,14 +1076,25 @@ class IndexTTS2:
                 reset_beam_cache_per_segment=reset_beam_cache_per_segment,
                 verbose=verbose,
                 **generation_kwargs,
-            )
+                )
             if timings["warned"]:
                 warnings.warn(
                     f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}).",
                     category=RuntimeWarning,
                 )
+            generated_audio_seconds += self._count_audio_seconds(wavs, sampling_rate)
             for (result_idx, segment_idx, _), wav in zip(batch, wavs):
                 collected_segments[result_idx].append((segment_idx, wav))
+            if console_progress_enabled:
+                self._print_console_progress(
+                    console_progress_label,
+                    start_idx + len(batch),
+                    len(segment_items),
+                    progress_started_at,
+                    generated_audio_seconds=generated_audio_seconds,
+                    batch_size=len(batch),
+                    item_label=console_progress_item_label,
+                )
 
         results = []
         for idx in range(len(texts)):
@@ -1114,6 +1183,9 @@ class IndexTTS2:
         num_beams = generation_kwargs.pop("num_beams", 3)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        console_progress_enabled = bool(generation_kwargs.pop("console_progress_enabled", True))
+        console_progress_label = generation_kwargs.pop("console_progress_label", "Text synthesis")
+        console_progress_item_label = generation_kwargs.pop("console_progress_item_label", "section")
         sampling_rate = 22050
 
         wavs = []
@@ -1123,6 +1195,12 @@ class IndexTTS2:
         bigvgan_time = 0.0
         has_warned = False
         micro_batch_size = max(1, int(section_batch_size))
+        generated_audio_seconds = 0.0
+        if console_progress_enabled and segments_count:
+            print(
+                f">> {console_progress_label} started | sections {segments_count} | "
+                f"batch size {micro_batch_size}"
+            )
 
         for start_idx in range(0, segments_count, micro_batch_size):
             batch_segments = segments[start_idx:start_idx + micro_batch_size]
@@ -1162,6 +1240,17 @@ class IndexTTS2:
                     category=RuntimeWarning,
                 )
                 has_warned = True
+            generated_audio_seconds += self._count_audio_seconds(batch_wavs, sampling_rate)
+            if console_progress_enabled:
+                self._print_console_progress(
+                    console_progress_label,
+                    start_idx + len(batch_segments),
+                    segments_count,
+                    start_time,
+                    generated_audio_seconds=generated_audio_seconds,
+                    batch_size=len(batch_segments),
+                    item_label=console_progress_item_label,
+                )
 
         end_time = time.perf_counter()
 

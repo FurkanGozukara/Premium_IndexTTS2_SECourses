@@ -102,6 +102,11 @@ MAX_LENGTH_TO_USE_SPEED = 70
 APP_TITLE = "Index TTS2 Premium SECourses App"
 APP_ASSETS_DIR = os.path.join(current_dir, "ui_assets")
 APP_FAVICON_PATH = os.path.join(APP_ASSETS_DIR, "indextts_premium_favicon.svg")
+SUBTITLE_TIMING_INTERVAL_SILENCE_MS = 0
+SUBTITLE_RETRY_DURATION_DELTA_MS = 1000
+SUBTITLE_RETRY_DURATION_RATIO_THRESHOLD = 0.05
+SUBTITLE_LATENT_MULTIPLIER_MIN = 0.85
+SUBTITLE_LATENT_MULTIPLIER_MAX = 2.4
 APP_HEAD = """
 <meta name="theme-color" content="#a11236">
 <script>
@@ -628,6 +633,58 @@ def format_elapsed_duration(elapsed_seconds):
     return f"{seconds}.{milliseconds:03d}s"
 
 
+def print_console_progress(label, completed, total, started_at, processed_audio_seconds=None, item_label="item"):
+    total = max(1, int(total))
+    completed = min(total, max(0, int(completed)))
+    elapsed_seconds = max(0.0, time.perf_counter() - started_at)
+    eta_seconds = ((elapsed_seconds / completed) * (total - completed)) if completed else None
+    percent = 100.0 * completed / total
+    parts = [
+        f">> {label} {completed}/{total} {item_label}{'' if completed == 1 else 's'} ({percent:.1f}%)",
+        f"elapsed {format_elapsed_duration(elapsed_seconds)}",
+    ]
+    if eta_seconds is not None:
+        parts.append(f"eta {format_elapsed_duration(eta_seconds)}")
+    if processed_audio_seconds is not None and processed_audio_seconds > 0 and elapsed_seconds > 0:
+        parts.append(f"speed {processed_audio_seconds / elapsed_seconds:.2f}x RT")
+        parts.append(f"audio {processed_audio_seconds:.2f}s")
+    print(" | ".join(parts))
+
+
+def audio_duration_ms(audio, sampling_rate):
+    matrix = np.asarray(audio)
+    if matrix.ndim == 0:
+        return 0
+    return int(round(matrix.shape[0] * 1000.0 / sampling_rate))
+
+
+def should_retry_subtitle_unit(target_duration_ms, natural_duration_ms):
+    if target_duration_ms <= 0 or natural_duration_ms <= 0:
+        return False
+
+    duration_delta_ms = abs(int(natural_duration_ms) - int(target_duration_ms))
+    duration_ratio = natural_duration_ms / float(target_duration_ms)
+    return (
+        duration_delta_ms >= SUBTITLE_RETRY_DURATION_DELTA_MS
+        or abs(duration_ratio - 1.0) >= SUBTITLE_RETRY_DURATION_RATIO_THRESHOLD
+    )
+
+
+def compute_subtitle_retry_latent_multiplier(base_multiplier, target_duration_ms, natural_duration_ms):
+    if target_duration_ms <= 0 or natural_duration_ms <= 0:
+        return None
+
+    adjusted_multiplier = float(base_multiplier) * (target_duration_ms / float(natural_duration_ms))
+    adjusted_multiplier = max(
+        SUBTITLE_LATENT_MULTIPLIER_MIN,
+        min(SUBTITLE_LATENT_MULTIPLIER_MAX, adjusted_multiplier),
+    )
+
+    if abs(adjusted_multiplier - float(base_multiplier)) < 0.05:
+        return None
+    return adjusted_multiplier
+
+
 def abs_path_or_none(path):
     return os.path.abspath(path) if path else None
 
@@ -643,7 +700,7 @@ def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling
         f"Loaded {len(cues)} {format_label} cue(s).",
         f"Timeline end: {format_srt_timestamp(cues[-1].end_ms)}.",
         f"Synthesis units: {len(render_units)}.",
-        "Subtitle timing uses cue start times, merges overlapping cues into larger render units when needed, and fits each rendered unit to its target slot duration.",
+        "Subtitle timing uses cue start times, merges overlapping cues into larger render units when needed, avoids extra section-gap silence inside each unit, and fits each rendered unit to its target slot duration.",
     ]
 
     if len(render_units) < len(cues):
@@ -902,6 +959,14 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         "low_memory_mode": bool(low_memory_mode),
         "prevent_vram_accumulation": bool(prevent_vram_accumulation),
         "resolved_generation_kwargs": infer_kwargs,
+        "subtitle_timing_overrides": (
+            {
+                "interval_silence": SUBTITLE_TIMING_INTERVAL_SILENCE_MS,
+                "duration_retry_enabled": True,
+            }
+            if subtitle_mode
+            else None
+        ),
         "normalized_emotion_vector": vec,
     }
 
@@ -970,7 +1035,15 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
                     "text": unit.text,
                     "source_cue_indices": list(unit.cue_indices),
                     "segment_file": None,
+                    "natural_duration_ms": None,
                     "generated_duration_ms": None,
+                    "duration_delta_before_fit_ms": None,
+                    "fit_method": None,
+                    "fit_stretch_rate": None,
+                    "selected_latent_multiplier": float(infer_kwargs["latent_multiplier"]),
+                    "retry_attempted": False,
+                    "retry_selected": False,
+                    "retry_latent_multiplier": None,
                 }
                 for unit in subtitle_render_units
             ],
@@ -994,25 +1067,104 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
             rendered_units = []
             original_progress = tts.gr_progress
             sampling_rate = 22050
+            subtitle_console_started_at = time.perf_counter()
+            assembled_audio_seconds = 0.0
 
             try:
                 tts.gr_progress = None
                 non_empty_units = [unit for unit in subtitle_render_units if unit.text.strip()]
                 generated_unit_audio = {}
+                unit_render_metadata = {}
+                subtitle_infer_kwargs = dict(infer_kwargs)
+                subtitle_infer_kwargs["interval_silence"] = SUBTITLE_TIMING_INTERVAL_SILENCE_MS
+                subtitle_infer_kwargs["console_progress_enabled"] = True
+                subtitle_infer_kwargs["console_progress_label"] = "Subtitle synthesis"
+                subtitle_infer_kwargs["console_progress_item_label"] = "section"
+                base_latent_multiplier = float(subtitle_infer_kwargs["latent_multiplier"])
+                processing_sections = sum(
+                    len(get_text_processing_sections(unit.text, max_tokens))
+                    for unit in non_empty_units
+                )
+                print(
+                    f">> Subtitle timing started | cues {len(subtitle_cues)} | "
+                    f"timing units {len(subtitle_render_units)} | sections {processing_sections} | "
+                    f"batch size {subtitle_infer_kwargs['section_batch_size']}"
+                )
 
                 if non_empty_units:
                     batch_results = tts.infer_texts(
                         spk_audio_prompt=prompt,
                         texts=[unit.text for unit in non_empty_units],
-                        **infer_kwargs,
+                        **subtitle_infer_kwargs,
                     )
                     for unit, result in zip(non_empty_units, batch_results):
                         sampling_rate, unit_audio = result
-                        generated_unit_audio[unit.index] = fit_audio_to_duration(
-                            unit_audio,
+                        selected_audio = unit_audio
+                        natural_duration = audio_duration_ms(unit_audio, sampling_rate)
+                        selected_latent_multiplier = base_latent_multiplier
+                        retry_attempted = False
+                        retry_selected = False
+                        retry_latent_multiplier = None
+
+                        if should_retry_subtitle_unit(unit.duration_ms, natural_duration):
+                            retry_latent_multiplier = compute_subtitle_retry_latent_multiplier(
+                                base_latent_multiplier,
+                                unit.duration_ms,
+                                natural_duration,
+                            )
+                            if retry_latent_multiplier is not None:
+                                retry_attempted = True
+                                print(
+                                    f">> Subtitle retry requested | unit {unit.index}/{len(subtitle_render_units)} | "
+                                    f"target {unit.duration_ms / 1000.0:.2f}s | natural {natural_duration / 1000.0:.2f}s | "
+                                    f"latent {base_latent_multiplier:.2f} -> {retry_latent_multiplier:.2f}"
+                                )
+                                retry_kwargs = dict(subtitle_infer_kwargs)
+                                retry_kwargs["latent_multiplier"] = retry_latent_multiplier
+                                retry_kwargs["section_batch_size"] = 1
+                                retry_kwargs["console_progress_label"] = f"Subtitle retry unit {unit.index}"
+                                retry_result = tts.infer_texts(
+                                    spk_audio_prompt=prompt,
+                                    texts=[unit.text],
+                                    **retry_kwargs,
+                                )[0]
+                                retry_sampling_rate, retry_audio = retry_result
+                                retry_natural_duration = audio_duration_ms(retry_audio, retry_sampling_rate)
+                                if abs(retry_natural_duration - unit.duration_ms) < abs(natural_duration - unit.duration_ms):
+                                    sampling_rate = retry_sampling_rate
+                                    selected_audio = retry_audio
+                                    natural_duration = retry_natural_duration
+                                    selected_latent_multiplier = retry_latent_multiplier
+                                    retry_selected = True
+                                    print(
+                                        f">> Subtitle retry selected | unit {unit.index} | "
+                                        f"natural {natural_duration / 1000.0:.2f}s"
+                                    )
+                                else:
+                                    print(
+                                        f">> Subtitle retry discarded | unit {unit.index} | "
+                                        f"retry natural {retry_natural_duration / 1000.0:.2f}s"
+                                    )
+
+                        fitted_audio, fit_info = fit_audio_to_duration(
+                            selected_audio,
                             sampling_rate=sampling_rate,
                             target_duration_ms=unit.duration_ms,
+                            return_info=True,
                         )
+                        generated_unit_audio[unit.index] = fitted_audio
+                        unit_render_metadata[unit.index] = {
+                            "natural_duration_ms": int(natural_duration),
+                            "duration_delta_before_fit_ms": int(natural_duration - unit.duration_ms),
+                            "fit_method": fit_info["method"],
+                            "fit_stretch_rate": float(fit_info["stretch_rate"]),
+                            "selected_latent_multiplier": float(selected_latent_multiplier),
+                            "retry_attempted": bool(retry_attempted),
+                            "retry_selected": bool(retry_selected),
+                            "retry_latent_multiplier": (
+                                float(retry_latent_multiplier) if retry_latent_multiplier is not None else None
+                            ),
+                        }
 
                 for unit_idx, unit in enumerate(subtitle_render_units):
                     progress(
@@ -1028,21 +1180,60 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
                     save_pcm16_wav(unit_audio, sampling_rate, segment_path)
 
                     metadata["subtitle"]["render_units"][unit_idx]["segment_file"] = abs_path_or_none(segment_path)
+                    metadata["subtitle"]["render_units"][unit_idx]["natural_duration_ms"] = (
+                        unit_render_metadata.get(unit.index, {}).get("natural_duration_ms")
+                    )
                     metadata["subtitle"]["render_units"][unit_idx]["generated_duration_ms"] = int(
                         round(unit_audio.shape[0] * 1000.0 / sampling_rate)
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["duration_delta_before_fit_ms"] = (
+                        unit_render_metadata.get(unit.index, {}).get("duration_delta_before_fit_ms")
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["fit_method"] = (
+                        unit_render_metadata.get(unit.index, {}).get("fit_method")
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["fit_stretch_rate"] = (
+                        unit_render_metadata.get(unit.index, {}).get("fit_stretch_rate")
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["selected_latent_multiplier"] = (
+                        unit_render_metadata.get(unit.index, {}).get("selected_latent_multiplier")
+                        or float(base_latent_multiplier)
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["retry_attempted"] = (
+                        unit_render_metadata.get(unit.index, {}).get("retry_attempted", False)
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["retry_selected"] = (
+                        unit_render_metadata.get(unit.index, {}).get("retry_selected", False)
+                    )
+                    metadata["subtitle"]["render_units"][unit_idx]["retry_latent_multiplier"] = (
+                        unit_render_metadata.get(unit.index, {}).get("retry_latent_multiplier")
                     )
                     metadata["updated_at"] = current_timestamp()
                     write_metadata_file(metadata_path, metadata)
 
                     rendered_units.append((unit, unit_audio))
+                    assembled_audio_seconds += unit_audio.shape[0] / float(sampling_rate) if sampling_rate else 0.0
+                    print_console_progress(
+                        "Subtitle timeline",
+                        unit_idx + 1,
+                        len(subtitle_render_units),
+                        subtitle_console_started_at,
+                        processed_audio_seconds=assembled_audio_seconds,
+                        item_label="unit",
+                    )
             finally:
                 tts.gr_progress = original_progress
 
             progress(0.92, desc="assembling subtitle timeline...")
+            print(">> Subtitle timeline assembly started")
             combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_units, sampling_rate=sampling_rate)
             if combined_audio.shape[0] == 0:
                 raise gr.Error("The caption file does not contain any spoken text to synthesize.")
 
+            print(
+                f">> Subtitle timeline complete | duration {combined_audio.shape[0] / float(sampling_rate):.2f}s | "
+                f"timing issues {len(subtitle_issues)}"
+            )
             output = save_pcm16_wav(combined_audio, sampling_rate, output_path)
             metadata["subtitle"]["timing_issues"] = subtitle_issues
             subtitle_status_update = gr.update(
