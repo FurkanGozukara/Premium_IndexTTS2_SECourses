@@ -104,6 +104,36 @@ APP_ASSETS_DIR = os.path.join(current_dir, "ui_assets")
 APP_FAVICON_PATH = os.path.join(APP_ASSETS_DIR, "indextts_premium_favicon.svg")
 APP_HEAD = """
 <meta name="theme-color" content="#a11236">
+<script>
+(() => {
+  let sectionCountTimer = null;
+
+  function scheduleSectionCountRefresh() {
+    const signal = document.querySelector("#section-count-refresh-signal textarea, #section-count-refresh-signal input");
+    if (!signal) {
+      return;
+    }
+    if (sectionCountTimer) {
+      clearTimeout(sectionCountTimer);
+    }
+    sectionCountTimer = setTimeout(() => {
+      signal.value = String(Date.now());
+      signal.dispatchEvent(new Event("input", { bubbles: true }));
+      signal.dispatchEvent(new Event("change", { bubbles: true }));
+    }, 500);
+  }
+
+  document.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!target) {
+      return;
+    }
+    if (target.closest("#input-text-source") || target.closest("#max-tokens-segment-source")) {
+      scheduleSectionCountRefresh();
+    }
+  }, true);
+})();
+</script>
 """
 MEDIA_FILE_TYPES = [
     ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
@@ -135,6 +165,10 @@ APP_CSS = """
     padding: 0;
     background: transparent !important;
     box-shadow: none !important;
+}
+
+.ui-hidden-signal {
+    display: none !important;
 }
 
 .top-input-panel > div {
@@ -581,6 +615,19 @@ def current_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def format_elapsed_duration(elapsed_seconds):
+    elapsed_ms = max(0, int(round(float(elapsed_seconds) * 1000.0)))
+    hours, remainder_ms = divmod(elapsed_ms, 3600000)
+    minutes, remainder_ms = divmod(remainder_ms, 60000)
+    seconds, milliseconds = divmod(remainder_ms, 1000)
+
+    if hours:
+        return f"{hours}h {minutes}m {seconds}.{milliseconds:03d}s"
+    if minutes:
+        return f"{minutes}m {seconds}.{milliseconds:03d}s"
+    return f"{seconds}.{milliseconds:03d}s"
+
+
 def abs_path_or_none(path):
     return os.path.abspath(path) if path else None
 
@@ -629,6 +676,56 @@ def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling
     return " ".join(message_parts)
 
 
+def resolve_max_text_tokens(max_text_tokens_per_segment):
+    if not max_text_tokens_per_segment:
+        return 120
+
+    try:
+        max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
+        return max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
+    except (ValueError, TypeError):
+        return 120
+
+
+def get_text_processing_sections(text, max_text_tokens_per_segment):
+    if not text:
+        return []
+
+    max_tokens = resolve_max_text_tokens(max_text_tokens_per_segment)
+    text_tokens_list = tts.tokenizer.tokenize(text)
+    return tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
+
+
+def build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
+    if subtitle_mode and subtitle_file:
+        try:
+            cues = parse_subtitle_file(subtitle_file)
+            render_units = build_subtitle_render_units(cues)
+            processing_sections = 0
+            for unit in render_units:
+                if unit.text.strip():
+                    processing_sections += len(get_text_processing_sections(unit.text, max_text_tokens_per_segment))
+
+            if processing_sections == len(render_units):
+                return (
+                    f"**Current Sections:** {processing_sections} subtitle timing "
+                    f"{'unit' if processing_sections == 1 else 'units'} from {len(cues)} cue"
+                    f"{'' if len(cues) == 1 else 's'}"
+                )
+
+            return (
+                f"**Current Sections:** {processing_sections} processing section"
+                f"{'' if processing_sections == 1 else 's'} across {len(render_units)} subtitle timing unit"
+                f"{'' if len(render_units) == 1 else 's'} from {len(cues)} cue"
+                f"{'' if len(cues) == 1 else 's'}"
+            )
+        except Exception as e:
+            return f"**Current Sections:** Unable to read subtitle file: {html.escape(str(e))}"
+
+    sections = get_text_processing_sections(text, max_text_tokens_per_segment)
+    return f"**Current Sections:** {len(sections)} text section{'' if len(sections) == 1 else 's'}"
+
+
 def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
     if subtitle_mode and subtitle_file:
         try:
@@ -645,17 +742,7 @@ def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, sub
     if not text:
         return []
 
-    if not max_text_tokens_per_segment:
-        max_tokens = 120
-    else:
-        try:
-            max_tokens = int(float(str(max_text_tokens_per_segment).strip()))
-            max_tokens = max(20, min(max_tokens, tts.cfg.gpt.max_text_tokens))
-        except (ValueError, TypeError):
-            max_tokens = 120
-
-    text_tokens_list = tts.tokenizer.tokenize(text)
-    segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
+    segments = get_text_processing_sections(text, max_text_tokens_per_segment)
 
     data = []
     for i, segment_tokens in enumerate(segments):
@@ -709,6 +796,8 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
     subtitle_mode = bool(subtitle_mode)
     if not prompt:
         raise gr.Error("Speaker reference audio is required before you can generate speech.")
+    processing_started_at = current_timestamp()
+    processing_started_perf = time.perf_counter()
 
     subtitle_extension = get_subtitle_extension(subtitle_file) if subtitle_mode else None
     task_layout = create_task_output_layout(
@@ -842,6 +931,13 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
             "segments_dir": abs_path_or_none(task_layout["segments_dir"]),
             "speaker_reference_copy_path": None,
             "subtitle_copy_path": None,
+        },
+        "processing": {
+            "started_at": processing_started_at,
+            "ended_at": None,
+            "elapsed_ms": None,
+            "elapsed_seconds": None,
+            "elapsed_human": None,
         },
         "subtitle": None,
         "error": None,
@@ -979,19 +1075,29 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         if save_as_mp3 and MP3_AVAILABLE:
             output = convert_wav_to_mp3(output, task_layout["final_mp3_path"], bitrate=mp3_bitrate)
 
+        processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         metadata["status"] = "completed"
         metadata["updated_at"] = current_timestamp()
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
         metadata["outputs"]["final_wav_exists"] = bool(task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"]))
         metadata["outputs"]["final_mp3_exists"] = bool(task_layout["final_mp3_path"] and os.path.exists(task_layout["final_mp3_path"]))
+        metadata["processing"]["ended_at"] = metadata["updated_at"]
+        metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
+        metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
+        metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
         write_metadata_file(metadata_path, metadata)
 
         return gr.update(value=output,visible=True), subtitle_status_update
     except Exception as e:
+        processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         metadata["status"] = "failed"
         metadata["updated_at"] = current_timestamp()
         metadata["error"] = str(e)
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
+        metadata["processing"]["ended_at"] = metadata["updated_at"]
+        metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
+        metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
+        metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
         write_metadata_file(metadata_path, metadata)
         raise
 
@@ -1089,8 +1195,16 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 input_text_single = gr.TextArea(
                     label="Text to Synthesize",
                     key="input_text_single",
+                    elem_id="input-text-source",
                     placeholder="Enter the text you want to convert to speech",
                     info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts are automatically segmented. Upload a caption file (.srt/.vtt/.sbv) when you want cue-by-cue timing."
+                )
+                section_count_refresh_signal = gr.Textbox(
+                    value="",
+                    show_label=False,
+                    container=False,
+                    elem_id="section-count-refresh-signal",
+                    elem_classes=["ui-hidden-signal"],
                 )
                 with gr.Row():
                     gen_button = gr.Button(
@@ -1102,6 +1216,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     )
                     open_outputs_button = gr.Button("Open Outputs Folder", key="open_outputs_button")
 
+                section_count_label = gr.Markdown("**Current Sections:** 0")
                 autoregressive_batch_size = gr.Slider(
                     label="Section Batch Size",
                     value=1,
@@ -1260,6 +1375,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     label="Max Tokens per Segment",
                     value=str(initial_value),
                     key="max_text_tokens_per_segment",
+                    elem_id="max-tokens-segment-source",
                     info=f"Splits long text into chunks for processing. Valid range: 20-{tts.cfg.gpt.max_text_tokens}. Smaller (80-120) = more natural pauses and consistent quality but slower. Larger (150-200) = faster but may have quality variations. Default: {initial_value}. Bigger value uses more VRAM."
                 )
 
@@ -1544,22 +1660,37 @@ with gr.Blocks(title=APP_TITLE) as demo:
     def load_subtitle_file(subtitle_file_path, current_text, subtitle_mode, max_text_tokens_per_segment):
         if not subtitle_file_path:
             preview_rows = get_preview_rows(current_text, max_text_tokens_per_segment, False, None)
+            section_count = build_section_count_message(current_text, max_text_tokens_per_segment, False, None)
             return (
                 current_text,
                 gr.update(value=False),
                 gr.update(value="", visible=False),
                 gr.update(value=preview_rows, visible=True, type="array"),
+                gr.update(value=section_count),
             )
 
         try:
             cues = parse_subtitle_file(subtitle_file_path)
             subtitle_text = subtitle_cues_to_text(cues)
-            preview_rows = get_preview_rows(subtitle_text, max_text_tokens_per_segment, True, subtitle_file_path)
+            use_subtitle_timing = bool(subtitle_mode)
+            preview_rows = get_preview_rows(
+                subtitle_text,
+                max_text_tokens_per_segment,
+                use_subtitle_timing,
+                subtitle_file_path,
+            )
+            section_count = build_section_count_message(
+                subtitle_text,
+                max_text_tokens_per_segment,
+                use_subtitle_timing,
+                subtitle_file_path,
+            )
             return (
                 subtitle_text,
-                gr.update(value=True),
+                gr.update(value=use_subtitle_timing),
                 gr.update(value=build_subtitle_status_message(cues, subtitle_file=subtitle_file_path), visible=True),
                 gr.update(value=preview_rows, visible=True, type="array"),
+                gr.update(value=section_count),
             )
         except Exception as e:
             preview_rows = [[0, "Caption Error", str(e), ""]]
@@ -1568,13 +1699,16 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 gr.update(value=False),
                 gr.update(value=f"Failed to load caption file: {str(e)}", visible=True),
                 gr.update(value=preview_rows, visible=True, type="array"),
+                gr.update(value=f"**Current Sections:** Unable to read subtitle file: {html.escape(str(e))}"),
             )
 
-    def on_input_text_change(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path):
+    def on_segmentation_inputs_change(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path):
         data = get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path)
-        return {
-            segments_preview: gr.update(value=data, visible=True, type="array"),
-        }
+        section_count = build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path)
+        return (
+            gr.update(value=data, visible=True, type="array"),
+            gr.update(value=section_count),
+        )
 
     def on_method_change(emo_control_method):
         if emo_control_method == 1:  # emotion reference audio
@@ -1616,28 +1750,24 @@ with gr.Blocks(title=APP_TITLE) as demo:
     )
 
 
-    input_text_single.change(
-        on_input_text_change,
+    section_count_refresh_signal.change(
+        on_segmentation_inputs_change,
         inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
-        outputs=[segments_preview]
-    )
-
-    max_text_tokens_per_segment.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
-        outputs=[segments_preview]
+        outputs=[segments_preview, section_count_label],
+        queue=False,
+        show_progress="hidden"
     )
 
     subtitle_mode.change(
-        on_input_text_change,
+        on_segmentation_inputs_change,
         inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
-        outputs=[segments_preview]
+        outputs=[segments_preview, section_count_label]
     )
 
     subtitle_file.change(
         load_subtitle_file,
         inputs=[subtitle_file, input_text_single, subtitle_mode, max_text_tokens_per_segment],
-        outputs=[input_text_single, subtitle_mode, subtitle_status, segments_preview]
+        outputs=[input_text_single, subtitle_mode, subtitle_status, segments_preview, section_count_label]
     )
 
     prompt_audio.upload(update_prompt_audio,
