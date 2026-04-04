@@ -5,11 +5,14 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import glob
+from pathlib import Path
 import platform
 import subprocess
 import tempfile
 import shutil
+from typing import Any, Dict, List, Optional
 
 import warnings
 
@@ -101,6 +104,13 @@ EMO_CHOICES_ALL = ["Same as speaker voice",
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 os.makedirs("outputs/used_audios",exist_ok=True)
+PRESETS_DIR = os.path.join(current_dir, "presets")
+os.makedirs(PRESETS_DIR, exist_ok=True)
+
+UI_PRESET_VERSION = "1.0"
+UI_PRESET_FORMAT = "indextts2_premium_ui"
+DEFAULT_UI_PRESET_NAME = "default"
+_LAST_USED_UI_PRESET_FILE = ".last_used_ui_preset.txt"
 
 MAX_LENGTH_TO_USE_SPEED = 70
 APP_TITLE = "Index TTS2 Premium SECourses App"
@@ -1313,6 +1323,105 @@ def update_prompt_audio():
     return update_button
 
 
+def _sanitize_preset_name(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+    return safe.strip("._") or "default"
+
+
+def _ui_preset_path(preset_name: str) -> Path:
+    return Path(PRESETS_DIR) / f"{_sanitize_preset_name(preset_name)}.json"
+
+
+def _list_ui_presets() -> List[str]:
+    root = Path(PRESETS_DIR)
+    saved = sorted(
+        p.stem
+        for p in root.glob("*.json")
+        if p.is_file() and p.stem != DEFAULT_UI_PRESET_NAME
+    )
+    return [DEFAULT_UI_PRESET_NAME] + saved
+
+
+def _set_last_used_ui_preset(preset_name: str) -> None:
+    try:
+        Path(PRESETS_DIR).mkdir(parents=True, exist_ok=True)
+        (Path(PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE).write_text(
+            _sanitize_preset_name(preset_name),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _get_last_used_ui_preset() -> Optional[str]:
+    path = Path(PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE
+    if not path.exists():
+        return None
+
+    try:
+        name = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+    return name if name in _list_ui_presets() else None
+
+
+def _save_ui_preset(preset_name: str, config: Dict[str, Any]) -> str:
+    if not preset_name or not str(preset_name).strip():
+        raise ValueError("Preset name cannot be empty.")
+
+    safe_name = _sanitize_preset_name(preset_name)
+    if safe_name == DEFAULT_UI_PRESET_NAME:
+        raise ValueError(f"Preset name '{DEFAULT_UI_PRESET_NAME}' is reserved.")
+
+    cfg = dict(config)
+    cfg.setdefault("_meta", {})
+    cfg["_meta"]["version"] = UI_PRESET_VERSION
+    cfg["_meta"]["format"] = UI_PRESET_FORMAT
+    cfg["_meta"]["last_modified"] = datetime.now().isoformat()
+    if "created_at" not in cfg["_meta"]:
+        cfg["_meta"]["created_at"] = cfg["_meta"]["last_modified"]
+
+    out_path = _ui_preset_path(safe_name)
+    tmp_path = out_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(out_path)
+    _set_last_used_ui_preset(safe_name)
+    return safe_name
+
+
+def _load_ui_preset(preset_name: str) -> Optional[Dict[str, Any]]:
+    if not preset_name or str(preset_name).strip() == DEFAULT_UI_PRESET_NAME:
+        return None
+
+    path = _ui_preset_path(preset_name)
+    if not path.exists():
+        return None
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    _set_last_used_ui_preset(preset_name)
+    return data
+
+
+def _delete_ui_preset(preset_name: str) -> bool:
+    if not preset_name or str(preset_name).strip() == DEFAULT_UI_PRESET_NAME:
+        return False
+
+    path = _ui_preset_path(preset_name)
+    if not path.exists():
+        return False
+
+    try:
+        path.unlink()
+        return True
+    except Exception:
+        return False
+
+
 theme = gr.themes.Soft()
 theme.font = [gr.themes.GoogleFont("Inter"), "Tahoma", "ui-sans-serif", "system-ui", "sans-serif"]
 with gr.Blocks(title=APP_TITLE) as demo:
@@ -1452,6 +1561,28 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     visible=True,
                     key="output_audio"
                 )
+                with gr.Accordion("Config Presets (Save / Load)", open=True):
+                    gr.Markdown(
+                        "Saves and loads all user-settable controls from the Audio Generation and Advanced Parameters tabs. Uploaded files/audio are intentionally not included."
+                    )
+                    ui_preset_dropdown = gr.Dropdown(
+                        label="Select Preset",
+                        choices=_list_ui_presets(),
+                        value=(_get_last_used_ui_preset() or DEFAULT_UI_PRESET_NAME),
+                        allow_custom_value=False,
+                    )
+                    ui_preset_name = gr.Textbox(
+                        label="New Preset Name",
+                        placeholder="Enter a preset name to save",
+                        value="",
+                    )
+                    with gr.Row():
+                        ui_preset_save_btn = gr.Button("Save", variant="primary")
+                        ui_preset_load_btn = gr.Button("Load Selected")
+                    with gr.Row():
+                        ui_preset_reset_btn = gr.Button("Reset Defaults", variant="secondary")
+                        ui_preset_delete_btn = gr.Button("Delete", variant="stop")
+                    ui_preset_status = gr.Markdown("")
 
         with gr.Accordion("Function Settings"):
             # 情感控制选项部分 - now showing ALL options including experimental
@@ -1788,6 +1919,311 @@ with gr.Blocks(title=APP_TITLE) as demo:
                        emo_bias_joy, emo_bias_anger, emo_bias_sad, emo_bias_fear,
                        emo_bias_disgust, emo_bias_depression, emo_bias_surprise, emo_bias_calm]
 
+        _CONFIG_FIELDS = [
+            {"section": "audio_generation", "key": "time_ranges_input", "component": time_ranges_input, "default": "", "kind": "str"},
+            {"section": "audio_generation", "key": "audio_path_input", "component": audio_path_input, "default": "", "kind": "str"},
+            {"section": "audio_generation", "key": "input_text_single", "component": input_text_single, "default": "", "kind": "str"},
+            {"section": "audio_generation", "key": "subtitle_mode", "component": subtitle_mode, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "autoregressive_batch_size", "component": autoregressive_batch_size, "default": 1, "kind": "int", "min": 1, "max": 8},
+            {"section": "audio_generation", "key": "output_filename", "component": output_filename, "default": "", "kind": "str"},
+            {"section": "audio_generation", "key": "save_used_audio", "component": save_used_audio, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "emo_control_method", "component": emo_control_method, "default": 0, "kind": "emotion_method"},
+            {"section": "audio_generation", "key": "emo_random", "component": emo_random, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "vec1", "component": vec1, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec2", "component": vec2, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec3", "component": vec3, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec4", "component": vec4, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec5", "component": vec5, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec6", "component": vec6, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec7", "component": vec7, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "vec8", "component": vec8, "default": 0.0, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "emo_text", "component": emo_text, "default": "", "kind": "str"},
+            {"section": "audio_generation", "key": "emo_weight", "component": emo_weight, "default": 0.65, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "audio_generation", "key": "diffusion_steps", "component": diffusion_steps, "default": 25, "kind": "int", "min": 10, "max": 100},
+            {"section": "audio_generation", "key": "inference_cfg_rate", "component": inference_cfg_rate, "default": 0.7, "kind": "float", "min": 0.0, "max": 2.0},
+            {"section": "audio_generation", "key": "max_speaker_audio_length", "component": max_speaker_audio_length, "default": 30, "kind": "int", "min": 3, "max": 90},
+            {"section": "audio_generation", "key": "max_emotion_audio_length", "component": max_emotion_audio_length, "default": 30, "kind": "int", "min": 3, "max": 90},
+            {"section": "audio_generation", "key": "do_sample", "component": do_sample, "default": True, "kind": "bool"},
+            {"section": "audio_generation", "key": "temperature", "component": temperature, "default": 0.8, "kind": "float", "min": 0.1, "max": 2.0},
+            {"section": "audio_generation", "key": "num_beams", "component": num_beams, "default": 3, "kind": "int", "min": 1, "max": 10},
+            {
+                "section": "audio_generation",
+                "key": "max_text_tokens_per_segment",
+                "component": max_text_tokens_per_segment,
+                "default": str(initial_value),
+                "kind": "int_text",
+                "min": 20,
+                "max": tts.cfg.gpt.max_text_tokens,
+            },
+            {"section": "audio_generation", "key": "save_as_mp3", "component": save_as_mp3, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "low_memory_mode", "component": low_memory_mode, "default": False, "kind": "bool"},
+            {"section": "audio_generation", "key": "prevent_vram_accumulation", "component": prevent_vram_accumulation, "default": False, "kind": "bool"},
+            {
+                "section": "advanced_parameters",
+                "key": "mp3_bitrate",
+                "component": mp3_bitrate,
+                "default": "256k",
+                "kind": "choice",
+                "choices": ["128k", "192k", "256k", "320k"],
+            },
+            {"section": "advanced_parameters", "key": "latent_multiplier", "component": latent_multiplier, "default": 1.72, "kind": "float", "min": 1.0, "max": 3.0},
+            {"section": "advanced_parameters", "key": "top_p", "component": top_p, "default": 0.8, "kind": "float", "min": 0.0, "max": 1.0},
+            {"section": "advanced_parameters", "key": "top_k", "component": top_k, "default": 30, "kind": "int", "min": 0, "max": 100},
+            {"section": "advanced_parameters", "key": "repetition_penalty", "component": repetition_penalty, "default": 10.0, "kind": "float", "min": 1.0, "max": 20.0},
+            {"section": "advanced_parameters", "key": "length_penalty", "component": length_penalty, "default": 0.0, "kind": "float", "min": -2.0, "max": 2.0},
+            {"section": "advanced_parameters", "key": "max_consecutive_silence", "component": max_consecutive_silence, "default": 0, "kind": "int", "min": 0, "max": 100},
+            {"section": "advanced_parameters", "key": "interval_silence", "component": interval_silence, "default": 200, "kind": "int", "min": 0, "max": 1000},
+            {"section": "advanced_parameters", "key": "apply_emo_bias", "component": apply_emo_bias, "default": True, "kind": "bool"},
+            {"section": "advanced_parameters", "key": "max_emotion_sum", "component": max_emotion_sum, "default": 0.8, "kind": "float", "min": 0.1, "max": 2.0},
+            {"section": "advanced_parameters", "key": "max_mel_tokens", "component": max_mel_tokens, "default": 1500, "kind": "int", "min": 50, "max": 1815},
+            {"section": "advanced_parameters", "key": "semantic_layer", "component": semantic_layer, "default": 17, "kind": "int", "min": 1, "max": 24},
+            {"section": "advanced_parameters", "key": "cfm_cache_length", "component": cfm_cache_length, "default": 8192, "kind": "int", "min": 1024, "max": 16384},
+            {"section": "advanced_parameters", "key": "emo_bias_joy", "component": emo_bias_joy, "default": 0.9375, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_anger", "component": emo_bias_anger, "default": 0.875, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_sad", "component": emo_bias_sad, "default": 1.0, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_fear", "component": emo_bias_fear, "default": 1.0, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_disgust", "component": emo_bias_disgust, "default": 0.9375, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_depression", "component": emo_bias_depression, "default": 0.9375, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_surprise", "component": emo_bias_surprise, "default": 0.6875, "kind": "float", "min": 0.5, "max": 1.5},
+            {"section": "advanced_parameters", "key": "emo_bias_calm", "component": emo_bias_calm, "default": 0.5625, "kind": "float", "min": 0.5, "max": 1.5},
+        ]
+        _CONFIG_COMPONENTS = [field["component"] for field in _CONFIG_FIELDS]
+        _CONFIG_SECTIONS = tuple(dict.fromkeys(field["section"] for field in _CONFIG_FIELDS))
+        _PRESET_AUX_OUTPUTS = [
+            emotion_reference_group,
+            emotion_randomize_group,
+            emotion_vector_group,
+            emo_text_group,
+            emo_weight_group,
+            segments_preview,
+            section_count_label,
+            subtitle_status,
+        ]
+
+        def _default_ui_config() -> Dict[str, Any]:
+            cfg: Dict[str, Any] = {
+                "_meta": {
+                    "version": UI_PRESET_VERSION,
+                    "format": UI_PRESET_FORMAT,
+                }
+            }
+            for section in _CONFIG_SECTIONS:
+                cfg[section] = {}
+            for field in _CONFIG_FIELDS:
+                cfg[field["section"]][field["key"]] = field["default"]
+            return cfg
+
+        def _merge_ui_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            merged = _default_ui_config()
+            if not isinstance(cfg, dict):
+                return merged
+
+            meta = cfg.get("_meta")
+            if isinstance(meta, dict):
+                merged["_meta"].update(meta)
+
+            for section in _CONFIG_SECTIONS:
+                section_data = cfg.get(section)
+                if isinstance(section_data, dict):
+                    merged[section].update(section_data)
+
+            return merged
+
+        def _normalize_bool(value: Any, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return bool(default)
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if normalized in {"0", "false", "no", "n", "off", ""}:
+                    return False
+            return bool(default)
+
+        def _normalize_int(value: Any, default: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+            try:
+                normalized = int(float(value))
+            except Exception:
+                normalized = int(default)
+            if min_value is not None:
+                normalized = max(min_value, normalized)
+            if max_value is not None:
+                normalized = min(max_value, normalized)
+            return normalized
+
+        def _normalize_float(value: Any, default: float, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+            try:
+                normalized = float(value)
+            except Exception:
+                normalized = float(default)
+            if min_value is not None:
+                normalized = max(min_value, normalized)
+            if max_value is not None:
+                normalized = min(max_value, normalized)
+            return normalized
+
+        def _normalize_text(value: Any, default: str) -> str:
+            if value is None:
+                return str(default)
+            return str(value)
+
+        def _normalize_emotion_method(value: Any, default: int = 0) -> int:
+            if hasattr(value, "value"):
+                value = value.value
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped in EMO_CHOICES_ALL:
+                    return EMO_CHOICES_ALL.index(stripped)
+            normalized = _normalize_int(value, default, 0, len(EMO_CHOICES_ALL) - 1)
+            return normalized
+
+        def _normalize_field_value(field: Dict[str, Any], value: Any) -> Any:
+            kind = field["kind"]
+            default = field["default"]
+            min_value = field.get("min")
+            max_value = field.get("max")
+
+            if kind == "str":
+                return _normalize_text(value, default)
+            if kind == "bool":
+                return _normalize_bool(value, default)
+            if kind == "int":
+                return _normalize_int(value, default, min_value, max_value)
+            if kind == "float":
+                return _normalize_float(value, default, min_value, max_value)
+            if kind == "int_text":
+                return str(_normalize_int(value, int(default), min_value, max_value))
+            if kind == "choice":
+                normalized = _normalize_text(value, default)
+                return normalized if normalized in field.get("choices", []) else default
+            if kind == "emotion_method":
+                return _normalize_emotion_method(value, default)
+            return value if value is not None else default
+
+        def _normalize_ui_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            merged = _merge_ui_config(cfg)
+            for field in _CONFIG_FIELDS:
+                section = field["section"]
+                key = field["key"]
+                merged[section][key] = _normalize_field_value(field, merged[section].get(key))
+            return merged
+
+        def _values_to_ui_config(*values: Any) -> Dict[str, Any]:
+            cfg = _default_ui_config()
+            for field, value in zip(_CONFIG_FIELDS, values):
+                cfg[field["section"]][field["key"]] = _normalize_field_value(field, value)
+            return cfg
+
+        def _ui_config_to_values(cfg: Optional[Dict[str, Any]]) -> List[Any]:
+            normalized = _normalize_ui_config(cfg)
+            return [normalized[field["section"]][field["key"]] for field in _CONFIG_FIELDS]
+
+        def _component_output_value(field: Dict[str, Any], value: Any) -> Any:
+            if field["kind"] == "emotion_method":
+                index_value = _normalize_emotion_method(value, field["default"])
+                return EMO_CHOICES_ALL[index_value]
+            return value
+
+        def _build_subtitle_status_for_preset(subtitle_mode_value: bool, current_subtitle_file: Optional[str]):
+            if not subtitle_mode_value or not current_subtitle_file:
+                return gr.update(value="", visible=False)
+            try:
+                cues = parse_subtitle_file(current_subtitle_file)
+                return gr.update(
+                    value=build_subtitle_status_message(cues, subtitle_file=current_subtitle_file),
+                    visible=True,
+                )
+            except Exception as e:
+                return gr.update(value=f"Failed to load caption file: {str(e)}", visible=True)
+
+        def _preset_component_updates(cfg: Optional[Dict[str, Any]], current_subtitle_file: Optional[str]) -> List[Any]:
+            normalized = _normalize_ui_config(cfg)
+            values = [
+                _component_output_value(field, normalized[field["section"]][field["key"]])
+                for field in _CONFIG_FIELDS
+            ]
+            text_value = normalized["audio_generation"]["input_text_single"]
+            subtitle_mode_value = normalized["audio_generation"]["subtitle_mode"]
+            max_tokens_value = normalized["audio_generation"]["max_text_tokens_per_segment"]
+            preview_rows = get_preview_rows(
+                text_value,
+                max_tokens_value,
+                subtitle_mode_value,
+                current_subtitle_file,
+            )
+            section_count = build_section_count_message(
+                text_value,
+                max_tokens_value,
+                subtitle_mode_value,
+                current_subtitle_file,
+            )
+            return values + list(on_method_change(normalized["audio_generation"]["emo_control_method"])) + [
+                gr.update(value=preview_rows, visible=True, type="array"),
+                gr.update(value=section_count),
+                _build_subtitle_status_for_preset(subtitle_mode_value, current_subtitle_file),
+            ]
+
+        def _save_preset_ui(preset_name: str, *values: Any):
+            try:
+                saved = _save_ui_preset(preset_name, _values_to_ui_config(*values))
+                return (
+                    gr.update(choices=_list_ui_presets(), value=saved),
+                    gr.update(value=saved),
+                    f"✅ Saved preset **{saved}**",
+                )
+            except Exception as e:
+                return (
+                    gr.update(choices=_list_ui_presets()),
+                    gr.update(),
+                    f"[ERROR] Save failed: {e}",
+                )
+
+        def _load_preset_ui(preset_name: str, current_subtitle_file: Optional[str]):
+            requested = (preset_name or "").strip()
+            if not requested or requested == DEFAULT_UI_PRESET_NAME:
+                _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+                return (*_preset_component_updates(_default_ui_config(), current_subtitle_file), "INFO: Loaded default settings.")
+
+            cfg = _load_ui_preset(requested)
+            if not cfg:
+                _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+                return (
+                    *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                    f"WARNING: Preset **{requested}** not found (loaded defaults).",
+                )
+
+            return (*_preset_component_updates(cfg, current_subtitle_file), f"✅ Loaded preset **{requested}**")
+
+        def _reset_defaults_ui(current_subtitle_file: Optional[str]):
+            _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+            return (
+                gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
+                *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                "✅ Reset to defaults",
+            )
+
+        def _delete_preset_ui(preset_name: str, current_subtitle_file: Optional[str]):
+            requested = (preset_name or "").strip()
+            if not requested or requested == DEFAULT_UI_PRESET_NAME:
+                _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+                return (
+                    gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
+                    *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                    f"INFO: Built-in preset **{DEFAULT_UI_PRESET_NAME}** cannot be deleted",
+                )
+
+            ok = _delete_ui_preset(requested)
+            _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+            return (
+                gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
+                *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                f"✅ Deleted preset **{requested}**" if ok else f"WARNING: Could not delete preset **{requested}**",
+            )
+
     def process_media_to_reference(media_path, time_ranges="", require_time_ranges=False):
         if not media_path:
             if require_time_ranges:
@@ -2028,6 +2464,49 @@ with gr.Blocks(title=APP_TITLE) as demo:
                      outputs=[output_audio, subtitle_status])
 
     open_outputs_button.click(open_outputs_folder)
+
+    ui_preset_save_btn.click(
+        fn=_save_preset_ui,
+        inputs=[ui_preset_name] + _CONFIG_COMPONENTS,
+        outputs=[ui_preset_dropdown, ui_preset_name, ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_load_btn.click(
+        fn=_load_preset_ui,
+        inputs=[ui_preset_dropdown, subtitle_file],
+        outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_dropdown.change(
+        fn=_load_preset_ui,
+        inputs=[ui_preset_dropdown, subtitle_file],
+        outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_reset_btn.click(
+        fn=_reset_defaults_ui,
+        inputs=[subtitle_file],
+        outputs=[ui_preset_dropdown] + _CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_delete_btn.click(
+        fn=_delete_preset_ui,
+        inputs=[ui_preset_dropdown, subtitle_file],
+        outputs=[ui_preset_dropdown] + _CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    demo.load(
+        fn=_load_preset_ui,
+        inputs=[ui_preset_dropdown, subtitle_file],
+        outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
 
 
 
