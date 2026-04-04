@@ -1777,7 +1777,7 @@ theme = gr.themes.Soft()
 theme.font = [gr.themes.GoogleFont("Inter"), "Tahoma", "ui-sans-serif", "system-ui", "sans-serif"]
 with gr.Blocks(title=APP_TITLE) as demo:
     mutex = threading.Lock()
-    gr.Markdown("## Index TTS2 Premium SECourses App : https://www.patreon.com/posts/139297407")
+    gr.Markdown("## Index TTS2 Premium SECourses App V4.0 : https://www.patreon.com/posts/139297407")
 
     with gr.Tab("Audio Generation"):
         with gr.Row(equal_height=False):
