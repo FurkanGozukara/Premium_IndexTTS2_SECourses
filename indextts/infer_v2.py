@@ -949,6 +949,7 @@ class IndexTTS2:
         self,
         spk_audio_prompt,
         texts,
+        on_text_complete=None,
         emo_audio_prompt=None,
         emo_alpha=1.0,
         emo_vector=None,
@@ -974,8 +975,9 @@ class IndexTTS2:
             return []
 
         if use_emo_text:
-            return [
-                self.infer(
+            results = []
+            for idx, text in enumerate(texts):
+                result = self.infer(
                     spk_audio_prompt=spk_audio_prompt,
                     text=text,
                     output_path=None,
@@ -1000,8 +1002,10 @@ class IndexTTS2:
                     reset_beam_cache_per_segment=reset_beam_cache_per_segment,
                     **dict(generation_kwargs),
                 )
-                for text in texts
-            ]
+                results.append(result)
+                if on_text_complete is not None:
+                    on_text_complete(idx, result)
+            return results
 
         if not self.models_loaded:
             self.load_models()
@@ -1037,13 +1041,18 @@ class IndexTTS2:
 
         collected_segments = [[] for _ in texts]
         empty_results = {}
+        segment_counts = [0 for _ in texts]
+        finalized_results = {}
         segment_items = []
         for idx, text in enumerate(texts):
             text_tokens_list = self.tokenizer.tokenize(text)
             segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
             if not segments:
                 empty_results[idx] = self._wav_tensor_to_gradio(torch.zeros((1, 0)), sampling_rate)
+                if on_text_complete is not None:
+                    on_text_complete(idx, empty_results[idx])
                 continue
+            segment_counts[idx] = len(segments)
             for segment_idx, segment in enumerate(segments):
                 segment_items.append((idx, segment_idx, segment))
 
@@ -1085,6 +1094,31 @@ class IndexTTS2:
             generated_audio_seconds += self._count_audio_seconds(wavs, sampling_rate)
             for (result_idx, segment_idx, _), wav in zip(batch, wavs):
                 collected_segments[result_idx].append((segment_idx, wav))
+            for result_idx in sorted({result_idx for result_idx, _, _ in batch}):
+                if result_idx in empty_results or result_idx in finalized_results:
+                    continue
+                if len(collected_segments[result_idx]) < segment_counts[result_idx]:
+                    continue
+
+                ordered_segments = [
+                    wav for _, wav in sorted(collected_segments[result_idx], key=lambda item: item[0])
+                ]
+                if ordered_segments:
+                    stitched_segments = self.insert_interval_silence(
+                        ordered_segments,
+                        sampling_rate=sampling_rate,
+                        interval_silence=interval_silence,
+                    )
+                    combined_wav = torch.cat(stitched_segments, dim=1)
+                    finalized_results[result_idx] = self._wav_tensor_to_gradio(combined_wav, sampling_rate)
+                else:
+                    finalized_results[result_idx] = self._wav_tensor_to_gradio(
+                        torch.zeros((1, 0)),
+                        sampling_rate,
+                    )
+                collected_segments[result_idx] = []
+                if on_text_complete is not None:
+                    on_text_complete(result_idx, finalized_results[result_idx])
             if console_progress_enabled:
                 self._print_console_progress(
                     console_progress_label,
@@ -1100,6 +1134,9 @@ class IndexTTS2:
         for idx in range(len(texts)):
             if idx in empty_results:
                 results.append(empty_results[idx])
+                continue
+            if idx in finalized_results:
+                results.append(finalized_results[idx])
                 continue
 
             ordered_segments = [
