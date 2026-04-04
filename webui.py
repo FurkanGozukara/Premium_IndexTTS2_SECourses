@@ -61,6 +61,8 @@ from indextts.infer_v2 import IndexTTS2
 from indextts.utils.subtitle_utils import (
     SUPPORTED_SUBTITLE_EXTENSIONS,
     assemble_subtitle_audio,
+    build_subtitle_render_units,
+    fit_audio_to_duration,
     format_srt_timestamp,
     get_subtitle_extension,
     get_subtitle_format_label,
@@ -589,11 +591,18 @@ def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling
         return "No subtitle cues loaded."
 
     format_label = get_subtitle_format_label(subtitle_file)
+    render_units = build_subtitle_render_units(cues)
     message_parts = [
         f"Loaded {len(cues)} {format_label} cue(s).",
         f"Timeline end: {format_srt_timestamp(cues[-1].end_ms)}.",
-        "When caption cue timing is enabled, each cue is synthesized separately and placed on the final timeline using its cue start time.",
+        f"Synthesis units: {len(render_units)}.",
+        "Subtitle timing uses cue start times, merges overlapping cues into larger render units when needed, and fits each rendered unit to its target slot duration.",
     ]
+
+    if len(render_units) < len(cues):
+        message_parts.append(
+            f"Detected {len(cues) - len(render_units)} overlapping cue transition(s); overlapping cues will be synthesized as merged units."
+        )
 
     if sample_count is not None and sampling_rate:
         message_parts.append(f"Generated output length: {sample_count / float(sampling_rate):.2f}s.")
@@ -780,7 +789,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         "inference_cfg_rate": float(inference_cfg_rate),
         "max_speaker_audio_length": float(max_speaker_audio_length),
         "max_emotion_audio_length": float(max_emotion_audio_length),
-        "autoregressive_batch_size": int(autoregressive_batch_size),
+        "section_batch_size": int(autoregressive_batch_size),
         "max_emotion_sum": float(max_emotion_sum),
         "latent_multiplier": float(latent_multiplier),
         "max_consecutive_silence": int(max_consecutive_silence),
@@ -791,6 +800,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
     infer_kwargs.update(kwargs)
 
     subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
+    subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
     resolved_settings = {
         "emotion_control_method_index": emo_control_method,
         "emotion_control_method_label": EMO_CHOICES_ALL[emo_control_method] if 0 <= emo_control_method < len(EMO_CHOICES_ALL) else str(emo_control_method),
@@ -841,6 +851,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         metadata["subtitle"] = {
             "format": get_subtitle_format_label(subtitle_file) if subtitle_file else None,
             "cue_count": len(subtitle_cues),
+            "render_unit_count": len(subtitle_render_units),
             "timeline_end_ms": subtitle_cues[-1].end_ms if subtitle_cues else 0,
             "cues": [
                 {
@@ -853,6 +864,19 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
                     "generated_duration_ms": None,
                 }
                 for cue in subtitle_cues
+            ],
+            "render_units": [
+                {
+                    "index": unit.index,
+                    "start_ms": unit.start_ms,
+                    "end_ms": unit.end_ms,
+                    "duration_ms": unit.duration_ms,
+                    "text": unit.text,
+                    "source_cue_indices": list(unit.cue_indices),
+                    "segment_file": None,
+                    "generated_duration_ms": None,
+                }
+                for unit in subtitle_render_units
             ],
             "timing_issues": [],
         }
@@ -871,41 +895,55 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
             if not subtitle_cues:
                 raise gr.Error("No caption cues were found in the selected file.")
 
-            rendered_cues = []
+            rendered_units = []
             original_progress = tts.gr_progress
             sampling_rate = 22050
 
             try:
                 tts.gr_progress = None
-                for cue_idx, cue in enumerate(subtitle_cues):
-                    progress(0.05 + 0.8 * cue_idx / max(len(subtitle_cues), 1),
-                             desc=f"subtitle cue {cue_idx + 1}/{len(subtitle_cues)}...")
-                    if cue.text.strip():
-                        sampling_rate, cue_audio = tts.infer(
-                            spk_audio_prompt=prompt,
-                            text=cue.text,
-                            output_path=None,
-                            **infer_kwargs,
+                non_empty_units = [unit for unit in subtitle_render_units if unit.text.strip()]
+                generated_unit_audio = {}
+
+                if non_empty_units:
+                    batch_results = tts.infer_texts(
+                        spk_audio_prompt=prompt,
+                        texts=[unit.text for unit in non_empty_units],
+                        **infer_kwargs,
+                    )
+                    for unit, result in zip(non_empty_units, batch_results):
+                        sampling_rate, unit_audio = result
+                        generated_unit_audio[unit.index] = fit_audio_to_duration(
+                            unit_audio,
+                            sampling_rate=sampling_rate,
+                            target_duration_ms=unit.duration_ms,
                         )
+
+                for unit_idx, unit in enumerate(subtitle_render_units):
+                    progress(
+                        0.05 + 0.8 * unit_idx / max(len(subtitle_render_units), 1),
+                        desc=f"subtitle unit {unit_idx + 1}/{len(subtitle_render_units)}...",
+                    )
+                    if unit.text.strip():
+                        unit_audio = generated_unit_audio.get(unit.index, np.zeros((0, 1), dtype=np.int16))
                     else:
-                        cue_audio = np.zeros((0, 1), dtype=np.int16)
+                        unit_audio = np.zeros((0, 1), dtype=np.int16)
 
-                    segment_path = build_segment_output_path(task_layout["segments_dir"], cue_idx + 1)
-                    save_pcm16_wav(cue_audio, sampling_rate, segment_path)
+                    segment_path = build_segment_output_path(task_layout["segments_dir"], unit_idx + 1)
+                    save_pcm16_wav(unit_audio, sampling_rate, segment_path)
 
-                    metadata["subtitle"]["cues"][cue_idx]["segment_file"] = abs_path_or_none(segment_path)
-                    metadata["subtitle"]["cues"][cue_idx]["generated_duration_ms"] = int(
-                        round(cue_audio.shape[0] * 1000.0 / sampling_rate)
+                    metadata["subtitle"]["render_units"][unit_idx]["segment_file"] = abs_path_or_none(segment_path)
+                    metadata["subtitle"]["render_units"][unit_idx]["generated_duration_ms"] = int(
+                        round(unit_audio.shape[0] * 1000.0 / sampling_rate)
                     )
                     metadata["updated_at"] = current_timestamp()
                     write_metadata_file(metadata_path, metadata)
 
-                    rendered_cues.append((cue, cue_audio))
+                    rendered_units.append((unit, unit_audio))
             finally:
                 tts.gr_progress = original_progress
 
             progress(0.92, desc="assembling subtitle timeline...")
-            combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_cues, sampling_rate=sampling_rate)
+            combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_units, sampling_rate=sampling_rate)
             if combined_audio.shape[0] == 0:
                 raise gr.Error("The caption file does not contain any spoken text to synthesize.")
 
@@ -1063,6 +1101,15 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         variant="primary"
                     )
                     open_outputs_button = gr.Button("Open Outputs Folder", key="open_outputs_button")
+
+                autoregressive_batch_size = gr.Slider(
+                    label="Section Batch Size",
+                    value=1,
+                    minimum=1,
+                    maximum=8,
+                    step=1,
+                    info="Real micro-batch size for processing multiple text/subtitle sections together with shared reference conditioning. Higher values increase throughput with a smaller VRAM increase than parallel runs, but still use more memory. Start with 2."
+                )
 
                 # Output filename and save used audio options
                 with gr.Row():
@@ -1345,15 +1392,6 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 )
 
         with gr.Row():
-            with gr.Column():
-                autoregressive_batch_size = gr.Slider(
-                    label="Autoregressive Batch Size",
-                    value=1,
-                    minimum=1,
-                    maximum=8,
-                    step=1,
-                    info="Generates multiple speech variations simultaneously. Higher (3-8) = more options, potentially better quality but much slower. 1 = single fast generation."
-                )
             with gr.Column():
                 max_mel_tokens = gr.Slider(
                     label="Max Mel Tokens",
