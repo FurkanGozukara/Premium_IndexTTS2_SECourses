@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import shutil
+import subprocess
 from typing import List, Sequence, Tuple
+import wave
 
 import librosa
 import numpy as np
@@ -289,12 +292,174 @@ def ensure_audio_matrix(audio: np.ndarray) -> np.ndarray:
     return matrix
 
 
+def write_pcm16_wav(audio: np.ndarray, sampling_rate: int, output_path: str) -> str:
+    matrix = ensure_audio_matrix(audio)
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with wave.open(output_path, "wb") as wav_file:
+        wav_file.setnchannels(matrix.shape[1])
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sampling_rate))
+        wav_file.writeframes(matrix.tobytes())
+
+    return output_path
+
+
+def read_pcm16_wav(path: str) -> Tuple[int, np.ndarray]:
+    with wave.open(path, "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sampling_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        frames = wav_file.readframes(frame_count)
+
+    if sample_width != 2:
+        raise ValueError(f"Expected 16-bit PCM WAV, got sample width {sample_width} bytes: {path}")
+
+    audio = np.frombuffer(frames, dtype=np.int16)
+    if audio.size == 0:
+        return sampling_rate, np.zeros((0, channels), dtype=np.int16)
+
+    if audio.size % channels != 0:
+        raise ValueError(f"PCM frame data is not divisible by channel count for {path}")
+
+    return sampling_rate, audio.reshape(-1, channels).copy()
+
+
+def pad_or_trim_audio_to_samples(audio: np.ndarray, target_samples: int) -> np.ndarray:
+    matrix = ensure_audio_matrix(audio)
+    target_samples = max(0, int(target_samples))
+    current_samples = matrix.shape[0]
+
+    if current_samples == target_samples:
+        return matrix
+
+    if target_samples == 0:
+        return np.zeros((0, matrix.shape[1]), dtype=np.int16)
+
+    if current_samples == 0:
+        return np.zeros((target_samples, matrix.shape[1]), dtype=np.int16)
+
+    if current_samples > target_samples:
+        return matrix[:target_samples]
+
+    padding = np.zeros((target_samples - current_samples, matrix.shape[1]), dtype=np.int16)
+    return np.concatenate([matrix, padding], axis=0)
+
+
 def samples_to_ms(sample_count: int, sampling_rate: int) -> int:
     return int(round(sample_count * 1000.0 / sampling_rate))
 
 
 def ms_to_samples(value_ms: int, sampling_rate: int) -> int:
     return int(round(value_ms * sampling_rate / 1000.0))
+
+
+def build_ffmpeg_atempo_chain(playback_rate: float) -> List[float]:
+    rate = float(playback_rate)
+    if rate <= 0:
+        raise ValueError(f"Playback rate must be positive, got {playback_rate}")
+
+    chain: List[float] = []
+    while rate < 0.5:
+        chain.append(0.5)
+        rate /= 0.5
+    while rate > 2.0:
+        chain.append(2.0)
+        rate /= 2.0
+
+    if not chain or abs(rate - 1.0) > 1e-9:
+        chain.append(rate)
+
+    return chain or [1.0]
+
+
+def retime_audio_file_with_ffmpeg(
+    input_path: str,
+    output_path: str,
+    target_duration_ms: int,
+) -> dict:
+    sampling_rate, source_audio = read_pcm16_wav(input_path)
+    source_audio = ensure_audio_matrix(source_audio)
+    target_duration_ms = max(0, int(target_duration_ms))
+    target_samples = ms_to_samples(target_duration_ms, sampling_rate)
+    source_duration_ms = samples_to_ms(source_audio.shape[0], sampling_rate)
+
+    info = {
+        "method": "copy",
+        "source_duration_ms": source_duration_ms,
+        "target_duration_ms": target_duration_ms,
+        "delta_ms_before_fit": int(source_duration_ms - target_duration_ms),
+        "stretch_rate": 1.0,
+        "output_duration_ms": target_duration_ms,
+    }
+
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    if source_audio.shape[0] == target_samples:
+        shutil.copyfile(input_path, output_path)
+        return info
+
+    if target_samples == 0:
+        info["method"] = "target_silence"
+        write_pcm16_wav(np.zeros((0, source_audio.shape[1]), dtype=np.int16), sampling_rate, output_path)
+        info["output_duration_ms"] = 0
+        return info
+
+    if source_audio.shape[0] == 0:
+        info["method"] = "source_silence"
+        write_pcm16_wav(
+            np.zeros((target_samples, source_audio.shape[1]), dtype=np.int16),
+            sampling_rate,
+            output_path,
+        )
+        return info
+
+    stretch_rate = source_audio.shape[0] / float(target_samples)
+    atempo_chain = build_ffmpeg_atempo_chain(stretch_rate)
+    target_seconds = target_samples / float(sampling_rate)
+    filters = [f"atempo={factor:.10f}" for factor in atempo_chain]
+    filters.append(f"apad=whole_dur={target_seconds:.10f}")
+    filters.append(f"atrim=duration={target_seconds:.10f}")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-filter:a",
+        ",".join(filters),
+        "-ar",
+        str(sampling_rate),
+        "-ac",
+        str(source_audio.shape[1]),
+        "-acodec",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        output_path,
+        "-loglevel",
+        "error",
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg retime failed for {os.path.basename(output_path)}: {result.stderr.strip()}")
+
+    output_sampling_rate, output_audio = read_pcm16_wav(output_path)
+    exact_audio = pad_or_trim_audio_to_samples(output_audio, target_samples)
+    if exact_audio.shape[0] != output_audio.shape[0]:
+        write_pcm16_wav(exact_audio, output_sampling_rate, output_path)
+    else:
+        exact_audio = ensure_audio_matrix(output_audio)
+
+    info["method"] = "ffmpeg_atempo"
+    info["stretch_rate"] = float(stretch_rate)
+    info["output_duration_ms"] = samples_to_ms(exact_audio.shape[0], output_sampling_rate)
+    return info
 
 
 def fit_audio_to_duration(

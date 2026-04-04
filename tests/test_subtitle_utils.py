@@ -1,5 +1,6 @@
 import unittest
 import os
+import shutil
 import tempfile
 
 import numpy as np
@@ -8,16 +9,21 @@ from indextts.utils.subtitle_utils import (
     SUPPORTED_SUBTITLE_EXTENSIONS,
     SubtitleCue,
     build_subtitle_render_units,
+    build_ffmpeg_atempo_chain,
     assemble_subtitle_audio,
     fit_audio_to_duration,
     format_srt_timestamp,
     get_subtitle_format_label,
+    pad_or_trim_audio_to_samples,
     parse_sbv,
     parse_srt,
     parse_srt_timestamp,
     parse_subtitle_file,
     parse_vtt,
+    read_pcm16_wav,
+    retime_audio_file_with_ffmpeg,
     subtitle_cues_to_text,
+    write_pcm16_wav,
 )
 
 
@@ -170,6 +176,41 @@ Third line
         self.assertEqual((920, 1), fitted.shape)
         self.assertEqual("trim_tail", info["method"])
         self.assertEqual(1.0, info["stretch_rate"])
+
+    def test_build_ffmpeg_atempo_chain_splits_large_rates(self):
+        chain = build_ffmpeg_atempo_chain(4.5)
+
+        self.assertEqual([2.0, 2.0, 1.125], chain)
+
+    def test_pad_or_trim_audio_to_samples_matches_target(self):
+        audio = np.full((120, 1), 321, dtype=np.int16)
+
+        padded = pad_or_trim_audio_to_samples(audio, 150)
+        trimmed = pad_or_trim_audio_to_samples(audio, 80)
+
+        self.assertEqual((150, 1), padded.shape)
+        self.assertEqual((80, 1), trimmed.shape)
+        self.assertTrue(np.all(trimmed[:, 0] == 321))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+    def test_retime_audio_file_with_ffmpeg_matches_target_duration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, "input.wav")
+            output_path = os.path.join(temp_dir, "output.wav")
+            input_audio = np.full((1000, 1), 1500, dtype=np.int16)
+            write_pcm16_wav(input_audio, 1000, input_path)
+
+            info = retime_audio_file_with_ffmpeg(
+                input_path=input_path,
+                output_path=output_path,
+                target_duration_ms=400,
+            )
+            sampling_rate, output_audio = read_pcm16_wav(output_path)
+
+        self.assertEqual(1000, sampling_rate)
+        self.assertEqual((400, 1), output_audio.shape)
+        self.assertEqual("ffmpeg_atempo", info["method"])
+        self.assertAlmostEqual(2.5, info["stretch_rate"])
 
     def test_parse_subtitle_file_uses_extension_to_pick_parser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
