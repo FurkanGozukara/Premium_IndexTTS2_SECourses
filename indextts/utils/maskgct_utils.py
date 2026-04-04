@@ -1,3 +1,4 @@
+import os
 import torch
 import librosa
 import json5
@@ -84,8 +85,17 @@ class JsonHParams:
         return self.__dict__.__repr__()
 
 
-def build_semantic_model(path_='./models/tts/maskgct/ckpt/wav2vec2bert_stats.pt'):
-    semantic_model = Wav2Vec2BertModel.from_pretrained("facebook/w2v-bert-2.0")
+def build_semantic_model(
+    path_='./models/tts/maskgct/ckpt/wav2vec2bert_stats.pt',
+    model_name_or_path="facebook/w2v-bert-2.0",
+    cache_dir=None,
+    local_files_only=False,
+):
+    semantic_model = Wav2Vec2BertModel.from_pretrained(
+        model_name_or_path,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
     semantic_model.eval()
     stat_mean_var = torch.load(path_)
     semantic_mean = stat_mean_var["mean"]

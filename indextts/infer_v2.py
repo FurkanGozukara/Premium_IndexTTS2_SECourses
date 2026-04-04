@@ -22,6 +22,7 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.hf_cache_utils import cached_file_path, cached_snapshot_dir
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -35,6 +36,22 @@ import safetensors
 from transformers import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
+
+
+W2V_BERT_REPO = "facebook/w2v-bert-2.0"
+W2V_BERT_REQUIRED_FILES = [
+    "config.json",
+    "model.safetensors",
+    "preprocessor_config.json",
+]
+MASKGCT_REPO = "amphion/MaskGCT"
+MASKGCT_SEMANTIC_CODEC_FILE = "semantic_codec/model.safetensors"
+CAMPPLUS_REPO = "funasr/campplus"
+CAMPPLUS_FILE = "campplus_cn_common.bin"
+BIGVGAN_REQUIRED_FILES = [
+    "config.json",
+    "bigvgan_generator.pt",
+]
 
 class IndexTTS2:
     def __init__(
@@ -77,6 +94,8 @@ class IndexTTS2:
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
         self.cfg_path = cfg_path
+        self.hf_cache_dir = os.path.join(self.model_dir, "hf_cache")
+        os.environ["HF_HUB_CACHE"] = self.hf_cache_dir
         self.dtype = torch.float16 if self.use_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         self.use_deepspeed = use_deepspeed
@@ -146,6 +165,20 @@ class IndexTTS2:
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
+    def _cached_repo_snapshot(self, repo_id, required_files=None):
+        return cached_snapshot_dir(
+            self.hf_cache_dir,
+            repo_id,
+            required_files=required_files,
+        )
+
+    def _cached_repo_file(self, repo_id, filename):
+        return cached_file_path(
+            self.hf_cache_dir,
+            repo_id,
+            filename,
+        )
+
     def load_models(self):
         """Load all models - called only when first synthesis is requested
 
@@ -200,9 +233,23 @@ class IndexTTS2:
                 self.use_cuda_kernel = False
 
         # Initialize semantic models
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        w2v_repo_path = self._cached_repo_snapshot(W2V_BERT_REPO, required_files=W2V_BERT_REQUIRED_FILES)
+        if w2v_repo_path:
+            print(">> w2v-bert restored from local HF cache:", w2v_repo_path)
+        else:
+            print(">> w2v-bert local HF cache missing, falling back to remote:", W2V_BERT_REPO)
+        extract_features_source = w2v_repo_path or W2V_BERT_REPO
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
+            extract_features_source,
+            cache_dir=None if w2v_repo_path else self.hf_cache_dir,
+            local_files_only=bool(w2v_repo_path),
+        )
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
-            os.path.join(self.model_dir, self.cfg.w2v_stat))
+            os.path.join(self.model_dir, self.cfg.w2v_stat),
+            model_name_or_path=extract_features_source,
+            cache_dir=None if w2v_repo_path else self.hf_cache_dir,
+            local_files_only=bool(w2v_repo_path),
+        )
         # In hybrid mode, keep models on CPU initially
         if self.hybrid_model_device:
             self.semantic_model = self.semantic_model.to(self.cpu_device)
@@ -217,7 +264,15 @@ class IndexTTS2:
 
         # Initialize semantic codec
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
-        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        semantic_code_ckpt = self._cached_repo_file(MASKGCT_REPO, MASKGCT_SEMANTIC_CODEC_FILE)
+        if semantic_code_ckpt:
+            print(">> semantic_codec restored from local HF cache:", semantic_code_ckpt)
+        else:
+            semantic_code_ckpt = hf_hub_download(
+                MASKGCT_REPO,
+                filename=MASKGCT_SEMANTIC_CODEC_FILE,
+                cache_dir=self.hf_cache_dir,
+            )
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         # In hybrid mode, keep model on CPU initially
         if self.hybrid_model_device:
@@ -251,9 +306,15 @@ class IndexTTS2:
         print(">> s2mel weights restored from:", s2mel_path)
 
         # Load CAMPPlus model
-        campplus_ckpt_path = hf_hub_download(
-            "funasr/campplus", filename="campplus_cn_common.bin"
-        )
+        campplus_ckpt_path = self._cached_repo_file(CAMPPLUS_REPO, CAMPPLUS_FILE)
+        if campplus_ckpt_path:
+            print(">> campplus restored from local HF cache:", campplus_ckpt_path)
+        else:
+            campplus_ckpt_path = hf_hub_download(
+                CAMPPLUS_REPO,
+                filename=CAMPPLUS_FILE,
+                cache_dir=self.hf_cache_dir,
+            )
         campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
         # In hybrid mode, keep model on CPU initially
@@ -267,7 +328,17 @@ class IndexTTS2:
 
         # Initialize BigVGAN
         bigvgan_name = self.cfg.vocoder.name
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
+        bigvgan_source = self._cached_repo_snapshot(bigvgan_name, required_files=BIGVGAN_REQUIRED_FILES)
+        if bigvgan_source:
+            print(">> bigvgan restored from local HF cache:", bigvgan_source)
+        else:
+            print(">> bigvgan local HF cache missing, falling back to remote:", bigvgan_name)
+        self.bigvgan = bigvgan.BigVGAN.from_pretrained(
+            bigvgan_source or bigvgan_name,
+            cache_dir=None if bigvgan_source else self.hf_cache_dir,
+            local_files_only=bool(bigvgan_source),
+            use_cuda_kernel=self.use_cuda_kernel,
+        )
         # In hybrid mode, keep model on CPU initially
         if self.hybrid_model_device:
             self.bigvgan = self.bigvgan.to(self.cpu_device)
@@ -276,7 +347,7 @@ class IndexTTS2:
             self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", bigvgan_name)
+        print(">> bigvgan weights restored from:", bigvgan_source or bigvgan_name)
 
         # Text processing already initialized in __init__ for UI preview
 
