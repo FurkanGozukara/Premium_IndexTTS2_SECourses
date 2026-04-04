@@ -1,4 +1,8 @@
-# 5 March 2026 Update V4
+# IndexTTS2 SECourses Premium Voice Cloning and Generation App - 1-Click to Install on Windows, RunPod and Massed Compute - Generate Entire Audiobooks With Consistent High Quality Voice
+
+## This app is made only for SECourses Patreon users : https://www.patreon.com/posts/139297407
+
+## 5 March 2026 Update V4
 
 - This is a massive update of the app so please make a fresh install
 
