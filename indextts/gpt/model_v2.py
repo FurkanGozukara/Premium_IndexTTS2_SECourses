@@ -688,8 +688,6 @@ class UnifiedVoice(nn.Module):
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
             emo_vec = self.emovec_layer(emo_vec)
             emo_vec = self.emo_layer(emo_vec)
-        else:
-            print('Use the specified emotion vector')
 
         tmp = torch.zeros(text_inputs.size(0)).to(text_inputs.device)
         duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())

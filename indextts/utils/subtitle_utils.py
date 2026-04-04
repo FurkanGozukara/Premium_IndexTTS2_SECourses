@@ -301,20 +301,49 @@ def fit_audio_to_duration(
     audio: np.ndarray,
     sampling_rate: int,
     target_duration_ms: int,
-) -> np.ndarray:
+    return_info: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
     matrix = ensure_audio_matrix(audio)
+    source_duration_ms = samples_to_ms(matrix.shape[0], sampling_rate)
     target_samples = max(0, ms_to_samples(target_duration_ms, sampling_rate))
+    info = {
+        "method": "none",
+        "source_duration_ms": source_duration_ms,
+        "target_duration_ms": int(target_duration_ms),
+        "delta_ms_before_fit": int(source_duration_ms - target_duration_ms),
+        "stretch_rate": 1.0,
+    }
 
     if matrix.shape[0] == target_samples:
-        return matrix
+        return (matrix, info) if return_info else matrix
 
     if target_samples == 0:
-        return np.zeros((0, matrix.shape[1]), dtype=np.int16)
+        info["method"] = "target_silence"
+        fitted = np.zeros((0, matrix.shape[1]), dtype=np.int16)
+        return (fitted, info) if return_info else fitted
 
     if matrix.shape[0] == 0:
-        return np.zeros((target_samples, matrix.shape[1]), dtype=np.int16)
+        info["method"] = "source_silence"
+        fitted = np.zeros((target_samples, matrix.shape[1]), dtype=np.int16)
+        return (fitted, info) if return_info else fitted
+
+    tolerance_ms = min(250, max(80, int(round(target_duration_ms * 0.01))))
+    tolerance_samples = ms_to_samples(tolerance_ms, sampling_rate)
+    delta_samples = target_samples - matrix.shape[0]
+
+    if abs(delta_samples) <= tolerance_samples:
+        if delta_samples > 0:
+            info["method"] = "pad_silence"
+            padding = np.zeros((delta_samples, matrix.shape[1]), dtype=np.int16)
+            fitted = np.concatenate([matrix, padding], axis=0)
+        else:
+            info["method"] = "trim_tail"
+            fitted = matrix[:target_samples]
+        return (fitted, info) if return_info else fitted
 
     stretch_rate = matrix.shape[0] / float(target_samples)
+    info["method"] = "time_stretch"
+    info["stretch_rate"] = float(stretch_rate)
     stretched_channels: List[np.ndarray] = []
 
     for channel_idx in range(matrix.shape[1]):
@@ -334,7 +363,8 @@ def fit_audio_to_duration(
         stretched_matrix = np.concatenate([stretched_matrix, padding], axis=0)
 
     stretched_matrix = np.clip(stretched_matrix, -1.0, 1.0)
-    return (stretched_matrix * 32767.0).astype(np.int16)
+    fitted = (stretched_matrix * 32767.0).astype(np.int16)
+    return (fitted, info) if return_info else fitted
 
 
 def assemble_subtitle_audio(
