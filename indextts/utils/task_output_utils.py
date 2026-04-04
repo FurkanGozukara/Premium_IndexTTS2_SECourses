@@ -40,6 +40,7 @@ def create_task_output_layout(
     output_root: str = "outputs",
     filename: str | None = None,
     subtitle_mode: bool = False,
+    subtitle_extension: str | None = None,
 ) -> Dict[str, str | None]:
     while True:
         task_id = f"{get_next_output_index(output_root):04d}"
@@ -50,6 +51,9 @@ def create_task_output_layout(
     os.makedirs(task_folder, exist_ok=False)
 
     final_basename = sanitize_output_basename(filename, fallback=task_id)
+    normalized_subtitle_extension = (subtitle_extension or ".srt").strip().lower()
+    if not normalized_subtitle_extension.startswith("."):
+        normalized_subtitle_extension = f".{normalized_subtitle_extension}"
     layout: Dict[str, str | None] = {
         "task_id": task_id,
         "task_folder": task_folder,
@@ -57,7 +61,11 @@ def create_task_output_layout(
         "final_wav_path": os.path.join(task_folder, f"{final_basename}.wav"),
         "final_mp3_path": os.path.join(task_folder, f"{final_basename}.mp3"),
         "metadata_path": os.path.join(task_folder, "metadata.json"),
-        "subtitle_copy_path": os.path.join(task_folder, "source_subtitles.srt") if subtitle_mode else None,
+        "subtitle_copy_path": (
+            os.path.join(task_folder, f"source_subtitles{normalized_subtitle_extension}")
+            if subtitle_mode
+            else None
+        ),
         "speaker_reference_copy_path": os.path.join(task_folder, "speaker_reference.wav"),
         "segments_dir": None,
     }

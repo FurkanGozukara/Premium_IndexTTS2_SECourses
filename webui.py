@@ -59,10 +59,12 @@ for file in [
 import gradio as gr
 from indextts.infer_v2 import IndexTTS2
 from indextts.utils.subtitle_utils import (
+    SUPPORTED_SUBTITLE_EXTENSIONS,
     assemble_subtitle_audio,
     format_srt_timestamp,
-    parse_srt,
-    read_srt_file,
+    get_subtitle_extension,
+    get_subtitle_format_label,
+    parse_subtitle_file,
     subtitle_cues_to_text,
 )
 from indextts.utils.task_output_utils import (
@@ -101,16 +103,101 @@ APP_FAVICON_PATH = os.path.join(APP_ASSETS_DIR, "indextts_premium_favicon.svg")
 APP_HEAD = """
 <meta name="theme-color" content="#a11236">
 """
+MEDIA_FILE_TYPES = [
+    ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".wma", ".aac", ".opus",
+]
+CAPTION_TIMING_HELP = """
+**What cue timing does**
+
+Each caption block becomes its own speech segment. The app generates every cue separately, then places those clips on the final timeline using the cue start times from your caption file.
+
+**Example**
+
+`00:00:01.000 --> 00:00:03.000   Hello there.`
+
+`00:00:04.500 --> 00:00:06.000   Welcome back.`
+
+With cue timing **off**, the app treats the text like normal paragraphs and decides pacing on its own.
+
+With cue timing **on**, `Hello there.` starts at `1.0s`, the `1.5s` gap is preserved, and `Welcome back.` starts at `4.5s`.
+
+**Impact on the result**
+
+This is useful for subtitle-aligned narration, dubbing, and scene-matched timing. If generated speech runs longer than a cue slot, later cues can start late. The status box reports those overruns so you can see timing drift.
+"""
 APP_CSS = """
-.speaker-reference-required-note > div {
-    margin-top: 0.55rem;
-    padding: 0.8rem 0.95rem;
-    border-radius: 14px;
-    border: 1px solid rgba(185, 28, 28, 0.2);
-    background: linear-gradient(180deg, rgba(255, 245, 245, 0.97), rgba(255, 236, 236, 0.94));
-    color: #991b1b;
-    font-weight: 700;
-    font-size: 0.93rem;
+.top-input-panel {
+    border: 0 !important;
+    border-radius: 0;
+    padding: 0;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+.top-input-panel > div {
+    border: 1px solid var(--block-border-color, rgba(255, 255, 255, 0.08)) !important;
+    border-radius: var(--radius-lg, 18px) !important;
+    padding: 0.95rem !important;
+    background: var(--block-background-fill, transparent) !important;
+    box-shadow: none !important;
+}
+
+.top-input-panel h3,
+.top-input-panel .prose h3 {
+    margin-top: 0 !important;
+    margin-bottom: 0.8rem !important;
+    padding-bottom: 0.7rem;
+    border-bottom: 1px solid var(--block-border-color, rgba(255, 255, 255, 0.08));
+    color: var(--body-text-color, inherit) !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.02em;
+}
+
+.caption-timing-help > div,
+.caption-timing-help .prose {
+    padding: 0.45rem 0 0.3rem !important;
+}
+
+.reference-subsection-title > div,
+.reference-subsection-title .prose {
+    padding: 0.1rem 0 0.35rem !important;
+}
+
+.reference-subsection h4,
+.reference-subsection-title h4,
+.reference-subsection-title .prose h4 {
+    color: var(--body-text-color, inherit) !important;
+    font-weight: 700 !important;
+    margin: 0 !important;
+}
+
+.reference-subsection {
+    margin: 0 0 0.9rem;
+}
+
+.reference-subsection > div {
+    border: 1px solid var(--block-border-color, rgba(255, 255, 255, 0.08)) !important;
+    border-radius: calc(var(--radius-lg, 18px) - 4px) !important;
+    padding: 0.85rem !important;
+    background: var(--background-fill-secondary, transparent) !important;
+    box-shadow: none !important;
+}
+
+.top-section-flat {
+    border-width: 0 !important;
+    border-style: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+}
+
+.top-section-flat > .wrap,
+.top-section-flat > .block,
+.top-section-flat .block {
+    border-width: 0 !important;
+    border-style: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
 }
 
 #generate-speech-button button {
@@ -217,6 +304,13 @@ FFMPEG_AVAILABLE = check_ffmpeg()
 if not FFMPEG_AVAILABLE:
     print("Warning: FFmpeg not found in PATH. Video/audio processing will not work.")
     print("Please install FFmpeg: https://ffmpeg.org/download.html")
+
+REFERENCE_WAVEFORM_OPTIONS = gr.WaveformOptions(
+    waveform_color="#f7c0cb",
+    waveform_progress_color="#a11436",
+    trim_region_color="#e23a5e",
+    sample_rate=24000,
+)
 
 def get_next_file_number(output_dir="outputs", target_folder=None, prefix=""):
     """Get the next available file number in sequence."""
@@ -481,13 +575,6 @@ def save_pcm16_wav(audio_matrix, sampling_rate, output_path):
     print(">> wav file saved to:", output_path)
     return output_path
 
-
-def parse_subtitle_file(subtitle_file):
-    if not subtitle_file:
-        return []
-    return parse_srt(read_srt_file(subtitle_file))
-
-
 def current_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -497,14 +584,15 @@ def abs_path_or_none(path):
 
 
 def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling_rate=None,
-                                  task_folder=None, segments_dir=None):
+                                  task_folder=None, segments_dir=None, subtitle_file=None):
     if not cues:
         return "No subtitle cues loaded."
 
+    format_label = get_subtitle_format_label(subtitle_file)
     message_parts = [
-        f"Loaded {len(cues)} subtitle cue(s).",
+        f"Loaded {len(cues)} {format_label} cue(s).",
         f"Timeline end: {format_srt_timestamp(cues[-1].end_ms)}.",
-        "When SRT timing is enabled, generation uses the uploaded caption file directly.",
+        "When caption cue timing is enabled, each cue is synthesized separately and placed on the final timeline using its cue start time.",
     ]
 
     if sample_count is not None and sampling_rate:
@@ -537,12 +625,13 @@ def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, sub
         try:
             cues = parse_subtitle_file(subtitle_file)
             data = []
+            cue_label = f"{get_subtitle_format_label(subtitle_file)} Cue"
             for cue in cues:
                 details = f"{format_srt_timestamp(cue.start_ms)} -> {format_srt_timestamp(cue.end_ms)} ({cue.duration_ms} ms)"
-                data.append([cue.index, "SRT Cue", cue.text, details])
+                data.append([cue.index, cue_label, cue.text, details])
             return data
         except Exception as e:
-            return [[0, "SRT Error", str(e), ""]]
+            return [[0, "Caption Error", str(e), ""]]
 
     if not text:
         return []
@@ -612,7 +701,13 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
     if not prompt:
         raise gr.Error("Speaker reference audio is required before you can generate speech.")
 
-    task_layout = create_task_output_layout(output_root="outputs", filename=output_filename, subtitle_mode=subtitle_mode)
+    subtitle_extension = get_subtitle_extension(subtitle_file) if subtitle_mode else None
+    task_layout = create_task_output_layout(
+        output_root="outputs",
+        filename=output_filename,
+        subtitle_mode=subtitle_mode,
+        subtitle_extension=subtitle_extension,
+    )
     output_path = task_layout["final_wav_path"]
     metadata_path = task_layout["metadata_path"]
     task_folder = task_layout["task_folder"]
@@ -704,6 +799,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         "save_as_mp3_enabled": bool(save_as_mp3 and MP3_AVAILABLE),
         "mp3_bitrate": mp3_bitrate,
         "subtitle_mode": subtitle_mode,
+        "subtitle_format": get_subtitle_format_label(subtitle_file) if subtitle_mode and subtitle_file else None,
         "low_memory_mode": bool(low_memory_mode),
         "prevent_vram_accumulation": bool(prevent_vram_accumulation),
         "resolved_generation_kwargs": infer_kwargs,
@@ -743,6 +839,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
 
     if subtitle_mode:
         metadata["subtitle"] = {
+            "format": get_subtitle_format_label(subtitle_file) if subtitle_file else None,
             "cue_count": len(subtitle_cues),
             "timeline_end_ms": subtitle_cues[-1].end_ms if subtitle_cues else 0,
             "cues": [
@@ -772,7 +869,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
     try:
         if subtitle_mode:
             if not subtitle_cues:
-                raise gr.Error("No subtitle cues were found in the selected .srt file.")
+                raise gr.Error("No caption cues were found in the selected file.")
 
             rendered_cues = []
             original_progress = tts.gr_progress
@@ -810,7 +907,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
             progress(0.92, desc="assembling subtitle timeline...")
             combined_audio, subtitle_issues = assemble_subtitle_audio(rendered_cues, sampling_rate=sampling_rate)
             if combined_audio.shape[0] == 0:
-                raise gr.Error("The subtitle file does not contain any spoken text to synthesize.")
+                raise gr.Error("The caption file does not contain any spoken text to synthesize.")
 
             output = save_pcm16_wav(combined_audio, sampling_rate, output_path)
             metadata["subtitle"]["timing_issues"] = subtitle_issues
@@ -822,6 +919,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
                     sampling_rate=sampling_rate,
                     task_folder=task_folder,
                     segments_dir=task_layout["segments_dir"],
+                    subtitle_file=subtitle_file,
                 ),
                 visible=True,
             )
@@ -871,60 +969,51 @@ with gr.Blocks(title=APP_TITLE) as demo:
     gr.Markdown("## Index TTS2 Premium SECourses App : https://www.patreon.com/posts/139297407")
 
     with gr.Tab("Audio Generation"):
-        with gr.Row():
+        with gr.Row(equal_height=False):
             os.makedirs("prompts",exist_ok=True)
 
-            # Left column for reference audio
-            with gr.Column():
-                # Video/Audio upload panel (initially visible)
-                with gr.Group(visible=True) as media_upload_group:
-                    media_upload = gr.File(
-                        label="Upload Video/Audio File",
-                        file_count="single",
-                        file_types=[".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
-                                    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".wma", ".aac", ".opus"],
-                        type="filepath"
-                    )
-
-                    # Time range extraction section
-                    with gr.Column():
+            with gr.Column(scale=1, min_width=280):
+                with gr.Group(elem_classes="top-input-panel"):
+                    gr.Markdown("### Reference Media (Mandatory!)")
+                    gr.Markdown("#### Upload / Import Speaker Audio", elem_classes="reference-subsection-title")
+                    with gr.Group(elem_classes="reference-subsection"):
+                        media_upload = gr.File(
+                            label="Upload Speaker Reference / Audio / Video",
+                            file_count="single",
+                            file_types=MEDIA_FILE_TYPES,
+                            type="filepath",
+                            height=120,
+                            elem_classes="top-section-flat",
+                        )
                         time_ranges_input = gr.Textbox(
                             label="Extract Audio Segments (optional)",
-                            placeholder="e.g., 1:3; 3:7; 11:15 (extracts and merges segments from 1-3s, 3-7s, 11-15s)",
+                            placeholder="e.g., 1:3; 3:7; 11:15",
                             value="",
-                            info="Enter time ranges to extract specific parts of the audio"
+                            info="Optional. Extract and merge only these time ranges from the uploaded audio/video before using it as the speaker reference."
                         )
                         extract_button = gr.Button("Extract and Use Audio", variant="secondary")
-
-                # Speaker reference audio
-                prompt_audio = gr.Audio(
-                    label="Speaker Reference Audio (Required, 3-90 seconds)",
-                    key="prompt_audio",
-                    sources=["upload","microphone"],
-                    type="filepath",
-                    visible=True,
-                    elem_id="speaker-reference-audio"
-                )
-                gr.HTML(
-                    "<div>Speaker reference audio is mandatory. Upload, record, or extract it before clicking Generate Speech.</div>",
-                    elem_classes="speaker-reference-required-note"
-                )
-
-                with gr.Group(elem_classes="subtitle-controls-group"):
-                    with gr.Row():
-                        subtitle_file = gr.File(
-                            label="Caption File (.srt)",
-                            file_count="single",
-                            file_types=[".srt"],
-                            type="filepath"
+                        gr.Markdown("##### Load Audio from Path")
+                        with gr.Row():
+                            audio_path_input = gr.Textbox(
+                                label="Audio File Path",
+                                placeholder="Enter full path to audio or video file",
+                                value=""
+                            )
+                            load_audio_button = gr.Button("Load Audio", variant="secondary")
+                    gr.Markdown("#### Record Speaker Audio", elem_classes="reference-subsection-title")
+                    with gr.Group(elem_classes="reference-subsection"):
+                        prompt_audio = gr.Audio(
+                            label="Active Speaker Reference Audio (Required, 3-90 seconds)",
+                            key="prompt_audio",
+                            sources=["microphone"],
+                            type="filepath",
+                            format="wav",
+                            elem_id="speaker-reference-audio",
+                            waveform_options=REFERENCE_WAVEFORM_OPTIONS,
+                            elem_classes="top-section-flat",
                         )
-                        subtitle_mode = gr.Checkbox(
-                            label="Use SRT Cue Timing",
-                            value=False,
-                            info="Generate each subtitle cue separately and preserve subtitle start-time gaps from the .srt file."
-                        )
-                    subtitle_status = gr.Textbox(
-                        label="Subtitle Status",
+                    reference_status = gr.Textbox(
+                        label="Reference Audio Status",
                         value="",
                         interactive=False,
                         visible=False
@@ -935,13 +1024,36 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 if prompt_list:
                     default = prompt_list[0]
 
-            # Main workspace
-            with gr.Column():
+            with gr.Column(scale=1, min_width=280):
+                with gr.Group(elem_classes=["subtitle-controls-group", "top-input-panel"]):
+                    gr.Markdown("### Captions")
+                    subtitle_file = gr.File(
+                        label="Caption File (.srt, .vtt, .sbv)",
+                        file_count="single",
+                        file_types=list(SUPPORTED_SUBTITLE_EXTENSIONS),
+                        type="filepath",
+                        height=120,
+                        elem_classes="top-section-flat",
+                    )
+                    subtitle_mode = gr.Checkbox(
+                        label="Use Caption Cue Timing",
+                        value=False,
+                        info="Generate one clip per caption cue and try to preserve each cue's start time from the uploaded caption file."
+                    )
+                    gr.Markdown(CAPTION_TIMING_HELP, elem_classes="caption-timing-help")
+                    subtitle_status = gr.Textbox(
+                        label="Caption Timing Status",
+                        value="",
+                        interactive=False,
+                        visible=False
+                    )
+
+            with gr.Column(scale=1, min_width=300):
                 input_text_single = gr.TextArea(
                     label="Text to Synthesize",
                     key="input_text_single",
                     placeholder="Enter the text you want to convert to speech",
-                    info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts will be automatically segmented. Upload an .srt file to synthesize subtitle cues with preserved timing."
+                    info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts are automatically segmented. Upload a caption file (.srt/.vtt/.sbv) when you want cue-by-cue timing."
                 )
                 with gr.Row():
                     gen_button = gr.Button(
@@ -951,7 +1063,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         interactive=True,
                         variant="primary"
                     )
-                    open_outputs_button = gr.Button("📁 Open Outputs Folder", key="open_outputs_button")
+                    open_outputs_button = gr.Button("Open Outputs Folder", key="open_outputs_button")
 
                 # Output filename and save used audio options
                 with gr.Row():
@@ -966,29 +1078,12 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         info="Copy the speaker reference audio into this generation's numbered task folder"
                     )
 
-            # Right column for output and load from path
-            with gr.Column():
+            with gr.Column(scale=1, min_width=280):
                 output_audio = gr.Audio(
                     label="Generated Result (click to play/download)",
                     visible=True,
                     key="output_audio"
                 )
-
-                with gr.Group():
-                    gr.Markdown("### Load Audio from Path")
-                    with gr.Row():
-                        audio_path_input = gr.Textbox(
-                            label="Audio File Path",
-                            placeholder="Enter full path to audio file",
-                            value=""
-                        )
-                        load_audio_button = gr.Button("Load Audio", variant="secondary")
-                    load_status = gr.Textbox(
-                        label="Status",
-                        value="",
-                        interactive=False,
-                        visible=False
-                    )
 
         with gr.Accordion("Function Settings"):
             # 情感控制选项部分 - now showing ALL options including experimental
@@ -1333,102 +1428,81 @@ with gr.Blocks(title=APP_TITLE) as demo:
                        emo_bias_joy, emo_bias_anger, emo_bias_sad, emo_bias_fear,
                        emo_bias_disgust, emo_bias_depression, emo_bias_surprise, emo_bias_calm]
 
-    def process_media_upload(media_file, time_ranges):
-        """Process uploaded media file and extract audio."""
-        if media_file is None:
-            return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
+    def process_media_to_reference(media_path, time_ranges="", require_time_ranges=False):
+        if not media_path:
+            if require_time_ranges:
+                return None, "Upload an audio or video file first."
+            return None, ""
 
         try:
-            # Extract audio from media file
             temp_audio = tempfile.mktemp(suffix=".wav")
-            extracted_audio = extract_audio_from_media(media_file, temp_audio)
-
+            extracted_audio = extract_audio_from_media(media_path, temp_audio)
             if not extracted_audio:
-                return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
+                return None, f"Failed to read audio from {os.path.basename(media_path)}."
 
-            # If time ranges specified, extract and merge segments
-            if time_ranges and time_ranges.strip():
+            has_ranges = bool(time_ranges and time_ranges.strip())
+            if has_ranges:
                 segments_audio = extract_time_ranges(extracted_audio, time_ranges)
                 if segments_audio:
-                    os.remove(extracted_audio)
+                    if os.path.exists(extracted_audio):
+                        os.remove(extracted_audio)
                     extracted_audio = segments_audio
+                    return (
+                        extracted_audio,
+                        f"Loaded extracted reference audio from {os.path.basename(media_path)} using ranges: {time_ranges.strip()}."
+                    )
+                if os.path.exists(extracted_audio):
+                    os.remove(extracted_audio)
+                return None, "No valid time ranges were found. Use a format like 1:3; 3:7; 11:15."
 
-            # Hide upload panel, show audio panel with extracted audio
-            return (
-                gr.update(visible=False),  # Hide media upload
-                gr.update(visible=True, value=extracted_audio),  # Show and update prompt_audio
-                gr.update(value=extracted_audio)  # Return path
-            )
+            if require_time_ranges:
+                if os.path.exists(extracted_audio):
+                    os.remove(extracted_audio)
+                return None, "Enter time ranges like 1:3; 3:7 before extracting segments."
+
+            return extracted_audio, f"Loaded reference audio from {os.path.basename(media_path)}."
         except Exception as e:
             print(f"Error processing media: {e}")
-            return gr.update(visible=True), gr.update(visible=True, value=None), gr.update(value=None)
+            return None, f"Error while processing media: {str(e)}"
+
+    def process_media_upload(media_file, time_ranges):
+        """Process uploaded media file and extract audio."""
+        extracted_audio, status = process_media_to_reference(media_file, time_ranges, require_time_ranges=False)
+        if not extracted_audio:
+            if not status:
+                return gr.update(), gr.update(value="", visible=False)
+            return gr.update(), gr.update(value=status, visible=True)
+        return gr.update(value=extracted_audio), gr.update(value=status, visible=True)
 
     def extract_audio_segments(media_file, time_ranges):
         """Extract specific time segments from uploaded media."""
-        if media_file is None:
-            return gr.update(), gr.update(), gr.update()
-
-        try:
-            # First extract full audio
-            temp_audio = tempfile.mktemp(suffix=".wav")
-            extracted_audio = extract_audio_from_media(media_file, temp_audio)
-
-            if not extracted_audio:
-                return gr.update(), gr.update(), gr.update()
-
-            # Extract and merge segments if specified
-            if time_ranges and time_ranges.strip():
-                segments_audio = extract_time_ranges(extracted_audio, time_ranges)
-                if segments_audio:
-                    os.remove(extracted_audio)
-                    extracted_audio = segments_audio
-
-            # Update audio component
-            return (
-                gr.update(visible=False),  # Hide upload panel
-                gr.update(visible=True, value=extracted_audio),  # Update audio
-                gr.update(value=extracted_audio)  # Return path
-            )
-        except Exception as e:
-            print(f"Error extracting segments: {e}")
-            return gr.update(), gr.update(), gr.update()
+        extracted_audio, status = process_media_to_reference(media_file, time_ranges, require_time_ranges=True)
+        if not extracted_audio:
+            return gr.update(), gr.update(value=status, visible=True)
+        return gr.update(value=extracted_audio), gr.update(value=status, visible=True)
 
     def clear_reference_audio():
-        """Clear reference audio and show upload panel again."""
-        return gr.update(visible=True), gr.update(visible=True, value=None)
+        """Clear the merged reference-media inputs."""
+        return (
+            gr.update(value=None),
+            gr.update(value=None),
+            gr.update(value=""),
+            gr.update(value="", visible=False),
+        )
 
-    def load_audio_from_path_ui(audio_path):
+    def load_audio_from_path_ui(audio_path, time_ranges):
         """Load audio from the specified file path."""
         if not audio_path:
-            return gr.update(), gr.update(visible=True, value=None), gr.update(value="Please enter a file path", visible=True)
+            return gr.update(), gr.update(value="Please enter a file path", visible=True)
 
         audio_path = audio_path.strip()
         if not os.path.exists(audio_path):
-            return gr.update(), gr.update(visible=True, value=None), gr.update(value=f"File not found: {audio_path}", visible=True)
+            return gr.update(), gr.update(value=f"File not found: {audio_path}", visible=True)
 
-        try:
-            # Convert to acceptable format if needed
-            temp_audio = tempfile.mktemp(suffix=".wav")
-            extracted_audio = extract_audio_from_media(audio_path, temp_audio)
-
-            if extracted_audio:
-                return (
-                    gr.update(visible=False),  # Hide upload panel
-                    gr.update(visible=True, value=extracted_audio),  # Update prompt audio
-                    gr.update(value="Audio loaded successfully!", visible=True)  # Status
-                )
-            else:
-                return (
-                    gr.update(),
-                    gr.update(),
-                    gr.update(value="Failed to load audio file", visible=True)
-                )
-        except Exception as e:
-            return (
-                gr.update(),
-                gr.update(),
-                gr.update(value=f"Error: {str(e)}", visible=True)
-            )
+        extracted_audio, status = process_media_to_reference(audio_path, time_ranges, require_time_ranges=False)
+        if extracted_audio:
+            return gr.update(value=extracted_audio), gr.update(value=status, visible=True)
+        return gr.update(), gr.update(value=status or "Failed to load audio file", visible=True)
 
     def load_subtitle_file(subtitle_file_path, current_text, subtitle_mode, max_text_tokens_per_segment):
         if not subtitle_file_path:
@@ -1447,15 +1521,15 @@ with gr.Blocks(title=APP_TITLE) as demo:
             return (
                 subtitle_text,
                 gr.update(value=True),
-                gr.update(value=build_subtitle_status_message(cues), visible=True),
+                gr.update(value=build_subtitle_status_message(cues, subtitle_file=subtitle_file_path), visible=True),
                 gr.update(value=preview_rows, visible=True, type="array"),
             )
         except Exception as e:
-            preview_rows = [[0, "SRT Error", str(e), ""]]
+            preview_rows = [[0, "Caption Error", str(e), ""]]
             return (
                 current_text,
                 gr.update(value=False),
-                gr.update(value=f"Failed to load subtitle file: {str(e)}", visible=True),
+                gr.update(value=f"Failed to load caption file: {str(e)}", visible=True),
                 gr.update(value=preview_rows, visible=True, type="array"),
             )
 
@@ -1531,30 +1605,40 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     prompt_audio.upload(update_prompt_audio,
                          inputs=[],
-                         outputs=[gen_button])
+                         outputs=[gen_button],
+                         queue=False,
+                         show_progress="hidden")
 
-    # New UI callbacks
-    media_upload.change(
+    media_upload.upload(
         process_media_upload,
         inputs=[media_upload, time_ranges_input],
-        outputs=[media_upload_group, prompt_audio, prompt_audio]
+        outputs=[prompt_audio, reference_status],
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last"
     )
 
     extract_button.click(
         extract_audio_segments,
         inputs=[media_upload, time_ranges_input],
-        outputs=[media_upload_group, prompt_audio, prompt_audio]
+        outputs=[prompt_audio, reference_status],
+        queue=False,
+        show_progress="hidden"
     )
 
     prompt_audio.clear(
         clear_reference_audio,
-        outputs=[media_upload_group, prompt_audio]
+        outputs=[media_upload, prompt_audio, audio_path_input, reference_status],
+        queue=False,
+        show_progress="hidden"
     )
 
     load_audio_button.click(
         load_audio_from_path_ui,
-        inputs=[audio_path_input],
-        outputs=[media_upload_group, prompt_audio, load_status]
+        inputs=[audio_path_input, time_ranges_input],
+        outputs=[prompt_audio, reference_status],
+        queue=False,
+        show_progress="hidden"
     )
 
     gen_button.click(gen_single,

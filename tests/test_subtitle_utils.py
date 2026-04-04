@@ -1,13 +1,20 @@
 import unittest
+import os
+import tempfile
 
 import numpy as np
 
 from indextts.utils.subtitle_utils import (
+    SUPPORTED_SUBTITLE_EXTENSIONS,
     SubtitleCue,
     assemble_subtitle_audio,
     format_srt_timestamp,
+    get_subtitle_format_label,
+    parse_sbv,
     parse_srt,
     parse_srt_timestamp,
+    parse_subtitle_file,
+    parse_vtt,
     subtitle_cues_to_text,
 )
 
@@ -35,6 +42,40 @@ Third line
     def test_parse_srt_timestamp_accepts_comma_or_dot_separator(self):
         self.assertEqual(3723004, parse_srt_timestamp("01:02:03,004"))
         self.assertEqual(3723004, parse_srt_timestamp("01:02:03.004"))
+        self.assertEqual(62004, parse_srt_timestamp("01:02.004"))
+
+    def test_parse_vtt_accepts_header_identifiers_and_settings(self):
+        content = """WEBVTT
+
+intro
+00:00:01.000 --> 00:00:03.250 align:start position:0%
+First line
+Second line
+
+00:00:05.000 --> 00:00:06.000
+Third line
+"""
+        cues = parse_vtt(content)
+
+        self.assertEqual(2, len(cues))
+        self.assertEqual(1000, cues[0].start_ms)
+        self.assertEqual(3250, cues[0].end_ms)
+        self.assertEqual("First line\nSecond line", cues[0].text)
+
+    def test_parse_sbv_preserves_multiline_text(self):
+        content = """0:00:01.000,0:00:03.250
+First line
+Second line
+
+0:00:05.000,0:00:06.000
+Third line
+"""
+        cues = parse_sbv(content)
+
+        self.assertEqual(2, len(cues))
+        self.assertEqual(1000, cues[0].start_ms)
+        self.assertEqual(3250, cues[0].end_ms)
+        self.assertEqual("First line\nSecond line", cues[0].text)
 
     def test_assemble_subtitle_audio_inserts_silence_from_cue_start_times(self):
         cues = [
@@ -74,6 +115,23 @@ Third line
             ],
             issues,
         )
+
+    def test_parse_subtitle_file_uses_extension_to_pick_parser(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subtitle_path = os.path.join(temp_dir, "sample.vtt")
+            with open(subtitle_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello there\n"
+                )
+
+            cues = parse_subtitle_file(subtitle_path)
+
+        self.assertEqual(1, len(cues))
+        self.assertEqual("Hello there", cues[0].text)
+
+    def test_supported_extensions_have_labels(self):
+        self.assertEqual({".srt", ".vtt", ".sbv"}, set(SUPPORTED_SUBTITLE_EXTENSIONS))
+        self.assertEqual("WebVTT", get_subtitle_format_label("sample.vtt"))
 
 
 if __name__ == "__main__":

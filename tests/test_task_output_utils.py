@@ -28,7 +28,12 @@ class TaskOutputUtilsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             os.makedirs(os.path.join(temp_dir, "0002"))
 
-            layout = create_task_output_layout(temp_dir, filename="custom-name.mp3", subtitle_mode=True)
+            layout = create_task_output_layout(
+                temp_dir,
+                filename="custom-name.mp3",
+                subtitle_mode=True,
+                subtitle_extension=".vtt",
+            )
 
             self.assertEqual("0003", layout["task_id"])
             self.assertTrue(os.path.isdir(layout["task_folder"]))
@@ -36,6 +41,7 @@ class TaskOutputUtilsTests(unittest.TestCase):
             self.assertTrue(layout["final_wav_path"].endswith(os.path.join("0003", "custom-name.wav")))
             self.assertTrue(layout["final_mp3_path"].endswith(os.path.join("0003", "custom-name.mp3")))
             self.assertTrue(layout["metadata_path"].endswith(os.path.join("0003", "metadata.json")))
+            self.assertTrue(layout["subtitle_copy_path"].endswith(os.path.join("0003", "source_subtitles.vtt")))
             self.assertEqual(
                 os.path.join(layout["segments_dir"], "0007.wav"),
                 build_segment_output_path(layout["segments_dir"], 7),
