@@ -251,52 +251,148 @@ APP_CSS = """
     background: transparent !important;
 }
 
-#generate-speech-button button {
+:is(button.action-button, .action-button button) {
     position: relative;
     overflow: hidden;
-    min-height: 52px;
+    min-height: 48px;
     border-radius: 16px !important;
-    border: 1px solid rgba(127, 29, 29, 0.34) !important;
-    color: #fff7f7 !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+    color: #fdf8ff !important;
     font-weight: 700 !important;
-    letter-spacing: 0.02em;
-    text-shadow: 0 1px 1px rgba(85, 7, 28, 0.28);
-    background: linear-gradient(180deg, #ffabb8 0%, #ff7f95 14%, #e23a5e 52%, #a11436 100%) !important;
-    box-shadow:
-        0 14px 30px rgba(226, 58, 94, 0.26),
-        0 1px 0 rgba(255, 255, 255, 0.35) inset,
-        0 -3px 0 rgba(104, 10, 30, 0.32) inset !important;
+    letter-spacing: 0.01em;
+    text-shadow: 0 1px 0 rgba(15, 23, 42, 0.28);
     transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease !important;
-    animation: premium-button-glow 2.8s ease-in-out infinite;
 }
 
-#generate-speech-button button::before {
+:is(button.action-button, .action-button button)::before {
     content: "";
     position: absolute;
     inset: 0;
-    background: linear-gradient(120deg, transparent 18%, rgba(255, 255, 255, 0.24) 38%, transparent 55%);
-    transform: translateX(-150%);
-    animation: premium-button-sheen 3.6s ease-in-out infinite;
+    background: linear-gradient(120deg, transparent 18%, rgba(255, 255, 255, 0.22) 38%, transparent 56%);
+    transform: translateX(-160%);
+    transition: transform 0.55s ease;
     pointer-events: none;
 }
 
-#generate-speech-button button:hover {
+:is(button.action-button, .action-button button):hover {
     transform: translateY(-1px);
-    filter: saturate(1.08) brightness(1.03);
-    box-shadow:
-        0 18px 34px rgba(226, 58, 94, 0.34),
-        0 1px 0 rgba(255, 255, 255, 0.37) inset,
-        0 -3px 0 rgba(104, 10, 30, 0.36) inset !important;
+    filter: saturate(1.06) brightness(1.03);
 }
 
-#generate-speech-button button:active {
+:is(button.action-button, .action-button button):hover::before {
+    transform: translateX(160%);
+}
+
+:is(button.action-button, .action-button button):active {
     transform: translateY(1px);
+}
+
+:is(button.action-button, .action-button button):focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.82);
+    outline-offset: 2px;
+}
+
+:is(button#extract-audio-button, #extract-audio-button button) {
+    background: linear-gradient(180deg, #ffd4a4 0%, #ffb05f 18%, #e67c26 58%, #9a4a0d 100%) !important;
+    border-color: rgba(160, 77, 14, 0.65) !important;
+    box-shadow:
+        0 14px 28px rgba(230, 124, 38, 0.28),
+        0 1px 0 rgba(255, 247, 234, 0.34) inset,
+        0 -3px 0 rgba(113, 50, 5, 0.28) inset !important;
+}
+
+:is(button#load-audio-button, #load-audio-button button) {
+    background: linear-gradient(180deg, #9df2db 0%, #47d6ab 16%, #0f9f7f 56%, #0a5f4e 100%) !important;
+    border-color: rgba(8, 100, 82, 0.65) !important;
+    box-shadow:
+        0 14px 28px rgba(15, 159, 127, 0.25),
+        0 1px 0 rgba(229, 255, 248, 0.34) inset,
+        0 -3px 0 rgba(5, 73, 60, 0.28) inset !important;
+}
+
+:is(button#generate-speech-button, #generate-speech-button button) {
+    min-height: 54px;
+    letter-spacing: 0.03em;
+    color: #ffe7eb !important;
+    text-shadow:
+        0 0 8px rgba(255, 222, 228, 0.65),
+        0 0 18px rgba(255, 131, 157, 0.48),
+        0 1px 0 rgba(107, 13, 35, 0.9);
+    background:
+        radial-gradient(circle at 18% 0%, rgba(255, 197, 210, 0.36), transparent 34%),
+        linear-gradient(180deg, #ff9aae 0%, #ff6383 16%, #d91f4d 55%, #7f102c 100%) !important;
+    border-color: rgba(135, 17, 48, 0.72) !important;
+    box-shadow:
+        0 0 0 1px rgba(255, 180, 196, 0.12),
+        0 16px 34px rgba(217, 31, 77, 0.34),
+        0 0 26px rgba(255, 77, 116, 0.26),
+        0 1px 0 rgba(255, 234, 239, 0.34) inset,
+        0 -3px 0 rgba(95, 9, 31, 0.34) inset !important;
+    animation: premium-button-glow 2.8s ease-in-out infinite;
+}
+
+:is(button#generate-speech-button, #generate-speech-button button)::before {
+    background: linear-gradient(120deg, transparent 15%, rgba(255, 255, 255, 0.28) 36%, transparent 58%);
+    animation: premium-button-sheen 3.6s ease-in-out infinite;
+}
+
+:is(button#generate-speech-button, #generate-speech-button button):hover {
+    box-shadow:
+        0 0 0 1px rgba(255, 188, 202, 0.18),
+        0 20px 38px rgba(217, 31, 77, 0.42),
+        0 0 34px rgba(255, 77, 116, 0.34),
+        0 1px 0 rgba(255, 238, 242, 0.38) inset,
+        0 -3px 0 rgba(95, 9, 31, 0.38) inset !important;
+}
+
+:is(button#generate-speech-button, #generate-speech-button button):active {
     animation-play-state: paused;
 }
 
-#generate-speech-button button:focus-visible {
-    outline: 2px solid rgba(255, 215, 223, 0.9);
-    outline-offset: 2px;
+:is(button#open-outputs-button, #open-outputs-button button) {
+    background: linear-gradient(180deg, #b5e8ff 0%, #69c8ff 18%, #238cd8 58%, #12518d 100%) !important;
+    border-color: rgba(19, 85, 145, 0.68) !important;
+    box-shadow:
+        0 14px 28px rgba(35, 140, 216, 0.26),
+        0 1px 0 rgba(234, 248, 255, 0.34) inset,
+        0 -3px 0 rgba(14, 60, 106, 0.28) inset !important;
+}
+
+:is(button#preset-save-button, #preset-save-button button) {
+    background: linear-gradient(180deg, #d6bcff 0%, #b084ff 18%, #7a41d8 58%, #4c1f96 100%) !important;
+    border-color: rgba(80, 31, 151, 0.68) !important;
+    box-shadow:
+        0 14px 28px rgba(122, 65, 216, 0.27),
+        0 1px 0 rgba(246, 239, 255, 0.34) inset,
+        0 -3px 0 rgba(60, 20, 118, 0.28) inset !important;
+}
+
+:is(button#preset-load-button, #preset-load-button button) {
+    background: linear-gradient(180deg, #c1cbff 0%, #8ea2ff 18%, #4c65e2 58%, #2c3a97 100%) !important;
+    border-color: rgba(42, 58, 151, 0.7) !important;
+    box-shadow:
+        0 14px 28px rgba(76, 101, 226, 0.26),
+        0 1px 0 rgba(241, 244, 255, 0.34) inset,
+        0 -3px 0 rgba(28, 40, 112, 0.3) inset !important;
+}
+
+:is(button#preset-reset-button, #preset-reset-button button) {
+    background: linear-gradient(180deg, #ffe9b0 0%, #ffd463 18%, #e0a61f 58%, #8f6200 100%) !important;
+    border-color: rgba(145, 99, 1, 0.68) !important;
+    color: #fffdf5 !important;
+    box-shadow:
+        0 14px 28px rgba(224, 166, 31, 0.26),
+        0 1px 0 rgba(255, 251, 231, 0.34) inset,
+        0 -3px 0 rgba(109, 74, 2, 0.28) inset !important;
+}
+
+:is(button#preset-delete-button, #preset-delete-button button) {
+    background: linear-gradient(180deg, #ffbdd1 0%, #ff7aa2 18%, #d62f6b 58%, #7b163d 100%) !important;
+    border-color: rgba(125, 20, 62, 0.72) !important;
+    box-shadow:
+        0 14px 28px rgba(214, 47, 107, 0.28),
+        0 1px 0 rgba(255, 238, 244, 0.34) inset,
+        0 -3px 0 rgba(92, 10, 43, 0.32) inset !important;
 }
 
 @keyframes premium-button-glow {
@@ -324,8 +420,8 @@ APP_CSS = """
 }
 
 @media (prefers-reduced-motion: reduce) {
-    #generate-speech-button button,
-    #generate-speech-button button::before {
+    :is(button#generate-speech-button, #generate-speech-button button),
+    :is(button#generate-speech-button, #generate-speech-button button)::before {
         animation: none !important;
     }
 }
@@ -1450,7 +1546,12 @@ with gr.Blocks(title=APP_TITLE) as demo:
                             value="",
                             info="Optional. Extract and merge only these time ranges from the uploaded audio/video before using it as the speaker reference."
                         )
-                        extract_button = gr.Button("Extract and Use Audio", variant="secondary")
+                        extract_button = gr.Button(
+                            "Extract and Use Audio",
+                            variant="secondary",
+                            elem_id="extract-audio-button",
+                            elem_classes=["action-button"],
+                        )
                         gr.Markdown("##### Load Audio from Path")
                         with gr.Row():
                             audio_path_input = gr.Textbox(
@@ -1458,7 +1559,12 @@ with gr.Blocks(title=APP_TITLE) as demo:
                                 placeholder="Enter full path to audio or video file",
                                 value=""
                             )
-                            load_audio_button = gr.Button("Load Audio", variant="secondary")
+                            load_audio_button = gr.Button(
+                                "Load Audio",
+                                variant="secondary",
+                                elem_id="load-audio-button",
+                                elem_classes=["action-button"],
+                            )
                     gr.Markdown("#### Record Speaker Audio", elem_classes="reference-subsection-title")
                     with gr.Group(elem_classes="reference-subsection"):
                         prompt_audio = gr.Audio(
@@ -1527,10 +1633,16 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         "Generate Speech",
                         key="gen_button",
                         elem_id="generate-speech-button",
+                        elem_classes=["action-button"],
                         interactive=True,
                         variant="primary"
                     )
-                    open_outputs_button = gr.Button("Open Outputs Folder", key="open_outputs_button")
+                    open_outputs_button = gr.Button(
+                        "Open Outputs Folder",
+                        key="open_outputs_button",
+                        elem_id="open-outputs-button",
+                        elem_classes=["action-button"],
+                    )
 
                 section_count_label = gr.Markdown("**Current Sections:** 0")
                 autoregressive_batch_size = gr.Slider(
@@ -1563,7 +1675,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 )
                 with gr.Accordion("Config Presets (Save / Load)", open=True):
                     gr.Markdown(
-                        "Saves and loads all user-settable controls from the Audio Generation and Advanced Parameters tabs. Uploaded files/audio are intentionally not included."
+                        "Saves and loads tunable controls from the Audio Generation and Advanced Parameters tabs. Working content like Text to Synthesize, uploaded subtitle/reference files, and active reference-media inputs is intentionally not included."
                     )
                     ui_preset_dropdown = gr.Dropdown(
                         label="Select Preset",
@@ -1577,11 +1689,30 @@ with gr.Blocks(title=APP_TITLE) as demo:
                         value="",
                     )
                     with gr.Row():
-                        ui_preset_save_btn = gr.Button("Save", variant="primary")
-                        ui_preset_load_btn = gr.Button("Load Selected")
+                        ui_preset_save_btn = gr.Button(
+                            "Save",
+                            variant="primary",
+                            elem_id="preset-save-button",
+                            elem_classes=["action-button"],
+                        )
+                        ui_preset_load_btn = gr.Button(
+                            "Load Selected",
+                            elem_id="preset-load-button",
+                            elem_classes=["action-button"],
+                        )
                     with gr.Row():
-                        ui_preset_reset_btn = gr.Button("Reset Defaults", variant="secondary")
-                        ui_preset_delete_btn = gr.Button("Delete", variant="stop")
+                        ui_preset_reset_btn = gr.Button(
+                            "Reset Defaults",
+                            variant="secondary",
+                            elem_id="preset-reset-button",
+                            elem_classes=["action-button"],
+                        )
+                        ui_preset_delete_btn = gr.Button(
+                            "Delete",
+                            variant="stop",
+                            elem_id="preset-delete-button",
+                            elem_classes=["action-button"],
+                        )
                     ui_preset_status = gr.Markdown("")
 
         with gr.Accordion("Function Settings"):
@@ -1920,10 +2051,6 @@ with gr.Blocks(title=APP_TITLE) as demo:
                        emo_bias_disgust, emo_bias_depression, emo_bias_surprise, emo_bias_calm]
 
         _CONFIG_FIELDS = [
-            {"section": "audio_generation", "key": "time_ranges_input", "component": time_ranges_input, "default": "", "kind": "str"},
-            {"section": "audio_generation", "key": "audio_path_input", "component": audio_path_input, "default": "", "kind": "str"},
-            {"section": "audio_generation", "key": "input_text_single", "component": input_text_single, "default": "", "kind": "str"},
-            {"section": "audio_generation", "key": "subtitle_mode", "component": subtitle_mode, "default": False, "kind": "bool"},
             {"section": "audio_generation", "key": "autoregressive_batch_size", "component": autoregressive_batch_size, "default": 1, "kind": "int", "min": 1, "max": 8},
             {"section": "audio_generation", "key": "output_filename", "component": output_filename, "default": "", "kind": "str"},
             {"section": "audio_generation", "key": "save_used_audio", "component": save_used_audio, "default": False, "kind": "bool"},
@@ -2140,14 +2267,19 @@ with gr.Blocks(title=APP_TITLE) as demo:
             except Exception as e:
                 return gr.update(value=f"Failed to load caption file: {str(e)}", visible=True)
 
-        def _preset_component_updates(cfg: Optional[Dict[str, Any]], current_subtitle_file: Optional[str]) -> List[Any]:
+        def _preset_component_updates(
+            cfg: Optional[Dict[str, Any]],
+            current_text: str,
+            current_subtitle_mode: bool,
+            current_subtitle_file: Optional[str],
+        ) -> List[Any]:
             normalized = _normalize_ui_config(cfg)
             values = [
                 _component_output_value(field, normalized[field["section"]][field["key"]])
                 for field in _CONFIG_FIELDS
             ]
-            text_value = normalized["audio_generation"]["input_text_single"]
-            subtitle_mode_value = normalized["audio_generation"]["subtitle_mode"]
+            text_value = current_text
+            subtitle_mode_value = bool(current_subtitle_mode)
             max_tokens_value = normalized["audio_generation"]["max_text_tokens_per_segment"]
             preview_rows = get_preview_rows(
                 text_value,
@@ -2182,37 +2314,78 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     f"[ERROR] Save failed: {e}",
                 )
 
-        def _load_preset_ui(preset_name: str, current_subtitle_file: Optional[str]):
+        def _load_preset_ui(
+            preset_name: str,
+            current_text: str,
+            current_subtitle_mode: bool,
+            current_subtitle_file: Optional[str],
+        ):
             requested = (preset_name or "").strip()
             if not requested or requested == DEFAULT_UI_PRESET_NAME:
                 _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
-                return (*_preset_component_updates(_default_ui_config(), current_subtitle_file), "INFO: Loaded default settings.")
+                return (
+                    *_preset_component_updates(
+                        _default_ui_config(),
+                        current_text,
+                        current_subtitle_mode,
+                        current_subtitle_file,
+                    ),
+                    "INFO: Loaded default settings.",
+                )
 
             cfg = _load_ui_preset(requested)
             if not cfg:
                 _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
                 return (
-                    *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                    *_preset_component_updates(
+                        _default_ui_config(),
+                        current_text,
+                        current_subtitle_mode,
+                        current_subtitle_file,
+                    ),
                     f"WARNING: Preset **{requested}** not found (loaded defaults).",
                 )
 
-            return (*_preset_component_updates(cfg, current_subtitle_file), f"✅ Loaded preset **{requested}**")
+            return (
+                *_preset_component_updates(
+                    cfg,
+                    current_text,
+                    current_subtitle_mode,
+                    current_subtitle_file,
+                ),
+                f"✅ Loaded preset **{requested}**",
+            )
 
-        def _reset_defaults_ui(current_subtitle_file: Optional[str]):
+        def _reset_defaults_ui(current_text: str, current_subtitle_mode: bool, current_subtitle_file: Optional[str]):
             _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
             return (
                 gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
-                *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                *_preset_component_updates(
+                    _default_ui_config(),
+                    current_text,
+                    current_subtitle_mode,
+                    current_subtitle_file,
+                ),
                 "✅ Reset to defaults",
             )
 
-        def _delete_preset_ui(preset_name: str, current_subtitle_file: Optional[str]):
+        def _delete_preset_ui(
+            preset_name: str,
+            current_text: str,
+            current_subtitle_mode: bool,
+            current_subtitle_file: Optional[str],
+        ):
             requested = (preset_name or "").strip()
             if not requested or requested == DEFAULT_UI_PRESET_NAME:
                 _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
                 return (
                     gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
-                    *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                    *_preset_component_updates(
+                        _default_ui_config(),
+                        current_text,
+                        current_subtitle_mode,
+                        current_subtitle_file,
+                    ),
                     f"INFO: Built-in preset **{DEFAULT_UI_PRESET_NAME}** cannot be deleted",
                 )
 
@@ -2220,7 +2393,12 @@ with gr.Blocks(title=APP_TITLE) as demo:
             _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
             return (
                 gr.update(choices=_list_ui_presets(), value=DEFAULT_UI_PRESET_NAME),
-                *_preset_component_updates(_default_ui_config(), current_subtitle_file),
+                *_preset_component_updates(
+                    _default_ui_config(),
+                    current_text,
+                    current_subtitle_mode,
+                    current_subtitle_file,
+                ),
                 f"✅ Deleted preset **{requested}**" if ok else f"WARNING: Could not delete preset **{requested}**",
             )
 
@@ -2474,35 +2652,35 @@ with gr.Blocks(title=APP_TITLE) as demo:
     )
     ui_preset_load_btn.click(
         fn=_load_preset_ui,
-        inputs=[ui_preset_dropdown, subtitle_file],
+        inputs=[ui_preset_dropdown, input_text_single, subtitle_mode, subtitle_file],
         outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
     )
     ui_preset_dropdown.change(
         fn=_load_preset_ui,
-        inputs=[ui_preset_dropdown, subtitle_file],
+        inputs=[ui_preset_dropdown, input_text_single, subtitle_mode, subtitle_file],
         outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
     )
     ui_preset_reset_btn.click(
         fn=_reset_defaults_ui,
-        inputs=[subtitle_file],
+        inputs=[input_text_single, subtitle_mode, subtitle_file],
         outputs=[ui_preset_dropdown] + _CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
     )
     ui_preset_delete_btn.click(
         fn=_delete_preset_ui,
-        inputs=[ui_preset_dropdown, subtitle_file],
+        inputs=[ui_preset_dropdown, input_text_single, subtitle_mode, subtitle_file],
         outputs=[ui_preset_dropdown] + _CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
     )
     demo.load(
         fn=_load_preset_ui,
-        inputs=[ui_preset_dropdown, subtitle_file],
+        inputs=[ui_preset_dropdown, input_text_single, subtitle_mode, subtitle_file],
         outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
