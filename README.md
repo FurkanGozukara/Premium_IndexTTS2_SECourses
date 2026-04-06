@@ -4,6 +4,10 @@
 
 ### Download app from here > https://www.patreon.com/posts/139297407
 
+## 1-Click Installers 
+
+<img height="600" alt="image" src="https://github.com/user-attachments/assets/9d7b363c-aecf-4c7c-bd96-b336a599d4d8" />
+
 ## 5 March 2026 Update V4
 
 - This is a massive update of the app so please make a fresh install
