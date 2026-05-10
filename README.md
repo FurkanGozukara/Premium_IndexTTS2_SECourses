@@ -8,7 +8,19 @@
 
 <img height="600" alt="image" src="https://github.com/user-attachments/assets/9d7b363c-aecf-4c7c-bd96-b336a599d4d8" />
 
-## 5 March 2026 Update V4
+## 11 May 2026 Update V4.1
+
+- New feature provide image and generate video automatically implemented
+
+- Just run installer bat file, zip file is still same, to update
+
+<img  height="600" alt="image" src="https://github.com/user-attachments/assets/1ccb7828-5fce-44e6-ae8e-b8e472c000e6" />
+
+<img  height="600" alt="image" src="https://github.com/user-attachments/assets/477f5510-8da1-418b-a1ac-a82c57be9bc7" />
+
+
+
+## 5 April 2026 Update V4
 
 - This is a massive update of the app so please make a fresh install
 
