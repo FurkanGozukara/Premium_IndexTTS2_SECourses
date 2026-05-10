@@ -6,6 +6,7 @@ from indextts.utils.task_output_utils import (
     build_segment_output_path,
     create_task_output_layout,
     get_next_output_index,
+    normalize_file_extension,
     sanitize_output_basename,
 )
 
@@ -14,6 +15,11 @@ class TaskOutputUtilsTests(unittest.TestCase):
     def test_sanitize_output_basename_strips_extension_and_invalid_chars(self):
         self.assertEqual("My_Name", sanitize_output_basename("  My:Name.wav  "))
         self.assertEqual("fallback", sanitize_output_basename("...", fallback="fallback"))
+
+    def test_normalize_file_extension(self):
+        self.assertEqual(".jpg", normalize_file_extension("JPG"))
+        self.assertEqual(".png", normalize_file_extension(""))
+        self.assertEqual(".png", normalize_file_extension("."))
 
     def test_get_next_output_index_considers_existing_files_and_folders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -33,6 +39,7 @@ class TaskOutputUtilsTests(unittest.TestCase):
                 filename="custom-name.mp3",
                 subtitle_mode=True,
                 subtitle_extension=".vtt",
+                image_extension=".jpg",
             )
 
             self.assertEqual("0003", layout["task_id"])
@@ -40,8 +47,10 @@ class TaskOutputUtilsTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(layout["segments_dir"]))
             self.assertTrue(layout["final_wav_path"].endswith(os.path.join("0003", "custom-name.wav")))
             self.assertTrue(layout["final_mp3_path"].endswith(os.path.join("0003", "custom-name.mp3")))
+            self.assertTrue(layout["final_mp4_path"].endswith(os.path.join("0003", "custom-name.mp4")))
             self.assertTrue(layout["metadata_path"].endswith(os.path.join("0003", "metadata.json")))
             self.assertTrue(layout["subtitle_copy_path"].endswith(os.path.join("0003", "source_subtitles.vtt")))
+            self.assertTrue(layout["source_image_copy_path"].endswith(os.path.join("0003", "source_image.jpg")))
             self.assertEqual(
                 os.path.join(layout["segments_dir"], "0007.wav"),
                 build_segment_output_path(layout["segments_dir"], 7),

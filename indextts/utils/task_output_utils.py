@@ -23,6 +23,16 @@ def sanitize_output_basename(filename: str | None, fallback: str = "final") -> s
     return stem or fallback
 
 
+def normalize_file_extension(extension: str | None, fallback: str = ".png") -> str:
+    normalized = (extension or fallback).strip().lower()
+    if not normalized:
+        normalized = fallback
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    normalized = re.sub(r"[^a-z0-9.]+", "", normalized)
+    return normalized if normalized.strip(".") else fallback
+
+
 def get_next_output_index(output_root: str = "outputs") -> int:
     os.makedirs(output_root, exist_ok=True)
 
@@ -41,6 +51,7 @@ def create_task_output_layout(
     filename: str | None = None,
     subtitle_mode: bool = False,
     subtitle_extension: str | None = None,
+    image_extension: str | None = None,
 ) -> Dict[str, str | None]:
     while True:
         task_id = f"{get_next_output_index(output_root):04d}"
@@ -54,16 +65,23 @@ def create_task_output_layout(
     normalized_subtitle_extension = (subtitle_extension or ".srt").strip().lower()
     if not normalized_subtitle_extension.startswith("."):
         normalized_subtitle_extension = f".{normalized_subtitle_extension}"
+    normalized_image_extension = normalize_file_extension(image_extension) if image_extension else None
     layout: Dict[str, str | None] = {
         "task_id": task_id,
         "task_folder": task_folder,
         "final_basename": final_basename,
         "final_wav_path": os.path.join(task_folder, f"{final_basename}.wav"),
         "final_mp3_path": os.path.join(task_folder, f"{final_basename}.mp3"),
+        "final_mp4_path": os.path.join(task_folder, f"{final_basename}.mp4"),
         "metadata_path": os.path.join(task_folder, "metadata.json"),
         "subtitle_copy_path": (
             os.path.join(task_folder, f"source_subtitles{normalized_subtitle_extension}")
             if subtitle_mode
+            else None
+        ),
+        "source_image_copy_path": (
+            os.path.join(task_folder, f"source_image{normalized_image_extension}")
+            if normalized_image_extension
             else None
         ),
         "speaker_reference_copy_path": os.path.join(task_folder, "speaker_reference.wav"),

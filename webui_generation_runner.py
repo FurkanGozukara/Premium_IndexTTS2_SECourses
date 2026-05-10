@@ -65,18 +65,84 @@ def create_tts(runtime_options: Dict[str, Any]):
     )
 
 
-def convert_wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "256k") -> str:
+def convert_wav_to_mp3(
+    wav_path: str,
+    mp3_path: str,
+    bitrate: str = "256k",
+    remove_source: bool = True,
+) -> str:
     if not MP3_AVAILABLE or AudioSegment is None:
         return wav_path
 
     try:
         audio = AudioSegment.from_wav(wav_path)
         audio.export(mp3_path, format="mp3", bitrate=bitrate)
-        os.remove(wav_path)
+        if remove_source:
+            os.remove(wav_path)
         return mp3_path
     except Exception as exc:
         print(f"Error converting to MP3: {exc}")
         return wav_path
+
+
+def create_mp4_from_image_audio(image_path: str, audio_path: str, mp4_path: str) -> str:
+    if not FFMPEG_AVAILABLE:
+        raise RuntimeError("FFmpeg is required to generate MP4 output from an image.")
+    if not image_path or not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    if not audio_path or not os.path.isfile(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    if os.path.dirname(mp4_path):
+        os.makedirs(os.path.dirname(mp4_path), exist_ok=True)
+    if os.path.isfile(mp4_path):
+        os.remove(mp4_path)
+
+    video_filter = (
+        "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        "setsar=1,format=yuv420p"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        "30",
+        "-i",
+        image_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-vf",
+        video_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-tune",
+        "stillimage",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-pix_fmt",
+        "yuv420p",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        mp4_path,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"FFmpeg MP4 generation failed: {stderr[-2000:] or 'unknown error'}")
+
+    print(">> mp4 file saved to:", mp4_path)
+    return mp4_path
 
 
 def save_pcm16_wav(audio_matrix: np.ndarray, sampling_rate: int, output_path: str) -> str:
@@ -298,6 +364,7 @@ def run_generation_request(
     save_used_audio = bool(request["save_used_audio"])
     save_as_mp3 = bool(request["save_as_mp3"])
     mp3_bitrate = request["mp3_bitrate"]
+    image_path = request.get("image_path")
     infer_kwargs = dict(request["infer_kwargs"])
     low_memory_mode = bool(request["low_memory_mode"])
     task_layout = dict(request["task_layout"])
@@ -309,6 +376,7 @@ def run_generation_request(
     metadata = _load_metadata(metadata_path)
     subtitle_status_message = ""
     output = None
+    video_output = None
 
     tts.gr_progress = progress_callback
     tts.hybrid_model_device = low_memory_mode
@@ -502,19 +570,36 @@ def run_generation_request(
             except Exception as exc:
                 print(f"Error saving used audio: {exc}")
 
+        if image_path:
+            _emit_progress(progress_callback, 0.96, "rendering mp4...")
+            video_output = create_mp4_from_image_audio(
+                image_path,
+                output,
+                task_layout["final_mp4_path"],
+            )
+
         if save_as_mp3 and MP3_AVAILABLE:
-            output = convert_wav_to_mp3(output, task_layout["final_mp3_path"], bitrate=mp3_bitrate)
+            output = convert_wav_to_mp3(
+                output,
+                task_layout["final_mp3_path"],
+                bitrate=mp3_bitrate,
+                remove_source=not bool(image_path),
+            )
 
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         metadata["status"] = "completed"
         metadata["updated_at"] = current_timestamp()
         metadata["error"] = None
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
+        metadata["outputs"]["final_video_path"] = abs_path_or_none(video_output)
         metadata["outputs"]["final_wav_exists"] = bool(
             task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"])
         )
         metadata["outputs"]["final_mp3_exists"] = bool(
             task_layout["final_mp3_path"] and os.path.exists(task_layout["final_mp3_path"])
+        )
+        metadata["outputs"]["final_mp4_exists"] = bool(
+            task_layout["final_mp4_path"] and os.path.exists(task_layout["final_mp4_path"])
         )
         metadata["processing"]["ended_at"] = metadata["updated_at"]
         metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
@@ -524,6 +609,7 @@ def run_generation_request(
 
         return {
             "output_path": output,
+            "video_path": video_output,
             "subtitle_status": subtitle_status_message,
         }
     except Exception as exc:
@@ -532,6 +618,16 @@ def run_generation_request(
         metadata["updated_at"] = current_timestamp()
         metadata["error"] = str(exc)
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
+        metadata["outputs"]["final_video_path"] = abs_path_or_none(video_output)
+        metadata["outputs"]["final_wav_exists"] = bool(
+            task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"])
+        )
+        metadata["outputs"]["final_mp3_exists"] = bool(
+            task_layout["final_mp3_path"] and os.path.exists(task_layout["final_mp3_path"])
+        )
+        metadata["outputs"]["final_mp4_exists"] = bool(
+            task_layout["final_mp4_path"] and os.path.exists(task_layout["final_mp4_path"])
+        )
         metadata["processing"]["ended_at"] = metadata["updated_at"]
         metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
         metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)

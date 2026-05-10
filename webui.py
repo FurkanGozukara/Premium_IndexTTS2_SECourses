@@ -82,6 +82,7 @@ from indextts.utils.subtitle_utils import (
 from indextts.utils.task_output_utils import (
     build_segment_output_path,
     create_task_output_layout,
+    normalize_file_extension,
     write_metadata_file,
 )
 from tools.i18n.i18n import I18nAuto
@@ -631,7 +632,7 @@ def generate_output_path(target_folder=None, filename=None, save_as_mp3=False, p
         filename = f"{prefix}{next_num:04d}{extension}"
         return os.path.join(output_dir, filename)
 
-def convert_wav_to_mp3(wav_path, mp3_path, bitrate="256k"):
+def convert_wav_to_mp3(wav_path, mp3_path, bitrate="256k", remove_source=True):
     """Convert WAV file to MP3 using pydub."""
     if not MP3_AVAILABLE:
         print("Warning: MP3 conversion not available. Keeping WAV format.")
@@ -640,8 +641,8 @@ def convert_wav_to_mp3(wav_path, mp3_path, bitrate="256k"):
     try:
         audio = AudioSegment.from_wav(wav_path)
         audio.export(mp3_path, format="mp3", bitrate=bitrate)
-        # Remove the original WAV file
-        os.remove(wav_path)
+        if remove_source:
+            os.remove(wav_path)
         return mp3_path
     except Exception as e:
         print(f"Error converting to MP3: {e}")
@@ -926,6 +927,34 @@ def abs_path_or_none(path):
     return os.path.abspath(path) if path else None
 
 
+def resolve_optional_image_path(image_input):
+    if not image_input:
+        return None
+
+    if isinstance(image_input, dict):
+        image_path = image_input.get("path") or image_input.get("name")
+    elif hasattr(image_input, "path"):
+        image_path = image_input.path
+    elif hasattr(image_input, "name"):
+        image_path = image_input.name
+    else:
+        image_path = image_input
+
+    image_path = str(image_path).strip() if image_path else ""
+    if not image_path:
+        return None
+    if not os.path.isfile(image_path):
+        raise gr.Error(f"Image file not found: {image_path}")
+    if not FFMPEG_AVAILABLE:
+        raise gr.Error("FFmpeg is required to generate MP4 output from an image.")
+    return image_path
+
+
+def get_image_copy_extension(image_path):
+    _, extension = os.path.splitext(image_path or "")
+    return normalize_file_extension(extension or ".png")
+
+
 def build_subtitle_status_message(cues, issues=None, sample_count=None, sampling_rate=None,
                                   task_folder=None, segments_dir=None, subtitle_file=None):
     if not cues:
@@ -1118,6 +1147,7 @@ def _prepare_generation_request(
     subtitle_file,
     save_used_audio,
     output_filename,
+    image_input,
     emo_ref_path,
     emo_weight,
     vec1,
@@ -1171,14 +1201,20 @@ def _prepare_generation_request(
 
     processing_started_at = current_timestamp()
     subtitle_extension = get_subtitle_extension(subtitle_file) if subtitle_mode else None
+    source_image_path = resolve_optional_image_path(image_input)
     task_layout = create_task_output_layout(
         output_root="outputs",
         filename=output_filename,
         subtitle_mode=subtitle_mode,
         subtitle_extension=subtitle_extension,
+        image_extension=get_image_copy_extension(source_image_path) if source_image_path else None,
     )
     metadata_path = task_layout["metadata_path"]
     task_folder = task_layout["task_folder"]
+    original_source_image_path = source_image_path
+    if source_image_path and task_layout.get("source_image_copy_path"):
+        shutil.copy2(source_image_path, task_layout["source_image_copy_path"])
+        source_image_path = task_layout["source_image_copy_path"]
 
     if not isinstance(emo_control_method, int) and hasattr(emo_control_method, "value"):
         emo_control_method = emo_control_method.value
@@ -1254,6 +1290,7 @@ def _prepare_generation_request(
         "save_used_audio": bool(save_used_audio),
         "save_as_mp3_requested": bool(save_as_mp3),
         "save_as_mp3_enabled": bool(save_as_mp3 and MP3_AVAILABLE),
+        "generate_mp4": bool(source_image_path),
         "mp3_bitrate": mp3_bitrate,
         "subtitle_mode": subtitle_mode,
         "subtitle_format": get_subtitle_format_label(subtitle_file) if subtitle_mode and subtitle_file else None,
@@ -1291,15 +1328,19 @@ def _prepare_generation_request(
             "speaker_reference_audio": abs_path_or_none(prompt),
             "emotion_reference_audio": abs_path_or_none(emo_ref_path),
             "subtitle_file": abs_path_or_none(subtitle_file),
+            "source_image": abs_path_or_none(original_source_image_path),
         },
         "settings": resolved_settings,
         "outputs": {
             "final_audio_path": None,
+            "final_video_path": None,
             "final_wav_path": abs_path_or_none(task_layout["final_wav_path"]),
             "final_mp3_path": abs_path_or_none(task_layout["final_mp3_path"]) if save_as_mp3 and MP3_AVAILABLE else None,
+            "final_mp4_path": abs_path_or_none(task_layout["final_mp4_path"]) if source_image_path else None,
             "metadata_path": abs_path_or_none(metadata_path),
             "segments_dir": abs_path_or_none(task_layout["segments_dir"]),
             "speaker_reference_copy_path": None,
+            "source_image_copy_path": abs_path_or_none(source_image_path),
             "subtitle_copy_path": None,
         },
         "processing": {
@@ -1373,6 +1414,7 @@ def _prepare_generation_request(
         "save_used_audio": bool(save_used_audio),
         "save_as_mp3": bool(save_as_mp3),
         "mp3_bitrate": mp3_bitrate,
+        "image_path": source_image_path,
         "infer_kwargs": infer_kwargs,
         "low_memory_mode": bool(low_memory_mode),
         "max_text_tokens": max_tokens,
@@ -1435,8 +1477,10 @@ def _run_generation_subprocess(request):
             raise gr.Error(result.get("error") or "Generation subprocess failed.")
 
         subtitle_status_message = result.get("subtitle_status") or ""
+        video_path = result.get("video_path")
         return (
             gr.update(value=result["output_path"], visible=True),
+            gr.update(value=video_path, visible=bool(video_path)),
             gr.update(value=subtitle_status_message, visible=bool(subtitle_status_message)),
         )
     finally:
@@ -1561,7 +1605,7 @@ def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, sub
     return data
 
 
-def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, save_used_audio, output_filename,
+def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, save_used_audio, output_filename, image_input,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
@@ -1611,6 +1655,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         subtitle_file,
         save_used_audio,
         output_filename,
+        image_input,
         emo_ref_path,
         emo_weight,
         vec1,
@@ -1664,8 +1709,10 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
 
     result = run_generation_request(request, tts.get_instance(), progress_callback=progress)
     subtitle_status_message = result.get("subtitle_status") or ""
+    video_path = result.get("video_path")
     return (
         gr.update(value=result["output_path"], visible=True),
+        gr.update(value=video_path, visible=bool(video_path)),
         gr.update(value=subtitle_status_message, visible=bool(subtitle_status_message)),
     )
 
@@ -1777,7 +1824,7 @@ theme = gr.themes.Soft()
 theme.font = [gr.themes.GoogleFont("Inter"), "Tahoma", "ui-sans-serif", "system-ui", "sans-serif"]
 with gr.Blocks(title=APP_TITLE) as demo:
     mutex = threading.Lock()
-    gr.Markdown("## Index TTS2 Premium SECourses App V4.0 : https://www.patreon.com/posts/139297407")
+    gr.Markdown("## Index TTS2 Premium SECourses App V4.1 : https://www.patreon.com/posts/139297407")
 
     with gr.Tab("Audio Generation"):
         with gr.Row(equal_height=False):
@@ -1916,11 +1963,17 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
                 # Output filename and save used audio options
                 with gr.Row():
-                    output_filename = gr.Textbox(
-                        label="Output Filename (optional)",
-                        placeholder="Optional final filename inside the numbered task folder",
-                        value=""
-                    )
+                    with gr.Column():
+                        output_filename = gr.Textbox(
+                            label="Output Filename (optional)",
+                            placeholder="Optional final filename inside the numbered task folder",
+                            value=""
+                        )
+                        mp4_image_input = gr.Image(
+                            label="Image for MP4 (optional)",
+                            type="filepath",
+                            height=160,
+                        )
                     save_used_audio = gr.Checkbox(
                         label="Save Used Reference Audio",
                         value=False,
@@ -1932,6 +1985,11 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     label="Generated Result (click to play/download)",
                     visible=True,
                     key="output_audio"
+                )
+                output_video = gr.Video(
+                    label="Generated MP4",
+                    visible=False,
+                    key="output_video",
                 )
                 with gr.Accordion("Config Presets (Save / Load)", open=True):
                     gr.Markdown(
@@ -2907,17 +2965,17 @@ with gr.Blocks(title=APP_TITLE) as demo:
     )
 
     gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, subtitle_mode, subtitle_file, save_used_audio, output_filename, emo_upload, emo_weight,
-                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                              emo_text,emo_random,
-                              max_text_tokens_per_segment,
+                     inputs=[emo_control_method,prompt_audio, input_text_single, subtitle_mode, subtitle_file, save_used_audio, output_filename, mp4_image_input, emo_upload, emo_weight,
+                              vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                               emo_text,emo_random,
+                               max_text_tokens_per_segment,
                               save_as_mp3,
                               *expert_params,
                               *advanced_params,
                               *model_params,
-                              use_subprocess_system,
-                      ],
-                      outputs=[output_audio, subtitle_status])
+                               use_subprocess_system,
+                       ],
+                       outputs=[output_audio, output_video, subtitle_status])
 
     open_outputs_button.click(open_outputs_folder)
 
