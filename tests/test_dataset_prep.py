@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -81,6 +82,133 @@ def test_import_presegmented_metadata_without_recutting(tmp_path: Path) -> None:
     assert row["speaker"] == "Speaker A"
     assert row["transcript_source"] == "metadata_csv"
     assert row["duration_s"] == pytest.approx(2.0, abs=2 / output_rate)
+
+
+class _RecordingReporter:
+    def __init__(self) -> None:
+        self.logs: list[str] = []
+
+    def update(self, *args, **kwargs) -> None:
+        return None
+
+    def log(self, message: str) -> None:
+        self.logs.append(message)
+
+    def set_stage(self, name: str) -> None:
+        return None
+
+    def finish(self) -> None:
+        return None
+
+
+def _run_duplicate_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    drop_duplicate_sentences: bool,
+):
+    import indextts.training.dataset_prep as dataset_prep
+
+    source = tmp_path / "duplicate_source"
+    source.mkdir()
+    sample_rate = 8000
+    fixture_rows = [
+        ("a_near.wav", "Hello [music], WORLD! <pause=0.5>", 2.0, 0.70),
+        ("b_aligned.wav", "hello world", 2.8, 0.95),
+        ("c_unique.wav", "A unique training sentence.", 2.2, 0.80),
+    ]
+    for filename, _, duration_s, _ in fixture_rows:
+        time = np.arange(round(sample_rate * duration_s), dtype=np.float32) / sample_rate
+        sf.write(
+            source / filename,
+            0.05 * np.sin(2 * np.pi * 220 * time),
+            sample_rate,
+            subtype="PCM_16",
+        )
+    (source / "metadata.csv").write_text(
+        "".join(f"{filename}|{text}|Speaker A\n" for filename, text, _, _ in fixture_rows),
+        encoding="utf-8",
+    )
+
+    coverage_by_text = {text: coverage for _, text, _, coverage in fixture_rows}
+    original_base_row = dataset_prep._base_row
+
+    def base_row_with_alignment(**kwargs):
+        row = original_base_row(**kwargs)
+        row["alignment_coverage"] = coverage_by_text[kwargs["text"]]
+        return row
+
+    monkeypatch.setattr(dataset_prep, "_base_row", base_row_with_alignment)
+    reporter = _RecordingReporter()
+    config = DatasetPrepConfig(
+        name="duplicates_on" if drop_duplicate_sentences else "duplicates_off",
+        inputs=[str(source)],
+        output_root=str(tmp_path),
+        sample_rate=sample_rate,
+        min_s=1.5,
+        target_s=2.0,
+        max_s=3.0,
+        min_words_per_second=0.1,
+        max_words_per_second=20.0,
+        min_peak_dbfs=-80.0,
+        loudness_normalize=False,
+        export_reference_candidates=0,
+        drop_duplicate_sentences=drop_duplicate_sentences,
+    )
+    summary = run_dataset_prep(config, reporter=reporter)
+    return summary, Path(summary.output_dir), reporter
+
+
+def test_dataset_prep_keeps_best_aligned_duplicate_sentence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary, dataset_dir, reporter = _run_duplicate_fixture(
+        tmp_path, monkeypatch, drop_duplicate_sentences=True
+    )
+    rows = load_manifest(dataset_dir)
+
+    assert summary.segment_count == len(rows) == 2
+    assert {row["text"] for row in rows} == {
+        "hello world",
+        "A unique training sentence.",
+    }
+    assert next(row for row in rows if row["text"] == "hello world")[
+        "alignment_coverage"
+    ] == pytest.approx(0.95)
+    assert summary.filter_drop_counts["duplicate_sentence"] == 1
+    assert summary.subtitle_stats["duplicate_sentences_dropped"] == 1
+    source_stats = {
+        Path(source["source_media"]).name: source for source in summary.sources
+    }
+    assert source_stats["a_near.wav"]["filter_drop_counts"]["duplicate_sentence"] == 1
+    assert source_stats["b_aligned.wav"]["filter_drop_counts"]["duplicate_sentence"] == 0
+    info = json.loads((dataset_dir / "dataset_info.json").read_text(encoding="utf-8"))
+    assert info["segment_count"] == 2
+    assert info["filter_drop_counts"]["duplicate_sentence"] == 1
+    assert info["subtitle_stats"]["duplicate_sentences_dropped"] == 1
+    assert {path.name for path in (dataset_dir / "segments").glob("*.wav")} == {
+        Path(row["audio"]).name for row in rows
+    }
+    with (dataset_dir / "preview.csv").open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.DictReader(handle))) == 2
+    assert (
+        ">> dropped 1 duplicate sentence(s) (kept the best-aligned copy of each)"
+        in reporter.logs
+    )
+
+
+def test_dataset_prep_can_keep_duplicate_sentences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary, dataset_dir, reporter = _run_duplicate_fixture(
+        tmp_path, monkeypatch, drop_duplicate_sentences=False
+    )
+
+    assert summary.segment_count == len(load_manifest(dataset_dir)) == 3
+    assert summary.filter_drop_counts["duplicate_sentence"] == 0
+    assert summary.subtitle_stats["duplicate_sentences_dropped"] == 0
+    assert len(list((dataset_dir / "segments").glob("*.wav"))) == 3
+    assert not any("duplicate sentence(s)" in message for message in reporter.logs)
 
 
 def test_segmentation_mode_auto_and_legacy_alias(monkeypatch: pytest.MonkeyPatch) -> None:

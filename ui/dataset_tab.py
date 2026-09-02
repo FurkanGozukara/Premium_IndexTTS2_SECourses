@@ -422,8 +422,10 @@ def build_dataset_tab(
             with gr.Row():
                 segmentation_mode = gr.Dropdown(choices=["auto", "sentence_aligned", "cue_boundaries", "whisper_only"], value=DATASET_DEFAULTS["segmentation_mode"], label="Segmentation mode", info="Sentence aligned uses Whisper word times with caption sentences and is recommended on CUDA.")
                 align = gr.Checkbox(value=False, label="Force Whisper alignment", info="Compatibility alias that forces sentence_aligned mode.")
+            with gr.Row():
                 remove_annotations = gr.Checkbox(value=True, label="Remove bracket annotations", info="Removes caption notes such as [music] and [applause].")
                 dedupe = gr.Checkbox(value=True, label="Deduplicate rolling captions", info="Removes repeated text from live/rolling subtitle cues.")
+                drop_duplicates = gr.Checkbox(value=True, label="Drop duplicate sentences", info="Keeps one copy (best aligned) of every sentence that is spoken more than once, e.g. repeated intros or outros; recommended for voice training.")
             _reg(registry, controls, "subtitle_policy", subtitle_policy, kind="choice", choices=["prefer_sidecar", "whisper_only", "sidecar_only"])
             _reg(registry, controls, "whisper_model", whisper_model, kind="str")
             _reg(registry, controls, "whisper_device", whisper_device, kind="str")
@@ -431,6 +433,7 @@ def build_dataset_tab(
             _reg(registry, controls, "align_with_whisper", align, kind="bool")
             _reg(registry, controls, "remove_bracket_annotations", remove_annotations, kind="bool")
             _reg(registry, controls, "dedupe_rolling_captions", dedupe, kind="bool")
+            _reg(registry, controls, "drop_duplicate_sentences", drop_duplicates, kind="bool")
 
         with gr.Accordion("Segmentation", open=False):
             with gr.Row():

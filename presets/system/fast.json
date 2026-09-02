@@ -15,6 +15,7 @@
     "dataset.align_with_whisper": false,
     "dataset.clipping_threshold": 0.999,
     "dataset.dedupe_rolling_captions": true,
+    "dataset.drop_duplicate_sentences": true,
     "dataset.export_reference_candidates": 5,
     "dataset.inputs": "",
     "dataset.language": "EN",

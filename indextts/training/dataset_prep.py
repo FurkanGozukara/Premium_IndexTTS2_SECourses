@@ -16,6 +16,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 import soundfile as sf
 
+from indextts.utils.pause_tags import TextChunk, split_text_with_pauses
+
 from .dataset_manifest import (
     DATASET_INFO_FILENAME,
     MANIFEST_FILENAME,
@@ -23,6 +25,7 @@ from .dataset_manifest import (
     append_manifest_row,
     atomic_write_json,
     summarize_manifest,
+    write_manifest,
     write_preview_csv,
 )
 from .media import (
@@ -59,6 +62,7 @@ from .subtitles import (
 
 
 _WORD_RE = re.compile(r"\b[\w]+(?:['’-][\w]+)*\b", flags=re.UNICODE)
+_BRACKET_ANNOTATION_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}")
 
 
 def _cuda_available() -> bool:
@@ -121,6 +125,7 @@ class DatasetPrepConfig:
     silence_frame_ms: int = 20
     remove_bracket_annotations: bool = True
     dedupe_rolling_captions: bool = True
+    drop_duplicate_sentences: bool = True
     export_reference_candidates: int = 5
     overwrite: bool = False
     max_segments: int = 0
@@ -604,6 +609,66 @@ def _increment_reason(counts: dict[str, int], reason: str) -> None:
     counts[reason] = counts.get(reason, 0) + 1
 
 
+def _normalize_duplicate_sentence(text: str) -> str:
+    without_pauses = " ".join(
+        chunk.text
+        for chunk in split_text_with_pauses(str(text or ""))
+        if isinstance(chunk, TextChunk)
+    )
+    without_annotations = (
+        _BRACKET_ANNOTATION_RE.sub(" ", without_pauses).lower().replace("’", "'")
+    )
+    alphanumeric = "".join(
+        character if character.isalnum() or character == "'" else " "
+        for character in without_annotations
+    )
+    return " ".join(alphanumeric.split())
+
+
+def _duplicate_preference(
+    row: Mapping[str, Any],
+    target_s: float,
+    original_index: int,
+) -> tuple[int, float, float, int]:
+    try:
+        alignment_coverage = float(row.get("alignment_coverage"))
+    except (TypeError, ValueError, OverflowError):
+        alignment_coverage = float("nan")
+    has_alignment = math.isfinite(alignment_coverage)
+    try:
+        duration_s = float(row.get("duration_s", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        duration_s = float("inf")
+    duration_distance = (
+        abs(duration_s - target_s) if math.isfinite(duration_s) else float("inf")
+    )
+    return (
+        0 if has_alignment else 1,
+        -alignment_coverage if has_alignment else 0.0,
+        duration_distance,
+        original_index,
+    )
+
+
+def _deduplicate_sentence_rows(
+    rows: Sequence[dict[str, Any]],
+    target_s: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    best_by_sentence: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        normalized = _normalize_duplicate_sentence(str(row.get("text", "")))
+        previous_index = best_by_sentence.get(normalized)
+        if previous_index is None or _duplicate_preference(
+            row, target_s, index
+        ) < _duplicate_preference(rows[previous_index], target_s, previous_index):
+            best_by_sentence[normalized] = index
+
+    kept_indices = set(best_by_sentence.values())
+    kept = [row for index, row in enumerate(rows) if index in kept_indices]
+    dropped = [row for index, row in enumerate(rows) if index not in kept_indices]
+    return kept, dropped
+
+
 def _transcribe_cached(
     *,
     audio: np.ndarray,
@@ -803,6 +868,7 @@ def run_dataset_prep(
             "silence_ratio",
             "empty_audio",
             "non_finite_loudness",
+            "duplicate_sentence",
         )
     }
     alignment_files: list[dict[str, Any]] = []
@@ -812,6 +878,7 @@ def run_dataset_prep(
         "cues_dropped": 0,
         "cues_merged": 0,
         "subtitle_segments": 0,
+        "duplicate_sentences_dropped": 0,
     }
     used_keys: set[str] = set()
     started = time.monotonic()
@@ -908,6 +975,7 @@ def run_dataset_prep(
                         "transcript_source": item.transcript_source,
                         "segments": 1,
                         "duration_s": round(duration_s, 6),
+                        "filter_drop_counts": {"duplicate_sentence": 0},
                     }
                 )
             except Exception as exc:
@@ -1283,6 +1351,59 @@ def run_dataset_prep(
                     warning = f"Could not decode/process {media_path}: {exc}; skipped"
                     warnings.append(warning)
                     _log(reporter, f"Warning: {warning}")
+
+    if config.drop_duplicate_sentences:
+        rows, duplicate_rows = _deduplicate_sentence_rows(rows, config.target_s)
+        duplicate_count = len(duplicate_rows)
+        kept_ids = {str(row.get("id", "")) for row in rows}
+        candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate["row"].get("id", "")) in kept_ids
+        ]
+        duplicate_counts_by_source: dict[str, int] = {}
+        for row in duplicate_rows:
+            source_name = str(row.get("source_media", ""))
+            duplicate_counts_by_source[source_name] = (
+                duplicate_counts_by_source.get(source_name, 0) + 1
+            )
+            (output_dir / str(row["audio"])).unlink(missing_ok=True)
+        filter_drop_counts["duplicate_sentence"] = duplicate_count
+        subtitle_stats["duplicate_sentences_dropped"] = duplicate_count
+
+        kept_rows_by_source: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            kept_rows_by_source.setdefault(str(row.get("source_media", "")), []).append(row)
+        for source in sources:
+            source_name = str(source.get("source_media", ""))
+            source_rows = kept_rows_by_source.get(source_name, [])
+            source_counts = dict(source.get("filter_drop_counts") or {})
+            source_counts["duplicate_sentence"] = duplicate_counts_by_source.get(
+                source_name, 0
+            )
+            source["filter_drop_counts"] = dict(sorted(source_counts.items()))
+            source["segments"] = len(source_rows)
+            if "segment_duration_s" in source:
+                source["segment_duration_s"] = round(
+                    sum(float(row["duration_s"]) for row in source_rows), 6
+                )
+        subtitle_stats["subtitle_segments"] = sum(
+            int(source.get("segments", 0) or 0)
+            for source in sources
+            if source.get("subtitle")
+        )
+        if duplicate_count:
+            write_manifest(manifest_path, rows)
+        _log(
+            reporter,
+            f">> dropped {duplicate_count} duplicate sentence(s) "
+            "(kept the best-aligned copy of each)",
+        )
+    else:
+        for source in sources:
+            source_counts = dict(source.get("filter_drop_counts") or {})
+            source_counts.setdefault("duplicate_sentence", 0)
+            source["filter_drop_counts"] = dict(sorted(source_counts.items()))
 
     if status == "running":
         status = "cancelled" if _cancelled(cancel_check) else "complete"
