@@ -69,14 +69,27 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "grid.num_beams",
     }.issubset(keys)
     default_path = demo.preset_store.system_dir / "default.json"
-    before = default_path.read_bytes()
+    before = {
+        path.name: path.read_bytes()
+        for path in demo.preset_store.system_dir.glob("*.json")
+    }
     demo.preset_store.ensure_system_presets()
-    assert default_path.read_bytes() == before
-    values = json.loads(before.decode("utf-8"))["values"]
+    after = {
+        path.name: path.read_bytes()
+        for path in demo.preset_store.system_dir.glob("*.json")
+    }
+    assert after == before
+    values = json.loads(before[default_path.name].decode("utf-8"))["values"]
     assert values["grid.eval_reference_mode"] == ""
     assert values["grid.eval_train_subset"] == 48
     assert values["grid.eval_include_base"] is True
     assert values["grid.num_beams"] == GENERATION_DEFAULTS["generation.num_beams"]
+    assert values["dataset.boundary_mode"] == "sentence"
+    assert values["dataset.min_pause_boundary_ms"] == 400
+    for preset_path in demo.preset_store.system_dir.glob("*.json"):
+        preset_values = json.loads(preset_path.read_text(encoding="utf-8"))["values"]
+        assert preset_values["dataset.boundary_mode"] == "sentence"
+        assert preset_values["dataset.min_pause_boundary_ms"] == 400
 
     measured_fields = (
         "rank",

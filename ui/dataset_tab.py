@@ -437,6 +437,20 @@ def build_dataset_tab(
 
         with gr.Accordion("Segmentation", open=False):
             with gr.Row():
+                boundary_mode = gr.Dropdown(
+                    choices=["sentence", "sentence_or_pause"],
+                    value=DATASET_DEFAULTS["boundary_mode"],
+                    label="Segment boundaries",
+                    info="Sentence requires punctuation; sentence_or_pause recovers more audio at aligned-word pauses with a small risk of less natural cuts.",
+                )
+                min_pause_boundary = gr.Number(
+                    value=DATASET_DEFAULTS["min_pause_boundary_ms"],
+                    minimum=0,
+                    precision=0,
+                    label="Minimum pause for a boundary (ms)",
+                    info="A fragment edge must have at least this much silence when punctuation does not provide the boundary.",
+                )
+            with gr.Row():
                 target_s = gr.Slider(1, 20, value=8, step=0.25, label="Target seconds", info="8 seconds gives efficient, stable training segments.")
                 min_s = gr.Slider(0.5, 15, value=4, step=0.25, label="Minimum seconds", info="4 seconds is recommended for enough voice context.")
                 max_s = gr.Slider(2, 30, value=12, step=0.25, label="Maximum seconds", info="12 seconds limits memory while preserving sentences.")
@@ -455,6 +469,23 @@ def build_dataset_tab(
                 ("max_words", max_words, "int", 10, 200),
             ):
                 _reg(registry, controls, field_name, component, kind=kind, minimum=minimum, maximum=maximum)
+            _reg(
+                registry,
+                controls,
+                "boundary_mode",
+                boundary_mode,
+                kind="choice",
+                choices=["sentence", "sentence_or_pause"],
+            )
+            _reg(
+                registry,
+                controls,
+                "min_pause_boundary_ms",
+                min_pause_boundary,
+                kind="int",
+                minimum=0,
+                maximum=60000,
+            )
 
         with gr.Accordion("Cleanup & Loudness", open=False):
             with gr.Row():

@@ -90,6 +90,8 @@ class DatasetPrepConfig:
     ``whisper_only``, or ``auto``. Auto resolves to sentence alignment when
     CUDA is available and cue boundaries otherwise. ``align_with_whisper`` is
     retained as a compatibility alias for ``sentence_aligned``.
+    ``boundary_mode`` keeps strict sentence edges by default or also accepts
+    fragments whose missing sentence edges have sufficiently long word gaps.
     """
 
     name: str
@@ -106,6 +108,8 @@ class DatasetPrepConfig:
     min_s: float = 4.0
     max_s: float = 12.0
     max_gap_ms: int = 700
+    boundary_mode: str = "sentence"
+    min_pause_boundary_ms: int = 400
     pad_ms: int = 60
     snap_to_silence: bool = True
     snap_window_ms: int = 200
@@ -152,6 +156,10 @@ class DatasetPrepConfig:
             "whisper_only",
         }:
             raise ValueError(f"Unsupported segmentation_mode: {self.segmentation_mode}")
+        if self.boundary_mode not in {"sentence", "sentence_or_pause"}:
+            raise ValueError(f"Unsupported boundary_mode: {self.boundary_mode}")
+        if self.min_pause_boundary_ms < 0:
+            raise ValueError("min_pause_boundary_ms must be zero or positive")
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if not 0 < self.min_s <= self.target_s <= self.max_s:
@@ -215,6 +223,7 @@ class DatasetSummary:
     subtitle_stats: dict[str, int] = field(default_factory=dict)
     alignment: dict[str, Any] = field(default_factory=dict)
     filter_drop_counts: dict[str, int] = field(default_factory=dict)
+    filter_keep_counts: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -801,6 +810,7 @@ def _base_row(
     lufs: float,
     alignment_coverage: float | None = None,
     sentence_aligned: bool | None = None,
+    boundary: str | None = None,
     peak_dbfs: float | None = None,
     clipping_ratio: float | None = None,
     silence_ratio: float | None = None,
@@ -823,6 +833,8 @@ def _base_row(
         row["alignment_coverage"] = round(float(alignment_coverage), 6)
     if sentence_aligned is not None:
         row["sentence_aligned"] = bool(sentence_aligned)
+    if boundary is not None:
+        row["boundary"] = str(boundary)
     if peak_dbfs is not None:
         row["peak_dbfs"] = round(float(peak_dbfs), 3)
     if clipping_ratio is not None:
@@ -883,6 +895,7 @@ def run_dataset_prep(
             "duplicate_sentence",
         )
     }
+    filter_keep_counts: dict[str, int] = {"pause_boundary": 0}
     alignment_files: list[dict[str, Any]] = []
     subtitle_stats = {
         "cues_total": 0,
@@ -988,6 +1001,7 @@ def run_dataset_prep(
                         "segments": 1,
                         "duration_s": round(duration_s, 6),
                         "filter_drop_counts": {"duplicate_sentence": 0},
+                        "filter_keep_counts": {"pause_boundary": 0},
                     }
                 )
             except Exception as exc:
@@ -1021,6 +1035,7 @@ def run_dataset_prep(
                 source_cleaned_cues = 0
                 source_merged = 0
                 source_filter_counts: dict[str, int] = {}
+                source_filter_keep_counts: dict[str, int] = {"pause_boundary": 0}
                 source_alignment_coverage: float | None = None
                 source_effective_mode = segmentation_mode
                 try:
@@ -1131,6 +1146,8 @@ def run_dataset_prep(
                                     max_s=segmentation_max_s,
                                     min_s=config.min_s,
                                     max_gap_ms=config.max_gap_ms,
+                                    boundary_mode=config.boundary_mode,
+                                    min_pause_boundary_ms=config.min_pause_boundary_ms,
                                 )
                                 transcript_source = sidecar_source + "+whisper_sentence_aligned"
                             _log(
@@ -1211,6 +1228,7 @@ def run_dataset_prep(
                             media_duration_ms,
                         )
                     structural_drop_counts: dict[str, int] = {}
+                    structural_keep_counts: dict[str, int] = {}
                     segments = filter_segments(
                         segments,
                         config.min_s,
@@ -1223,11 +1241,18 @@ def run_dataset_prep(
                             else None
                         ),
                         require_sentence_aligned=word_safe_boundaries,
+                        boundary_mode=config.boundary_mode,
                         reason_counts=structural_drop_counts,
+                        keep_counts=structural_keep_counts,
                     )
                     for reason, count in structural_drop_counts.items():
                         source_filter_counts[reason] = source_filter_counts.get(reason, 0) + count
                         filter_drop_counts[reason] = filter_drop_counts.get(reason, 0) + count
+                    for reason, count in structural_keep_counts.items():
+                        source_filter_keep_counts[reason] = (
+                            source_filter_keep_counts.get(reason, 0) + count
+                        )
+                        filter_keep_counts[reason] = filter_keep_counts.get(reason, 0) + count
                     filtered_count = preliminary_count - len(segments)
                     if filtered_count:
                         _log(
@@ -1305,6 +1330,7 @@ def run_dataset_prep(
                             lufs=lufs,
                             alignment_coverage=segment.alignment_coverage,
                             sentence_aligned=segment.sentence_aligned,
+                            boundary=segment.boundary if word_safe_boundaries else None,
                             peak_dbfs=quality.peak_dbfs,
                             clipping_ratio=quality.clipping_ratio,
                             silence_ratio=quality.silence_ratio,
@@ -1352,6 +1378,7 @@ def run_dataset_prep(
                             "segments": len(source_rows),
                             "segment_duration_s": round(sum(row["duration_s"] for row in source_rows), 6),
                             "filter_drop_counts": dict(sorted(source_filter_counts.items())),
+                            "filter_keep_counts": dict(sorted(source_filter_keep_counts.items())),
                         }
                     )
                     subtitle_stats["cues_total"] += source_cues
@@ -1445,7 +1472,12 @@ def run_dataset_prep(
         "minimum_segment_coverage": config.min_segment_alignment_coverage,
         "files": alignment_files,
     }
-    sentence_aligned_count = sum(is_sentence_aligned_text(str(row.get("text", ""))) for row in rows)
+    sentence_aligned_count = sum(
+        bool(row["sentence_aligned"])
+        if "sentence_aligned" in row
+        else is_sentence_aligned_text(str(row.get("text", "")))
+        for row in rows
+    )
     sentence_alignment = {
         "aligned_segments": sentence_aligned_count,
         "exception_segments": len(rows) - sentence_aligned_count,
@@ -1470,6 +1502,7 @@ def run_dataset_prep(
         "alignment": alignment_summary,
         "sentence_alignment": sentence_alignment,
         "filter_drop_counts": dict(sorted(filter_drop_counts.items())),
+        "filter_keep_counts": dict(sorted(filter_keep_counts.items())),
         "warnings": warnings,
         "reference_candidates": references,
         "config": config.to_dict(),
@@ -1515,6 +1548,7 @@ def run_dataset_prep(
         subtitle_stats=subtitle_stats,
         alignment=alignment_summary,
         filter_drop_counts=dict(sorted(filter_drop_counts.items())),
+        filter_keep_counts=dict(sorted(filter_keep_counts.items())),
     )
     _log(
         reporter,

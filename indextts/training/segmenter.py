@@ -13,6 +13,7 @@ from .subtitles import CaptionTranscript, Segment
 _TERMINAL_RE = re.compile(r"[.?!;:。！？][\"')\]]*$")
 _WORD_TOKEN_RE = re.compile(r"\b[\w]+(?:['’-][\w]+)*\b", flags=re.UNICODE)
 _SENTENCE_TERMINAL_RE = re.compile(r"[.?!;。！？；][\"')\]]*$")
+_BOUNDARY_MODES = frozenset({"sentence", "sentence_or_pause"})
 _ALWAYS_NONTERMINAL_ABBREVIATIONS = {
     "dr",
     "mr",
@@ -310,9 +311,9 @@ def _group_duration_ms(group: Sequence[SentenceSpan], words: Sequence[Any]) -> i
     return end_ms - start_ms
 
 
-def is_sentence_aligned_text(text: str) -> bool:
+def _starts_sentence_text(text: str) -> bool:
     value = str(text or "").strip()
-    if not value or not _SENTENCE_TERMINAL_RE.search(value):
+    if not value:
         return False
     first = next((character for character in value if character.isalnum()), "")
     if not first:
@@ -323,6 +324,57 @@ def is_sentence_aligned_text(text: str) -> bool:
     return first.lower() == first.upper()
 
 
+def _ends_sentence_text(text: str) -> bool:
+    return bool(_SENTENCE_TERMINAL_RE.search(str(text or "").strip()))
+
+
+def is_sentence_aligned_text(text: str) -> bool:
+    return _starts_sentence_text(text) and _ends_sentence_text(text)
+
+
+def _validate_boundary_options(boundary_mode: str, min_pause_boundary_ms: int) -> tuple[str, int]:
+    mode = str(boundary_mode)
+    if mode not in _BOUNDARY_MODES:
+        raise ValueError(f"Unsupported boundary_mode: {boundary_mode}")
+    pause_ms = int(min_pause_boundary_ms)
+    if pause_ms < 0:
+        raise ValueError("min_pause_boundary_ms must be zero or positive")
+    return mode, pause_ms
+
+
+def _classify_aligned_boundary(
+    group: Sequence[SentenceSpan],
+    words: Sequence[Any],
+    text: str,
+    boundary_mode: str,
+    min_pause_boundary_ms: int,
+) -> tuple[bool, str | None]:
+    word_start = group[0].word_start
+    word_end = group[-1].word_end
+    starts_sentence = group[0].starts_sentence and _starts_sentence_text(text)
+    ends_sentence = group[-1].ends_sentence and _ends_sentence_text(text)
+    sentence_aligned = starts_sentence and ends_sentence
+    if sentence_aligned:
+        return True, "sentence"
+    if boundary_mode != "sentence_or_pause":
+        return False, None
+
+    start_ms, _ = _unit_times_ms(words[word_start])
+    _, end_ms = _unit_times_ms(words[word_end - 1])
+    preceded_by_pause = False
+    if word_start > 0:
+        _, previous_end_ms = _unit_times_ms(words[word_start - 1])
+        preceded_by_pause = start_ms - previous_end_ms >= min_pause_boundary_ms
+    followed_by_pause = False
+    if word_end < len(words):
+        next_start_ms, _ = _unit_times_ms(words[word_end])
+        followed_by_pause = next_start_ms - end_ms >= min_pause_boundary_ms
+
+    if (starts_sentence or preceded_by_pause) and (ends_sentence or followed_by_pause):
+        return False, "pause"
+    return False, None
+
+
 def build_sentence_aligned_segments(
     caption: CaptionTranscript,
     aligned_words: Sequence[Any],
@@ -330,11 +382,18 @@ def build_sentence_aligned_segments(
     max_s: float = 12.0,
     min_s: float = 4.0,
     max_gap_ms: int = 700,
+    *,
+    boundary_mode: str = "sentence",
+    min_pause_boundary_ms: int = 400,
 ) -> list[Segment]:
-    """Pack exact caption sentences using aligned first/last word timestamps."""
+    """Pack caption spans and classify their aligned sentence or pause edges."""
 
     if not caption.words or len(aligned_words) != len(caption.words):
         return []
+    boundary_mode, min_pause_boundary_ms = _validate_boundary_options(
+        boundary_mode,
+        min_pause_boundary_ms,
+    )
     target_ms = max(1, int(round(target_s * 1000.0)))
     max_ms = max(1, int(round(max_s * 1000.0)))
     min_ms = max(0, int(round(min_s * 1000.0)))
@@ -401,6 +460,13 @@ def build_sentence_aligned_segments(
         cue_indices = tuple(dict.fromkeys(int(_value(word, "cue_index")) for word in selected_words))
         matched_count = sum(bool(_value(word, "matched", False)) for word in selected_words)
         coverage = matched_count / len(selected_words) if selected_words else 0.0
+        sentence_aligned, boundary = _classify_aligned_boundary(
+            group,
+            aligned_words,
+            text,
+            boundary_mode,
+            min_pause_boundary_ms,
+        )
         segments.append(
             Segment(
                 start_ms=start_ms,
@@ -417,11 +483,8 @@ def build_sentence_aligned_segments(
                     for word in selected_words
                 ],
                 alignment_coverage=coverage,
-                sentence_aligned=(
-                    group[0].starts_sentence
-                    and group[-1].ends_sentence
-                    and is_sentence_aligned_text(text)
-                ),
+                sentence_aligned=sentence_aligned,
+                boundary=boundary,
             )
         )
     return segments
@@ -558,8 +621,11 @@ def filter_segments(
     *,
     min_alignment_coverage: float | None = None,
     require_sentence_aligned: bool = False,
+    boundary_mode: str = "sentence",
     reason_counts: dict[str, int] | None = None,
+    keep_counts: dict[str, int] | None = None,
 ) -> list[Segment]:
+    boundary_mode, _ = _validate_boundary_options(boundary_mode, 0)
     minimum_ms = int(round(min_s * 1000.0))
     maximum_ms = int(round(max_s * 1000.0))
     accepted: list[Segment] = []
@@ -582,9 +648,13 @@ def filter_segments(
                 reason_counts["alignment_coverage"] = reason_counts.get("alignment_coverage", 0) + 1
             continue
         if require_sentence_aligned and segment.sentence_aligned is False:
-            if reason_counts is not None:
-                reason_counts["sentence_boundary"] = reason_counts.get("sentence_boundary", 0) + 1
-            continue
+            if boundary_mode == "sentence_or_pause" and segment.boundary == "pause":
+                if keep_counts is not None:
+                    keep_counts["pause_boundary"] = keep_counts.get("pause_boundary", 0) + 1
+            else:
+                if reason_counts is not None:
+                    reason_counts["sentence_boundary"] = reason_counts.get("sentence_boundary", 0) + 1
+                continue
         if segment.text.strip():
             accepted.append(segment)
     return accepted

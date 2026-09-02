@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-s", type=float, default=1.5)
     parser.add_argument("--max-s", type=float, default=15.0)
     parser.add_argument("--max-gap-ms", type=int, default=700)
+    parser.add_argument(
+        "--boundary-mode",
+        choices=("sentence", "sentence_or_pause"),
+        default="sentence",
+    )
+    parser.add_argument("--min-pause-boundary-ms", type=int, default=400)
     parser.add_argument("--pad-ms", type=int, default=60)
     parser.add_argument("--snap-to-silence", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--snap-window-ms", type=int, default=200)
@@ -79,6 +85,8 @@ def config_from_args(args: argparse.Namespace) -> DatasetPrepConfig:
         min_s=args.min_s,
         max_s=args.max_s,
         max_gap_ms=args.max_gap_ms,
+        boundary_mode=args.boundary_mode,
+        min_pause_boundary_ms=args.min_pause_boundary_ms,
         pad_ms=args.pad_ms,
         snap_to_silence=args.snap_to_silence,
         snap_window_ms=args.snap_window_ms,

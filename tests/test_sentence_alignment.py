@@ -10,6 +10,7 @@ from indextts.training.dataset_prep import DatasetPrepConfig, run_dataset_prep
 from indextts.training.media import extract_audio
 from indextts.training.segmenter import (
     build_sentence_aligned_segments,
+    filter_segments,
     is_sentence_aligned_text,
     split_caption_sentences,
 )
@@ -99,6 +100,74 @@ def test_sentence_split_ignores_decimals_and_lowercase_caption_artifacts() -> No
 def test_sentence_alignment_accepts_uncased_scripts() -> None:
     assert is_sentence_aligned_text("你好。")
     assert not is_sentence_aligned_text("lowercase fragment.")
+
+
+def test_pause_boundaries_keep_only_fragments_with_long_aligned_word_gaps() -> None:
+    text = (
+        "Intro words end here. Pause bounded fragment here "
+        "bridge fragment keeps moving quick gap fragment here "
+        "final trailing fragment here"
+    )
+    caption = build_caption_transcript([SubtitleCue(1, 0, 7000, text)])
+    group_starts_ms = [0, 1600, 3200, 4400, 5600]
+    timings_ms = [
+        (group_start + offset, group_start + offset + 200)
+        for group_start in group_starts_ms
+        for offset in (0, 300, 600, 900)
+    ]
+    assert len(caption.words) == len(timings_ms)
+    aligned_words = [
+        {
+            "text": word.text,
+            "start_s": start_ms / 1000.0,
+            "end_s": end_ms / 1000.0,
+            "char_start": word.char_start,
+            "char_end": word.char_end,
+            "cue_index": word.cue_index,
+            "matched": True,
+        }
+        for word, (start_ms, end_ms) in zip(caption.words, timings_ms)
+    ]
+
+    def filtered(mode: str) -> tuple[list, dict[str, int], dict[str, int]]:
+        candidates = build_sentence_aligned_segments(
+            caption,
+            aligned_words,
+            target_s=1.0,
+            min_s=0.5,
+            max_s=1.4,
+            boundary_mode=mode,
+            min_pause_boundary_ms=400,
+        )
+        drop_counts: dict[str, int] = {}
+        keep_counts: dict[str, int] = {}
+        accepted = filter_segments(
+            candidates,
+            min_s=0.5,
+            max_s=1.4,
+            min_words=2,
+            max_words=20,
+            require_sentence_aligned=True,
+            boundary_mode=mode,
+            reason_counts=drop_counts,
+            keep_counts=keep_counts,
+        )
+        return accepted, drop_counts, keep_counts
+
+    sentence, sentence_drops, sentence_keeps = filtered("sentence")
+    pause, pause_drops, pause_keeps = filtered("sentence_or_pause")
+
+    assert [segment.text for segment in sentence] == ["Intro words end here."]
+    assert [segment.text for segment in pause] == [
+        "Intro words end here.",
+        "Pause bounded fragment here",
+    ]
+    assert pause[-1].boundary == "pause"
+    assert "quick gap fragment here" not in {segment.text for segment in sentence + pause}
+    assert sentence_drops["sentence_boundary"] == 4
+    assert sentence_keeps == {}
+    assert pause_drops["sentence_boundary"] == 3
+    assert pause_keeps == {"pause_boundary": 1}
 
 
 def _write_three_minute_sidecar(destination: Path) -> None:

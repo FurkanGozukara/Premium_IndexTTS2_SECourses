@@ -30,6 +30,7 @@ class Segment:
     word_timestamps: list[dict[str, Any]] = field(default_factory=list)
     alignment_coverage: float | None = None
     sentence_aligned: bool | None = None
+    boundary: str | None = None
 
     @property
     def duration_ms(self) -> int:

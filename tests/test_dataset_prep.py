@@ -176,15 +176,21 @@ def test_dataset_prep_keeps_best_aligned_duplicate_sentence(
         "alignment_coverage"
     ] == pytest.approx(0.95)
     assert summary.filter_drop_counts["duplicate_sentence"] == 1
+    assert summary.filter_keep_counts == {"pause_boundary": 0}
     assert summary.subtitle_stats["duplicate_sentences_dropped"] == 1
     source_stats = {
         Path(source["source_media"]).name: source for source in summary.sources
     }
     assert source_stats["a_near.wav"]["filter_drop_counts"]["duplicate_sentence"] == 1
     assert source_stats["b_aligned.wav"]["filter_drop_counts"]["duplicate_sentence"] == 0
+    assert all(
+        source["filter_keep_counts"] == {"pause_boundary": 0}
+        for source in source_stats.values()
+    )
     info = json.loads((dataset_dir / "dataset_info.json").read_text(encoding="utf-8"))
     assert info["segment_count"] == 2
     assert info["filter_drop_counts"]["duplicate_sentence"] == 1
+    assert info["filter_keep_counts"] == {"pause_boundary": 0}
     assert info["subtitle_stats"]["duplicate_sentences_dropped"] == 1
     assert {path.name for path in (dataset_dir / "segments").glob("*.wav")} == {
         Path(row["audio"]).name for row in rows
@@ -236,6 +242,26 @@ def test_segmentation_mode_auto_and_legacy_alias(monkeypatch: pytest.MonkeyPatch
         segmentation_mode="whisper_only",
     )
     assert whisper_config.resolved_segmentation_mode() == "whisper_only"
+
+
+def test_prepare_dataset_cli_maps_pause_boundary_options() -> None:
+    from tools.prepare_dataset import build_parser, config_from_args
+
+    args = build_parser().parse_args(
+        [
+            "input.wav",
+            "--name",
+            "pause_fixture",
+            "--boundary-mode",
+            "sentence_or_pause",
+            "--min-pause-boundary-ms",
+            "525",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.boundary_mode == "sentence_or_pause"
+    assert config.min_pause_boundary_ms == 525
 
 
 @pytest.mark.gpu
