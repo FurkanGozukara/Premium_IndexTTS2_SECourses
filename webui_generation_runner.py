@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -53,24 +54,119 @@ def check_ffmpeg() -> bool:
 FFMPEG_AVAILABLE = check_ffmpeg()
 
 
-def create_tts(runtime_options: Dict[str, Any]):
+def _ensure_selected_int8(
+    runtime: Any,
+    model_dir: str,
+    *,
+    progress_file: str | None = None,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> str:
+    if runtime.model_variant != "int8_convrot":
+        return ""
+
+    from indextts.runtime.progress import ProgressReporter
+    from indextts.utils import model_downloads
+
+    checkpoint = model_downloads.int8_gpt_path(model_dir)
+    if checkpoint.is_file():
+        return ""
+
+    print(
+        f">> INT8 ConvRot GPT is missing at {checkpoint}; starting automatic download",
+        flush=True,
+    )
+    reporter = ProgressReporter(
+        "INT8 ConvRot GPT",
+        total=1000,
+        progress_file=progress_file,
+        gr_progress=progress_callback,
+    )
+    reporter.set_stage("model download")
+
+    def download_progress(*values: Any, **kwargs: Any) -> None:
+        fraction = kwargs.get("fraction")
+        if fraction is None and values and isinstance(values[0], (int, float)):
+            fraction = values[0]
+        try:
+            normalized = max(0.0, min(1.0, float(fraction or 0.0)))
+        except (TypeError, ValueError):
+            normalized = 0.0
+        description = str(
+            kwargs.get("desc")
+            or kwargs.get("message")
+            or (values[-1] if values and isinstance(values[-1], str) else "")
+        )
+        message = model_downloads.int8_download_progress_message(
+            normalized,
+            description,
+            models_dir=model_dir,
+        )
+        reporter.update(round(normalized * 1000), desc=message)
+
+    try:
+        model_downloads.ensure_int8_gpt(model_dir, download_progress)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(
+                f"download returned without creating {checkpoint}"
+            )
+        ready = model_downloads.int8_download_progress_message(
+            1.0, models_dir=model_dir
+        )
+        reporter.update(1000, desc=ready)
+        print(f">> INT8 ConvRot GPT ready at {checkpoint}", flush=True)
+        return ""
+    except Exception as exc:
+        warning = model_downloads.int8_fallback_warning(model_dir, exc)
+        runtime.model_variant = "bf16"
+        warning_reporter = ProgressReporter(
+            "model load",
+            total=1,
+            progress_file=progress_file,
+            gr_progress=progress_callback,
+        )
+        warning_reporter.update(0, desc=warning)
+        print(">> " + warning, flush=True)
+        return warning
+
+
+def create_tts(
+    runtime_options: Dict[str, Any],
+    *,
+    progress_file: str | None = None,
+    progress_callback: Optional[Callable[..., Any]] = None,
+):
     import torch
 
     from indextts.infer_v2_5 import IndexTTS2
+    from indextts.runtime.vram_presets import RuntimeConfig
 
-    use_bf16 = bool(runtime_options.get("use_bf16", runtime_options.get("use_fp16")))
-    if use_bf16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        print(">> BF16 is unavailable on this GPU; using full precision.")
-        use_bf16 = False
-
-    return IndexTTS2(
-        model_dir=runtime_options["model_dir"],
-        cfg_path=runtime_options["cfg_path"],
-        use_bf16=use_bf16,
-        use_deepspeed=bool(runtime_options.get("use_deepspeed")),
-        use_cuda_kernel=bool(runtime_options.get("use_cuda_kernel")),
-        use_qwen_emo=True,
+    options = dict(runtime_options or {})
+    runtime_payload = options.get("runtime")
+    if not isinstance(runtime_payload, dict):
+        runtime_payload = options
+    runtime = RuntimeConfig.from_dict(runtime_payload)
+    model_dir = str(
+        options.get("model_dir", runtime_payload.get("model_dir", "models"))
     )
+    if runtime.gpt_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        print(">> BF16 is unavailable on this GPU; using full precision.")
+        runtime.gpt_dtype = "fp32"
+    runtime_warning = _ensure_selected_int8(
+        runtime,
+        model_dir,
+        progress_file=progress_file,
+        progress_callback=progress_callback,
+    )
+    engine = IndexTTS2(
+        model_dir=model_dir,
+        cfg_path=options.get("cfg_path", runtime_payload.get("cfg_path", "models/config.yaml")),
+        runtime=runtime,
+        use_deepspeed=bool(options.get("use_deepspeed", runtime_payload.get("use_deepspeed", False))),
+        use_qwen_emo=bool(options.get("use_qwen_emo", runtime_payload.get("use_qwen_emo", True))),
+    )
+    if runtime_warning:
+        engine.runtime_warning = runtime_warning
+    return engine
 
 
 def convert_wav_to_mp3(
@@ -365,6 +461,9 @@ def run_generation_request(
     tts,
     progress_callback: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
+    from indextts.runtime.progress import ProgressReporter
+    from indextts.runtime.vram_presets import RuntimeConfig
+
     prompt = request["prompt"]
     text = request["text"]
     subtitle_mode = bool(request["subtitle_mode"])
@@ -375,6 +474,39 @@ def run_generation_request(
     mp3_bitrate = request["mp3_bitrate"]
     image_path = request.get("image_path")
     infer_kwargs = dict(request["infer_kwargs"])
+    inference_extra_defaults = {
+        "segment_budget_scale_non_cjk": 0.72,
+        "cfm_temperature": 1.0,
+        "seed": None,
+        "reuse_spk_cond_for_emo": False,
+        "enable_pause_tags": True,
+        "trim_silence_ms_threshold": 0,
+        "target_duration_s": None,
+        "target_duration_mode": "off",
+    }
+    for key, default in inference_extra_defaults.items():
+        if key in request:
+            infer_kwargs[key] = request[key]
+        else:
+            infer_kwargs.setdefault(key, default)
+    num_candidates = max(1, min(32, int(request.get("num_candidates", infer_kwargs.pop("num_candidates", 1)))))
+    audio_tuning_preset = str(request.get("audio_tuning_preset", "bypass") or "bypass").strip().lower()
+    audio_tuning_overrides = request.get("audio_tuning_overrides", {})
+    if audio_tuning_overrides is None:
+        audio_tuning_overrides = {}
+    if not isinstance(audio_tuning_overrides, dict):
+        raise TypeError("audio_tuning_overrides must be a dictionary")
+    requested_seed = infer_kwargs.pop("seed", None)
+    if requested_seed is None or int(requested_seed) == -1:
+        base_seed = secrets.randbelow(2**32)
+    else:
+        base_seed = int(requested_seed) % (2**32)
+    if subtitle_mode:
+        # Subtitle timing already owns duration fitting cue by cue.
+        infer_kwargs["target_duration_s"] = None
+        infer_kwargs["target_duration_mode"] = "off"
+    request_runtime = RuntimeConfig.from_dict(request.get("runtime"))
+    infer_kwargs.setdefault("cfm_cache_length", request_runtime.cfm_cache_length)
     section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
     latent_multiplier = float(infer_kwargs.pop("latent_multiplier", 1.72))
     infer_kwargs["duration_factor"] = latent_multiplier / 1.72
@@ -390,11 +522,40 @@ def run_generation_request(
     subtitle_status_message = ""
     output = None
     video_output = None
+    raw_output = None
+    candidate_paths = []
+    candidate_stats = []
+    final_wav_audio_seconds = 0.0
+    runtime_warning = str(getattr(tts, "runtime_warning", "") or "")
 
+    reporter = ProgressReporter(
+        "segments",
+        progress_file=request.get("progress_file"),
+        gr_progress=progress_callback,
+    )
+    tts.progress_reporter = reporter
     tts.gr_progress = progress_callback
+    if runtime_warning:
+        reporter.update(0, total=1, desc=runtime_warning)
+    lora_path = request.get("lora_path", request_runtime.lora_path)
+    lora_strength = request.get("lora_strength", request_runtime.lora_strength)
+    lora_merge_into_base = bool(
+        request.get("lora_merge_into_base", request_runtime.lora_merge_into_base)
+    )
+    normalized_lora_path = os.path.abspath(str(lora_path)) if lora_path else ""
     tts.low_vram = bool(low_memory_mode or getattr(tts, "low_vram", False))
 
     try:
+        if hasattr(tts, "set_lora") and (
+            normalized_lora_path != str(getattr(tts, "_lora_path", ""))
+            or float(lora_strength) != float(getattr(tts, "_lora_strength", 1.0))
+            or lora_merge_into_base != bool(getattr(tts, "_lora_merged", False))
+        ):
+            tts.set_lora(
+                lora_path,
+                lora_strength,
+                merge_into_base=lora_merge_into_base,
+            )
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
         subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
 
@@ -415,6 +576,7 @@ def run_generation_request(
                 non_empty_units = [unit for unit in subtitle_render_units if unit.text.strip()]
                 unit_render_metadata = {}
                 subtitle_infer_kwargs = dict(infer_kwargs)
+                subtitle_infer_kwargs["seed"] = base_seed
                 subtitle_infer_kwargs["interval_silence"] = SUBTITLE_TIMING_INTERVAL_SILENCE_MS
                 subtitle_infer_kwargs["console_progress_enabled"] = True
                 subtitle_infer_kwargs["console_progress_label"] = "Subtitle synthesis"
@@ -563,6 +725,63 @@ def run_generation_request(
                 f"timing issues {len(subtitle_issues)}"
             )
             output = save_pcm16_wav(combined_audio, sampling_rate, output_path)
+            candidate_path = os.path.join(task_folder, "candidate_01.wav")
+            shutil.copy2(output, candidate_path)
+            candidate_paths.append(candidate_path)
+            candidate_stats.append(dict(getattr(tts, "last_generation_stats", {})))
+            for candidate_index in range(1, num_candidates):
+                candidate_seed = (base_seed + candidate_index) % (2**32)
+                print(
+                    f">> Generating subtitle candidate {candidate_index + 1}/{num_candidates} "
+                    f"with seed {candidate_seed}"
+                )
+                tts.progress_reporter = ProgressReporter(
+                    f"candidate {candidate_index + 1}",
+                    progress_file=request.get("progress_file"),
+                    gr_progress=progress_callback,
+                )
+                extra_kwargs = dict(infer_kwargs)
+                extra_kwargs["seed"] = candidate_seed
+                extra_kwargs["interval_silence"] = SUBTITLE_TIMING_INTERVAL_SILENCE_MS
+                extra_results = tts.infer_texts(
+                    spk_audio_prompt=prompt,
+                    texts=[unit.text for unit in non_empty_units],
+                    lang=language,
+                    section_batch_size=section_batch_size,
+                    console_progress_label=f"Subtitle candidate {candidate_index + 1}",
+                    **extra_kwargs,
+                )
+                result_by_unit = {
+                    unit.index: result
+                    for unit, result in zip(non_empty_units, extra_results)
+                }
+                extra_rendered_units = []
+                for unit in subtitle_render_units:
+                    if not unit.text.strip():
+                        fitted_audio = np.zeros((0, 1), dtype=np.int16)
+                    else:
+                        unit_rate, unit_audio = result_by_unit[unit.index]
+                        if unit_rate != sampling_rate:
+                            raise ValueError(
+                                f"Subtitle candidate returned {unit_rate} Hz instead of {sampling_rate} Hz"
+                            )
+                        fitted_audio = fit_audio_to_duration(
+                            unit_audio,
+                            sampling_rate=sampling_rate,
+                            target_duration_ms=unit.duration_ms,
+                        )
+                    extra_rendered_units.append((unit, fitted_audio))
+                extra_audio, _ = assemble_subtitle_audio(
+                    extra_rendered_units,
+                    sampling_rate=sampling_rate,
+                )
+                extra_candidate_path = os.path.join(
+                    task_folder,
+                    f"candidate_{candidate_index + 1:02d}.wav",
+                )
+                save_pcm16_wav(extra_audio, sampling_rate, extra_candidate_path)
+                candidate_paths.append(extra_candidate_path)
+                candidate_stats.append(dict(getattr(tts, "last_generation_stats", {})))
             metadata["subtitle"]["timing_issues"] = subtitle_issues
             subtitle_status_message = build_subtitle_status_message(
                 subtitle_cues,
@@ -574,27 +793,50 @@ def run_generation_request(
                 subtitle_file=subtitle_file,
             )
         else:
-            if section_batch_size > 1:
-                batch_results = tts.infer_texts(
-                    spk_audio_prompt=prompt,
-                    texts=[text],
-                    lang=language,
-                    section_batch_size=section_batch_size,
-                    console_progress_label="Text synthesis",
-                    **infer_kwargs,
+            for candidate_index in range(num_candidates):
+                if candidate_index:
+                    tts.progress_reporter = ProgressReporter(
+                        f"candidate {candidate_index + 1}",
+                        progress_file=request.get("progress_file"),
+                        gr_progress=progress_callback,
+                    )
+                candidate_seed = (base_seed + candidate_index) % (2**32)
+                candidate_path = os.path.join(task_folder, f"candidate_{candidate_index + 1:02d}.wav")
+                candidate_kwargs = dict(infer_kwargs)
+                candidate_kwargs["seed"] = candidate_seed
+                print(
+                    f">> Generating candidate {candidate_index + 1}/{num_candidates} "
+                    f"with seed {candidate_seed}"
                 )
-                if not batch_results or batch_results[0] is None:
-                    raise RuntimeError("IndexTTS 2.5 did not return audio for the text request.")
-                output_rate, output_audio = batch_results[0]
-                output = save_pcm16_wav(output_audio, output_rate, output_path)
-            else:
-                output = tts.infer(
-                    spk_audio_prompt=prompt,
-                    text=text,
-                    output_path=output_path,
-                    lang=language,
-                    **infer_kwargs,
-                )
+                if section_batch_size > 1:
+                    batch_results = tts.infer_texts(
+                        spk_audio_prompt=prompt,
+                        texts=[text],
+                        lang=language,
+                        section_batch_size=section_batch_size,
+                        console_progress_label=f"Candidate {candidate_index + 1}",
+                        **candidate_kwargs,
+                    )
+                    if not batch_results or batch_results[0] is None:
+                        raise RuntimeError("IndexTTS 2.5 did not return audio for the text request.")
+                    output_rate, output_audio = batch_results[0]
+                    save_pcm16_wav(output_audio, output_rate, candidate_path)
+                else:
+                    candidate_result = tts.infer(
+                        spk_audio_prompt=prompt,
+                        text=text,
+                        output_path=candidate_path,
+                        lang=language,
+                        **candidate_kwargs,
+                    )
+                    if not candidate_result:
+                        raise RuntimeError("IndexTTS 2.5 did not return audio for the text request.")
+                candidate_paths.append(candidate_path)
+                candidate_stats.append(dict(getattr(tts, "last_generation_stats", {})))
+
+            shutil.copy2(candidate_paths[0], output_path)
+            output = output_path
+            print(">> Primary output uses candidate 1:", output)
 
         if save_used_audio and prompt:
             try:
@@ -605,6 +847,25 @@ def run_generation_request(
                 print(f"Saved used reference audio to: {task_layout['speaker_reference_copy_path']}")
             except Exception as exc:
                 print(f"Error saving used audio: {exc}")
+
+        tuning_active = audio_tuning_preset != "bypass" or bool(audio_tuning_overrides)
+        if tuning_active:
+            from indextts.utils.audio_tuning import apply_audio_tuning
+
+            stem, extension = os.path.splitext(output_path)
+            raw_output = f"{stem}_raw{extension or '.wav'}"
+            shutil.copy2(output, raw_output)
+            apply_audio_tuning(
+                raw_output,
+                output_path,
+                audio_tuning_preset,
+                **audio_tuning_overrides,
+            )
+            output = output_path
+            print(f">> Audio tuning applied ({audio_tuning_preset}); untouched WAV: {raw_output}")
+
+        final_rate, final_audio = read_pcm16_wav(output_path)
+        final_wav_audio_seconds = final_audio.shape[0] / float(final_rate) if final_rate else 0.0
 
         if image_path:
             _emit_progress(progress_callback, 0.96, "rendering mp4...")
@@ -623,11 +884,28 @@ def run_generation_request(
             )
 
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
+        primary_stats = dict(candidate_stats[0] if candidate_stats else getattr(tts, "last_generation_stats", {}))
+        primary_stats.setdefault("seed", base_seed)
+        primary_stats.setdefault("segments_count", 0)
+        primary_stats["audio_seconds"] = float(final_wav_audio_seconds)
+        primary_stats.setdefault(
+            "rtf",
+            processing_elapsed_seconds / final_wav_audio_seconds if final_wav_audio_seconds > 0 else 0.0,
+        )
+        for timing_key in ("gpt_time", "s2mel_time", "vocoder_time", "peak_vram_gb"):
+            primary_stats.setdefault(timing_key, 0.0)
+        primary_stats["candidate_seeds"] = [
+            int(stats.get("seed", (base_seed + index) % (2**32)))
+            for index, stats in enumerate(candidate_stats)
+        ]
+        primary_stats["candidate_paths"] = [os.path.abspath(path) for path in candidate_paths]
         metadata["status"] = "completed"
         metadata["updated_at"] = current_timestamp()
         metadata["error"] = None
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)
         metadata["outputs"]["final_video_path"] = abs_path_or_none(video_output)
+        metadata["outputs"]["raw_wav_path"] = abs_path_or_none(raw_output)
+        metadata["outputs"]["candidate_wav_paths"] = [abs_path_or_none(path) for path in candidate_paths]
         metadata["outputs"]["final_wav_exists"] = bool(
             task_layout["final_wav_path"] and os.path.exists(task_layout["final_wav_path"])
         )
@@ -641,12 +919,43 @@ def run_generation_request(
         metadata["processing"]["elapsed_ms"] = int(round(processing_elapsed_seconds * 1000.0))
         metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
         metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
+        metadata["generation"] = primary_stats
+        if runtime_warning:
+            metadata["runtime_warning"] = runtime_warning
         write_metadata_file(metadata_path, metadata)
+
+        print(">> === Request summary ===")
+        print(
+            f">> seed={primary_stats['seed']} | segments={primary_stats['segments_count']} | "
+            f"audio={primary_stats['audio_seconds']:.3f}s | RTF={primary_stats['rtf']:.4f}"
+        )
+        print(
+            f">> GPT={primary_stats['gpt_time']:.3f}s | s2mel={primary_stats['s2mel_time']:.3f}s | "
+            f"vocoder={primary_stats['vocoder_time']:.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB"
+        )
+        print(">> =======================")
 
         return {
             "output_path": output,
             "video_path": video_output,
             "subtitle_status": subtitle_status_message,
+            **{
+                key: primary_stats[key]
+                for key in (
+                    "seed",
+                    "segments_count",
+                    "audio_seconds",
+                    "rtf",
+                    "gpt_time",
+                    "s2mel_time",
+                    "vocoder_time",
+                    "peak_vram_gb",
+                )
+            },
+            "candidate_paths": primary_stats["candidate_paths"],
+            "candidate_seeds": primary_stats["candidate_seeds"],
+            "raw_wav_path": abs_path_or_none(raw_output),
+            "runtime_warning": runtime_warning,
         }
     except Exception as exc:
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf

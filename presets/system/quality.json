@@ -1,7 +1,7 @@
 {
   "_meta": {
     "format": "indextts2_premium_universal",
-    "name": "default",
+    "name": "quality",
     "read_only": true,
     "scope": "system",
     "version": 2
@@ -58,8 +58,8 @@
     "generation.audio_tuning_preset": "bypass",
     "generation.auto_lora_reference": true,
     "generation.cfm_cache_length": 8192,
-    "generation.cfm_temperature": 1.0,
-    "generation.diffusion_steps": 25,
+    "generation.cfm_temperature": 0.9,
+    "generation.diffusion_steps": 40,
     "generation.do_sample": true,
     "generation.emotion_anger": 0.0,
     "generation.emotion_bias_anger": 0.875,
@@ -95,7 +95,7 @@
     "generation.max_speaker_audio_length": 15.0,
     "generation.max_text_tokens_per_segment": 60,
     "generation.mp3_bitrate": "256k",
-    "generation.num_beams": 3,
+    "generation.num_beams": 4,
     "generation.num_candidates": 1,
     "generation.output_filename": "",
     "generation.prevent_vram_accumulation": false,
