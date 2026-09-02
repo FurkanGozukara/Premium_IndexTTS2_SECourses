@@ -81,7 +81,6 @@ def _download_single_file(repo_id: str, filename: str, local_path: str) -> str:
 
 
 _VERSION_TO_REPO = {
-    "2": "IndexTeam/IndexTTS-2",
     "2.5": "IndexTeam/IndexTTS-2.5",
 }
 

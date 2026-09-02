@@ -17,6 +17,9 @@ class BASECFM(torch.nn.Module, ABC):
         self.sigma_min = 1e-6
 
         self.estimator = None
+        # Inference runtimes may opt into BF16 for the DiT forward only. The
+        # solver state and the vocoder remain FP32.
+        self.estimator_autocast_dtype = None
 
         self.in_channels = args.DiT.in_channels
 
@@ -82,6 +85,14 @@ class BASECFM(torch.nn.Module, ABC):
         x[..., :prompt_len] = 0
         if self.zero_prompt_speech_token:
             mu[..., :prompt_len] = 0
+
+        def estimate(*args):
+            dtype = self.estimator_autocast_dtype
+            enabled = dtype is not None and args[0].device.type == "cuda"
+            with torch.amp.autocast(args[0].device.type, enabled=enabled, dtype=dtype):
+                value = self.estimator(*args)
+            return value.to(dtype=x.dtype)
+
         for step in tqdm(range(1, len(t_span))):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
@@ -94,7 +105,7 @@ class BASECFM(torch.nn.Module, ABC):
                 stacked_x_lens = torch.cat([x_lens, x_lens], dim=0)
 
                 # Perform a single forward pass for both original and CFG inputs
-                stacked_dphi_dt = self.estimator(
+                stacked_dphi_dt = estimate(
                     stacked_x, stacked_prompt_x, stacked_x_lens, stacked_t, stacked_style, stacked_mu,
                 )
 
@@ -104,7 +115,7 @@ class BASECFM(torch.nn.Module, ABC):
                 # Apply CFG formula
                 dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t.expand(B), style, mu)
+                dphi_dt = estimate(x, prompt_x, x_lens, t.expand(B), style, mu)
 
             x = x + dt * dphi_dt
             t = t + dt
