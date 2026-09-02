@@ -35,6 +35,7 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "Batch Generation",
         "LoRA Dataset Preparation",
         "LoRA / DoRA Training",
+        "Checkpoint Grid",
         "Models & Performance",
         "Help",
     ]
@@ -53,6 +54,14 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         }
         assert {item.name for item in fields(config_type)}.issubset(registered)
     assert demo.request_coverage["ok"]
+    assert {
+        "grid.adapter_dir",
+        "grid.checkpoints",
+        "grid.strengths",
+        "grid.texts",
+        "grid.references",
+        "grid.seed",
+    }.issubset(keys)
     default_path = demo.preset_store.system_dir / "default.json"
     before = default_path.read_bytes()
     demo.preset_store.ensure_system_presets()
@@ -86,7 +95,7 @@ def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():
         if "window.confirm(" in (dependency.get("js") or "")
     ]
 
-    assert len(confirmations) == 7
+    assert len(confirmations) == 8
     for dependency in confirmations:
         confirmation_input = components[dependency["inputs"][0]]
         assert confirmation_input["type"] == "checkbox"

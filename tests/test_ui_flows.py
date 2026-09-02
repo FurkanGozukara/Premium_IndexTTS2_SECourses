@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from ui.app import build_app
 from ui.dataset_tab import dataset_status_to_panel, dataset_status_updates
 from ui.generation_tab import build_generation_request, recent_outputs
+from ui.grid_tab import grid_status_updates
 from ui.training_tab import training_status_updates
 
 
@@ -78,6 +79,24 @@ def test_cpu_ui_flow_mappings_without_loading_models(tmp_path):
         training = training_status_updates(str(real_training.parent), 0.9)
         assert "Training" in training[0]
         assert "step" in training[1].lower()
+
+    grid_state = tmp_path / "grids" / "voice_grid"
+    grid_state.mkdir(parents=True)
+    (grid_state / "status.json").write_text(
+        json.dumps(
+            {
+                "phase": "generating",
+                "message": "best / ref 1 / text 1",
+                "completed": 1,
+                "total": 4,
+                "elapsed_s": 9.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    mapped_grid = grid_status_updates(str(grid_state), output_root=tmp_path / "grids")
+    assert "25.0%" in mapped_grid[1]
+    assert "Attached to running grid" in mapped_grid[2]
 
 
 def _write_output(folder: Path, task_id: str) -> None:

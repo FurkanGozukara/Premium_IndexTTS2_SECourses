@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from indextts.runtime import gpu_free_gb, gpu_total_gb, resolve_preset
+from indextts.utils.atomic_json import write_json_atomic
 
 from .train_config import TrainConfig
 
@@ -104,7 +105,7 @@ def generate_training_sample(
         },
         "error": None,
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    write_json_atomic(metadata_path, metadata, indent=2, ensure_ascii=False)
     request = {
         "runtime": {
             "runtime": runtime.to_dict(),
@@ -158,9 +159,7 @@ def generate_training_sample(
             "reset_beam_cache_per_segment": True,
         },
     }
-    request_path.write_text(
-        json.dumps(request, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    write_json_atomic(request_path, request, indent=2, ensure_ascii=False)
     worker = Path(__file__).resolve().parents[2] / "webui_subprocess_worker.py"
     command = [
         sys.executable,

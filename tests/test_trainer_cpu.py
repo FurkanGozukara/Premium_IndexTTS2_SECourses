@@ -112,6 +112,8 @@ def _config(tmp_path: Path, name: str, *, max_steps: int) -> TrainConfig:
         save_every_steps=0,
         save_best=False,
         sample_enabled=False,
+        auto_analyze=False,
+        auto_evaluate_checkpoints=False,
         num_workers=0,
     ).validate()
 
@@ -242,3 +244,41 @@ def test_metric_charts_collapse_duplicate_event_rows(tmp_path: Path) -> None:
     assert len(metrics) == 2
     validation = chart[chart["series"] == "validation"]
     assert validation[["step", "value"]].values.tolist() == [[2, 0.9]]
+
+
+def test_early_stopping_writes_the_normal_final_adapter(
+    tmp_path: Path, synthetic_cpu_trainer, monkeypatch
+) -> None:
+    values = iter([(1.0, 0.1), (1.2, 0.1)])
+    monkeypatch.setattr(
+        trainer_module.LoraTrainer,
+        "validate",
+        lambda self, built, loader, device: next(values),
+    )
+    config = _config(tmp_path, "early_stop", max_steps=4)
+    config.val_fraction = 0.25
+    config.val_every_steps = 1
+    config.early_stop_patience = 1
+
+    result = run_training(config)
+
+    assert result.status == "stopped"
+    assert result.step == 2
+    assert Path(result.output_path).name == "early_stop.safetensors"
+    status = json.loads((Path(result.output_path).parent / "status.json").read_text(encoding="utf-8"))
+    assert "early stopping" in status["message"]
+
+
+def test_auto_analysis_writes_report(
+    tmp_path: Path, synthetic_cpu_trainer
+) -> None:
+    config = _config(tmp_path, "auto_analysis", max_steps=2)
+    config.val_fraction = 0.25
+    config.auto_analyze = True
+    config.auto_evaluate_checkpoints = False
+
+    result = run_training(config)
+
+    report = Path(result.output_path).parent / "analysis" / "training_analysis.json"
+    assert report.is_file()
+    assert json.loads(report.read_text(encoding="utf-8"))["best_epoch"] == 1

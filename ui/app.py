@@ -34,6 +34,7 @@ from .generation_tab import (
     validate_request_coverage,
 )
 from .help_tab import build_help_tab
+from .grid_tab import bind_grid_events, build_grid_tab
 from .models_tab import (
     APPLIED_RUNTIME,
     build_models_tab,
@@ -294,6 +295,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             batch = build_batch_tab(options, registry, load_hook=demo.load)
             dataset = build_dataset_tab(options, registry, load_hook=demo.load)
             training = build_training_tab(options, registry, load_hook=demo.load)
+            grid = build_grid_tab(options, registry, load_hook=demo.load)
             models = build_models_tab(options, registry)
             build_help_tab()
 
@@ -302,6 +304,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         bind_batch_events(batch, generation, options, registry)
         bind_dataset_events(dataset, training)
         bind_training_events(training, models, generation, main_tabs)
+        bind_grid_events(grid, training, generation, models, main_tabs)
 
         store.ensure_system_presets()
         choices = store.list_presets()
@@ -467,6 +470,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         "Batch Generation": batch,
         "LoRA Dataset Preparation": dataset,
         "LoRA / DoRA Training": training,
+        "Checkpoint Grid": grid,
         "Models & Performance": models,
         "Help": True,
     }

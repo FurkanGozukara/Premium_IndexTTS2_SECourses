@@ -417,9 +417,12 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
         "alpha": structure.alpha,
         "targets": list(structure.target_modules),
         "steps": metadata.trained_steps,
+        "epochs": metadata.epochs,
         "dataset": metadata.dataset_name,
         "date": created,
         "size_mb": round(source.stat().st_size / (1024 * 1024), 3),
+        "base_variant": metadata.base_variant,
+        "train_config": dict(metadata.train_config),
         "recommended_reference": reference,
     }
 

@@ -18,6 +18,8 @@ from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.gpu import gpu_total_gb
 from indextts.runtime.vram_presets import auto_tier, resolve_preset
 from indextts.training.charts import GRAD_SERIES, LOSS_SERIES, LR_SERIES, SPEED_SERIES, empty_series_frame, load_metrics, lr_frame, speed_frame
+from indextts.training.analysis import ANALYSIS_SERIES, analysis_epoch_frame, load_training_analysis
+from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.train_config import TrainConfig
 
 from .common import (
@@ -43,10 +45,21 @@ TRAINING_TERMINAL_PHASES = frozenset(
 )
 
 
+_NON_TRAINING_STATE_FOLDERS = frozenset({"analysis", "eval_jobs", "eval_job", ".sample_jobs", "samples"})
+
+
 def _training_states(root: str | Path = ROOT / "loras") -> list[Path]:
     values: list[tuple[float, Path]] = []
     base = Path(root).expanduser()
     for status_path in base.rglob("status.json") if base.is_dir() else []:
+        try:
+            relative_parts = status_path.relative_to(base).parts
+        except ValueError:
+            relative_parts = status_path.parts
+        # Checkpoint evaluation jobs and training samples keep their own status.json
+        # below an adapter folder; only the adapter folder itself is a training run.
+        if any(part.lower() in _NON_TRAINING_STATE_FOLDERS for part in relative_parts[:-1]):
+            continue
         try:
             values.append((status_path.stat().st_mtime, status_path.parent.resolve()))
         except OSError:
@@ -173,14 +186,64 @@ def _checkpoint_rows(state_dir: str | Path | None) -> list[list[Any]]:
     if not state_dir:
         return []
     root = Path(state_dir)
+    analysis = load_training_analysis(root)
+    measured = load_checkpoint_eval(root)
+    by_path: dict[str, tuple[float | None, str]] = {}
+    if analysis is not None:
+        for item in analysis.checkpoints:
+            path_value = str(Path(str(item.get("path") or "")).resolve())
+            by_path[path_value] = (item.get("val_loss"), str(item.get("phase") or "unknown"))
+    if measured is not None:
+        for item in measured.rows:
+            if item.path and abs(item.strength - 1.0) < 1e-9:
+                by_path[str(Path(item.path).resolve())] = (item.val_loss, item.phase)
     rows = []
     for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True):
+        if path.name.startswith("."):
+            continue
         try:
             info = inspect_lora(path)
-            rows.append([path.name, info.get("adapter_type", ""), info.get("rank", 0), info.get("steps", 0), round(path.stat().st_size / 1024**2, 2), str(path)])
+            val_loss, phase = by_path.get(str(path.resolve()), (None, "unknown"))
+            rows.append([
+                path.name,
+                info.get("adapter_type", ""),
+                info.get("rank", 0),
+                info.get("steps", 0),
+                info.get("epochs", 0),
+                round(float(val_loss), 4) if val_loss is not None else None,
+                _verdict_text(phase),
+                round(path.stat().st_size / 1024**2, 2),
+                str(path),
+            ])
         except Exception:
-            rows.append([path.name, "", 0, 0, round(path.stat().st_size / 1024**2, 2), str(path)])
+            rows.append([path.name, "", 0, 0, 0, None, "Not measured", round(path.stat().st_size / 1024**2, 2), str(path)])
     return rows
+
+
+def _verdict_text(phase: str) -> str:
+    return {
+        "best": "Best generalization",
+        "improving": "Improving",
+        "plateau": "Plateau",
+        "overfitting": "Overfitting (memorizes training clips)",
+        "base": "Base model (no adapter)",
+        "variant": "Strength variant",
+    }.get(str(phase), "Not measured")
+
+
+def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.DataFrame]:
+    if not state_dir:
+        return "### Generalization summary\n\nGeneralization analysis will appear after validation runs.", analysis_epoch_frame(None)
+    root = Path(state_dir)
+    analysis = load_training_analysis(root)
+    measured = load_checkpoint_eval(root)
+    if measured is not None:
+        summary = measured.summary_markdown
+    elif analysis is not None:
+        summary = analysis.summary_markdown
+    else:
+        summary = "Run training with validation enabled to identify the checkpoint that generalizes best."
+    return "### Generalization summary\n\n" + summary, analysis_epoch_frame(analysis)
 
 
 def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> str:
@@ -243,6 +306,8 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
             None,
             "No sample yet.",
             [],
+            "### Generalization summary\n\nGeneralization analysis will appear after validation runs.",
+            analysis_epoch_frame(None),
             gr.Timer(5.0, active=True),
         )
     root = Path(state_value)
@@ -265,7 +330,13 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         "vram_total_gb": _training_vram_total(root),
         "desc": f"epoch {status.get('epoch', 0)}/{status.get('total_epochs', 0)}",
     }
+    if phase == "evaluating":
+        evaluation_progress = read_json(root / "analysis" / "eval_job" / "progress.json", {}) or {}
+        if evaluation_progress:
+            payload = dict(evaluation_progress)
+        payload["desc"] = str(status.get("message") or payload.get("desc") or "evaluating checkpoints")
     titles = {
+        "evaluating": "Evaluating checkpoints",
         "complete": "Training complete",
         "stopped": "Training stopped",
         "cancelled": "Training canceled",
@@ -281,6 +352,7 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         if sample
         else "No sample yet."
     )
+    generalization_summary, generalization_chart = _training_generalization(root)
     return (
         progress_panel_html(payload, title=titles.get(phase, "Training in progress")),
         _training_status_text(status, metrics),
@@ -292,6 +364,8 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         sample,
         sample_text_value,
         _checkpoint_rows(root),
+        generalization_summary,
+        generalization_chart,
         gr.Timer(5.0 if terminal else 1.0, active=True),
     )
 
@@ -330,6 +404,7 @@ class TrainingTab:
     pin_swap_memory: Any
     state_dir: Any
     use_in_generation: Any
+    compare_grid: Any
     dataset: Any
     dataset_info: Any
     start_event: Any = None
@@ -434,6 +509,20 @@ def build_training_tab(
                 val_fraction = gr.Slider(0, 0.5, value=0.05, step=0.01, label="Validation fraction", info="5% provides useful validation without sacrificing much training data.")
                 val_steps = gr.Number(value=50, minimum=0, precision=0, label="Validate every steps", info="0 disables step validation; epoch validation still runs when a split exists.")
                 val_batches = gr.Number(value=20, minimum=1, precision=0, label="Maximum validation batches", info="Caps validation time on large datasets.")
+            with gr.Row():
+                early_patience = gr.Number(
+                    value=0,
+                    minimum=0,
+                    precision=0,
+                    label="Early-stop patience",
+                    info="0 disables early stopping; otherwise stop after this many validations without a meaningful improvement.",
+                )
+                early_delta = gr.Number(
+                    value=0.0,
+                    minimum=0,
+                    label="Early-stop minimum improvement",
+                    info="Validation loss must fall by at least this amount to reset patience.",
+                )
             optimization_fields = (
                 ("learning_rate", learning_rate, "float", None, 1e-8, 1), ("optimizer", optimizer, "choice", ["adamw", "adamw_fused", "prodigy"], None, None),
                 ("lr_scheduler", scheduler, "choice", ["cosine", "linear", "constant", "constant_with_warmup"], None, None),
@@ -447,6 +536,8 @@ def build_training_tab(
                 ("max_codes", max_codes, "int", None, 1, 100000), ("max_text_tokens", max_text, "int", None, 1, 100000),
                 ("val_fraction", val_fraction, "float", None, 0, 0.5), ("val_every_steps", val_steps, "int", None, 0, 1000000),
                 ("val_max_batches", val_batches, "int", None, 1, 1000000),
+                ("early_stop_patience", early_patience, "int", None, 0, 1000000),
+                ("early_stop_min_delta", early_delta, "float", None, 0, 1000000),
             )
             for field_name, component, kind, choices, minimum, maximum in optimization_fields:
                 default = TRAIN_DEFAULTS[field_name]
@@ -480,7 +571,7 @@ def build_training_tab(
                 output_dir = gr.Textbox(value="loras", label="Output root", info="Adapter parent folder; relative paths resolve from the app directory.")
                 save_epochs = gr.Number(value=1, minimum=0, precision=0, label="Save every epochs", info="1 keeps an epoch checkpoint; 0 disables epoch checkpoints.")
                 save_steps = gr.Number(value=0, minimum=0, precision=0, label="Save every steps", info="0 disables step checkpoints.")
-                keep = gr.Number(value=3, minimum=0, precision=0, label="Keep last N", info="Prunes periodic checkpoints; best/final checkpoints are retained.")
+                keep = gr.Number(value=3, minimum=0, precision=0, label="Keep last N", info="0 keeps every epoch checkpoint, which is what the Checkpoint Grid needs to compare epochs.")
             with gr.Row():
                 save_best = gr.Checkbox(value=True, label="Save best", info="Keeps the checkpoint with the lowest validation loss.")
                 save_dtype = gr.Dropdown(choices=["bf16", "fp32"], value="bf16", label="Adapter save dtype", info="BF16 halves adapter file size; FP32 preserves full update precision.")
@@ -493,6 +584,23 @@ def build_training_tab(
                     info="Weights only starts a fresh schedule at step 0; Continue run restores train state when available.",
                 )
                 refresh_resume = gr.Button("Refresh resume list", elem_classes=["compact-button"])
+            with gr.Row():
+                auto_analyze = gr.Checkbox(
+                    value=True,
+                    label="Analyze generalization automatically",
+                    info="Reads the CPU-only training log after complete or stopped runs and recommends a checkpoint.",
+                )
+                auto_evaluate = gr.Checkbox(
+                    value=True,
+                    label="Evaluate checkpoints automatically",
+                    info="After training releases its model, measures saved checkpoints on validation and a small training subset.",
+                )
+                eval_timeout = gr.Number(
+                    value=900,
+                    minimum=1,
+                    label="Evaluation timeout (s)",
+                    info="Stops automatic checkpoint evaluation after this many seconds without failing the completed training run.",
+                )
             resume_info = gr.Markdown("Start fresh.")
             for field_name, component, kind, choices, minimum, maximum in (
                 ("output_dir", output_dir, "str", None, None, None), ("save_every_epochs", save_epochs, "int", None, 0, 100000),
@@ -500,6 +608,9 @@ def build_training_tab(
                 ("save_best", save_best, "bool", None, None, None), ("save_dtype", save_dtype, "choice", ["bf16", "fp32"], None, None),
                 ("save_train_state", save_state, "bool", None, None, None), ("resume_from", resume, "str", None, None, None),
                 ("resume_mode", resume_mode, "choice", ["weights_only", "continue"], None, None),
+                ("auto_analyze", auto_analyze, "bool", None, None, None),
+                ("auto_evaluate_checkpoints", auto_evaluate, "bool", None, None, None),
+                ("eval_timeout_s", eval_timeout, "float", None, 1, 100000),
             ):
                 _reg(registry, controls, field_name, component, kind=kind, choices=choices, minimum=minimum, maximum=maximum)
 
@@ -543,7 +654,8 @@ def build_training_tab(
             stop = gr.Button("Stop", variant="stop", elem_classes=["danger-button"])
             force = gr.Button("Force stop", variant="stop", elem_classes=["danger-button"])
             open_output = gr.Button("Open output folder")
-            use_generation = gr.Button("Use this LoRA in Voice Generation")
+            compare_grid = gr.Button("Compare checkpoints in grid")
+            use_generation = gr.Button("Use recommended checkpoint in Voice Generation")
 
         state_dir = gr.State(current_state)
         timer = gr.Timer(5.0, active=True)
@@ -561,10 +673,30 @@ def build_training_tab(
             latest_sample = gr.Audio(label="Latest training sample", type="filepath", buttons=["download"])
             sample_label = gr.Markdown("No sample yet.")
         checkpoints = gr.Dataframe(
-            headers=["Checkpoint", "Type", "Rank", "Steps", "Size MB", "Path"],
-            datatype=["str", "str", "number", "number", "number", "str"],
+            headers=["Checkpoint", "Type", "Rank", "Steps", "Epoch", "Validation loss", "Verdict", "Size MB", "Path"],
+            datatype=["str", "str", "number", "number", "number", "number", "str", "number", "str"],
             value=_checkpoint_rows(current_state), type="array", interactive=False, wrap=True,
             label="Checkpoints", max_height=320, buttons=["fullscreen", "copy"],
+        )
+        initial_generalization, initial_generalization_frame = _training_generalization(current_state)
+        generalization_summary = gr.Markdown(initial_generalization)
+        generalization_plot = gr.LinePlot(
+            initial_generalization_frame,
+            x="step",
+            y="value",
+            color="series",
+            title="Generalization by epoch",
+            height=300,
+            buttons=["fullscreen", "export"],
+            x_title="epoch",
+            x_axis_format="d",
+            y_title="loss",
+            colors_in_legend=list(ANALYSIS_SERIES),
+            color_map={
+                "train loss": "#6b7280",
+                "validation (improving)": "#1ca881",
+                "validation (overfitting)": "#df345b",
+            },
         )
 
         with gr.Accordion("LoRA Manager", open=False):
@@ -693,6 +825,8 @@ def build_training_tab(
             latest_sample,
             sample_label,
             checkpoints,
+            generalization_summary,
+            generalization_plot,
             timer,
         ],
         api_name="start_training",
@@ -701,7 +835,7 @@ def build_training_tab(
         stream_every=0.5,
     )
 
-    poll_outputs = [state_dir, dashboard_progress, status_text, loss_plot, lr_plot_component, grad_plot, speed_plot_component, log, latest_sample, sample_label, checkpoints, timer]
+    poll_outputs = [state_dir, dashboard_progress, status_text, loss_plot, lr_plot_component, grad_plot, speed_plot_component, log, latest_sample, sample_label, checkpoints, generalization_summary, generalization_plot, timer]
     timer.tick(training_poll_updates, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
     smoothing_slider.change(training_poll_updates, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden", trigger_mode="always_last")
     if load_hook is not None:
@@ -837,6 +971,7 @@ def build_training_tab(
         pinned,
         state_dir,
         use_generation,
+        compare_grid,
         dataset,
         dataset_info,
         start_event,
@@ -887,10 +1022,23 @@ def bind_training_events(
         def use_adapter(state_value: str):
             if not state_value:
                 raise gr.Error("No training state is attached")
-            status = read_json(Path(state_value) / "status.json", {}) or {}
-            path = status.get("last_checkpoint")
+            root = Path(state_value)
+            measured = load_checkpoint_eval(root)
+            analysis = load_training_analysis(root)
+            status = read_json(root / "status.json", {}) or {}
+            path = (
+                measured.recommended_checkpoint
+                if measured is not None
+                else (
+                    analysis.recommended_checkpoint
+                    if analysis is not None
+                    else status.get("recommended_checkpoint")
+                )
+            )
             if not path or not Path(path).is_file():
-                candidates = sorted(Path(state_value).glob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
+                path = status.get("last_checkpoint")
+            if not path or not Path(path).is_file():
+                candidates = sorted(root.glob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
                 path = str(candidates[0]) if candidates else ""
             if not path:
                 raise gr.Error("No completed checkpoint is available yet")

@@ -161,8 +161,8 @@ APP_CSS = r"""
 /* Gradio 6 tab strip: at borderline widths the overflow logic can render the selected tab twice; hide the duplicate. */
 .tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"].selected ~ button[role="tab"].selected { display: none !important; }
 .tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"] { white-space: nowrap; }
-/* The main strip has exactly six tabs; Gradio 6 occasionally appends a stray duplicate button after a tab switch. */
-#main-tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"]:nth-child(n+7) { display: none !important; }
+/* The main strip has exactly seven tabs; Gradio 6 occasionally appends a stray duplicate button after a tab switch. */
+#main-tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"]:nth-child(n+8) { display: none !important; }
 
 .gradio-container { width: 100% !important; max-width: 1540px !important; margin: 0 auto !important; padding: 0 18px 40px !important; }
 .app-header { margin: 0 -18px 14px; padding: 18px 22px 15px; border-bottom: 3px solid #a11236; background: #eef2f6; }
@@ -279,7 +279,7 @@ def latest_output_task(
         lowered = [part.lower() for part in parts]
         if any(part.startswith((".", "_")) for part in parts):
             continue
-        if any(part in {"training_runs", "worker_runtime_e2e", ".sample_jobs"} for part in lowered):
+        if any(part in {"grids", "training_runs", "worker_runtime_e2e", ".sample_jobs"} for part in lowered):
             continue
         first = lowered[0] if lowered else ""
         if first.startswith("ui_") and any(token in first for token in ("batch", "smoke")):

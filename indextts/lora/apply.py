@@ -370,6 +370,22 @@ def set_lora_strength(model_or_handle: nn.Module | LoraHandle, strength: float) 
             attached.strength = value
 
 
+def move_adapters_to_device(
+    model: nn.Module, device: str | torch.device
+) -> dict[str, LoRAAdapter]:
+    """Move only active adapter tensors, leaving frozen base residency unchanged."""
+
+    target = torch.device(device)
+    adapters = _find_adapters(model)
+    for adapter in adapters.values():
+        adapter.lora_A.to(target)
+        adapter.lora_B.to(target)
+        if adapter.lora_magnitude is not None:
+            adapter.lora_magnitude.data = adapter.lora_magnitude.data.to(target)
+        adapter.invalidate_cache()
+    return adapters
+
+
 def remove_lora(model: nn.Module) -> None:
     """Unwrap every adapter and restore all backed-up full-module tensors."""
 
@@ -500,6 +516,7 @@ __all__ = [
     "list_target_modules",
     "merge_lora_for_inference",
     "merge_lora_into_model",
+    "move_adapters_to_device",
     "remove_lora",
     "set_lora_strength",
     "set_training_mode",

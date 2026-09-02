@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
 import random
 import shutil
+import subprocess
+import sys
+import threading
 import time
 import warnings
 from collections import deque
@@ -40,10 +44,12 @@ from indextts.runtime import (
     BlockSwapConfig,
     ProgressReporter,
     enable_block_swap,
+    gpu_free_gb,
     gpu_total_gb,
     memory_stats,
 )
 from indextts.utils import model_downloads
+from indextts.utils.atomic_json import read_json_retry
 
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
@@ -459,6 +465,178 @@ class LoraTrainer:
             shutil.copy2(candidate, self.reference_copy)
         return self.reference_copy if self.reference_copy.is_file() else candidate
 
+    def _write_automatic_analysis(self) -> tuple[str, str]:
+        """Analyze saved metrics without allowing a reporting error to fail training."""
+
+        if not self.config.auto_analyze:
+            self.log(">> automatic generalization analysis is disabled")
+            return "", ""
+        try:
+            from .analysis import analyze_training_run, write_training_analysis
+
+            analysis = analyze_training_run(self.adapter_dir, self.state_dir)
+            path = write_training_analysis(analysis)
+            for line in analysis.summary_markdown.splitlines():
+                if line.strip():
+                    self.log(">> " + line.replace("**", ""))
+            if analysis.best_epoch is not None and analysis.best_val_loss is not None:
+                detail = (
+                    f">> Best validation loss {analysis.best_val_loss:.4f} at epoch "
+                    f"{analysis.best_epoch}"
+                )
+                if (
+                    analysis.status == "best_found"
+                    and analysis.final_epoch is not None
+                    and analysis.final_val_loss is not None
+                ):
+                    detail += (
+                        f"; the final epoch {analysis.final_epoch} adapter is overfitted "
+                        f"(validation {analysis.final_val_loss:.4f})"
+                    )
+                if analysis.recommended_checkpoint:
+                    try:
+                        recommended = Path(analysis.recommended_checkpoint).relative_to(
+                            self.adapter_dir
+                        )
+                    except ValueError:
+                        recommended = Path(analysis.recommended_checkpoint)
+                    detail += f". Recommended: {recommended.as_posix()}"
+                self.log(detail)
+            self.write_status(
+                analysis_path=str(path.resolve()),
+                recommended_checkpoint=analysis.recommended_checkpoint,
+            )
+            return str(path.resolve()), analysis.recommended_checkpoint
+        except Exception as exc:
+            self.log(f">> automatic generalization analysis failed but training is safe: {exc}")
+            return "", ""
+
+    def _run_automatic_evaluation(
+        self,
+        *,
+        terminal_phase: str,
+        terminal_message: str,
+        recommended_checkpoint: str,
+    ) -> str:
+        """Run checkpoint evaluation in a bounded child process after model cleanup."""
+
+        config = self.config
+        if not config.auto_evaluate_checkpoints:
+            self.log(">> automatic checkpoint evaluation is disabled")
+            return recommended_checkpoint
+        device = torch.device(config.device)
+        if device.type == "cuda":
+            free_gb = gpu_free_gb(device.index or 0)
+            if free_gb < config.sample_min_free_vram_gb:
+                self.log(
+                    f">> checkpoint evaluation skipped: {free_gb:.1f} GB free VRAM is below "
+                    f"the {config.sample_min_free_vram_gb:.1f} GB threshold"
+                )
+                return recommended_checkpoint
+
+        from .checkpoint_eval import CheckpointEvalConfig, load_checkpoint_eval
+
+        job_dir = self.adapter_dir / "analysis" / "eval_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        eval_config = CheckpointEvalConfig(
+            adapter_dir=str(self.adapter_dir),
+            dataset_dir=str(self.dataset_dir),
+            include_base=True,
+            strengths=[1.0],
+            train_subset=48,
+            device=config.device,
+            base_variant=config.base_variant,
+            base_dtype=config.base_dtype,
+            model_dir=config.model_dir,
+            model_config=config.model_config,
+            attention_backend=config.attention_backend,
+            val_fraction=config.val_fraction,
+            seed=config.seed,
+        ).validate()
+        config_path = job_dir / "eval_config.json"
+        atomic_write_json(config_path, eval_config.to_dict())
+        command = [
+            sys.executable,
+            "-m",
+            "indextts.training.eval_worker",
+            "--config",
+            str(config_path),
+            "--state-dir",
+            str(job_dir),
+        ]
+        self.log(">> starting automatic checkpoint evaluation")
+        self.write_status(phase="evaluating", message="loading model for checkpoint evaluation")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+
+        def pump() -> None:
+            if process.stdout is None:
+                return
+            for line in iter(process.stdout.readline, ""):
+                if line:
+                    self.log(line.rstrip())
+
+        pump_thread = threading.Thread(target=pump, daemon=True, name="checkpoint-eval-log")
+        pump_thread.start()
+        started = time.perf_counter()
+        timed_out = False
+        while process.poll() is None:
+            elapsed = time.perf_counter() - started
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(
+                phase="evaluating",
+                message=str(child.get("message") or "evaluating checkpoints"),
+                eval_completed=int(child.get("completed", 0) or 0),
+                eval_total=int(child.get("total", 0) or 0),
+                eval_elapsed_s=float(child.get("elapsed_s", elapsed) or elapsed),
+            )
+            if elapsed >= config.eval_timeout_s:
+                timed_out = True
+                process.kill()
+                break
+            time.sleep(0.5)
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        pump_thread.join(timeout=2.0)
+        if timed_out:
+            self.log(
+                f">> checkpoint evaluation timed out after {config.eval_timeout_s:.0f}s; "
+                "training output remains valid"
+            )
+        elif process.returncode != 0:
+            self.log(
+                f">> checkpoint evaluation failed with code {process.returncode}; "
+                "training output remains valid"
+            )
+        else:
+            report = load_checkpoint_eval(self.adapter_dir)
+            if report is not None and report.recommended_checkpoint:
+                recommended_checkpoint = report.recommended_checkpoint
+            self.log(">> automatic checkpoint evaluation complete")
+        self.write_status(
+            phase=terminal_phase,
+            message=terminal_message,
+            recommended_checkpoint=recommended_checkpoint,
+            evaluation_path=str((self.adapter_dir / "analysis" / "checkpoint_eval.json").resolve())
+            if (self.adapter_dir / "analysis" / "checkpoint_eval.json").is_file()
+            else "",
+        )
+        return recommended_checkpoint
+
     def _metadata(self, step: int, epochs: int, targets: list[str]) -> LoraMetadata:
         return LoraMetadata(
             adapter_type=self.config.adapter_type,
@@ -758,6 +936,8 @@ class LoraTrainer:
         resume_next_batch = resume_batch
         best_val_loss = state.get("best_val_loss")
         best_val_loss = float(best_val_loss) if best_val_loss is not None else None
+        early_stop_best = best_val_loss
+        validations_without_improvement = 0
         ema_loss = state.get("ema_loss")
         ema_loss = float(ema_loss) if ema_loss is not None else None
         moving_losses: deque[float] = deque(
@@ -771,6 +951,8 @@ class LoraTrainer:
         last_val_loss: float | None = None
         last_validation_step: int | None = None
         stopped = False
+        early_stopped = False
+        early_stop_reason = ""
         starting_step = global_step
         amp_dtype = _dtype(config.mixed_precision)
         amp_enabled = device.type == "cuda" and amp_dtype != torch.float32
@@ -786,6 +968,28 @@ class LoraTrainer:
             if val_dataset is not None
             else None
         )
+
+        def update_early_stopping(validation_loss: float) -> bool:
+            nonlocal early_stop_best, validations_without_improvement, early_stop_reason
+            if config.early_stop_patience <= 0 or not math.isfinite(validation_loss):
+                return False
+            if (
+                early_stop_best is None
+                or validation_loss < early_stop_best - config.early_stop_min_delta
+            ):
+                early_stop_best = validation_loss
+                validations_without_improvement = 0
+                return False
+            validations_without_improvement += 1
+            if validations_without_improvement < config.early_stop_patience:
+                return False
+            early_stop_reason = (
+                f"early stopping after {validations_without_improvement} consecutive validation "
+                f"check(s) without an improvement of at least {config.early_stop_min_delta:.4g}; "
+                f"best validation loss {early_stop_best:.4f}"
+            )
+            self.log(">> " + early_stop_reason)
+            return True
 
         self.write_status(
             phase="training",
@@ -950,7 +1154,7 @@ class LoraTrainer:
                             scheduler=scheduler,
                             scaler=scaler,
                             step=global_step,
-                            epochs_completed=epoch_index,
+                            epochs_completed=epoch_index + 1,
                             next_epoch=next_epoch,
                             next_batch=next_batch,
                             dataset_fingerprint=train_dataset.fingerprint,
@@ -990,7 +1194,7 @@ class LoraTrainer:
                                 scheduler=scheduler,
                                 scaler=scaler,
                                 step=global_step,
-                                epochs_completed=epoch_index,
+                                epochs_completed=epoch_index + 1,
                                 next_epoch=next_epoch,
                                 next_batch=next_batch,
                                 dataset_fingerprint=train_dataset.fingerprint,
@@ -1000,6 +1204,10 @@ class LoraTrainer:
                                 keep=True,
                             )
 
+                        if update_early_stopping(last_val_loss):
+                            early_stopped = True
+                            break
+
                     if self.stop_path.is_file():
                         stopped = True
                         break
@@ -1007,7 +1215,7 @@ class LoraTrainer:
                         break
 
                 resume_batch = 0
-                if stopped:
+                if stopped or early_stopped:
                     break
 
                 if val_loader is not None and last_validation_step != global_step:
@@ -1046,6 +1254,12 @@ class LoraTrainer:
                             moving_losses=moving_losses,
                             keep=True,
                         )
+
+                    if update_early_stopping(last_val_loss):
+                        early_stopped = True
+
+                if early_stopped:
+                    break
 
                 if config.save_every_epochs and (epoch_index + 1) % config.save_every_epochs == 0:
                     epoch_path = self.adapter_dir / f"{config.name}_epoch_{epoch_index + 1:03d}.safetensors"
@@ -1114,7 +1328,7 @@ class LoraTrainer:
                     scheduler=scheduler,
                     scaler=scaler,
                     step=global_step,
-                    epochs_completed=min(config.epochs, epoch_index),
+                    epochs_completed=min(effective_epochs, epoch_index + 1),
                     next_epoch=resume_next_epoch,
                     next_batch=resume_next_batch,
                     dataset_fingerprint=train_dataset.fingerprint,
@@ -1152,9 +1366,12 @@ class LoraTrainer:
                     moving_losses=moving_losses,
                     keep=True,
                 )
-                self.reporter.finish()
+                if not early_stopped:
+                    self.reporter.finish()
+                terminal_phase = "stopped" if early_stopped else "complete"
+                terminal_message = early_stop_reason if early_stopped else "training complete"
                 self.write_status(
-                    phase="complete",
+                    phase=terminal_phase,
                     step=global_step,
                     total_steps=total_steps,
                     epoch=min(effective_epochs, epoch_index + 1),
@@ -1162,12 +1379,12 @@ class LoraTrainer:
                     avg_loss=ema_loss,
                     val_loss=last_val_loss,
                     eta_s=0.0,
-                    message="training complete",
+                    message=terminal_message,
                     last_checkpoint=str(final_path.resolve()),
                     last_sample=self.last_sample,
                 )
                 self.log(f">> final adapter saved to {final_path}")
-                result_status = "complete"
+                result_status = terminal_phase
         except BaseException as exc:
             self.write_status(phase="failed", message=str(exc), elapsed_s=time.perf_counter() - self.started_perf)
             self.log(f">> training failed: {exc}")
@@ -1177,6 +1394,37 @@ class LoraTrainer:
                 built.block_swap.remove(to_cpu=True)
 
         stats = memory_stats(device)
+        _analysis_path, recommended_checkpoint = self._write_automatic_analysis()
+        terminal_status = read_json_retry(self.status_path, {}) or {}
+        terminal_message = str(
+            terminal_status.get("message")
+            or ("training complete" if result_status == "complete" else "training stopped")
+        )
+        if config.auto_evaluate_checkpoints:
+            del built
+            del optimizer, scheduler, scaler
+            del train_loader, val_loader, batch, loss, values
+            del first_adapter, scaled_loss, grad_norm_tensor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                recommended_checkpoint = self._run_automatic_evaluation(
+                    terminal_phase=result_status,
+                    terminal_message=terminal_message,
+                    recommended_checkpoint=recommended_checkpoint,
+                )
+            except Exception as exc:
+                self.log(
+                    f">> automatic checkpoint evaluation failed but training is safe: {exc}"
+                )
+                self.write_status(
+                    phase=result_status,
+                    message=terminal_message,
+                    recommended_checkpoint=recommended_checkpoint,
+                )
+        elif recommended_checkpoint:
+            self.write_status(recommended_checkpoint=recommended_checkpoint)
         return TrainingResult(
             status=result_status,
             step=global_step,

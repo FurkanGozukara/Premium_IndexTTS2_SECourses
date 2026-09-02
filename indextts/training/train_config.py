@@ -55,6 +55,8 @@ class TrainConfig:
     val_fraction: float = 0.05
     val_every_steps: int = 50
     val_max_batches: int = 20
+    early_stop_patience: int = 0
+    early_stop_min_delta: float = 0.0
     save_every_epochs: int = 1
     save_every_steps: int = 0
     keep_last_n: int = 3
@@ -71,6 +73,9 @@ class TrainConfig:
     sample_runtime_tier: str = "auto"
     sample_min_free_vram_gb: float = 6.0
     sample_timeout_s: float = 300.0
+    auto_analyze: bool = True
+    auto_evaluate_checkpoints: bool = True
+    eval_timeout_s: float = 900.0
 
     seed: int = 42
     num_workers: int = 2
@@ -140,6 +145,8 @@ class TrainConfig:
         self.val_fraction = min(0.5, max(0.0, float(self.val_fraction)))
         self.val_every_steps = max(0, int(self.val_every_steps))
         self.val_max_batches = max(1, int(self.val_max_batches))
+        self.early_stop_patience = max(0, int(self.early_stop_patience))
+        self.early_stop_min_delta = max(0.0, float(self.early_stop_min_delta))
         self.save_every_epochs = max(0, int(self.save_every_epochs))
         self.save_every_steps = max(0, int(self.save_every_steps))
         self.keep_last_n = max(0, int(self.keep_last_n))
@@ -149,6 +156,7 @@ class TrainConfig:
         self.sample_every_epochs = max(1, int(self.sample_every_epochs))
         self.sample_min_free_vram_gb = max(0.0, float(self.sample_min_free_vram_gb))
         self.sample_timeout_s = max(1.0, float(self.sample_timeout_s))
+        self.eval_timeout_s = max(1.0, float(self.eval_timeout_s))
         self.num_workers = max(0, int(self.num_workers))
         self.log_every_steps = max(1, int(self.log_every_steps))
         self.attention_backend = str(self.attention_backend).lower()

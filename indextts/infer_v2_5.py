@@ -567,11 +567,11 @@ class IndexTTS2:
             from indextts.lora.apply import (
                 apply_lora,
                 merge_lora_for_inference,
+                move_adapters_to_device,
                 remove_lora,
                 set_lora_strength,
                 unmerge_lora_from_model,
             )
-            from indextts.lora.layers import LoRAAdapter
         except ImportError:
             if requested:
                 print(">> LoRA support is not installed yet; continuing without an adapter.")
@@ -604,12 +604,7 @@ class IndexTTS2:
         if not os.path.isfile(requested):
             raise FileNotFoundError(f"LoRA/DoRA adapter not found: {requested}")
         self._lora_handle = apply_lora(self.gpt, requested, strength)
-        for module in self.gpt.modules():
-            if isinstance(module, LoRAAdapter):
-                module.lora_A.to(self.device)
-                module.lora_B.to(self.device)
-                if module.lora_magnitude is not None:
-                    module.lora_magnitude.data = module.lora_magnitude.data.to(self.device)
+        move_adapters_to_device(self.gpt, self.device)
         self._lora_path = resolved
         self._lora_strength = strength
         self.runtime.lora_path = requested

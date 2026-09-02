@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Dict
+
+from .atomic_json import write_json_atomic
 
 
 TASK_ID_RE = re.compile(r"^(\d{4})")
@@ -101,6 +102,4 @@ def build_segment_output_path(segments_dir: str, cue_order: int) -> str:
 
 
 def write_metadata_file(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, ensure_ascii=False)
+    write_json_atomic(path, data, indent=2, ensure_ascii=False)

@@ -49,6 +49,11 @@ indextts/training/           # dataset preparation + training (task TRAINING)
     features.py              # feature caching (text tokens, semantic codes, campplus emb, emo vec) using the loaded models
     dataset.py               # torch Dataset/collate over cached features
     trainer.py               # TrainConfig + LoRA/DoRA trainer loop (block swap aware, grad checkpointing, val, samples)
+    analysis.py              # CPU-only metrics analysis, phase verdicts, recommended checkpoint
+    checkpoint_eval.py       # teacher-forced base/checkpoint comparison on matching train/validation splits
+    eval_worker.py           # isolated checkpoint-evaluation worker and status/progress contract
+    grid.py                  # deterministic checkpoint/strength/reference/text listening grids
+    grid_worker.py           # isolated listening-grid worker and status/progress contract
     train_worker.py          # subprocess entry: python -m indextts.training.train_worker --config cfg.json --state-dir DIR
     prep_worker.py           # subprocess entry for dataset preparation
     charts.py                # helpers that turn metrics.jsonl into pandas frames for gr.LinePlot
@@ -60,13 +65,14 @@ ui/                          # Gradio UI modules (task UI)
     batch_tab.py             # Batch Generation tab
     dataset_tab.py           # LoRA Dataset Preparation tab
     training_tab.py          # LoRA / DoRA Training tab (+ LoRA manager)
+    grid_tab.py              # Checkpoint Grid, generalization verdicts, evaluation and saved-grid playback
     models_tab.py            # Models & Performance tab (VRAM presets, model variant download, device, block swap)
     help_tab.py              # Help / About
 webui.py                     # thin entry point: CLI args, builds tabs, launches
 webui_generation_runner.py   # generation orchestration (in-process or subprocess); already exists, extended
 webui_subprocess_worker.py   # generation subprocess entry; already exists, extended (runtime + lora + progress)
-tests/                       # pytest unit tests (CPU-only by default; GPU tests skipped unless CUDA available)
-tools/                       # CLI tools: vram_benchmark.py, convert_int8.py wrapper, etc.
+tests/                       # pytest unit tests (CPU-only by default; GPU tests require an explicit opt-in)
+tools/                       # CLI tools, including evaluate_checkpoints.py and generate_grid.py
 ```
 Delete obsolete legacy code only in task CLEANUP (see that spec). Other tasks must not delete files.
 
@@ -189,6 +195,24 @@ append `state_dir/metrics.jsonl` (one JSON per logged step: step, epoch, loss, a
 append `state_dir/log.txt`, and honour `state_dir/stop.flag` (graceful: finish step, save, exit) and process kill.
 The parent UI uses the same `_terminate_process_tree` approach as webui.py for hard cancel.
 
+Completed and gracefully stopped training runs can write `loras/<name>/analysis/training_analysis.json`
+and `training_analysis.md`. Measured evaluation adds `checkpoint_eval.json` and `checkpoint_eval.md` in the
+same folder. `training_analysis` is derived only from `metrics.jsonl`; `checkpoint_eval` loads the base GPT,
+reconstructs the saved validation split, evaluates the base model first, and then hot-swaps adapters. Status
+records expose `analysis_path`, `evaluation_path`, and `recommended_checkpoint` when available.
+
+Checkpoint evaluation workers run as
+`python -m indextts.training.eval_worker --config <json> --state-dir <dir>`. Their state directory contains
+atomic `status.json` and `progress.json`, plus `log.txt`; status moves through `initializing`, `evaluating`,
+and `complete` or `failed`. The report itself always lands in the adapter's `analysis/` folder.
+
+Listening-grid workers run as
+`python -m indextts.training.grid_worker --config <json> --state-dir <grid-dir>`. Each grid is stored at
+`outputs/grids/<grid-name>/` with atomic `grid.json`, readable `grid.md`, `status.json`, `progress.json`,
+`log.txt`, one top-level WAV per cell, and reproducibility artifacts below `.cells/<cell>/`. Cell order is
+checkpoint, strength, reference, then text. The generation engine is constructed once and adapters are hot
+swapped between cells. `outputs/grids/` is never treated as an ordinary recent Voice Generation task.
+
 ## LoRA file contract (indextts/lora/io.py)
 Single `.safetensors` file. Tensor keys: `<module_path>.lora_A.weight`, `<module_path>.lora_B.weight`,
 `<module_path>.lora_magnitude` (DoRA only), plus optional full tensors `full.<module_path>.<param>` for fully
@@ -211,7 +235,8 @@ with MB/s and ETA. No silent long operations.
 
 ## Testing policy
 - `tests/` uses pytest; CPU-only tests must pass with `venv\Scripts\python.exe -m pytest tests -q`.
-- GPU tests are marked `@pytest.mark.gpu` and skipped if CUDA is unavailable.
+- GPU tests are marked `@pytest.mark.gpu` and are opt-in with
+  `INDEXTTS_RUN_GPU_TESTS=1`; they are also skipped when CUDA is unavailable.
 - Each task adds tests for its modules.
 
 ## Atomic status/progress files (added after a Windows race was observed)

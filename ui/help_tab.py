@@ -22,7 +22,15 @@ Use one speaker, natural pacing, little echo, and no music. A representative cli
 1. **Prepare:** add media and sidecar captions in **LoRA Dataset Preparation**, scan the files, then prepare clean 24 kHz segments.
 2. **Cache:** inspect segment statistics and audio, then select **Cache features now**. Training requires the cache index.
 3. **Train:** choose the dataset in **LoRA / DoRA Training**. DoRA, rank 32, BF16, gradient checkpointing, and validation are the recommended defaults.
-4. **Use:** after a checkpoint is saved, select **Use this LoRA in Voice Generation**. Strength 1.0 reproduces the trained scale.
+4. **Use:** after a checkpoint is saved, select **Use recommended checkpoint in Voice Generation**. Strength 1.0 reproduces the trained scale.
+
+## Which checkpoint should I use?
+
+Validation loss checks sentences the adapter never saw during training, and lower is better. Training loss checks the clips it is actively learning. When training loss keeps falling but validation loss rises, the adapter is memorizing those clips instead of learning a voice that transfers cleanly to new text. The app calls that overfitting.
+
+After training, the app analyzes the log and recommends the checkpoint with the lowest end-of-epoch validation loss. Use **Checkpoint Grid** to compare that checkpoint with the base model, the final file, other saved epochs, and optional strength values. Keep the text, reference, and seed fixed, then listen down the rows. A measured checkpoint evaluation can add unseen-text and training-text accuracy to the verdict before you generate the grid.
+
+Set **Keep last N** to 0 when you want every epoch available for comparison. Early stopping can end a run after validation stops improving, while the `analysis/` folder preserves the automatic verdict and any measured comparison.
 
 ## VRAM Tiers
 

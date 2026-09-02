@@ -6,6 +6,10 @@
 - GPU VRAM presets for 6, 8, 10, 12, 16, 24, and 32 GB cards, including GPT block swapping for lower-VRAM GPUs.
 - Optional INT8 ConvRot GPT model for memory-efficient generation while retaining the required 2.5 codec and vocoder models.
 - LoRA and DoRA dataset preparation and training tabs, including subtitle-driven segmentation and training progress charts.
+- Checkpoint Grid tab for listening to the base model, recommended checkpoint, final file, saved epochs, and strength variants with identical text, references, and seed.
+- Automatic generalization analysis identifies the lowest validation-loss epoch, marks the sustained overfitting region, and makes Voice Generation prefer the recommended checkpoint.
+- Optional validation-based early stopping and automatic measured checkpoint evaluation after the training model releases its memory.
+- Every adapter keeps machine-readable and plain-language reports under `loras/<adapter>/analysis/`; listening grids are saved under `outputs/grids/`.
 - Batch voice generation with reusable system and user presets.
 - Live generation, download, dataset, and training progress with speed and ETA reporting.
 - Cross-platform one-click installers and launchers for Windows, Massed Compute, RunPod, SimplePod, and other Linux hosts.

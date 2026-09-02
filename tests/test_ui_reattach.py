@@ -1,3 +1,4 @@
+import time
 import json
 import os
 from pathlib import Path
@@ -159,3 +160,22 @@ def test_dataset_wording_and_chart_placeholders_keep_frontend_contract(tmp_path:
         assert pd.api.types.is_float_dtype(placeholder["value"])
     plotted = loss_frame(pd.DataFrame([{"step": 1, "loss": 1.0, "avg_loss": 0.9, "val_loss": 0.8}]))
     assert set(plotted["series"]).issubset(LOSS_SERIES)
+
+
+def test_training_state_discovery_ignores_evaluation_job_folders(tmp_path: Path) -> None:
+    from ui.training_tab import latest_training_state
+
+    adapter = tmp_path / "voice_adapter"
+    adapter.mkdir()
+    (adapter / "status.json").write_text(json.dumps({"phase": "complete"}), encoding="utf-8")
+    job = adapter / "analysis" / "eval_jobs" / "20260902_000000"
+    job.mkdir(parents=True)
+    (job / "status.json").write_text(json.dumps({"phase": "evaluating"}), encoding="utf-8")
+    sample = adapter / "samples" / ".sample_jobs" / "epoch_001"
+    sample.mkdir(parents=True)
+    (sample / "status.json").write_text(json.dumps({"phase": "generating"}), encoding="utf-8")
+    newer = time.time() + 60
+    os.utime(job / "status.json", (newer, newer))
+    os.utime(sample / "status.json", (newer + 1, newer + 1))
+
+    assert latest_training_state(tmp_path) == str(adapter.resolve())

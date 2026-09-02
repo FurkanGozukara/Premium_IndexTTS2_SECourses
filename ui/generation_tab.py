@@ -639,7 +639,7 @@ def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int =
         lowered = [part.lower() for part in parts]
         if any(part.startswith("_") for part in parts):
             continue
-        if any(part in {"worker_runtime_e2e", ".sample_jobs"} for part in lowered):
+        if any(part in {"grids", "worker_runtime_e2e", ".sample_jobs"} for part in lowered):
             continue
         first = lowered[0] if lowered else ""
         if first.startswith("ui_") and any(
