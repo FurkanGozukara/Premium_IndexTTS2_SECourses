@@ -2,7 +2,6 @@ import os
 import torch
 import librosa
 import json5
-from huggingface_hub import hf_hub_download
 from transformers import SeamlessM4TFeatureExtractor, Wav2Vec2BertModel
 import safetensors
 import numpy as np
@@ -87,16 +86,12 @@ class JsonHParams:
 
 def build_semantic_model(
     path_='./models/tts/maskgct/ckpt/wav2vec2bert_stats.pt',
-    model_name_or_path="facebook/w2v-bert-2.0",
-    cache_dir=None,
-    local_files_only=False,
+    model_path="facebook/w2v-bert-2.0",
+    local_files_only: bool | None = None,
 ):
-    semantic_model = Wav2Vec2BertModel.from_pretrained(
-        model_name_or_path,
-        cache_dir=cache_dir,
-        local_files_only=local_files_only,
-    )
-    semantic_model.eval()
+    if local_files_only is None:
+        local_files_only = os.path.isdir(model_path)
+    semantic_model = Wav2Vec2BertModel.from_pretrained(model_path, local_files_only=local_files_only)
     stat_mean_var = torch.load(path_)
     semantic_mean = stat_mean_var["mean"]
     semantic_std = torch.sqrt(stat_mean_var["var"])

@@ -145,19 +145,9 @@ class Transformer(nn.Module):
             for b in self.layers:
                 b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype).to(device)
 
-        # Create and register as buffers so they move with the model between devices
-        freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim,
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim,
                                               self.config.rope_base, dtype).to(device)
-        # Delete existing attribute if present and register as buffer
-        if hasattr(self, 'freqs_cis'):
-            delattr(self, 'freqs_cis')
-        self.register_buffer('freqs_cis', freqs_cis)
-
-        causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)).to(device)
-        # Delete existing attribute if present and register as buffer
-        if hasattr(self, 'causal_mask'):
-            delattr(self, 'causal_mask')
-        self.register_buffer('causal_mask', causal_mask)
+        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)).to(device)
         self.use_kv_cache = use_kv_cache
         self.uvit_skip_connection = self.config.uvit_skip_connection
         if self.uvit_skip_connection:

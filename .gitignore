@@ -30,6 +30,7 @@ desktop.ini
 /cache/
 /checkpoints/*
 !/checkpoints/*.yaml
+/models/
 /outputs/
 indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
 a.png
@@ -37,4 +38,4 @@ demo_voice_for_test.mp3
 test2.srt
 gradio/
 Trellis_2_3D_Generator/
-presets/
+/presets/user/

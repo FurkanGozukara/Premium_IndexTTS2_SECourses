@@ -1,5 +1,12 @@
 # IndexTTS2 SECourses Premium Voice Cloning and Generation App - 1-Click to Install on Windows, RunPod and Massed Compute - Generate Entire Audiobooks With Consistent High Quality Voice
 
+## 2 September 2026 IndexTTS 2.5 Upgrade
+
+- Uses the official `IndexTeam/IndexTTS-2.5` model and multilingual 2.5 inference stack.
+- Downloads and loads every model from the repository-relative `models` folder.
+- Stores read-only application defaults in `presets/system` and user global presets in `presets/user`, so a user preset cannot overwrite a system preset.
+- Supports real section micro-batching, subprocess cancellation, emotion reference/text/vector controls, caption timing, and main-process generation on IndexTTS 2.5.
+
 ## This app is made only for SECourses Patreon users : https://www.patreon.com/posts/139297407
 
 ### Download app from here > https://www.patreon.com/posts/139297407

@@ -10,6 +10,7 @@ import wave
 
 import librosa
 import numpy as np
+from scipy.signal import resample
 
 
 TIMECODE_RE = re.compile(
@@ -513,7 +514,13 @@ def fit_audio_to_duration(
 
     for channel_idx in range(matrix.shape[1]):
         samples = matrix[:, channel_idx].astype(np.float32) / 32768.0
-        stretched = librosa.effects.time_stretch(samples, rate=stretch_rate)
+        expected_samples = max(1, int(round(samples.shape[0] / stretch_rate)))
+        if samples.shape[0] < 2048:
+            stretched = resample(samples, expected_samples)
+        else:
+            stretched = librosa.effects.time_stretch(samples, rate=stretch_rate)
+            if not np.isfinite(stretched).all():
+                stretched = resample(samples, expected_samples)
         stretched_channels.append(stretched)
 
     max_len = max(channel.shape[0] for channel in stretched_channels)

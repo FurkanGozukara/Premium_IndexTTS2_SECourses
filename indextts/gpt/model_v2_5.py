@@ -5,32 +5,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import transformers
-from transformers import GPT2Config, GPT2Model, GPT2PreTrainedModel, LogitsProcessorList
-from transformers.generation.utils import GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-try:
-    from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
-except ImportError:
-    def get_device_map(layer_count, devices):
-        devices = list(devices)
-        if not devices:
-            return {"cpu": list(range(layer_count))}
-        return {
-            device: list(range(device, layer_count, len(devices)))
-            for device in devices
-        }
+from transformers import GPT2Config, LogitsProcessorList
+from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
 
-    def assert_device_map(device_map, layer_count):
-        mapped_layers = sorted(layer for layers in device_map.values() for layer in layers)
-        if mapped_layers != list(range(layer_count)):
-            raise ValueError("The device map must assign every transformer layer exactly once.")
+# from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.utils.model_parallel_utils import (assert_device_map,
+                                                     get_device_map)
 
 from indextts.gpt.conformer_encoder import ConformerEncoder
 from indextts.gpt.perceiver import PerceiverResampler
 from indextts.utils.arch_util import AttentionBlock
 from indextts.utils.typical_sampling import TypicalLogitsWarper
 from indextts.utils.tokenizer import LANGUAGE_DICT
-
 
 def null_position_embeddings(range, dim):
     return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
@@ -55,7 +42,7 @@ class ResBlock(nn.Module):
         return F.relu(self.net(x) + x)
 
 
-class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
+class GPT2InferenceModel(GPT2PreTrainedModel):
     def __init__(self, config, gpt, text_pos_emb, embeddings, norm, linear, kv_cache=False):
         super().__init__(config)
         # Note: the argument named `text_pos_emb` here actually represents the mel position embedding
@@ -104,15 +91,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         token_type_ids = kwargs.get("token_type_ids", None)  # usually None
         if not self.kv_cache:
             past_key_values = None
-        has_past = False
-        if past_key_values is not None:
-            if hasattr(past_key_values, "get_seq_length"):
-                has_past = int(past_key_values.get_seq_length()) > 0
-            elif isinstance(past_key_values, (tuple, list)) and past_key_values:
-                first_layer = past_key_values[0]
-                has_past = bool(first_layer) and first_layer[0].shape[-2] > 0
         # only last token for inputs_ids if past is defined in kwargs
-        if has_past:
+        if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
                 token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
@@ -124,7 +104,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
-            if has_past:
+            if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
@@ -286,8 +266,6 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
                             n_embd=model_dim,
                             n_layer=layers,
                             n_head=heads,
-                            bos_token_id=None,
-                            eos_token_id=None,
                             gradient_checkpointing=checkpointing,
                             use_cache=not checkpointing)
     gpt = GPT2Model(gpt_config)
@@ -329,8 +307,7 @@ class UnifiedVoice(nn.Module):
                  start_text_token=0, stop_text_token=1, number_mel_codes=8194, start_mel_token=8192, stop_mel_token=8193,
                  train_solo_embeddings=False, use_mel_codes_as_input=True,
                  checkpointing=True, types=1,
-                 condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False,
-                 spk_cond_mode="conformer"):
+                 condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False):
         """
         Args:
             layers: Number of layers in transformer stack.
@@ -369,29 +346,7 @@ class UnifiedVoice(nn.Module):
         self.cond_num = condition_num_latent
         self.cond_mask_pad = nn.ConstantPad1d((self.cond_num, 0), True)
         self.emo_cond_mask_pad = nn.ConstantPad1d((1, 0), True)
-        self.spk_cond_mode = spk_cond_mode
-        if spk_cond_mode == "campplus":
-            self.spk_emb_proj = nn.Linear(192, model_dim)
-        else:
-            if condition_type == "perceiver":
-                self.conditioning_encoder = ConditioningEncoder(1024, model_dim, num_attn_heads=heads)
-                self.perceiver_encoder = PerceiverResampler(model_dim, dim_context=model_dim, num_latents=self.cond_num)
-            elif condition_type == "conformer_perceiver" or condition_type == "conformer_encoder":
-                self.conditioning_encoder = ConformerEncoder(input_size=1024,
-                                                             output_size=condition_module['output_size'],
-                                                             linear_units=condition_module['linear_units'],
-                                                             attention_heads=condition_module['attention_heads'],
-                                                             num_blocks=condition_module['num_blocks'],
-                                                             input_layer=condition_module['input_layer'])
-                if condition_type == "conformer_perceiver":
-                    self.perceiver_encoder = PerceiverResampler(model_dim, dim_context=condition_module['output_size'],
-                                                                ff_mult=condition_module['perceiver_mult'],
-                                                                heads=condition_module['attention_heads'],
-                                                                num_latents=self.cond_num)
-            else:
-                self.conditioning_encoder = ConditioningEncoder(1024, model_dim, num_attn_heads=heads, mean=True)
-            self.speed_emb = nn.Embedding(2, model_dim)
-            self.speed_emb.weight.data.normal_(mean=0.0, std=0.0)
+        self.spk_emb_proj = nn.Linear(192, model_dim)
 
         self.emo_conditioning_encoder = ConformerEncoder(input_size=1024,
                                                          output_size=emo_condition_module['output_size'],
@@ -405,10 +360,8 @@ class UnifiedVoice(nn.Module):
                                                             num_latents=1)
 
 
-
         self.text_embedding = nn.Embedding(self.number_text_tokens * types + 1, model_dim)
-        if spk_cond_mode == "campplus":
-            self.lang_embedding = nn.Embedding(len(LANGUAGE_DICT) + 1, model_dim)
+        self.lang_embedding = nn.Embedding(len(LANGUAGE_DICT) + 1, model_dim)
         self.emo_layer = nn.Linear(model_dim, model_dim)
         self.emovec_layer = nn.Linear(1024, model_dim)
 
@@ -449,8 +402,6 @@ class UnifiedVoice(nn.Module):
             n_embd=self.model_dim,
             n_layer=self.layers,
             n_head=self.heads,
-            bos_token_id=None,
-            eos_token_id=None,
             gradient_checkpointing=False,
             use_cache=True,
         )
@@ -632,12 +583,7 @@ class UnifiedVoice(nn.Module):
         """
 
         if do_spk_cond:
-            if self.spk_cond_mode == "campplus":
-                speech_conditioning_latent = self.spk_emb_proj(speech_conditioning_latent)
-                if speech_conditioning_latent.ndim != 3:
-                    speech_conditioning_latent = speech_conditioning_latent.unsqueeze(1)
-            else:
-                speech_conditioning_latent = self.get_conditioning(speech_conditioning_latent.transpose(1,2), cond_mel_lengths)
+            speech_conditioning_latent = self.sv_pipeline([])
         else:
             speech_conditioning_latent = speech_conditioning_latent
 
@@ -652,12 +598,7 @@ class UnifiedVoice(nn.Module):
         mel_codes = self.set_mel_padding(mel_codes, mel_codes_lengths)
         mel_codes = F.pad(mel_codes, (0, 1), value=self.stop_mel_token)
 
-        if self.spk_cond_mode == "campplus":
-            conds = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), torch.zeros(speech_conditioning_latent.size(0), 2, speech_conditioning_latent.size(2)).to(speech_conditioning_latent.device)), 1)
-        else:
-            duration_emb = self.speed_emb(torch.zeros_like(use_speed))
-            duration_emb_half = self.speed_emb(torch.ones_like(use_speed))
-            conds = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
+        conds = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), torch.zeros(speech_conditioning_latent.size(0), 2, speech_conditioning_latent.size(2)).to(speech_conditioning_latent.device)), 1)
         text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
@@ -672,7 +613,7 @@ class UnifiedVoice(nn.Module):
         self,
         conditional_latents: torch.Tensor,
         text_inputs: torch.Tensor,
-        langs: torch.Tensor = None,
+        langs: torch.Tensor,
     ):
         
         """
@@ -700,8 +641,7 @@ class UnifiedVoice(nn.Module):
             text_input = F.pad(text_input, (0, 1), value=self.stop_text_token)
             text_input_pos = torch.arange(0, text_input.size(-1), device=device)
             text_emb = self.text_embedding(text_input) + self.text_pos_embedding.emb(text_input_pos)
-            if langs is not None and self.spk_cond_mode == "campplus":
-                text_emb += self.lang_embedding(langs[i])
+            text_emb += self.lang_embedding(langs)
             # concatenate [conditional latents][text embeddings]
             conds_text_emb = [
                 conditional_latents.squeeze(0) if single_cond else conditional_latents[i],
@@ -736,9 +676,9 @@ class UnifiedVoice(nn.Module):
         fake_inputs[:, -1] = self.start_mel_token
         return fake_inputs, batched_mel_emb, attention_mask
 
-    def inference_speech(self, speech_condition, text_inputs, langs=None,
-                         emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None,
-                         use_speed=False, campplus_embedding=None, wav=None,
+    def inference_speech(self, speech_condition, text_inputs, langs, 
+                         emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, 
+                         use_speed=False, use_campplus=False, wav=None, campplus_embedding=None,
                          input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
         """
@@ -760,25 +700,26 @@ class UnifiedVoice(nn.Module):
         if emo_cond_lengths is None:
             emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device) 
 
-        if self.spk_cond_mode == "campplus":
-            if campplus_embedding is not None:
-                speech_conditioning_latent = campplus_embedding
-            elif wav is not None:
-                if not hasattr(self, 'sv_pipeline'):
-                    from modelscope.pipelines import pipeline
-                    self.sv_pipeline = pipeline(
-                        task='speaker-verification',
-                        model='iic/speech_campplus_sv_zh-cn_16k-common',
-                        device='cpu'
-                    )
-                speech_conditioning_latent = torch.tensor(self.sv_pipeline([wav], output_emb=True)['embs']).to(text_inputs.device)
-            else:
-                raise ValueError("campplus mode requires campplus_embedding or wav")
-            speech_conditioning_latent = self.spk_emb_proj(speech_conditioning_latent)
-            speech_conditioning_latent = speech_conditioning_latent.unsqueeze(0) if speech_conditioning_latent.ndim != 3 else speech_conditioning_latent
+        # 优先使用外部传入的 embedding
+        if campplus_embedding is not None:
+            speech_conditioning_latent = campplus_embedding
+        # 否则从 wav 提取
+        elif wav is not None:
+            if not hasattr(self, 'sv_pipeline'):
+                from modelscope.pipelines import pipeline
+                self.sv_pipeline = pipeline(
+                    task='speaker-verification',
+                    model='iic/speech_campplus_sv_zh-cn_16k-common',
+                    device='cpu'
+                )
+            speech_conditioning_latent = torch.tensor(self.sv_pipeline([wav], output_emb=True)['embs']).to(text_inputs.device)
         else:
-            speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
-
+            raise ValueError("neither campplus_embedding nor wav is provided")
+        
+        # 投影到模型空间
+        speech_conditioning_latent = self.spk_emb_proj(speech_conditioning_latent)
+        speech_conditioning_latent = speech_conditioning_latent.unsqueeze(0) if speech_conditioning_latent.ndim != 3 else speech_conditioning_latent
+        
         if emo_vec is None:
             print('compute emo vec')
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
@@ -787,34 +728,10 @@ class UnifiedVoice(nn.Module):
         else:
             print('Use the specified emotion vector')
 
-        batch_size = text_inputs.size(0)
-        shared_conditioning = speech_conditioning_latent + emo_vec.unsqueeze(1)
-        if shared_conditioning.size(0) == 1 and batch_size > 1:
-            shared_conditioning = shared_conditioning.expand(batch_size, -1, -1)
-        elif shared_conditioning.size(0) != batch_size:
-            raise ValueError(
-                f"conditioning batch size {shared_conditioning.size(0)} does not match text batch size {batch_size}"
-            )
-
-        if self.spk_cond_mode == "campplus":
-            zeros = torch.zeros(
-                batch_size,
-                2,
-                shared_conditioning.size(2),
-                device=shared_conditioning.device,
-                dtype=shared_conditioning.dtype,
-            )
-            conds_latent = torch.cat((shared_conditioning, zeros), dim=1)
-        else:
-            tmp = torch.zeros(batch_size, device=text_inputs.device)
-            duration_emb = self.speed_emb(torch.zeros_like(tmp).long())
-            duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())
-            conds_latent = torch.cat(
-                (shared_conditioning, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)),
-                dim=1,
-            )
+        conds_latent = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), torch.zeros(speech_conditioning_latent.size(0), 2, speech_conditioning_latent.size(2)).to(speech_conditioning_latent.device)), 1)
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(conds_latent, text_inputs, langs)
         self.inference_model.store_mel_emb(inputs_embeds)
+        
         if input_tokens is None:
             inputs = input_ids
         else:
@@ -840,7 +757,7 @@ class UnifiedVoice(nn.Module):
             min_tokens_to_keep = 2 if hf_generate_kwargs.get("num_beams", 1) > 1 else 1
             logits_processor.append(TypicalLogitsWarper(mass=typical_mass, min_tokens_to_keep=min_tokens_to_keep))
         max_length = (trunc_index + self.max_mel_tokens - 1) if max_generate_length is None else trunc_index + max_generate_length
-
+        
         # Use accel engine if available (single sequence only)
         if self.accel_engine is not None and num_return_sequences == 1:
             output = self.accel_engine.generate(
@@ -854,28 +771,16 @@ class UnifiedVoice(nn.Module):
                 tts_text_pos_embedding=self.inference_model.text_pos_embedding,  # text_pos_embedding layer
             )
         else:
-            output = self.inference_model.generate(inputs,
+            output = self.inference_model.generate(inputs, 
                                                 bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token,
                                                 eos_token_id=self.stop_mel_token, attention_mask=attention_mask,
                                                 max_length=max_length, logits_processor=logits_processor,
                                                 num_return_sequences=num_return_sequences,
                                                 **hf_generate_kwargs)
-        def generated_tokens(sequences):
-            prompt = inputs
-            if sequences.shape[0] != prompt.shape[0]:
-                repeat_factor = sequences.shape[0] // prompt.shape[0]
-                prompt = prompt.repeat_interleave(repeat_factor, dim=0)
-            includes_prompt = (
-                sequences.shape[1] >= trunc_index
-                and prompt.shape[0] == sequences.shape[0]
-                and torch.equal(sequences[:, :trunc_index], prompt[:, :trunc_index])
-            )
-            return sequences[:, trunc_index:] if includes_prompt else sequences
-
         if isinstance(output, torch.Tensor):
-            return generated_tokens(output), speech_conditioning_latent
+            return output[:, trunc_index:], speech_conditioning_latent
         # GenerateOutput
-        output.sequences = generated_tokens(output.sequences)
+        output.sequences = output.sequences[:, trunc_index:]
         return output, speech_conditioning_latent
 
     def get_emovec(self, emo_speech_conditioning_latent, emo_cond_lengths):

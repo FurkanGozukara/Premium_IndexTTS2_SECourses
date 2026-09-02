@@ -1,11 +1,39 @@
 import os
 import random
 import re
+import wave
 
 import torch
 import torchaudio
 
 MATPLOTLIB_FLAG = False
+
+# Full-scale value used everywhere we convert between normalized waveforms and
+# 16-bit PCM. 32767 rather than 32768 so that the positive peak cannot overflow.
+PCM16_MAX = 32767.0
+
+
+def save_pcm_wav(path, wav, sampling_rate):
+    """Write a **PCM-scale** waveform to ``path`` as a 16-bit PCM WAV file.
+
+    ``wav`` holds values in ``[-32767, 32767]`` and may be either an integer tensor
+    or the float tensor produced by ``torch.clamp(PCM16_MAX * wav, ...)``. The
+    standard-library WAV writer avoids Torchaudio's optional TorchCodec dependency
+    and keeps output behavior stable across Torchaudio releases.
+    """
+    pcm = wav.detach().to(device="cpu", dtype=torch.float32)
+    pcm = pcm.clamp_(-PCM16_MAX, PCM16_MAX).round().to(torch.int16)
+    if pcm.ndim == 1:
+        pcm = pcm.unsqueeze(0)
+    if pcm.ndim != 2:
+        raise ValueError(f"Expected [channels, samples] audio, received shape {tuple(pcm.shape)}")
+
+    interleaved = pcm.transpose(0, 1).contiguous().numpy().astype("<i2", copy=False)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(pcm.shape[0])
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sampling_rate))
+        wav_file.writeframes(interleaved.tobytes())
 
 
 def load_audio(audiopath, sampling_rate):
@@ -62,22 +90,23 @@ def de_tokenized_by_CJK_char(line: str, do_lower_case=False) -> str:
       output = "see you!"
     """
     # replace english words in the line with placeholders
-    english_word_pattern = re.compile(r"([A-Z]+(?:[\s-][A-Z-]+)*)", re.IGNORECASE)
+    english_word_pattern = re.compile(r"([A-Z]+(?:[\s'-][A-Z-]+)*)", re.IGNORECASE)
     english_sents = english_word_pattern.findall(line)
     for i, sent in enumerate(english_sents):
         line = line.replace(sent, f"<sent_{i}>")
 
     words = line.split()
     # restore english sentences
-    sent_placeholder_pattern = re.compile(r"^.*?(<sent_(\d+)>)")
+    sent_placeholder_pattern = re.compile(r"(<sent_(\d+)>)")
     for i in range(len(words)):
-        m = sent_placeholder_pattern.match(words[i])
-        if m:
+        all_matches = sent_placeholder_pattern.findall(words[i])
+        if len(all_matches) > 1:
             # restore the english word
-            placeholder_index = int(m.group(2))
-            words[i] = words[i].replace(m.group(1), english_sents[placeholder_index])
-            if do_lower_case:
-                words[i] = words[i].lower()
+            for h,j in all_matches:
+                placeholder_index = int(j)
+                words[i] = words[i].replace(h, english_sents[placeholder_index])
+                if do_lower_case:
+                    words[i] = words[i].lower()
     return "".join(words)
 
 

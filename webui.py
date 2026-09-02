@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -37,8 +38,15 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
-parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
-parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
+parser.add_argument("--model_dir", type=str, default="./models", help="IndexTTS 2.5 model directory")
+parser.add_argument(
+    "--bf16",
+    "--fp16",
+    dest="bf16",
+    action="store_true",
+    default=False,
+    help="Use BF16 for IndexTTS 2.5 inference if available",
+)
 parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
 parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
 parser.add_argument("--gui_seg_tokens", type=int, default=80, help="GUI: Max tokens per generation segment")
@@ -50,11 +58,12 @@ if not os.path.exists(cmd_args.model_dir):
     sys.exit(1)
 
 for file in [
-    "bpe.model",
     "gpt.pth",
     "config.yaml",
     "s2mel.pth",
-    "wav2vec2bert_stats.pt"
+    "codec.pth",
+    "multilingual_zh_ja_yue_char_del.tiktoken",
+    "wav2vec2bert_stats.pt",
 ]:
     file_path = os.path.join(cmd_args.model_dir, file)
     if not os.path.exists(file_path):
@@ -63,7 +72,7 @@ for file in [
 
 import gradio as gr
 from omegaconf import OmegaConf
-from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.tokenizer import get_tokenizer
 from indextts.utils.subtitle_utils import (
     SUPPORTED_SUBTITLE_EXTENSIONS,
     assemble_subtitle_audio,
@@ -128,7 +137,7 @@ def _build_tts_runtime_options():
     return {
         "model_dir": cmd_args.model_dir,
         "cfg_path": os.path.join(cmd_args.model_dir, "config.yaml"),
-        "use_fp16": bool(cmd_args.fp16),
+        "use_bf16": bool(cmd_args.bf16),
         "use_deepspeed": bool(cmd_args.deepspeed),
         "use_cuda_kernel": bool(cmd_args.cuda_kernel),
     }
@@ -137,10 +146,14 @@ def _build_tts_runtime_options():
 PREVIEW_CFG = OmegaConf.load(os.path.join(cmd_args.model_dir, "config.yaml"))
 PREVIEW_MAX_TEXT_TOKENS = int(PREVIEW_CFG.gpt.max_text_tokens)
 MODEL_VERSION = str(getattr(PREVIEW_CFG, "version", "1.0"))
-PREVIEW_BPE_PATH = os.path.join(cmd_args.model_dir, PREVIEW_CFG.dataset["bpe_model"])
-PREVIEW_TEXT_NORMALIZER = TextNormalizer()
-PREVIEW_TEXT_NORMALIZER.load()
-PREVIEW_TEXT_TOKENIZER = TextTokenizer(PREVIEW_BPE_PATH, PREVIEW_TEXT_NORMALIZER)
+if MODEL_VERSION != "2.5":
+    raise RuntimeError(
+        f"The checkpoint config reports IndexTTS {MODEL_VERSION}; IndexTTS 2.5 models are required."
+    )
+PREVIEW_TEXT_TOKENIZER = get_tokenizer(multilingual=True, model_dir=cmd_args.model_dir)
+PREVIEW_SPLIT_PROTECTED_PATTERN = re.compile(
+    r"<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>"
+)
 
 
 def _create_inprocess_tts():
@@ -196,11 +209,7 @@ def unload_inprocess_tts():
         except Exception:
             pass
     return True
-# 支持的语言列表
-LANGUAGES = {
-    "中文": "zh_CN",
-    "English": "en_US"
-}
+LANGUAGE_CHOICES = ["ZH", "EN", "JA", "AR", "ES"]
 EMO_CHOICES_ALL = ["Same as speaker voice",
                 "Use emotion reference audio",
                 "Use emotion vector control",
@@ -209,16 +218,36 @@ EMO_CHOICES_ALL = ["Same as speaker voice",
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 os.makedirs("outputs/used_audios",exist_ok=True)
-PRESETS_DIR = os.path.join(current_dir, "presets")
-os.makedirs(PRESETS_DIR, exist_ok=True)
-
 UI_PRESET_VERSION = "1.0"
 UI_PRESET_FORMAT = "indextts2_premium_ui"
 DEFAULT_UI_PRESET_NAME = "default"
 _LAST_USED_UI_PRESET_FILE = ".last_used_ui_preset.txt"
+PRESETS_DIR = os.path.join(current_dir, "presets")
+SYSTEM_PRESETS_DIR = os.path.join(PRESETS_DIR, "system")
+USER_PRESETS_DIR = os.path.join(PRESETS_DIR, "user")
+os.makedirs(SYSTEM_PRESETS_DIR, exist_ok=True)
+os.makedirs(USER_PRESETS_DIR, exist_ok=True)
+
+
+def _migrate_legacy_ui_presets() -> None:
+    """Move legacy flat user presets into the isolated user preset folder."""
+    root = Path(PRESETS_DIR)
+    user_root = Path(USER_PRESETS_DIR)
+    for legacy_path in root.glob("*.json"):
+        target_path = user_root / legacy_path.name
+        if not target_path.exists():
+            legacy_path.replace(target_path)
+
+    legacy_last_used = root / _LAST_USED_UI_PRESET_FILE
+    user_last_used = user_root / _LAST_USED_UI_PRESET_FILE
+    if legacy_last_used.exists() and not user_last_used.exists():
+        legacy_last_used.replace(user_last_used)
+
+
+_migrate_legacy_ui_presets()
 
 MAX_LENGTH_TO_USE_SPEED = 70
-APP_TITLE = "Index TTS2 Premium SECourses App"
+APP_TITLE = "IndexTTS 2.5 Premium SECourses App"
 APP_ASSETS_DIR = os.path.join(current_dir, "ui_assets")
 APP_FAVICON_PATH = os.path.join(APP_ASSETS_DIR, "indextts_premium_favicon.svg")
 SUBTITLE_TIMING_INTERVAL_SILENCE_MS = 0
@@ -1143,6 +1172,7 @@ def _prepare_generation_request(
     emo_control_method,
     prompt,
     text,
+    language,
     subtitle_mode,
     subtitle_file,
     save_used_audio,
@@ -1283,6 +1313,8 @@ def _prepare_generation_request(
     subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
     subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
     resolved_settings = {
+        "model_version": MODEL_VERSION,
+        "language": str(language or "EN").upper(),
         "emotion_control_method_index": emo_control_method,
         "emotion_control_method_label": EMO_CHOICES_ALL[emo_control_method]
         if 0 <= emo_control_method < len(EMO_CHOICES_ALL)
@@ -1325,6 +1357,7 @@ def _prepare_generation_request(
         },
         "inputs": {
             "text": text,
+            "language": str(language or "EN").upper(),
             "speaker_reference_audio": abs_path_or_none(prompt),
             "emotion_reference_audio": abs_path_or_none(emo_ref_path),
             "subtitle_file": abs_path_or_none(subtitle_file),
@@ -1409,6 +1442,7 @@ def _prepare_generation_request(
         "task_id": task_layout["task_id"],
         "prompt": prompt,
         "text": text,
+        "language": str(language or "EN").upper(),
         "subtitle_mode": subtitle_mode,
         "subtitle_file": subtitle_file,
         "save_used_audio": bool(save_used_audio),
@@ -1488,10 +1522,7 @@ def _run_generation_subprocess(request):
         _cleanup_temp_file(result_path)
 
 
-def cancel_generation_process(use_subprocess_system, cancel_confirmed):
-    if not cancel_confirmed:
-        return gr.update()
-
+def cancel_generation_process(use_subprocess_system):
     with _SUBPROCESS_STATE_LOCK:
         process = _SUBPROCESS_STATE.get("process")
         metadata_path = _SUBPROCESS_STATE.get("metadata_path")
@@ -1540,16 +1571,75 @@ def resolve_max_text_tokens(max_text_tokens_per_segment):
         return 120
 
 
-def get_text_processing_sections(text, max_text_tokens_per_segment):
+def _preview_token_len(text):
+    return len(PREVIEW_TEXT_TOKENIZER.encode(text, allowed_special="all"))
+
+
+def _split_preview_text(text, max_tokens, language):
+    lang_prefix = f'<|{str(language or "EN").lower()}|> '
+    budget = max(1, min(int(max_tokens), PREVIEW_MAX_TEXT_TOKENS) - _preview_token_len(lang_prefix))
+    if _preview_token_len(text) <= budget:
+        return [text]
+
+    pieces = []
+    position = 0
+    for match in PREVIEW_SPLIT_PROTECTED_PATTERN.finditer(text):
+        if match.start() > position:
+            pieces.append((text[position:match.start()], False))
+        pieces.append((match.group(0), True))
+        position = match.end()
+    if position < len(text):
+        pieces.append((text[position:], False))
+
+    chunks = []
+    for piece, atomic in pieces:
+        if atomic:
+            chunks.append(piece)
+            continue
+        for part in re.split(r"(?<=[，。！？、；：,\.!\?;:\n])", piece):
+            if not part:
+                continue
+            if _preview_token_len(part) <= budget:
+                chunks.append(part)
+                continue
+            current = ""
+            for character in part:
+                if current and _preview_token_len(current + character) > budget:
+                    chunks.append(current)
+                    current = character
+                else:
+                    current += character
+            if current:
+                chunks.append(current)
+
+    segments = []
+    current = ""
+    for chunk in chunks:
+        if current and _preview_token_len(current + chunk) > budget:
+            segments.append(current)
+            current = chunk
+        else:
+            current += chunk
+    if current:
+        segments.append(current)
+    return segments or [text]
+
+
+def get_text_processing_sections(text, max_text_tokens_per_segment, language="EN"):
     if not text:
         return []
 
     max_tokens = resolve_max_text_tokens(max_text_tokens_per_segment)
-    text_tokens_list = PREVIEW_TEXT_TOKENIZER.tokenize(text)
-    return PREVIEW_TEXT_TOKENIZER.split_segments(text_tokens_list, max_text_tokens_per_segment=max_tokens)
+    return _split_preview_text(text, max_tokens, language)
 
 
-def build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
+def build_section_count_message(
+    text,
+    max_text_tokens_per_segment,
+    subtitle_mode=False,
+    subtitle_file=None,
+    language="EN",
+):
     if subtitle_mode and subtitle_file:
         try:
             cues = parse_subtitle_file(subtitle_file)
@@ -1557,7 +1647,9 @@ def build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode
             processing_sections = 0
             for unit in render_units:
                 if unit.text.strip():
-                    processing_sections += len(get_text_processing_sections(unit.text, max_text_tokens_per_segment))
+                    processing_sections += len(
+                        get_text_processing_sections(unit.text, max_text_tokens_per_segment, language)
+                    )
 
             if processing_sections == len(render_units):
                 return (
@@ -1575,11 +1667,17 @@ def build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode
         except Exception as e:
             return f"**Current Sections:** Unable to read subtitle file: {html.escape(str(e))}"
 
-    sections = get_text_processing_sections(text, max_text_tokens_per_segment)
+    sections = get_text_processing_sections(text, max_text_tokens_per_segment, language)
     return f"**Current Sections:** {len(sections)} text section{'' if len(sections) == 1 else 's'}"
 
 
-def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, subtitle_file=None):
+def get_preview_rows(
+    text,
+    max_text_tokens_per_segment,
+    subtitle_mode=False,
+    subtitle_file=None,
+    language="EN",
+):
     if subtitle_mode and subtitle_file:
         try:
             cues = parse_subtitle_file(subtitle_file)
@@ -1595,17 +1693,17 @@ def get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode=False, sub
     if not text:
         return []
 
-    segments = get_text_processing_sections(text, max_text_tokens_per_segment)
+    segments = get_text_processing_sections(text, max_text_tokens_per_segment, language)
 
     data = []
-    for i, segment_tokens in enumerate(segments):
-        segment_str = ''.join(segment_tokens)
-        tokens_count = len(segment_tokens)
+    lang_prefix = f'<|{str(language or "EN").lower()}|> '
+    for i, segment_str in enumerate(segments):
+        tokens_count = _preview_token_len(lang_prefix + segment_str)
         data.append([i, "Text Segment", segment_str, f"{tokens_count} tokens"])
     return data
 
 
-def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, save_used_audio, output_filename, image_input,
+def gen_single(emo_control_method, prompt, text, language, subtitle_mode, subtitle_file, save_used_audio, output_filename, image_input,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
@@ -1651,6 +1749,7 @@ def gen_single(emo_control_method,prompt, text, subtitle_mode, subtitle_file, sa
         emo_control_method,
         prompt,
         text,
+        language,
         subtitle_mode,
         subtitle_file,
         save_used_audio,
@@ -1726,24 +1825,42 @@ def _sanitize_preset_name(name: str) -> str:
     return safe.strip("._") or "default"
 
 
-def _ui_preset_path(preset_name: str) -> Path:
-    return Path(PRESETS_DIR) / f"{_sanitize_preset_name(preset_name)}.json"
+def _system_ui_preset_path(preset_name: str) -> Path:
+    return Path(SYSTEM_PRESETS_DIR) / f"{_sanitize_preset_name(preset_name)}.json"
+
+
+def _user_ui_preset_path(preset_name: str) -> Path:
+    return Path(USER_PRESETS_DIR) / f"{_sanitize_preset_name(preset_name)}.json"
+
+
+def _system_ui_preset_names() -> List[str]:
+    names = {
+        p.stem
+        for p in Path(SYSTEM_PRESETS_DIR).glob("*.json")
+        if p.is_file()
+    }
+    names.add(DEFAULT_UI_PRESET_NAME)
+    return sorted(names)
 
 
 def _list_ui_presets() -> List[str]:
-    root = Path(PRESETS_DIR)
-    saved = sorted(
+    system_names = _system_ui_preset_names()
+    protected_names = set(system_names)
+    user_names = sorted(
         p.stem
-        for p in root.glob("*.json")
-        if p.is_file() and p.stem != DEFAULT_UI_PRESET_NAME
+        for p in Path(USER_PRESETS_DIR).glob("*.json")
+        if p.is_file() and p.stem not in protected_names
     )
-    return [DEFAULT_UI_PRESET_NAME] + saved
+    ordered_system_names = [DEFAULT_UI_PRESET_NAME] + [
+        name for name in system_names if name != DEFAULT_UI_PRESET_NAME
+    ]
+    return ordered_system_names + user_names
 
 
 def _set_last_used_ui_preset(preset_name: str) -> None:
     try:
-        Path(PRESETS_DIR).mkdir(parents=True, exist_ok=True)
-        (Path(PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE).write_text(
+        Path(USER_PRESETS_DIR).mkdir(parents=True, exist_ok=True)
+        (Path(USER_PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE).write_text(
             _sanitize_preset_name(preset_name),
             encoding="utf-8",
         )
@@ -1752,7 +1869,7 @@ def _set_last_used_ui_preset(preset_name: str) -> None:
 
 
 def _get_last_used_ui_preset() -> Optional[str]:
-    path = Path(PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE
+    path = Path(USER_PRESETS_DIR) / _LAST_USED_UI_PRESET_FILE
     if not path.exists():
         return None
 
@@ -1769,8 +1886,8 @@ def _save_ui_preset(preset_name: str, config: Dict[str, Any]) -> str:
         raise ValueError("Preset name cannot be empty.")
 
     safe_name = _sanitize_preset_name(preset_name)
-    if safe_name == DEFAULT_UI_PRESET_NAME:
-        raise ValueError(f"Preset name '{DEFAULT_UI_PRESET_NAME}' is reserved.")
+    if safe_name in _system_ui_preset_names():
+        raise ValueError(f"Preset name '{safe_name}' is reserved by a system preset.")
 
     cfg = dict(config)
     cfg.setdefault("_meta", {})
@@ -1780,7 +1897,7 @@ def _save_ui_preset(preset_name: str, config: Dict[str, Any]) -> str:
     if "created_at" not in cfg["_meta"]:
         cfg["_meta"]["created_at"] = cfg["_meta"]["last_modified"]
 
-    out_path = _ui_preset_path(safe_name)
+    out_path = _user_ui_preset_path(safe_name)
     tmp_path = out_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(out_path)
@@ -1789,10 +1906,12 @@ def _save_ui_preset(preset_name: str, config: Dict[str, Any]) -> str:
 
 
 def _load_ui_preset(preset_name: str) -> Optional[Dict[str, Any]]:
-    if not preset_name or str(preset_name).strip() == DEFAULT_UI_PRESET_NAME:
+    if not preset_name:
         return None
 
-    path = _ui_preset_path(preset_name)
+    safe_name = _sanitize_preset_name(preset_name)
+    system_path = _system_ui_preset_path(safe_name)
+    path = system_path if system_path.exists() else _user_ui_preset_path(safe_name)
     if not path.exists():
         return None
 
@@ -1806,10 +1925,14 @@ def _load_ui_preset(preset_name: str) -> Optional[Dict[str, Any]]:
 
 
 def _delete_ui_preset(preset_name: str) -> bool:
-    if not preset_name or str(preset_name).strip() == DEFAULT_UI_PRESET_NAME:
+    if not preset_name:
         return False
 
-    path = _ui_preset_path(preset_name)
+    safe_name = _sanitize_preset_name(preset_name)
+    if safe_name in _system_ui_preset_names():
+        return False
+
+    path = _user_ui_preset_path(safe_name)
     if not path.exists():
         return False
 
@@ -1824,7 +1947,7 @@ theme = gr.themes.Soft()
 theme.font = [gr.themes.GoogleFont("Inter"), "Tahoma", "ui-sans-serif", "system-ui", "sans-serif"]
 with gr.Blocks(title=APP_TITLE) as demo:
     mutex = threading.Lock()
-    gr.Markdown("## Index TTS2 Premium SECourses App V4.1 : https://www.patreon.com/posts/139297407")
+    gr.Markdown("## IndexTTS 2.5 Premium SECourses App : https://www.patreon.com/posts/139297407")
 
     with gr.Tab("Audio Generation"):
         with gr.Row(equal_height=False):
@@ -1927,6 +2050,12 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     elem_id="input-text-source",
                     placeholder="Enter the text you want to convert to speech",
                     info=f"Model v{MODEL_VERSION} | Supports multiple languages. Long texts are automatically segmented. Upload a caption file (.srt/.vtt/.sbv) when you want cue-by-cue timing."
+                )
+                language_choice = gr.Dropdown(
+                    choices=LANGUAGE_CHOICES,
+                    value="EN",
+                    label="Synthesis Language",
+                    info="Select the language of the target text: Chinese, English, Japanese, Arabic, or Spanish.",
                 )
                 section_count_refresh_signal = gr.Textbox(
                     value="",
@@ -2039,7 +2168,6 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     elem_classes=["action-button"],
                 )
                 cancel_process_note = gr.Markdown("Small note: works only when subprocess mode is enabled.")
-                cancel_confirm_signal = gr.Checkbox(value=False, visible=False)
                 cancel_process_status = gr.Markdown("")
 
         with gr.Accordion("Function Settings"):
@@ -2378,6 +2506,14 @@ with gr.Blocks(title=APP_TITLE) as demo:
                        emo_bias_disgust, emo_bias_depression, emo_bias_surprise, emo_bias_calm]
 
         _CONFIG_FIELDS = [
+            {
+                "section": "audio_generation",
+                "key": "language",
+                "component": language_choice,
+                "default": "EN",
+                "kind": "choice",
+                "choices": LANGUAGE_CHOICES,
+            },
             {"section": "audio_generation", "key": "autoregressive_batch_size", "component": autoregressive_batch_size, "default": 1, "kind": "int", "min": 1, "max": 8},
             {"section": "audio_generation", "key": "output_filename", "component": output_filename, "default": "", "kind": "str"},
             {"section": "audio_generation", "key": "save_used_audio", "component": save_used_audio, "default": False, "kind": "bool"},
@@ -2467,6 +2603,20 @@ with gr.Blocks(title=APP_TITLE) as demo:
             for field in _CONFIG_FIELDS:
                 cfg[field["section"]][field["key"]] = field["default"]
             return cfg
+
+        def _ensure_system_default_ui_preset() -> None:
+            cfg = _default_ui_config()
+            cfg["_meta"]["scope"] = "system"
+            cfg["_meta"]["read_only"] = True
+            out_path = _system_ui_preset_path(DEFAULT_UI_PRESET_NAME)
+            serialized = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+            if out_path.exists() and out_path.read_text(encoding="utf-8") == serialized:
+                return
+            tmp_path = out_path.with_suffix(".json.tmp")
+            tmp_path.write_text(serialized, encoding="utf-8")
+            tmp_path.replace(out_path)
+
+        _ensure_system_default_ui_preset()
 
         def _merge_ui_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             merged = _default_ui_config()
@@ -2609,17 +2759,20 @@ with gr.Blocks(title=APP_TITLE) as demo:
             text_value = current_text
             subtitle_mode_value = bool(current_subtitle_mode)
             max_tokens_value = normalized["audio_generation"]["max_text_tokens_per_segment"]
+            language_value = normalized["audio_generation"]["language"]
             preview_rows = get_preview_rows(
                 text_value,
                 max_tokens_value,
                 subtitle_mode_value,
                 current_subtitle_file,
+                language_value,
             )
             section_count = build_section_count_message(
                 text_value,
                 max_tokens_value,
                 subtitle_mode_value,
                 current_subtitle_file,
+                language_value,
             )
             return values + list(on_method_change(normalized["audio_generation"]["emo_control_method"])) + [
                 gr.update(value=preview_rows, visible=True, type="array"),
@@ -2651,14 +2804,15 @@ with gr.Blocks(title=APP_TITLE) as demo:
             requested = (preset_name or "").strip()
             if not requested or requested == DEFAULT_UI_PRESET_NAME:
                 _set_last_used_ui_preset(DEFAULT_UI_PRESET_NAME)
+                default_cfg = _load_ui_preset(DEFAULT_UI_PRESET_NAME) or _default_ui_config()
                 return (
                     *_preset_component_updates(
-                        _default_ui_config(),
+                        default_cfg,
                         current_text,
                         current_subtitle_mode,
                         current_subtitle_file,
                     ),
-                    "INFO: Loaded default settings.",
+                    "INFO: Loaded read-only system defaults.",
                 )
 
             cfg = _load_ui_preset(requested)
@@ -2682,6 +2836,26 @@ with gr.Blocks(title=APP_TITLE) as demo:
                     current_subtitle_file,
                 ),
                 f"✅ Loaded preset **{requested}**",
+            )
+
+        def _load_initial_preset_ui(
+            preset_name: str,
+            current_text: str,
+            current_subtitle_mode: bool,
+            current_subtitle_file: Optional[str],
+        ):
+            choices = _list_ui_presets()
+            requested = (preset_name or "").strip()
+            if requested not in choices:
+                requested = DEFAULT_UI_PRESET_NAME
+            return (
+                gr.update(choices=choices, value=requested),
+                *_load_preset_ui(
+                    requested,
+                    current_text,
+                    current_subtitle_mode,
+                    current_subtitle_file,
+                ),
             )
 
         def _reset_defaults_ui(current_text: str, current_subtitle_mode: bool, current_subtitle_file: Optional[str]):
@@ -2806,10 +2980,28 @@ with gr.Blocks(title=APP_TITLE) as demo:
             return gr.update(value=extracted_audio), gr.update(value=status, visible=True)
         return gr.update(), gr.update(value=status or "Failed to load audio file", visible=True)
 
-    def load_subtitle_file(subtitle_file_path, current_text, subtitle_mode, max_text_tokens_per_segment):
+    def load_subtitle_file(
+        subtitle_file_path,
+        current_text,
+        subtitle_mode,
+        max_text_tokens_per_segment,
+        language,
+    ):
         if not subtitle_file_path:
-            preview_rows = get_preview_rows(current_text, max_text_tokens_per_segment, False, None)
-            section_count = build_section_count_message(current_text, max_text_tokens_per_segment, False, None)
+            preview_rows = get_preview_rows(
+                current_text,
+                max_text_tokens_per_segment,
+                False,
+                None,
+                language,
+            )
+            section_count = build_section_count_message(
+                current_text,
+                max_text_tokens_per_segment,
+                False,
+                None,
+                language,
+            )
             return (
                 current_text,
                 gr.update(value=False),
@@ -2827,12 +3019,14 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 max_text_tokens_per_segment,
                 use_subtitle_timing,
                 subtitle_file_path,
+                language,
             )
             section_count = build_section_count_message(
                 subtitle_text,
                 max_text_tokens_per_segment,
                 use_subtitle_timing,
                 subtitle_file_path,
+                language,
             )
             return (
                 subtitle_text,
@@ -2851,9 +3045,27 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 gr.update(value=f"**Current Sections:** Unable to read subtitle file: {html.escape(str(e))}"),
             )
 
-    def on_segmentation_inputs_change(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path):
-        data = get_preview_rows(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path)
-        section_count = build_section_count_message(text, max_text_tokens_per_segment, subtitle_mode, subtitle_file_path)
+    def on_segmentation_inputs_change(
+        text,
+        max_text_tokens_per_segment,
+        subtitle_mode,
+        subtitle_file_path,
+        language,
+    ):
+        data = get_preview_rows(
+            text,
+            max_text_tokens_per_segment,
+            subtitle_mode,
+            subtitle_file_path,
+            language,
+        )
+        section_count = build_section_count_message(
+            text,
+            max_text_tokens_per_segment,
+            subtitle_mode,
+            subtitle_file_path,
+            language,
+        )
         return (
             gr.update(value=data, visible=True, type="array"),
             gr.update(value=section_count),
@@ -2901,7 +3113,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     section_count_refresh_signal.change(
         on_segmentation_inputs_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file, language_choice],
         outputs=[segments_preview, section_count_label],
         queue=False,
         show_progress="hidden"
@@ -2909,13 +3121,19 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     subtitle_mode.change(
         on_segmentation_inputs_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file],
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file, language_choice],
         outputs=[segments_preview, section_count_label]
+    )
+
+    language_choice.change(
+        on_segmentation_inputs_change,
+        inputs=[input_text_single, max_text_tokens_per_segment, subtitle_mode, subtitle_file, language_choice],
+        outputs=[segments_preview, section_count_label],
     )
 
     subtitle_file.change(
         load_subtitle_file,
-        inputs=[subtitle_file, input_text_single, subtitle_mode, max_text_tokens_per_segment],
+        inputs=[subtitle_file, input_text_single, subtitle_mode, max_text_tokens_per_segment, language_choice],
         outputs=[input_text_single, subtitle_mode, subtitle_status, segments_preview, section_count_label]
     )
 
@@ -2965,7 +3183,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
     )
 
     gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, subtitle_mode, subtitle_file, save_used_audio, output_filename, mp4_image_input, emo_upload, emo_weight,
+                     inputs=[emo_control_method, prompt_audio, input_text_single, language_choice, subtitle_mode, subtitle_file, save_used_audio, output_filename, mp4_image_input, emo_upload, emo_weight,
                               vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                                emo_text,emo_random,
                                max_text_tokens_per_segment,
@@ -2981,16 +3199,10 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     cancel_process_button.click(
         fn=cancel_generation_process,
-        inputs=[use_subprocess_system, cancel_confirm_signal],
+        inputs=[use_subprocess_system],
         outputs=[cancel_process_status],
         queue=False,
         show_progress="hidden",
-        js="""
-        (use_subprocess_system, _signal) => [
-            use_subprocess_system,
-            window.confirm("Cancel the running generation subprocess?")
-        ]
-        """,
     )
 
     ui_preset_save_btn.click(
@@ -3029,9 +3241,9 @@ with gr.Blocks(title=APP_TITLE) as demo:
         show_progress="hidden",
     )
     demo.load(
-        fn=_load_preset_ui,
+        fn=_load_initial_preset_ui,
         inputs=[ui_preset_dropdown, input_text_single, subtitle_mode, subtitle_file],
-        outputs=_CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
+        outputs=[ui_preset_dropdown] + _CONFIG_COMPONENTS + _PRESET_AUX_OUTPUTS + [ui_preset_status],
         queue=False,
         show_progress="hidden",
     )

@@ -54,14 +54,22 @@ FFMPEG_AVAILABLE = check_ffmpeg()
 
 
 def create_tts(runtime_options: Dict[str, Any]):
-    from indextts.infer_v2 import IndexTTS2
+    import torch
+
+    from indextts.infer_v2_5 import IndexTTS2
+
+    use_bf16 = bool(runtime_options.get("use_bf16", runtime_options.get("use_fp16")))
+    if use_bf16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        print(">> BF16 is unavailable on this GPU; using full precision.")
+        use_bf16 = False
 
     return IndexTTS2(
         model_dir=runtime_options["model_dir"],
         cfg_path=runtime_options["cfg_path"],
-        use_fp16=bool(runtime_options.get("use_fp16")),
+        use_bf16=use_bf16,
         use_deepspeed=bool(runtime_options.get("use_deepspeed")),
         use_cuda_kernel=bool(runtime_options.get("use_cuda_kernel")),
+        use_qwen_emo=True,
     )
 
 
@@ -361,11 +369,16 @@ def run_generation_request(
     text = request["text"]
     subtitle_mode = bool(request["subtitle_mode"])
     subtitle_file = request.get("subtitle_file")
+    language = str(request.get("language") or "EN").upper()
     save_used_audio = bool(request["save_used_audio"])
     save_as_mp3 = bool(request["save_as_mp3"])
     mp3_bitrate = request["mp3_bitrate"]
     image_path = request.get("image_path")
     infer_kwargs = dict(request["infer_kwargs"])
+    section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
+    latent_multiplier = float(infer_kwargs.pop("latent_multiplier", 1.72))
+    infer_kwargs["duration_factor"] = latent_multiplier / 1.72
+    infer_kwargs.pop("max_emotion_sum", None)
     low_memory_mode = bool(request["low_memory_mode"])
     task_layout = dict(request["task_layout"])
     metadata_path = request["metadata_path"]
@@ -379,7 +392,7 @@ def run_generation_request(
     video_output = None
 
     tts.gr_progress = progress_callback
-    tts.hybrid_model_device = low_memory_mode
+    tts.low_vram = bool(low_memory_mode or getattr(tts, "low_vram", False))
 
     try:
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
@@ -406,16 +419,22 @@ def run_generation_request(
                 subtitle_infer_kwargs["console_progress_enabled"] = True
                 subtitle_infer_kwargs["console_progress_label"] = "Subtitle synthesis"
                 subtitle_infer_kwargs["console_progress_item_label"] = "section"
-                base_latent_multiplier = float(subtitle_infer_kwargs["latent_multiplier"])
+                base_latent_multiplier = latent_multiplier
                 processing_sections = sum(
-                    len(tts.tokenizer.split_segments(tts.tokenizer.tokenize(unit.text), request["max_text_tokens"]))
+                    len(
+                        tts.split_text_by_tokens(
+                            unit.text,
+                            request["max_text_tokens"],
+                            f'<|{language.lower()}|> ',
+                        )
+                    )
                     for unit in non_empty_units
                 )
                 unit_render_futures = {}
                 print(
                     f">> Subtitle timing started | cues {len(subtitle_cues)} | "
                     f"timing units {len(subtitle_render_units)} | sections {processing_sections} | "
-                    f"batch size {subtitle_infer_kwargs['section_batch_size']}"
+                    f"batch size {section_batch_size}"
                 )
                 if non_empty_units:
                     worker_count = max(1, min(4, os.cpu_count() or 1))
@@ -445,6 +464,8 @@ def run_generation_request(
                         spk_audio_prompt=prompt,
                         texts=[unit.text for unit in non_empty_units],
                         on_text_complete=schedule_subtitle_unit_timing,
+                        lang=language,
+                        section_batch_size=section_batch_size,
                         **subtitle_infer_kwargs,
                     )
 
@@ -553,12 +574,27 @@ def run_generation_request(
                 subtitle_file=subtitle_file,
             )
         else:
-            output = tts.infer(
-                spk_audio_prompt=prompt,
-                text=text,
-                output_path=output_path,
-                **infer_kwargs,
-            )
+            if section_batch_size > 1:
+                batch_results = tts.infer_texts(
+                    spk_audio_prompt=prompt,
+                    texts=[text],
+                    lang=language,
+                    section_batch_size=section_batch_size,
+                    console_progress_label="Text synthesis",
+                    **infer_kwargs,
+                )
+                if not batch_results or batch_results[0] is None:
+                    raise RuntimeError("IndexTTS 2.5 did not return audio for the text request.")
+                output_rate, output_audio = batch_results[0]
+                output = save_pcm16_wav(output_audio, output_rate, output_path)
+            else:
+                output = tts.infer(
+                    spk_audio_prompt=prompt,
+                    text=text,
+                    output_path=output_path,
+                    lang=language,
+                    **infer_kwargs,
+                )
 
         if save_used_audio and prompt:
             try:

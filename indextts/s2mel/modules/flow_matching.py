@@ -87,11 +87,11 @@ class BASECFM(torch.nn.Module, ABC):
             if inference_cfg_rate > 0:
                 # Stack original and CFG (null) inputs for batched processing
                 stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
-                stacked_x_lens = torch.cat([x_lens, x_lens], dim=0)
                 stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
                 stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
                 stacked_x = torch.cat([x, x], dim=0)
-                stacked_t = t.repeat(stacked_x.size(0))
+                stacked_t = t.expand(stacked_x.size(0))
+                stacked_x_lens = torch.cat([x_lens, x_lens], dim=0)
 
                 # Perform a single forward pass for both original and CFG inputs
                 stacked_dphi_dt = self.estimator(
@@ -104,7 +104,7 @@ class BASECFM(torch.nn.Module, ABC):
                 # Apply CFG formula
                 dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t.repeat(B), style, mu)
+                dphi_dt = self.estimator(x, prompt_x, x_lens, t.expand(B), style, mu)
 
             x = x + dt * dphi_dt
             t = t + dt
@@ -170,3 +170,18 @@ class CFM(BASECFM):
             self.estimator = DiT(args)
         else:
             raise NotImplementedError(f"Unknown diffusion type {args.dit_type}")
+
+    def enable_torch_compile(self):
+        """Enable torch.compile optimization for the estimator model.
+
+        This method applies torch.compile to the estimator (DiT model) for significant
+        performance improvements during inference. It also configures distributed
+        training optimizations if applicable.
+        """
+        if torch.distributed.is_initialized():
+            torch._inductor.config.reorder_for_compute_comm_overlap = True
+        self.estimator = torch.compile(
+            self.estimator,
+            fullgraph=True,
+            dynamic=True,
+        )
