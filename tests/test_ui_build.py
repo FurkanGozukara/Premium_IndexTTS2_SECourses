@@ -1,4 +1,5 @@
 from dataclasses import fields
+import json
 from types import SimpleNamespace
 import warnings
 
@@ -8,6 +9,7 @@ from indextts.training.train_config import TrainConfig
 from ui.app import build_app
 from ui.batch_tab import _batch_items
 from ui.generation_tab import GENERATION_DEFAULTS
+from ui.training_tab import TRAIN_DEFAULTS
 
 
 def test_build_app_constructs_all_tabs_without_loading_models():
@@ -61,11 +63,47 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "grid.texts",
         "grid.references",
         "grid.seed",
+        "grid.eval_reference_mode",
+        "grid.eval_train_subset",
+        "grid.eval_include_base",
+        "grid.num_beams",
     }.issubset(keys)
     default_path = demo.preset_store.system_dir / "default.json"
     before = default_path.read_bytes()
     demo.preset_store.ensure_system_presets()
     assert default_path.read_bytes() == before
+    values = json.loads(before.decode("utf-8"))["values"]
+    assert values["grid.eval_reference_mode"] == ""
+    assert values["grid.eval_train_subset"] == 48
+    assert values["grid.eval_include_base"] is True
+    assert values["grid.num_beams"] == GENERATION_DEFAULTS["generation.num_beams"]
+
+    measured_fields = (
+        "rank",
+        "alpha",
+        "learning_rate",
+        "epochs",
+        "speaker_ref_mode",
+        "emo_ref_mode",
+        "val_reference_mode",
+        "keep_last_n",
+        "epoch_train_state",
+        "sample_speaking_rate",
+    )
+    config_defaults = TrainConfig(
+        dataset_dir="datasets/secourses_demo", name="voice_adapter"
+    ).to_dict()
+    registry_defaults = demo.preset_registry.defaults()
+    for field_name in measured_fields:
+        key = f"training.{field_name}"
+        assert TRAIN_DEFAULTS[field_name] == config_defaults[field_name]
+        assert registry_defaults[key] == config_defaults[field_name]
+        for preset_path in demo.preset_store.system_dir.glob("*.json"):
+            preset_values = json.loads(preset_path.read_text(encoding="utf-8"))["values"]
+            assert preset_values[key] == config_defaults[field_name]
+    assert registry_defaults["generation.speaking_rate"] == 1.0
+    assert registry_defaults["generation.auto_lora_speaking_rate"] is True
+    assert registry_defaults["grid.speaking_rate"] == 1.0
 
 
 def test_blank_batch_folder_does_not_scan_working_directory(tmp_path, monkeypatch):

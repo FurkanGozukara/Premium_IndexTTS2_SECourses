@@ -13,22 +13,38 @@ HELP_MARKDOWN = r"""
 3. Leave the quality defaults in place and select **Generate voice**. Models load only on this first run.
 4. Watch section progress, elapsed time, ETA, realtime speed, VRAM, and the live console tail. Every task is saved below `outputs/`.
 
+Load last values restores the last run of every tab; nothing from earlier runs is shown until you click it in the header.
+
 ## Reference Audio
 
-Use one speaker, natural pacing, little echo, and no music. A representative clip is better than a very long one. The media extractor accepts common audio/video formats and can merge ranges such as `1:4; 8:13`. A LoRA/DoRA can carry a recommended reference; the adapter selector loads it only when the current reference is empty.
+Use one speaker, natural pacing, little echo, and no music. A representative clip is better than a very long one. The media extractor accepts common audio/video formats and can merge ranges such as `1:4; 8:13`. A LoRA / DoRA can carry a recommended reference; the LoRA / DoRA selector loads it only when the current reference is empty.
 
-## LoRA Workflow
+## LoRA / DoRA Workflow
 
 1. **Prepare:** add media and sidecar captions in **LoRA Dataset Preparation**, scan the files, then prepare clean 24 kHz segments.
 2. **Cache:** inspect segment statistics and audio, then select **Cache features now**. Training requires the cache index.
-3. **Train:** choose the dataset in **LoRA / DoRA Training**. DoRA, rank 32, BF16, gradient checkpointing, and validation are the recommended defaults.
-4. **Use:** after a checkpoint is saved, select **Use best checkpoint**, which opens the Voice Generation tab with that adapter selected. Strength 1.0 reproduces the trained scale.
+3. **Train:** choose the dataset in **LoRA / DoRA Training**. The measured quality defaults are DoRA, rank 128, alpha 129, learning rate 5e-5, 20 epochs, speaker reference `other`, emotion reference `follow_speaker`, validation reference `other`, and every epoch checkpoint kept (`keep_last_n=0`) without its large optimizer sidecar (`epoch_train_state=False`); BF16 and gradient checkpointing stay on.
+4. **Use:** after a checkpoint is saved, select **Use best checkpoint**, which opens the Voice Generation tab with that LoRA / DoRA selected. Strength 1.0 reproduces the trained scale.
+
+**Speaker reference mode:** `self` uses the target clip, `other` uses a deterministic different clip from the same speaker, and `mixed` alternates between them.
+
+**Emotion reference mode:** `self`, `other`, and `mixed` choose emotion independently, while `follow_speaker` uses the exact clip selected for the speaker embedding and matches inference.
+
+**Validation reference mode:** `self` validates with the target clip, while `other` uses a different same-speaker clip for both speaker and emotion conditioning to measure inference-like generalization.
+
+## Speaking Rate
+
+Speaking rate 1.0 is the model's natural pace; values below 1.0 speak more slowly and values above 1.0 speak faster. Training samples calibrate a completed LoRA / DoRA automatically, and **Calibrate speaking rate from this grid** can measure a saved listening grid. Voice Generation auto-applies the saved value so the trained voice matches the words-per-second pace of its recordings.
 
 ## Which checkpoint should I use?
 
-Validation loss checks sentences the adapter never saw during training, and lower is better. Training loss checks the clips it is actively learning. When training loss keeps falling but validation loss rises, the adapter is memorizing those clips instead of learning a voice that transfers cleanly to new text. The app calls that overfitting.
+Validation loss checks sentences the LoRA / DoRA never saw during training, and lower is better. Training loss checks the clips it is actively learning. When training loss keeps falling but validation loss rises, the LoRA / DoRA is memorizing those clips instead of learning a voice that transfers cleanly to new text. The app calls that overfitting.
 
-After training, the app analyzes the log and recommends the checkpoint with the lowest end-of-epoch validation loss. Use **Checkpoint Grid** to compare that checkpoint with the base model, the final file, other saved epochs, and optional strength values. Keep the text, reference, and seed fixed, then listen down the rows. A measured checkpoint evaluation can add unseen-text and training-text accuracy to the verdict before you generate the grid.
+After training, the app analyzes the log and recommends the checkpoint with the lowest end-of-epoch validation loss. Use **Checkpoint Grid** to compare that checkpoint with **Base model (no LoRA / DoRA)**, the final file, other saved epochs, and optional strength values. Keep the text, reference, and seed fixed, then listen down the rows. A measured checkpoint evaluation can add unseen-text and training-text accuracy to the verdict before you generate the grid.
+
+The **Base model (no LoRA / DoRA)** row is a plain voice clone: only the reference audio shapes the voice. Its verdict is **Reference-only baseline (no LoRA / DoRA)** and it has no strength value.
+
+For **Evaluation references**, **Same as training validation** reuses the run's validation setting, **self** conditions each validation clip on itself, and **other (inference-like: a different clip of the same speaker)** measures the more realistic different-clip workflow.
 
 Set **Keep last N** to 0 when you want every epoch available for comparison. Early stopping can end a run after validation stops improving, while the `analysis/` folder preserves the automatic verdict and any measured comparison.
 
@@ -55,7 +71,7 @@ Named tiers are conservative and reserve about 2 GB. Select a tier in **Models &
 - **CFG rate:** strength of diffusion conditioning. 0.7 is balanced.
 - **CFM temperature:** diffusion noise scale. 1.0 is the best-quality default.
 - **Segment tokens:** bounds each autoregressive section. EN/ES 60, AR 80, JA 100, and ZH 120 are recommended.
-- **Latent multiplier:** converts semantic-code length to acoustic duration. 1.72 is the natural baseline.
+- **Latent multiplier:** converts semantic-code length to acoustic duration; speaking rate divides this value before inference, so normal use can leave 1.72 unchanged.
 - **Semantic layer:** reference encoder layer used for speaker/emotion conditioning. Layer 17 is trained and recommended.
 - **Section batch size:** number of text sections generated together. Increase only within the active VRAM tier hint.
 - **Audio tuning:** optional FFmpeg post-processing. Bypass preserves the model waveform exactly.

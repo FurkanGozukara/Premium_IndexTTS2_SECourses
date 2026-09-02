@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import ui.batch_tab as batch_tab
+import ui.generation_tab as generation_tab
 from ui.app import build_app
 from ui.dataset_tab import dataset_status_to_panel, dataset_status_updates
 from ui.generation_tab import build_generation_request, recent_outputs
@@ -35,6 +37,28 @@ def test_cpu_ui_flow_mappings_without_loading_models(tmp_path):
     assert request["runtime"]["lora_merge_into_base"] is False
     assert request["lora_merge_into_base"] is False
     assert request["infer_kwargs"]["section_batch_size"] == 1
+
+    paced_values = {
+        **demo.preset_registry.defaults(),
+        "generation.latent_multiplier": 2.05,
+        "generation.speaking_rate": 0.8,
+    }
+    paced_request = build_generation_request(paced_values)
+    assert paced_request["infer_kwargs"]["latent_multiplier"] == 2.5625
+
+    reference = tmp_path / "batch-reference.wav"
+    reference.write_bytes(b"batch reference placeholder")
+    batch_request = batch_tab.prepare_generation_request(
+        paced_values,
+        prompt=str(reference),
+        text="Batch uses the shared speaking-rate request builder.",
+        subtitle_file=None,
+        image_path=None,
+        emotion_audio=None,
+        model_dir=str(ROOT / "models"),
+        output_root=tmp_path / "batch-output",
+    )
+    assert batch_request["infer_kwargs"]["latent_multiplier"] == 2.5625
 
     zero_strength_values = {
         **demo.preset_registry.defaults(),
@@ -121,3 +145,34 @@ def test_recent_outputs_only_returns_user_task_folders(tmp_path):
 
     rows = recent_outputs(tmp_path, limit=20)
     assert [row[0] for row in rows] == ["user-task"]
+
+
+def test_lora_selection_auto_applies_and_resets_calibrated_speaking_rate(
+    monkeypatch,
+) -> None:
+    report = SimpleNamespace(
+        recommended_speaking_rate=0.81,
+        dataset_words_per_second=2.67,
+        generated_words_per_second=3.30,
+    )
+    monkeypatch.setattr(
+        generation_tab,
+        "_lora_info",
+        lambda _path: ("adapter info", None),
+    )
+    monkeypatch.setattr(
+        generation_tab,
+        "load_speaking_rate",
+        lambda _path: report,
+    )
+
+    selected = generation_tab.lora_selection_updates(
+        "voice.safetensors", None, True, True
+    )
+    assert selected[0] == "adapter info"
+    assert selected[3] == 0.81
+    assert "Applied calibrated speaking rate 0.81" in selected[2]
+
+    cleared = generation_tab.lora_selection_updates("", None, True, True)
+    assert cleared[3] == 1.0
+    assert "natural pace" in cleared[2]

@@ -1,4 +1,4 @@
-"""Teacher-forced comparison of saved adapters on the original data split."""
+"""Teacher-forced comparison of saved LoRA / DoRA files on the original data split."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from indextts.runtime.progress import ProgressReporter
 from indextts.utils.atomic_json import write_json_atomic
 
 from .analysis import (
+    BASE_CHECKPOINT_LABEL,
     GENERALIZATION_LEGEND,
     _write_text_atomic,
     checkpoint_descriptor,
@@ -44,6 +45,24 @@ def _float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def parse_strengths(text: str) -> list[float]:
+    """Parse the shared comma-separated LoRA / DoRA strength contract."""
+
+    pieces = [piece.strip() for piece in str(text or "").replace(";", ",").split(",")]
+    strengths: list[float] = []
+    for piece in pieces:
+        if not piece:
+            continue
+        value = float(piece)
+        if not math.isfinite(value) or not 0.0 <= value <= 4.0:
+            raise ValueError("Strengths must be comma-separated values from 0 to 4")
+        if value not in strengths:
+            strengths.append(value)
+    if not strengths:
+        raise ValueError("Enter at least one LoRA / DoRA strength")
+    return strengths
+
+
 @dataclass
 class CheckpointEvalConfig:
     adapter_dir: str
@@ -62,6 +81,7 @@ class CheckpointEvalConfig:
     attention_backend: str = ""
     val_fraction: float | None = None
     seed: int | None = None
+    reference_mode: str = ""
 
     def validate(self) -> "CheckpointEvalConfig":
         self.adapter_dir = str(Path(self.adapter_dir).expanduser().resolve())
@@ -83,6 +103,9 @@ class CheckpointEvalConfig:
             self.val_fraction = min(0.5, max(0.0, float(self.val_fraction)))
         if self.seed is not None:
             self.seed = int(self.seed)
+        self.reference_mode = str(self.reference_mode or "").strip().lower()
+        if self.reference_mode not in {"", "self", "other"}:
+            raise ValueError("reference_mode must be self or other")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,6 +171,7 @@ class CheckpointEvalReport:
     device: str
     generated_at: str
     elapsed_s: float
+    reference_mode: str = "self"
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -162,6 +186,7 @@ class CheckpointEvalReport:
             for item in payload.get("rows", [])
             if isinstance(item, (CheckpointEvalRow, Mapping))
         ]
+        payload.setdefault("reference_mode", "self")
         allowed = {item.name for item in fields(cls)}
         return cls(**{key: item for key, item in payload.items() if key in allowed})
 
@@ -207,7 +232,7 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
     defaults = _training_defaults(adapter_dir, result.checkpoints)
     result.dataset_dir = str(result.dataset_dir or defaults.get("dataset_dir") or "")
     if not result.dataset_dir:
-        raise ValueError("dataset_dir is missing from the evaluation config and adapter metadata")
+        raise ValueError("dataset_dir is missing from the evaluation config and LoRA / DoRA metadata")
     dataset = Path(result.dataset_dir).expanduser()
     if not dataset.is_absolute():
         dataset = Path.cwd() / dataset
@@ -235,6 +260,11 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
         result.val_fraction = float(defaults.get("val_fraction", 0.05))
     if result.seed is None:
         result.seed = int(defaults.get("seed", 42))
+    result.reference_mode = str(
+        result.reference_mode or defaults.get("val_reference_mode") or "self"
+    ).strip().lower()
+    if result.reference_mode not in {"self", "other"}:
+        raise ValueError("reference_mode must be self or other")
     if result.device.startswith("cuda") and not torch.cuda.is_available():
         result.device = "cpu"
     if result.device == "cpu" and result.attention_backend == "flash_attention_2":
@@ -243,7 +273,7 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
 
 
 def build_evaluation_model(config: CheckpointEvalConfig) -> UnifiedVoice:
-    """Load a fresh base GPT with no adapter attached."""
+    """Load a fresh base GPT with no LoRA / DoRA attached."""
 
     device = torch.device(config.device)
     dtype_name = config.base_dtype
@@ -333,17 +363,27 @@ def _row_label(descriptor: Mapping[str, Any], strength: float) -> str:
 def _summary_markdown(
     rows: list[CheckpointEvalRow],
     best: CheckpointEvalRow | None,
+    reference_mode: str,
     analysis: Any = None,
 ) -> str:
     base = next((row for row in rows if row.kind == "base"), None)
-    lines: list[str] = []
+    if reference_mode == "other":
+        reference_sentence = (
+            "Measured with inference-like references (a different clip of the same speaker "
+            "supplies the voice and emotion vectors)."
+        )
+    else:
+        reference_sentence = (
+            "Measured with self references (each validation clip conditions on itself)."
+        )
+    lines: list[str] = [reference_sentence]
     if base is not None and base.val_loss is not None:
         lines.append(
-            f"Without any adapter the base model scores {base.val_loss:.2f}; every checkpoint below "
+            f"{BASE_CHECKPOINT_LABEL} scores {base.val_loss:.2f}; every checkpoint below "
             "that number learned something from your data."
         )
     if best is None or best.val_loss is None:
-        lines.append("No adapter checkpoint produced a measurable validation score.")
+        lines.append("No LoRA / DoRA checkpoint produced a measurable validation score.")
         return "  \n".join(lines) + "\n\n" + GENERALIZATION_LEGEND
     accuracy = (
         f", {best.val_accuracy * 100:.1f}% next-token accuracy"
@@ -446,8 +486,13 @@ def evaluate_checkpoints(
         "max_codes": int(train_defaults.get("max_codes", 1500)),
         "max_text_tokens": int(train_defaults.get("max_text_tokens", 600)),
     }
+    reference_options = (
+        {"speaker_ref_mode": "other", "emo_ref_mode": "follow_speaker"}
+        if cfg.reference_mode == "other"
+        else {"speaker_ref_mode": "self", "emo_ref_mode": "self"}
+    )
     val_dataset = LoraTrainDataset(
-        cfg.dataset_dir, split="val", speaker_ref_mode="self", **dataset_options
+        cfg.dataset_dir, split="val", **reference_options, **dataset_options
     )
     if len(val_dataset) == 0:
         raise ValueError("the configured validation split contains no items")
@@ -456,7 +501,7 @@ def evaluate_checkpoints(
     train_items = 0
     if cfg.train_subset > 0:
         train_dataset = LoraTrainDataset(
-            cfg.dataset_dir, split="train", speaker_ref_mode="self", **dataset_options
+            cfg.dataset_dir, split="train", **reference_options, **dataset_options
         )
         indices = list(range(min(cfg.train_subset, len(train_dataset))))
         train_items = len(indices)
@@ -522,7 +567,12 @@ def evaluate_checkpoints(
     progress.set_stage("evaluating")
     if cfg.include_base:
         evaluate_row(
-            label="base model", path="", kind="base", epoch=None, steps=0, strength=0.0
+            label=BASE_CHECKPOINT_LABEL,
+            path="",
+            kind="base",
+            epoch=None,
+            steps=0,
+            strength=0.0,
         )
     try:
         for descriptor in descriptors:
@@ -570,7 +620,9 @@ def evaluate_checkpoints(
         row for row in rows if row.kind != "base" and row.val_loss is not None
     ]
     best = min(candidates, key=lambda row: float(row.val_loss)) if candidates else None
-    summary = _summary_markdown(rows, best, load_training_analysis(cfg.adapter_dir))
+    summary = _summary_markdown(
+        rows, best, cfg.reference_mode, load_training_analysis(cfg.adapter_dir)
+    )
     elapsed = time.perf_counter() - started
     progress.finish()
     return CheckpointEvalReport(
@@ -586,6 +638,7 @@ def evaluate_checkpoints(
         device=str(device),
         generated_at=_utc_now(),
         elapsed_s=elapsed,
+        reference_mode=cfg.reference_mode,
     )
 
 
@@ -617,5 +670,6 @@ __all__ = [
     "build_evaluation_model",
     "evaluate_checkpoints",
     "load_checkpoint_eval",
+    "parse_strengths",
     "write_checkpoint_eval",
 ]

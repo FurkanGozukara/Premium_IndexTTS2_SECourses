@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,8 +16,8 @@ class TrainConfig:
     output_dir: str = "loras"
 
     adapter_type: str = "dora"
-    rank: int = 32
-    alpha: float = 32.0
+    rank: int = 128
+    alpha: float = 129.0
     dropout: float = 0.05
     target_attention: bool = True
     target_mlp: bool = True
@@ -26,7 +27,7 @@ class TrainConfig:
 
     base_variant: str = "bf16"
     base_dtype: str = "bf16"
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     lr_scheduler: str = "cosine"
     warmup_steps: int = 50
     weight_decay: float = 0.01
@@ -34,7 +35,7 @@ class TrainConfig:
     eps: float = 1e-8
     optimizer: str = "adamw"
 
-    epochs: int = 15
+    epochs: int = 20
     max_steps: int = 0
     batch_size: int = 4
     grad_accumulation: int = 2
@@ -48,21 +49,24 @@ class TrainConfig:
     mel_loss_weight: float = 1.0
     text_loss_weight: float = 0.1
     label_smoothing: float = 0.0
-    speaker_ref_mode: str = "mixed"
+    speaker_ref_mode: str = "other"
+    emo_ref_mode: str = "follow_speaker"
     max_codes: int = 1500
     max_text_tokens: int = 600
 
     val_fraction: float = 0.05
+    val_reference_mode: str = "other"
     val_every_steps: int = 50
     val_max_batches: int = 20
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     save_every_epochs: int = 1
     save_every_steps: int = 0
-    keep_last_n: int = 3
+    keep_last_n: int = 0
     save_best: bool = True
     save_dtype: str = "bf16"
     save_train_state: bool = True
+    epoch_train_state: bool = False
     resume_from: str = ""
     resume_mode: str = "weights_only"
 
@@ -73,8 +77,25 @@ class TrainConfig:
     sample_runtime_tier: str = "auto"
     sample_min_free_vram_gb: float = 6.0
     sample_timeout_s: float = 300.0
+    sample_language: str = "auto"
+    sample_seed: int = -1
+    sample_temperature: float = 0.8
+    sample_top_p: float = 0.8
+    sample_top_k: int = 30
+    sample_repetition_penalty: float = 10.0
+    sample_num_beams: int = 3
+    sample_emo_alpha: float = 0.65
+    sample_diffusion_steps: int = 25
+    sample_inference_cfg_rate: float = 0.7
+    sample_max_text_tokens: int = 60
+    sample_length_penalty: float = 0.0
+    sample_max_mel_tokens: int = 1500
+    sample_speaking_rate: float = 1.0
     auto_analyze: bool = True
     auto_evaluate_checkpoints: bool = True
+    eval_train_subset: int = 48
+    eval_strengths: str = "1.0"
+    eval_include_base: bool = True
     eval_timeout_s: float = 900.0
 
     seed: int = 42
@@ -94,14 +115,14 @@ class TrainConfig:
         self.output_dir = str(self.output_dir or "loras")
         self.adapter_type = str(self.adapter_type).lower()
         if self.adapter_type not in {"lora", "dora"}:
-            raise ValueError("adapter_type must be 'lora' or 'dora'")
+            raise ValueError("LoRA / DoRA type must be 'lora' or 'dora'")
         self.rank = max(1, int(self.rank))
         self.alpha = float(self.alpha)
         self.dropout = float(self.dropout)
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
         if not (self.target_attention or self.target_mlp):
-            raise ValueError("at least one adapter target group must be enabled")
+            raise ValueError("at least one LoRA / DoRA target group must be enabled")
 
         self.base_variant = str(self.base_variant).lower()
         if self.base_variant not in {"bf16", "int8_convrot"}:
@@ -140,9 +161,17 @@ class TrainConfig:
         self.speaker_ref_mode = str(self.speaker_ref_mode).lower()
         if self.speaker_ref_mode not in {"self", "other", "mixed"}:
             raise ValueError("speaker_ref_mode must be self, other, or mixed")
+        self.emo_ref_mode = str(self.emo_ref_mode).strip().lower()
+        if self.emo_ref_mode not in {"self", "other", "mixed", "follow_speaker"}:
+            raise ValueError(
+                "emo_ref_mode must be self, other, mixed, or follow_speaker"
+            )
         self.max_codes = max(1, int(self.max_codes))
         self.max_text_tokens = max(1, int(self.max_text_tokens))
         self.val_fraction = min(0.5, max(0.0, float(self.val_fraction)))
+        self.val_reference_mode = str(self.val_reference_mode).strip().lower()
+        if self.val_reference_mode not in {"self", "other"}:
+            raise ValueError("val_reference_mode must be self or other")
         self.val_every_steps = max(0, int(self.val_every_steps))
         self.val_max_batches = max(1, int(self.val_max_batches))
         self.early_stop_patience = max(0, int(self.early_stop_patience))
@@ -156,6 +185,69 @@ class TrainConfig:
         self.sample_every_epochs = max(1, int(self.sample_every_epochs))
         self.sample_min_free_vram_gb = max(0.0, float(self.sample_min_free_vram_gb))
         self.sample_timeout_s = max(1.0, float(self.sample_timeout_s))
+        sample_language = str(self.sample_language or "auto").strip()
+        self.sample_language = (
+            "auto" if sample_language.lower() == "auto" else sample_language.upper()
+        )
+        if self.sample_language not in {"auto", "ZH", "EN", "JA", "AR", "ES"}:
+            raise ValueError("sample_language must be auto, ZH, EN, JA, AR, or ES")
+        self.sample_seed = int(self.sample_seed)
+        if self.sample_seed < -1:
+            raise ValueError("sample_seed must be -1 or greater")
+        self.sample_temperature = _finite_float(
+            self.sample_temperature, "sample_temperature"
+        )
+        if self.sample_temperature <= 0.0:
+            raise ValueError("sample_temperature must be greater than 0")
+        self.sample_top_p = _finite_float(self.sample_top_p, "sample_top_p")
+        if not 0.0 <= self.sample_top_p <= 1.0:
+            raise ValueError("sample_top_p must be in [0, 1]")
+        self.sample_top_k = int(self.sample_top_k)
+        if self.sample_top_k < 0:
+            raise ValueError("sample_top_k must be 0 or greater")
+        self.sample_repetition_penalty = _finite_float(
+            self.sample_repetition_penalty, "sample_repetition_penalty"
+        )
+        if self.sample_repetition_penalty <= 0.0:
+            raise ValueError("sample_repetition_penalty must be greater than 0")
+        self.sample_num_beams = int(self.sample_num_beams)
+        if self.sample_num_beams < 1:
+            raise ValueError("sample_num_beams must be at least 1")
+        self.sample_emo_alpha = _finite_float(
+            self.sample_emo_alpha, "sample_emo_alpha"
+        )
+        if not 0.0 <= self.sample_emo_alpha <= 1.0:
+            raise ValueError("sample_emo_alpha must be in [0, 1]")
+        self.sample_diffusion_steps = int(self.sample_diffusion_steps)
+        if self.sample_diffusion_steps < 2:
+            raise ValueError("sample_diffusion_steps must be at least 2")
+        self.sample_inference_cfg_rate = _finite_float(
+            self.sample_inference_cfg_rate, "sample_inference_cfg_rate"
+        )
+        if self.sample_inference_cfg_rate < 0.0:
+            raise ValueError("sample_inference_cfg_rate must be 0 or greater")
+        self.sample_max_text_tokens = int(self.sample_max_text_tokens)
+        if self.sample_max_text_tokens < 20:
+            raise ValueError("sample_max_text_tokens must be at least 20")
+        self.sample_length_penalty = _finite_float(
+            self.sample_length_penalty, "sample_length_penalty"
+        )
+        self.sample_max_mel_tokens = int(self.sample_max_mel_tokens)
+        if self.sample_max_mel_tokens < 1:
+            raise ValueError("sample_max_mel_tokens must be at least 1")
+        self.sample_speaking_rate = _finite_float(
+            self.sample_speaking_rate, "sample_speaking_rate"
+        )
+        if not 0.5 <= self.sample_speaking_rate <= 1.5:
+            raise ValueError("sample_speaking_rate must be in [0.5, 1.5]")
+        self.eval_train_subset = int(self.eval_train_subset)
+        if self.eval_train_subset < 0:
+            raise ValueError("eval_train_subset must be 0 or greater")
+        self.eval_strengths = str(self.eval_strengths or "")
+        from .checkpoint_eval import parse_strengths
+
+        parse_strengths(self.eval_strengths)
+        self.eval_include_base = bool(self.eval_include_base)
         self.eval_timeout_s = max(1.0, float(self.eval_timeout_s))
         self.num_workers = max(0, int(self.num_workers))
         self.log_every_steps = max(1, int(self.log_every_steps))
@@ -199,12 +291,19 @@ def _dtype_name(value: Any) -> str:
     return name
 
 
+def _finite_float(value: Any, field_name: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
 def _safe_name(value: Any) -> str:
     name = str(value or "").strip()
     if not name:
         raise ValueError("name must not be empty")
     if name in {".", ".."} or any(char in name for char in '<>:"/\\|?*\x00'):
-        raise ValueError(f"invalid adapter name {name!r}")
+        raise ValueError(f"invalid LoRA / DoRA name {name!r}")
     return name
 
 

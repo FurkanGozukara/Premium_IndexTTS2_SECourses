@@ -17,7 +17,14 @@ from indextts.runtime.progress import ProgressReporter
 from indextts.utils.atomic_json import write_json_atomic
 from webui_generation_runner import create_tts, run_generation_request
 
-from .analysis import _write_text_atomic, checkpoint_descriptor, load_training_analysis
+from .analysis import (
+    BASE_CHECKPOINT_LABEL,
+    _write_text_atomic,
+    checkpoint_descriptor,
+    checkpoint_display_label,
+    load_training_analysis,
+    phase_display_label,
+)
 from .checkpoint_eval import load_checkpoint_eval
 
 
@@ -85,7 +92,7 @@ class GridConfig:
         self.adapter_dir = str(Path(self.adapter_dir).expanduser().resolve())
         self.checkpoints = [GridCheckpoint.from_dict(item) for item in self.checkpoints]
         if not self.checkpoints:
-            raise ValueError("select at least one checkpoint or the base model")
+            raise ValueError("select at least one checkpoint or Base model (no LoRA / DoRA)")
         values: list[float] = []
         for raw in self.strengths or [1.0]:
             strength = float(raw)
@@ -247,7 +254,12 @@ def build_grid_cells(config: GridConfig | Mapping[str, Any]) -> list[GridCell]:
                         f"{_safe_name(file_label)}__s{strength:g}__ref{reference_index}"
                         f"__t{text_index}.wav"
                     )
-                    row_label = checkpoint.label or file_label
+                    checkpoint_label = (
+                        checkpoint.label or file_label
+                        if checkpoint.path
+                        else BASE_CHECKPOINT_LABEL
+                    )
+                    row_label = checkpoint_label
                     if checkpoint.path and abs(strength - 1.0) >= 1e-9:
                         row_label += f" @{strength:g}"
                     cells.append(
@@ -255,7 +267,7 @@ def build_grid_cells(config: GridConfig | Mapping[str, Any]) -> list[GridCell]:
                             index=index,
                             label=f"{row_label} / ref {reference_index} / text {text_index}",
                             filename=filename,
-                            checkpoint_label=checkpoint.label or file_label,
+                            checkpoint_label=checkpoint_label,
                             checkpoint_path=str(Path(checkpoint.path).expanduser().resolve())
                             if checkpoint.path
                             else "",
@@ -460,13 +472,21 @@ def _grid_markdown(result: GridResult) -> str:
         "| Row | Checkpoint | Strength | Reference | Text | Seconds | Verdict | File |",
         "|---:|---|---:|---:|---:|---:|---|---|",
     ]
+    label_cache: dict[str, str] = {}
     for cell in result.cells:
+        checkpoint_label = checkpoint_display_label(
+            cell.checkpoint_label,
+            path=cell.checkpoint_path,
+            kind=cell.checkpoint_kind,
+            cache=label_cache,
+        )
         reference = f"{cell.reference_index}: {Path(cell.reference).name}".replace("|", "\\|")
         text = cell.text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+        strength = "-" if not cell.checkpoint_path else f"{cell.strength:g}"
         lines.append(
-            f"| {cell.index} | {cell.checkpoint_label} | {cell.strength:g} | "
+            f"| {cell.index} | {checkpoint_label} | {strength} | "
             f"{reference} | {cell.text_index}: {text} | {cell.audio_seconds:.2f} | "
-            f"{cell.verdict or 'Not measured'} | [{cell.filename}]({cell.filename}) |"
+            f"{phase_display_label(cell.verdict)} | [{cell.filename}]({cell.filename}) |"
         )
     return "\n".join(lines)
 

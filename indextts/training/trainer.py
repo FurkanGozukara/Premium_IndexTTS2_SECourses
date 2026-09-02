@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import secrets
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
 from .model_forward import enable_gradient_checkpointing, gpt_train_step_loss
 from .sampling import generate_training_sample
+from .speaking_rate import calibrate_from_samples, write_speaking_rate
 from .train_config import TrainConfig
 
 
@@ -110,7 +112,7 @@ def build_training_model(
     *,
     log: Callable[[str], None] | None = None,
 ) -> BuiltTrainingModel:
-    """Load the frozen base, attach adapters, and establish device residency."""
+    """Load the frozen base, attach LoRA / DoRA modules, and establish device residency."""
 
     cfg = TrainConfig.from_dict(config)
     emit = log or (lambda message: print(message, flush=True))
@@ -160,7 +162,7 @@ def build_training_model(
             cfg.alpha = resume_file.alpha
         saved_type = resume_file.adapter_type
         if cfg.adapter_type != saved_type:
-            changes.append(f"adapter_type {cfg.adapter_type} -> {saved_type}")
+            changes.append(f"LoRA / DoRA type {cfg.adapter_type} -> {saved_type}")
             cfg.adapter_type = saved_type
         if changes:
             emit(">> resume metadata overrides config: " + ", ".join(changes))
@@ -170,7 +172,7 @@ def build_training_model(
             model, attention=cfg.target_attention, mlp=cfg.target_mlp
         )
     if not targets:
-        raise ValueError("no GPT projection modules were selected for adapters")
+        raise ValueError("no GPT projection modules were selected for LoRA / DoRA")
 
     adapters = inject_adapters(
         model,
@@ -327,6 +329,7 @@ class LoraTrainer:
         self.best_path = self.adapter_dir / "best" / f"{self.config.name}.safetensors"
         self.last_sample = ""
         self.last_checkpoint = ""
+        self.resolved_sample_seed: int | None = None
         self._checkpoint_history: list[Path] = []
 
     def log(self, message: str) -> None:
@@ -361,6 +364,9 @@ class LoraTrainer:
         current.setdefault("message", "")
         current.setdefault("last_checkpoint", self.last_checkpoint)
         current.setdefault("last_sample", self.last_sample)
+        current.setdefault("sample_seed", self.resolved_sample_seed)
+        current.setdefault("val_reference_mode", self.config.val_reference_mode)
+        current.setdefault("recommended_speaking_rate", None)
         current["updated_at"] = time.time()
         atomic_write_json(self.status_path, current)
         return current
@@ -490,7 +496,7 @@ class LoraTrainer:
                     and analysis.final_val_loss is not None
                 ):
                     detail += (
-                        f"; the final epoch {analysis.final_epoch} adapter is overfitted "
+                        f"; the final epoch {analysis.final_epoch} LoRA / DoRA is overfitted "
                         f"(validation {analysis.final_val_loss:.4f})"
                     )
                 if analysis.recommended_checkpoint:
@@ -534,17 +540,22 @@ class LoraTrainer:
                 )
                 return recommended_checkpoint
 
-        from .checkpoint_eval import CheckpointEvalConfig, load_checkpoint_eval
+        from .checkpoint_eval import (
+            CheckpointEvalConfig,
+            load_checkpoint_eval,
+            parse_strengths,
+        )
 
         job_dir = self.adapter_dir / "analysis" / "eval_job"
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "stop.flag").unlink(missing_ok=True)
+        strengths = parse_strengths(config.eval_strengths)
         eval_config = CheckpointEvalConfig(
             adapter_dir=str(self.adapter_dir),
             dataset_dir=str(self.dataset_dir),
-            include_base=True,
-            strengths=[1.0],
-            train_subset=48,
+            include_base=config.eval_include_base,
+            strengths=strengths,
+            train_subset=config.eval_train_subset,
             device=config.device,
             base_variant=config.base_variant,
             base_dtype=config.base_dtype,
@@ -553,6 +564,7 @@ class LoraTrainer:
             attention_backend=config.attention_backend,
             val_fraction=config.val_fraction,
             seed=config.seed,
+            reference_mode=config.val_reference_mode,
         ).validate()
         config_path = job_dir / "eval_config.json"
         atomic_write_json(config_path, eval_config.to_dict())
@@ -565,6 +577,12 @@ class LoraTrainer:
             "--state-dir",
             str(job_dir),
         ]
+        self.log(
+            ">> automatic checkpoint evaluation settings | "
+            f"train subset: {eval_config.train_subset} | strengths: "
+            f"{','.join(f'{value:g}' for value in eval_config.strengths)} | "
+            f"include base: {eval_config.include_base} | reference: {eval_config.reference_mode}"
+        )
         self.log(">> starting automatic checkpoint evaluation")
         self.write_status(phase="evaluating", message="loading model for checkpoint evaluation")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -637,6 +655,35 @@ class LoraTrainer:
         )
         return recommended_checkpoint
 
+    def _write_speaking_rate_calibration(self) -> float | None:
+        """Measure completed epoch samples without risking the training result."""
+
+        samples_dir = self.adapter_dir / "samples"
+        if not samples_dir.is_dir() or not any(samples_dir.glob("epoch_*.wav")):
+            return None
+        try:
+            report = calibrate_from_samples(
+                self.adapter_dir,
+                self.dataset_dir,
+                self.config.sample_text,
+            )
+            if report is None:
+                self.log(
+                    ">> speaking-rate calibration skipped: no usable one-second training samples"
+                )
+                return None
+            write_speaking_rate(self.adapter_dir, report)
+            self.log(">> " + report.summary)
+            self.write_status(
+                recommended_speaking_rate=report.recommended_speaking_rate,
+            )
+            return report.recommended_speaking_rate
+        except Exception as exc:
+            self.log(
+                f">> speaking-rate calibration failed but training is safe: {exc}"
+            )
+            return None
+
     def _metadata(self, step: int, epochs: int, targets: list[str]) -> LoraMetadata:
         return LoraMetadata(
             adapter_type=self.config.adapter_type,
@@ -704,6 +751,13 @@ class LoraTrainer:
         keep: bool = False,
     ) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        periodic_checkpoint = any(
+            destination.stem.startswith(f"{self.config.name}_{kind}_")
+            and destination.stem.removeprefix(
+                f"{self.config.name}_{kind}_"
+            ).isdigit()
+            for kind in ("epoch", "step")
+        )
         save_lora(
             destination,
             built.adapters,
@@ -711,7 +765,9 @@ class LoraTrainer:
             self._metadata(step, epochs_completed, list(built.adapters)),
             dtype=_dtype(self.config.save_dtype),
         )
-        if self.config.save_train_state:
+        if self.config.save_train_state and (
+            self.config.epoch_train_state or not periodic_checkpoint
+        ):
             state = self._train_state(
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -734,9 +790,8 @@ class LoraTrainer:
     def _prune_checkpoints(self) -> None:
         keep = self.config.keep_last_n
         if keep <= 0:
-            victims = list(self._checkpoint_history)
-        else:
-            victims = self._checkpoint_history[:-keep]
+            return
+        victims = self._checkpoint_history[:-keep]
         for path in victims:
             path.unlink(missing_ok=True)
             Path(resume_state_path_for(path)).unlink(missing_ok=True)
@@ -782,14 +837,14 @@ class LoraTrainer:
             return {}
         if self.config.resume_mode == "weights_only":
             self.log(
-                ">> resumed adapter weights only; using a fresh optimizer/scheduler at step 0"
+                ">> resumed LoRA / DoRA weights only; using a fresh optimizer/scheduler at step 0"
             )
             return {}
         path = Path(resume_state_path_for(self.config.resume_from))
         if not path.is_file():
             self.log(
                 f">> continue mode requested, but train state was not found at {path}; "
-                "using adapter weights with a fresh optimizer/scheduler at step 0"
+                "using LoRA / DoRA weights with a fresh optimizer/scheduler at step 0"
             )
             return {}
         state = load_train_state(path)
@@ -834,7 +889,21 @@ class LoraTrainer:
     def run(self) -> TrainingResult:
         config = self.config
         _seed_everything(config.seed)
-        self.write_status(phase="initializing", message="loading cached dataset")
+        self.resolved_sample_seed = (
+            secrets.randbelow(2**32) if config.sample_seed == -1 else config.sample_seed
+        )
+        self.log(
+            f">> conditioning | train speaker ref: {config.speaker_ref_mode} | "
+            f"train emotion ref: {config.emo_ref_mode} | "
+            f"validation ref: {config.val_reference_mode}"
+        )
+        self.log(f">> training samples use seed {self.resolved_sample_seed}")
+        self.write_status(
+            phase="initializing",
+            message="loading cached dataset",
+            sample_seed=self.resolved_sample_seed,
+            val_reference_mode=config.val_reference_mode,
+        )
         train_dataset = LoraTrainDataset(
             self.dataset_dir,
             split="train",
@@ -843,6 +912,11 @@ class LoraTrainer:
             max_codes=config.max_codes,
             max_text_tokens=config.max_text_tokens,
             speaker_ref_mode=config.speaker_ref_mode,
+            emo_ref_mode=config.emo_ref_mode,
+        )
+        val_speaker_ref_mode = "other" if config.val_reference_mode == "other" else "self"
+        val_emo_ref_mode = (
+            "follow_speaker" if config.val_reference_mode == "other" else "self"
         )
         try:
             val_dataset = LoraTrainDataset(
@@ -852,7 +926,8 @@ class LoraTrainer:
                 seed=config.seed,
                 max_codes=config.max_codes,
                 max_text_tokens=config.max_text_tokens,
-                speaker_ref_mode="self",
+                speaker_ref_mode=val_speaker_ref_mode,
+                emo_ref_mode=val_emo_ref_mode,
             )
         except (ValueError, FileNotFoundError):
             val_dataset = None
@@ -1177,6 +1252,7 @@ class LoraTrainer:
                                 "epoch": epoch_index + 1,
                                 "val_loss": last_val_loss,
                                 "val_mel_accuracy": val_accuracy,
+                                "reference_mode": config.val_reference_mode,
                             }
                         )
                         self.log(
@@ -1228,6 +1304,7 @@ class LoraTrainer:
                             "epoch": epoch_index + 1,
                             "val_loss": last_val_loss,
                             "val_mel_accuracy": val_accuracy,
+                            "reference_mode": config.val_reference_mode,
                         }
                     )
                     self.log(
@@ -1304,6 +1381,7 @@ class LoraTrainer:
                         reference_path=sample_reference,
                         output_path=sample_path,
                         epoch=epoch_index + 1,
+                        seed=self.resolved_sample_seed,
                         log=self.log,
                     )
                     temp_adapter.unlink(missing_ok=True)
@@ -1383,7 +1461,7 @@ class LoraTrainer:
                     last_checkpoint=str(final_path.resolve()),
                     last_sample=self.last_sample,
                 )
-                self.log(f">> final adapter saved to {final_path}")
+                self.log(f">> final LoRA / DoRA saved to {final_path}")
                 result_status = terminal_phase
         except BaseException as exc:
             self.write_status(phase="failed", message=str(exc), elapsed_s=time.perf_counter() - self.started_perf)
@@ -1395,6 +1473,7 @@ class LoraTrainer:
 
         stats = memory_stats(device)
         _analysis_path, recommended_checkpoint = self._write_automatic_analysis()
+        self._write_speaking_rate_calibration()
         terminal_status = read_json_retry(self.status_path, {}) or {}
         terminal_message = str(
             terminal_status.get("message")

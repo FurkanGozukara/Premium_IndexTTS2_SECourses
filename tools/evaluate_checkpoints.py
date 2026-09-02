@@ -18,7 +18,7 @@ from indextts.training.checkpoint_eval import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate IndexTTS adapter checkpoints")
+    parser = argparse.ArgumentParser(description="Evaluate IndexTTS LoRA / DoRA checkpoints")
     parser.add_argument("--config", required=True, help="CheckpointEvalConfig JSON file")
     parser.add_argument("--state-dir", help="Optional progress directory")
     return parser.parse_args()

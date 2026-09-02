@@ -1,4 +1,4 @@
-"""Feature caching for inference-aligned IndexTTS 2.5 adapter training."""
+"""Feature caching for inference-aligned IndexTTS 2.5 LoRA / DoRA training."""
 
 from __future__ import annotations
 

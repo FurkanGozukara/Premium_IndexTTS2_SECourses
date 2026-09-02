@@ -9,10 +9,12 @@ import indextts.training.checkpoint_eval as eval_module
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.lora.apply import inject_adapters
 from indextts.lora.io import LoraMetadata, save_lora
+from indextts.training.analysis import BASE_CHECKPOINT_LABEL
 from indextts.training.checkpoint_eval import (
     CheckpointEvalConfig,
     evaluate_checkpoints,
     load_checkpoint_eval,
+    parse_strengths,
     write_checkpoint_eval,
 )
 
@@ -44,8 +46,11 @@ def _tiny_voice() -> UnifiedVoice:
 
 
 class _FakeDataset(torch.utils.data.Dataset):
+    calls: list[dict] = []
+
     def __init__(self, *_args, split="train", **_kwargs):
         self.split = split
+        self.calls.append({"split": split, **_kwargs})
 
     def __len__(self):
         return 2
@@ -54,6 +59,7 @@ class _FakeDataset(torch.utils.data.Dataset):
         return {
             "id": f"{self.split}-{index}",
             "reference_id": f"{self.split}-{index}",
+            "emo_reference_id": f"{self.split}-{index}",
             "text_tokens": torch.tensor([5 + index, 6 + index]),
             "codes": torch.tensor([11 + index, 12 + index, 13 + index]),
             "lang_id": 0,
@@ -95,6 +101,7 @@ def test_cpu_checkpoint_evaluation_and_report_files(
         dtype=torch.float32,
     )
     monkeypatch.setattr(eval_module, "LoraTrainDataset", _FakeDataset)
+    _FakeDataset.calls.clear()
     monkeypatch.setattr(eval_module, "build_evaluation_model", lambda _config: _tiny_voice())
     config = CheckpointEvalConfig(
         adapter_dir=str(adapter_dir),
@@ -111,18 +118,67 @@ def test_cpu_checkpoint_evaluation_and_report_files(
         attention_backend="eager",
         val_fraction=0.5,
         seed=7,
+        reference_mode="other",
     )
 
     report = evaluate_checkpoints(config)
 
     assert [row.phase for row in report.rows] == ["base", "best", "variant"]
     assert report.rows[0].kind == "base"
+    assert report.rows[0].label == BASE_CHECKPOINT_LABEL
+    assert report.rows[1].label == "epoch 2 (LoRA Checkpoint)"
     assert report.rows[1].val_loss is not None
     assert report.rows[1].train_loss is not None
-    assert "Without any adapter" in report.summary_markdown
+    assert report.reference_mode == "other"
+    assert "Measured with inference-like references" in report.summary_markdown
+    assert {call["split"] for call in _FakeDataset.calls} == {"train", "val"}
+    assert all(call["speaker_ref_mode"] == "other" for call in _FakeDataset.calls)
+    assert all(call["emo_ref_mode"] == "follow_speaker" for call in _FakeDataset.calls)
+    assert BASE_CHECKPOINT_LABEL in report.summary_markdown
+    assert "adapter" not in report.summary_markdown.lower()
     path = write_checkpoint_eval(report, adapter_dir)
     assert path.is_file()
     assert path.with_suffix(".md").is_file()
     loaded = load_checkpoint_eval(adapter_dir)
     assert loaded is not None and len(loaded.rows) == 3
+    assert loaded.reference_mode == "other"
 
+    old_payload = report.to_dict()
+    old_payload.pop("reference_mode")
+    assert eval_module.CheckpointEvalReport.from_dict(old_payload).reference_mode == "self"
+
+
+def test_parse_strengths_matches_the_shared_text_contract() -> None:
+    assert parse_strengths("0, 0.5; 1.0, 0.5") == [0.0, 0.5, 1.0]
+    with pytest.raises(ValueError, match="at least one"):
+        parse_strengths(" , ")
+    with pytest.raises(ValueError, match="0 to 4"):
+        parse_strengths("4.01")
+    with pytest.raises(ValueError, match="0 to 4"):
+        parse_strengths("nan")
+
+
+def test_empty_reference_mode_inherits_training_config_or_legacy_default(
+    tmp_path: Path,
+) -> None:
+    inherited_dir = tmp_path / "inherited"
+    inherited_dir.mkdir()
+    (inherited_dir / "train_config.json").write_text(
+        '{"val_reference_mode": "other"}', encoding="utf-8"
+    )
+    inherited, _ = eval_module._resolved_config(
+        CheckpointEvalConfig(
+            adapter_dir=str(inherited_dir), dataset_dir=str(tmp_path / "dataset")
+        )
+    )
+
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy, _ = eval_module._resolved_config(
+        CheckpointEvalConfig(
+            adapter_dir=str(legacy_dir), dataset_dir=str(tmp_path / "dataset")
+        )
+    )
+
+    assert inherited.reference_mode == "other"
+    assert legacy.reference_mode == "self"

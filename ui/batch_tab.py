@@ -134,8 +134,8 @@ def batch_task_updates(
     if not task_value:
         return (
             "",
-            progress_panel_html({}, title="Batch ready"),
-            "Ready.",
+            progress_panel_html({}, title="Ready"),
+            "",
             gr.skip(),
             "",
             gr.Timer(5.0, active=True),
@@ -303,8 +303,8 @@ def build_batch_tab(
             start = gr.Button("🎬  Generate batch", variant="primary", elem_classes=btn("emerald"))
             cancel = gr.Button("⛔  Cancel batch", variant="stop", elem_classes=btn("red"))
             open_button = gr.Button("📁  Open batch folder", elem_classes=btn("indigo"))
-        progress = gr.HTML(progress_panel_html({}, title="Batch ready"))
-        status = gr.Markdown("Ready.")
+        progress = gr.HTML(progress_panel_html({}, title="Ready"))
+        status = gr.Markdown("")
         results = gr.Dataframe(
             headers=["Item", "Status", "Audio seconds", "Output path", "Time seconds"],
             datatype=["str", "str", "number", "str", "number"],

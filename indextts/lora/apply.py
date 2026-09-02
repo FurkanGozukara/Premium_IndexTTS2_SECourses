@@ -1,4 +1,4 @@
-"""Adapter discovery, injection, hot swapping, and removal."""
+"""LoRA / DoRA discovery, injection, hot swapping, and removal."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def _get_submodule(model: nn.Module, path: str) -> nn.Module:
 
 def _replace_submodule(model: nn.Module, path: str, replacement: nn.Module) -> None:
     if not path:
-        raise ValueError("cannot replace the root model with an adapter")
+        raise ValueError("cannot replace the root model with LoRA / DoRA")
     parent_path, _, name = path.rpartition(".")
     parent = _get_submodule(model, parent_path)
     if name in parent._modules:
@@ -110,7 +110,7 @@ def inject_adapters(
     use_dora: bool,
     target_modules: list[str],
 ) -> dict[str, LoRAAdapter]:
-    """Replace the selected projection modules in place with adapters."""
+    """Replace the selected projection modules in place with LoRA / DoRA modules."""
 
     if len(set(target_modules)) != len(target_modules):
         raise ValueError("target_modules contains duplicate paths")
@@ -124,7 +124,7 @@ def inject_adapters(
                 or base.in_features <= 0
                 or base.out_features <= 0
             ):
-                raise ValueError(f"target {path!r} already has an incompatible adapter")
+                raise ValueError(f"target {path!r} already has an incompatible LoRA / DoRA")
             base.alpha = float(alpha)
             base.scaling = base.alpha / base.rank
             base.lora_dropout.p = float(dropout)
@@ -172,7 +172,7 @@ def _copy_adapter_tensors(adapters: Mapping[str, LoRAAdapter], loaded: LoraFile)
     ]
     if mismatches:
         raise ValueError(
-            "saved tensors do not match adapter target(s): " + ", ".join(mismatches)
+            "saved tensors do not match LoRA / DoRA target(s): " + ", ".join(mismatches)
         )
     for path, adapter in adapters.items():
         if adapter._merged:
@@ -309,7 +309,7 @@ def _can_reuse(
 def apply_lora(
     model: nn.Module, path: str, strength: float = 1.0
 ) -> LoraHandle:
-    """Load an adapter file and apply it without reloading any base weights."""
+    """Load a LoRA / DoRA file and apply it without reloading any base weights."""
 
     loaded = load_lora(path)
     use_dora = loaded.adapter_type == "dora"
@@ -373,7 +373,7 @@ def set_lora_strength(model_or_handle: nn.Module | LoraHandle, strength: float) 
 def move_adapters_to_device(
     model: nn.Module, device: str | torch.device
 ) -> dict[str, LoRAAdapter]:
-    """Move only active adapter tensors, leaving frozen base residency unchanged."""
+    """Move only active LoRA / DoRA tensors, leaving frozen base residency unchanged."""
 
     target = torch.device(device)
     adapters = _find_adapters(model)
@@ -387,7 +387,7 @@ def move_adapters_to_device(
 
 
 def remove_lora(model: nn.Module) -> None:
-    """Unwrap every adapter and restore all backed-up full-module tensors."""
+    """Unwrap every LoRA / DoRA and restore all backed-up full-module tensors."""
 
     handle = get_lora_handle(model)
     adapters = _find_adapters(model)
@@ -455,7 +455,7 @@ def trainable_parameters(
 
 
 def set_training_mode(model: nn.Module, training: bool) -> None:
-    """Toggle adapter dropout and quantized-base STE behavior."""
+    """Toggle LoRA / DoRA dropout and quantized-base STE behavior."""
 
     enabled = bool(training)
     for adapter in _find_adapters(model).values():
@@ -465,7 +465,7 @@ def set_training_mode(model: nn.Module, training: bool) -> None:
 
 
 def merge_lora_for_inference(model: nn.Module) -> None:
-    """Merge active adapters while keeping their wrappers available to unmerge."""
+    """Merge active LoRA / DoRA modules while keeping wrappers available to unmerge."""
 
     adapters = _find_adapters(model)
     int8_targets = [
@@ -482,14 +482,14 @@ def merge_lora_for_inference(model: nn.Module) -> None:
 
 
 def unmerge_lora_from_model(model: nn.Module) -> None:
-    """Restore the exact floating base weights for every temporarily merged adapter."""
+    """Restore exact floating base weights for every temporarily merged LoRA / DoRA."""
 
     for adapter in _find_adapters(model).values():
         adapter.unmerge_from_base()
 
 
 def merge_lora_into_model(model: nn.Module) -> None:
-    """Merge adapters into floating bases, unwrap them, and retain full tensors."""
+    """Merge LoRA / DoRA into floating bases, unwrap them, and retain full tensors."""
 
     adapters = _find_adapters(model)
     merge_lora_for_inference(model)

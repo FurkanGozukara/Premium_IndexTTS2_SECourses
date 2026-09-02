@@ -239,7 +239,7 @@ class BlockSwapController:
                 raise ValueError(
                     "Block swap training requires frozen streamed base weights; found trainable tensors: "
                     + ", ".join(trainable)
-                    + ". Freeze the base and train adapters under gradient checkpointing."
+                    + ". Freeze the base and train LoRA / DoRA under gradient checkpointing."
                 )
         layout = _layout(originals)
         flat = self._make_cpu_flat(layout[1])

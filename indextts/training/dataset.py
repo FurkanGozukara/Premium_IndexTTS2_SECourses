@@ -60,6 +60,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         max_codes: int = 1500,
         max_text_tokens: int = 600,
         speaker_ref_mode: str = "mixed",
+        emo_ref_mode: str = "self",
     ) -> None:
         self.dataset_dir = Path(dataset_dir).expanduser().resolve()
         self.split = str(split).lower()
@@ -72,6 +73,11 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         self.speaker_ref_mode = str(speaker_ref_mode).lower()
         if self.speaker_ref_mode not in {"self", "other", "mixed"}:
             raise ValueError("speaker_ref_mode must be self, other, or mixed")
+        self.emo_ref_mode = str(emo_ref_mode).lower()
+        if self.emo_ref_mode not in {"self", "other", "mixed", "follow_speaker"}:
+            raise ValueError(
+                "emo_ref_mode must be self, other, mixed, or follow_speaker"
+            )
         self.epoch = 0
 
         manifest_rows = load_manifest(self.dataset_dir)
@@ -151,7 +157,12 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _other_reference(self, record: Mapping[str, Any], index: int) -> Mapping[str, Any] | None:
+    def _other_reference(
+        self,
+        record: Mapping[str, Any],
+        index: int,
+        tag: str = "reference",
+    ) -> Mapping[str, Any] | None:
         choices = [
             candidate
             for candidate in self._speaker_records.get(str(record["speaker"]), [])
@@ -159,7 +170,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         ]
         if not choices:
             return None
-        unit = _stable_unit_interval(self.seed, self.epoch, record["id"], index, "reference")
+        unit = _stable_unit_interval(self.seed, self.epoch, record["id"], index, tag)
         return choices[min(len(choices) - 1, int(unit * len(choices)))]
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -179,16 +190,38 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
                 speaker_cache = torch.load(other["cache_path"], map_location="cpu", weights_only=False)
                 reference_id = other["id"]
 
+        emo_cache = cached
+        emo_reference_id = record["id"]
+        use_other_emo = self.emo_ref_mode == "other"
+        if self.emo_ref_mode == "mixed":
+            use_other_emo = (
+                _stable_unit_interval(
+                    self.seed, self.epoch, record["id"], "emo_mixed"
+                )
+                < 0.5
+            )
+        if self.emo_ref_mode == "follow_speaker":
+            emo_cache = speaker_cache
+            emo_reference_id = reference_id
+        elif use_other_emo:
+            other_emo = self._other_reference(record, index, "emo_reference")
+            if other_emo is not None:
+                emo_cache = torch.load(
+                    other_emo["cache_path"], map_location="cpu", weights_only=False
+                )
+                emo_reference_id = other_emo["id"]
+
         language = str(cached.get("language") or record.get("language") or "en")
         return {
             "id": record["id"],
             "reference_id": reference_id,
+            "emo_reference_id": emo_reference_id,
             "text_tokens": torch.as_tensor(cached["text_tokens"], dtype=torch.long).flatten(),
             "codes": torch.as_tensor(cached["codes"], dtype=torch.long).flatten(),
             "lang_id": int(cached.get("lang_id", lang_to_token(language))),
             "campplus": torch.as_tensor(speaker_cache["campplus"], dtype=torch.float32).flatten(),
-            "emo_raw": torch.as_tensor(cached["emo_raw"], dtype=torch.float32).flatten(),
-            "emo_vec": torch.as_tensor(cached["emo_vec"], dtype=torch.float32).flatten(),
+            "emo_raw": torch.as_tensor(emo_cache["emo_raw"], dtype=torch.float32).flatten(),
+            "emo_vec": torch.as_tensor(emo_cache["emo_vec"], dtype=torch.float32).flatten(),
             "speaker": str(cached.get("speaker", record.get("speaker", ""))),
         }
 
@@ -214,6 +247,9 @@ def collate(batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "emo_vec": torch.stack([torch.as_tensor(item["emo_vec"], dtype=torch.float32) for item in batch]),
         "ids": [str(item["id"]) for item in batch],
         "reference_ids": [str(item.get("reference_id", item["id"])) for item in batch],
+        "emo_reference_ids": [
+            str(item.get("emo_reference_id", item["id"])) for item in batch
+        ],
     }
 
 

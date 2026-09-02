@@ -154,6 +154,7 @@ BUTTON_HUES: dict[str, tuple[str, str, str]] = {
     "crimson": ("#4c0519", "#9f1239", "#fb7185"),
     "orange":  ("#9a3412", "#ea580c", "#fb923c"),
     "amber":   ("#92400e", "#d97706", "#fbbf24"),
+    "bronze":  ("#5c3a21", "#8b5a2b", "#d4a373"),
     "slate":   ("#334155", "#475569", "#94a3b8"),
     "gray":    ("#3f3f46", "#52525b", "#a1a1aa"),
 }

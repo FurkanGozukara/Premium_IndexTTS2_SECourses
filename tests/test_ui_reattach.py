@@ -22,6 +22,7 @@ from ui.dataset_tab import (
     scan_datasets,
 )
 from ui.generation_tab import generation_task_updates
+from ui.grid_tab import adopt_grid_state
 from ui.training_tab import adopt_training_state, training_poll_updates
 
 
@@ -142,6 +143,53 @@ def test_generation_and_batch_reload_attach_to_their_newest_tasks(tmp_path: Path
     assert Path(batch_updates[0]) == batch.resolve()
     assert "Attached to running run 0007" in batch_updates[2]
     assert batch_updates[-1].value == 1.0
+
+
+def test_idle_timers_do_not_adopt_finished_runs_without_page_load(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "0042"
+    _write_task(output, status="complete", task_id="0042", modified=100.0)
+    assert adopt_output_task(
+        "", root=tmp_path / "outputs", scope="generation", page_load=False
+    ) == ("", False)
+    assert adopt_output_task(
+        "", root=tmp_path / "outputs", scope="generation", page_load=True
+    ) == (str(output.resolve()), False)
+
+    dataset_state = tmp_path / "dataset_states" / "finished"
+    _write_json(
+        dataset_state / "config.json",
+        {"output_root": str(tmp_path / "datasets"), "name": "prepared"},
+    )
+    _write_json(dataset_state / "status.json", {"phase": "complete"})
+    assert adopt_dataset_state(
+        "", "", root=tmp_path / "dataset_states", page_load=False
+    ) == ("", "", False)
+    loaded_dataset = adopt_dataset_state(
+        "", "", root=tmp_path / "dataset_states", page_load=True
+    )
+    assert loaded_dataset[0] == str(dataset_state.resolve())
+    assert loaded_dataset[2] is False
+
+    training = tmp_path / "loras" / "finished"
+    grid = tmp_path / "grids" / "finished"
+    _write_json(training / "status.json", {"phase": "complete"})
+    _write_json(grid / "status.json", {"phase": "complete"})
+    assert adopt_training_state("", root=tmp_path / "loras", page_load=False) == (
+        "",
+        False,
+    )
+    assert adopt_grid_state("", root=tmp_path / "grids", page_load=False) == (
+        "",
+        False,
+    )
+    assert adopt_training_state("", root=tmp_path / "loras", page_load=True) == (
+        str(training.resolve()),
+        False,
+    )
+    assert adopt_grid_state("", root=tmp_path / "grids", page_load=True) == (
+        str(grid.resolve()),
+        False,
+    )
 
 
 def test_dataset_wording_and_chart_placeholders_keep_frontend_contract(tmp_path: Path) -> None:

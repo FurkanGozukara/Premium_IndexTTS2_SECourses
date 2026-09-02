@@ -14,7 +14,7 @@ from .trainer import run_training
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="IndexTTS 2.5 adapter training worker")
+    parser = argparse.ArgumentParser(description="IndexTTS 2.5 LoRA / DoRA training worker")
     parser.add_argument("--config", required=True, help="TrainConfig JSON file")
     parser.add_argument("--state-dir", required=True, help="Directory for status and metrics")
     return parser.parse_args()

@@ -281,8 +281,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         with gr.Accordion("Model Files & Downloads", open=False):
             with gr.Row():
                 int8_download = gr.Button("⬇️  Download INT8 model", elem_classes=btn("sky"))
-                base_download = gr.Button("⬇️  Download / verify base models", elem_classes=btn("teal"))
-                refresh_files = gr.Button("↻  Refresh file status", elem_classes=btn("green"))
+                base_download = gr.Button("📦  Download / verify base models", elem_classes=btn("teal"))
+                refresh_files = gr.Button("🔄  Refresh file status", elem_classes=btn("green"))
                 tab.refresh_files = refresh_files
                 open_models = gr.Button("📁  Open model folder", elem_classes=btn("indigo"))
             download_status = gr.Markdown("Downloads are idle.")

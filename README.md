@@ -5,21 +5,25 @@
 - IndexTTS 2.5-only inference using the official multilingual model stack, with all 1.x and 2.0 paths removed.
 - GPU VRAM presets for 6, 8, 10, 12, 16, 24, and 32 GB cards, including GPT block swapping for lower-VRAM GPUs.
 - Optional INT8 ConvRot GPT model for memory-efficient generation while retaining the required 2.5 codec and vocoder models.
-- LoRA and DoRA dataset preparation and training tabs, including subtitle-driven segmentation and training progress charts.
-- Checkpoint Grid tab for listening to the base model, recommended checkpoint, final file, saved epochs, and strength variants with identical text, references, and seed.
+- LoRA / DoRA dataset preparation and training tabs, including subtitle-driven segmentation and training progress charts.
+- Checkpoint Grid tab for listening to Base model (no LoRA / DoRA), the recommended checkpoint, final file, saved epochs, and strength variants with identical text, references, and seed.
 - Automatic generalization analysis identifies the lowest validation-loss epoch, marks the sustained overfitting region, and makes Voice Generation prefer the recommended checkpoint.
 - Optional validation-based early stopping and automatic measured checkpoint evaluation after the training model releases its memory.
-- Every adapter keeps machine-readable and plain-language reports under `loras/<adapter>/analysis/`; listening grids are saved under `outputs/grids/`.
+- Evaluation can use inference-like references from a different clip of the same speaker, matching the normal voice-cloning workflow more closely.
+- Measured quality-first training defaults use rank 128, alpha 129, learning rate 5e-5, 20 epochs, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`).
+- Per-voice speaking-rate calibration compares generated words/s with the training recordings and auto-applies the saved pace in Voice Generation; the Checkpoint Grid can calibrate older runs too.
+- Every LoRA / DoRA keeps machine-readable and plain-language reports under `loras/<lora-or-dora>/analysis/`; listening grids are saved under `outputs/grids/`.
+- The header's **🕘  Load last values** button restores the last run of every tab; earlier results stay hidden until it is clicked.
 - Batch voice generation with reusable system and user presets.
 - Live generation, download, dataset, and training progress with speed and ETA reporting.
 - Cross-platform one-click installers and launchers for Windows, Massed Compute, RunPod, SimplePod, and other Linux hosts.
 - Models & Performance tab: pick your GPU VRAM tier (6/8/10/12/16/24/32 GB); every tier was calibrated to keep about 2 GB of VRAM free. Lower tiers switch to the INT8 ConvRot GPT and stream GPT blocks from CPU RAM (block swap); the INT8 file is downloaded automatically from Hugging Face when needed.
 - Presets: system presets live in `presets/system` (read-only, marked with a star) and your own presets in `presets/user`; a preset stores every parameter of every tab, and the last-used preset is restored at startup.
 - LoRA Dataset Preparation: drop any audio/video files (with optional SRT/VTT/SBV subtitles); audio is extracted with FFmpeg, transcribed with Whisper (word timestamps), cut into sentence-aligned segments, loudness normalized, and cached as training features.
-- LoRA / DoRA Training: rank/alpha/dropout, DoRA toggle, learning-rate schedule, gradient checkpointing, block swap for low VRAM, validation split, periodic audio samples, live loss/learning-rate charts, resume from an existing adapter, single `.safetensors` output that the Voice Generation tab loads (with a strength slider) from the adapter dropdown.
+- LoRA / DoRA Training: rank/alpha/dropout, DoRA toggle, learning-rate schedule, gradient checkpointing, block swap for low VRAM, validation split, periodic audio samples, live loss/learning-rate charts, resume from an existing LoRA / DoRA, single `.safetensors` output that the Voice Generation tab loads (with a strength slider) from the LoRA / DoRA dropdown.
 - Cancel/Stop buttons ask for confirmation and really stop the worker process; every long task reports progress, it/s, ETA, and VRAM in both the UI and the console.
-- Resume training from any saved adapter: "Weights only" starts a fresh schedule from the adapter weights, "Continue run" restores the optimizer, scheduler and step counter and trains the extra epochs/steps you configure.
-- Reloading the page, or opening the app in a second browser tab, re-attaches to the running generation, dataset preparation or training job, and Stop/Cancel always target the job you are looking at.
+- Resume training from any saved LoRA / DoRA: "Weights only" starts a fresh schedule from the LoRA / DoRA weights, "Continue run" restores the optimizer, scheduler and step counter and trains the extra epochs/steps you configure.
+- Reloading starts with clean result panels; finished jobs and outputs are not restored automatically.
 - Selecting the INT8 ConvRot model downloads it automatically on first use (with progress); if the download fails the app falls back to the BF16 model and tells you why.
 - Tested on Windows 11 with an RTX 5090 (all seven VRAM tiers verified with GPU 0 otherwise idle), Python 3.12, PyTorch CUDA 13.0, transformers 5, Gradio 6.
 

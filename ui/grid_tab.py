@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 from pathlib import Path
 import sys
 import time
@@ -14,12 +15,18 @@ import gradio as gr
 from indextts.runtime.gpu import list_gpus
 from indextts.training.analysis import (
     ANALYSIS_SERIES,
+    BASE_CHECKPOINT_CHOICE_LABEL,
+    BASE_CHECKPOINT_LABEL,
+    BASE_GRID_HEADER_DETAIL,
     GENERALIZATION_LEGEND,
     analysis_epoch_frame,
     analyze_training_run,
     checkpoint_descriptor,
+    checkpoint_display_label,
+    display_legacy_report_text,
     discover_checkpoints,
     load_training_analysis,
+    phase_display_label,
     write_training_analysis,
 )
 from indextts.training.checkpoint_eval import (
@@ -31,6 +38,10 @@ from indextts.training.grid import (
     GridConfig,
     list_grids,
     load_grid,
+)
+from indextts.training.speaking_rate import (
+    calibrate_from_grid,
+    write_speaking_rate,
 )
 
 from .common import (
@@ -45,7 +56,13 @@ from .common import (
     tail_text,
     write_json_atomic,
 )
-from .generation_tab import GENERATION_DEFAULTS, LANGUAGES, GenerationTab, _lora_choices
+from .generation_tab import (
+    GENERATION_DEFAULTS,
+    LANGUAGES,
+    GenerationTab,
+    _lora_choices,
+    build_generation_request,
+)
 from .models_tab import ModelsTab
 from .presets_store import PresetRegistry
 
@@ -64,9 +81,13 @@ GRID_DEFAULTS: dict[str, Any] = {
     "grid.references": "",
     "grid.seed": -1,
     "grid.language": "EN",
+    "grid.eval_reference_mode": "",
+    "grid.eval_train_subset": 48,
+    "grid.eval_include_base": True,
     "grid.temperature": GENERATION_DEFAULTS["generation.temperature"],
     "grid.top_p": GENERATION_DEFAULTS["generation.top_p"],
     "grid.top_k": GENERATION_DEFAULTS["generation.top_k"],
+    "grid.num_beams": GENERATION_DEFAULTS["generation.num_beams"],
     "grid.repetition_penalty": GENERATION_DEFAULTS["generation.repetition_penalty"],
     "grid.diffusion_steps": GENERATION_DEFAULTS["generation.diffusion_steps"],
     "grid.inference_cfg_rate": GENERATION_DEFAULTS["generation.inference_cfg_rate"],
@@ -74,7 +95,25 @@ GRID_DEFAULTS: dict[str, Any] = {
         "generation.max_text_tokens_per_segment"
     ],
     "grid.emotion_weight": GENERATION_DEFAULTS["generation.emotion_weight"],
+    "grid.speaking_rate": 1.0,
 }
+GRID_EMPTY_HINT = (
+    "Select a LoRA / DoRA folder, or use Load last values in the header."
+)
+EVAL_REFERENCE_CHOICES = (
+    ("Same as training validation", ""),
+    ("self", "self"),
+    ("other (inference-like: a different clip of the same speaker)", "other"),
+)
+_GRID_RUNNER_EXTRAS = (
+    "segment_budget_scale_non_cjk",
+    "cfm_temperature",
+    "reuse_spk_cond_for_emo",
+    "enable_pause_tags",
+    "trim_silence_ms_threshold",
+    "target_duration_s",
+    "target_duration_mode",
+)
 
 
 def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]:
@@ -88,7 +127,11 @@ def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]
         try:
             full = checkpoint_descriptor(preferred["path"])
             metadata = full.get("metadata") or {}
-            adapter_type = str(metadata.get("adapter_type") or "lora").upper()
+            saved_type = str(metadata.get("adapter_type") or "").strip().lower()
+            adapter_type = {
+                "lora": "LoRA",
+                "dora": "DoRA",
+            }.get(saved_type, "LoRA / DoRA")
             rank = int(metadata.get("rank") or 0)
             steps = int(metadata.get("steps") or 0)
             label = f"{folder.name}  |  {adapter_type} r{rank}  |  {steps} steps"
@@ -99,21 +142,23 @@ def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]
 
 
 def _phase_label(phase: str) -> str:
-    return {
-        "best": "Best generalization",
-        "improving": "Improving",
-        "plateau": "Plateau",
-        "overfitting": "Overfitting (memorizes training clips)",
-        "base": "Base model (no adapter)",
-        "variant": "Strength variant",
-        "unknown": "Not measured",
-    }.get(str(phase), "Not measured")
+    return phase_display_label(phase)
+
+
+def _evaluation_reference_line(reference_mode: str | None) -> str:
+    mode = str(reference_mode or "self").strip().lower()
+    if mode == "other":
+        label = "other (inference-like: a different clip of the same speaker)"
+    else:
+        label = "self"
+    return f"Evaluation references used by this report: **{label}**."
 
 
 def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
     if not adapter_dir:
         return {
-            "summary": "Select an adapter folder.",
+            "summary": GRID_EMPTY_HINT,
+            "reference_mode_line": "",
             "chart": analysis_epoch_frame(None),
             "rows": [],
             "choices": [],
@@ -128,15 +173,22 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
     recommended = ""
     rows: list[list[Any]] = []
     phases_by_path: dict[str, str] = {}
+    label_cache: dict[str, str] = {}
     if measured is not None:
-        summary = measured.summary_markdown
+        summary = display_legacy_report_text(measured.summary_markdown)
+        reference_mode_line = _evaluation_reference_line(measured.reference_mode)
         if GENERALIZATION_LEGEND not in summary:
             summary += "\n\n" + GENERALIZATION_LEGEND
         recommended = measured.recommended_checkpoint
         for row in measured.rows:
             rows.append(
                 [
-                    row.label,
+                    checkpoint_display_label(
+                        row.label,
+                        path=row.path,
+                        kind=row.kind,
+                        cache=label_cache,
+                    ),
                     row.epoch if row.epoch is not None else "-",
                     f"{row.val_loss:.4f}" if row.val_loss is not None else "-",
                     f"{row.val_accuracy * 100:.1f}%" if row.val_accuracy is not None else "-",
@@ -148,7 +200,8 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
             if row.path and abs(row.strength - 1.0) < 1e-9:
                 phases_by_path[str(Path(row.path).resolve())] = row.phase
     elif analysis is not None:
-        summary = analysis.summary_markdown
+        summary = display_legacy_report_text(analysis.summary_markdown)
+        reference_mode_line = ""
         recommended = analysis.recommended_checkpoint
         for item in analysis.checkpoints:
             path = str(Path(str(item.get("path") or "")).resolve())
@@ -156,7 +209,12 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
             phases_by_path[path] = phase
             rows.append(
                 [
-                    item.get("label", Path(path).name),
+                    checkpoint_display_label(
+                        str(item.get("label") or Path(path).name),
+                        path=path,
+                        kind=str(item.get("kind") or ""),
+                        cache=label_cache,
+                    ),
                     item.get("epoch") or "-",
                     f"{float(item['val_loss']):.4f}" if item.get("val_loss") is not None else "-",
                     "-",
@@ -166,15 +224,16 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
                 ]
             )
     else:
+        reference_mode_line = ""
         summary = (
             "Run **Analyze training log** or train with validation enabled.\n\n"
             + GENERALIZATION_LEGEND
         )
     chart = analysis_epoch_frame(analysis)
     mapping: dict[str, dict[str, str]] = {
-        "base": {"label": "Base model (no adapter)", "path": ""}
+        "base": {"label": BASE_CHECKPOINT_LABEL, "path": ""}
     }
-    choices: list[tuple[str, str]] = [("Base model (no adapter)", "base")]
+    choices: list[tuple[str, str]] = [(BASE_CHECKPOINT_CHOICE_LABEL, "base")]
     final_ids: list[str] = []
     epoch_ids: list[str] = []
     recommended_id = ""
@@ -199,6 +258,7 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
         selected.extend(identifier for identifier in epoch_ids if identifier not in selected)
     return {
         "summary": summary,
+        "reference_mode_line": reference_mode_line,
         "chart": chart,
         "rows": rows,
         "choices": choices,
@@ -211,7 +271,7 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
 def _adapter_context(adapter_dir: str | Path | None) -> dict[str, Any]:
     if not adapter_dir:
         return {
-            "info": "Select an adapter folder.",
+            "info": GRID_EMPTY_HINT,
             "reference": "",
             "texts": GRID_DEFAULTS["grid.texts"],
         }
@@ -258,6 +318,142 @@ def _adapter_context(adapter_dir: str | Path | None) -> dict[str, Any]:
     return {"info": info, "reference": reference, "texts": texts}
 
 
+def _same_folder(left: str | Path, right: str | Path) -> bool:
+    try:
+        return os.path.normcase(str(Path(left).expanduser().resolve())) == os.path.normcase(
+            str(Path(right).expanduser().resolve())
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _adapter_dataset_dir(adapter_dir: str | Path) -> Path | None:
+    root = Path(adapter_dir).expanduser().resolve()
+    config = read_json(root / "train_config.json", {}) or {}
+    if not config:
+        descriptors = discover_checkpoints(root)
+        if descriptors:
+            try:
+                config = (
+                    checkpoint_descriptor(descriptors[0]["path"])
+                    .get("metadata", {})
+                    .get("train_config", {})
+                )
+            except Exception:
+                config = {}
+    value = str(config.get("dataset_dir") or "").strip()
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def calibrate_grid_speaking_rates(
+    grid_dir: str | Path | None,
+    adapter_dir: str | Path | None,
+    recommended_checkpoint: str | Path | None = None,
+) -> tuple[str, str]:
+    """Measure each non-base checkpoint row in the displayed listening grid."""
+
+    result = load_grid(grid_dir) if grid_dir else None
+    if result is None:
+        message = "Open a completed grid before calibrating speaking rate."
+        print(">> " + message, flush=True)
+        return "", message
+    if not adapter_dir:
+        message = "Select the LoRA / DoRA folder that produced this grid."
+        print(">> " + message, flush=True)
+        return "", message
+    configured_adapter = str((result.config or {}).get("adapter_dir") or "")
+    if not configured_adapter or not _same_folder(configured_adapter, adapter_dir):
+        message = (
+            "This grid does not belong to the selected LoRA / DoRA folder; "
+            "select its original folder before calibrating."
+        )
+        print(">> " + message, flush=True)
+        return "", message
+
+    dataset_dir = _adapter_dataset_dir(adapter_dir)
+    if dataset_dir is None or not (dataset_dir / "manifest.jsonl").is_file():
+        message = "The selected LoRA / DoRA has no readable training dataset manifest."
+        print(">> " + message, flush=True)
+        return "", message
+
+    rows: list[tuple[Any, Any]] = []
+    seen: set[str] = set()
+    label_cache: dict[str, str] = {}
+    for cell in result.cells:
+        if not cell.checkpoint_path:
+            continue
+        path_key = os.path.normcase(str(Path(cell.checkpoint_path).expanduser().resolve()))
+        row_key = f"{path_key}@{cell.strength:g}"
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+        calibration_label = cell.checkpoint_label
+        if abs(float(cell.strength) - 1.0) >= 1e-9:
+            calibration_label += f" @{cell.strength:g}"
+        report = calibrate_from_grid(
+            grid_dir,
+            calibration_label,
+            dataset_dir,
+        )
+        if report is None:
+            continue
+        label = checkpoint_display_label(
+            cell.checkpoint_label,
+            path=cell.checkpoint_path,
+            kind=cell.checkpoint_kind,
+            cache=label_cache,
+        )
+        if abs(float(cell.strength) - 1.0) >= 1e-9:
+            label += f" @{cell.strength:g}"
+        rows.append((cell, (label, report)))
+        print(">> " + report.summary, flush=True)
+
+    if not rows:
+        message = "No usable one-second non-base checkpoint cells were found in this grid."
+        print(">> " + message, flush=True)
+        return "", message
+
+    selected = rows[0]
+    if recommended_checkpoint:
+        matching = [
+            item
+            for item in rows
+            if _same_folder(item[0].checkpoint_path, recommended_checkpoint)
+        ]
+        selected = next(
+            (
+                item
+                for item in matching
+                if abs(float(item[0].strength) - 1.0) < 1e-9
+            ),
+            matching[0] if matching else selected,
+        )
+    selected_label, selected_report = selected[1]
+    saved_path = write_speaking_rate(adapter_dir, selected_report)
+    lines = [
+        "| Checkpoint | Generated words/s | Your recordings words/s | Recommended speaking rate |",
+        "|---|---:|---:|---:|",
+    ]
+    for _cell, (label, report) in rows:
+        lines.append(
+            f"| {str(label).replace('|', '\\|')} | "
+            f"{report.generated_words_per_second:.2f} | "
+            f"{report.dataset_words_per_second:.2f} | "
+            f"{report.recommended_speaking_rate:.3f} |"
+        )
+    message = (
+        f"Saved speaking rate {selected_report.recommended_speaking_rate:.3f} from "
+        f"{selected_label} to {saved_path}."
+    )
+    print(">> " + message, flush=True)
+    return "\n".join(lines), message
+
+
 def adapter_selection_updates(adapter_dir: str | None) -> tuple[Any, ...]:
     payload = _analysis_payload(adapter_dir)
     context = _adapter_context(adapter_dir)
@@ -265,6 +461,7 @@ def adapter_selection_updates(adapter_dir: str | None) -> tuple[Any, ...]:
         context["info"],
         payload["chart"],
         payload["summary"],
+        payload["reference_mode_line"],
         payload["rows"],
         gr.update(choices=payload["choices"], value=payload["selected"]),
         payload["mapping"],
@@ -283,6 +480,51 @@ def latest_grid_state(root: str | Path = ROOT / "outputs" / "grids") -> str:
         except OSError:
             continue
     values.sort(key=lambda item: item[0], reverse=True)
+    return str(values[0][1]) if values else ""
+
+
+def latest_lora_folder(root: str | Path = ROOT / "loras") -> str:
+    """Return the newest LoRA / DoRA training folder by status/checkpoint mtime."""
+
+    base = Path(root).expanduser().resolve()
+    values: list[tuple[float, Path]] = []
+    folders = (
+        (item for item in base.iterdir() if item.is_dir())
+        if base.is_dir()
+        else []
+    )
+    for folder in folders:
+        candidates = [folder / "status.json", *folder.rglob("*.safetensors")]
+        modified = 0.0
+        found = False
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    found = True
+                    modified = max(modified, candidate.stat().st_mtime)
+            except OSError:
+                continue
+        if found:
+            values.append((modified, folder.resolve()))
+    values.sort(key=lambda item: (item[0], str(item[1]).lower()), reverse=True)
+    return str(values[0][1]) if values else ""
+
+
+def latest_checkpoint_eval_state(adapter_dir: str | Path | None) -> str:
+    if not adapter_dir:
+        return ""
+    analysis_dir = Path(adapter_dir).expanduser().resolve() / "analysis"
+    candidates = list(analysis_dir.glob("eval_jobs/*/status.json"))
+    legacy = analysis_dir / "eval_job" / "status.json"
+    if legacy.is_file():
+        candidates.append(legacy)
+    values: list[tuple[float, Path]] = []
+    for status_path in candidates:
+        try:
+            values.append((status_path.stat().st_mtime, status_path.parent.resolve()))
+        except OSError:
+            continue
+    values.sort(key=lambda item: (item[0], str(item[1]).lower()), reverse=True)
     return str(values[0][1]) if values else ""
 
 
@@ -313,16 +555,43 @@ def _grid_rows(grid_dir: str | Path | None) -> list[list[Any]]:
     result = load_grid(grid_dir) if grid_dir else None
     if result is None:
         return []
+    label_cache: dict[str, str] = {}
     return [
         [
             cell.index,
+            checkpoint_display_label(
+                cell.checkpoint_label,
+                path=cell.checkpoint_path,
+                kind=cell.checkpoint_kind,
+                cache=label_cache,
+            ),
+            None if not cell.checkpoint_path else cell.strength,
             cell.reference_index,
             cell.text,
             round(cell.audio_seconds, 2),
+            _phase_label(cell.verdict),
             cell.audio_path,
         ]
         for cell in result.cells
     ]
+
+
+def _grid_result_heading(
+    cell: Any, label_cache: dict[str, str] | None = None
+) -> str:
+    display_label = checkpoint_display_label(
+        cell.checkpoint_label,
+        path=cell.checkpoint_path,
+        kind=cell.checkpoint_kind,
+        cache=label_cache,
+    )
+    if not cell.checkpoint_path:
+        return f"#### {BASE_CHECKPOINT_LABEL} | {BASE_GRID_HEADER_DETAIL}"
+    loss = f" | validation loss {cell.val_loss:.4f}" if cell.val_loss is not None else ""
+    return (
+        f"#### {display_label} @ {cell.strength:g} | "
+        f"{_phase_label(cell.verdict)}{loss}"
+    )
 
 
 def _saved_grid_choices(root: str | Path = ROOT / "outputs" / "grids") -> list[tuple[str, str]]:
@@ -345,8 +614,8 @@ def grid_status_updates(
     if not state:
         return (
             "",
-            progress_panel_html({}, title="Grid ready"),
-            "Ready.",
+            progress_panel_html({}, title="Ready"),
+            "",
             "",
             "",
             [],
@@ -391,9 +660,10 @@ def checkpoint_eval_status_updates(
 ) -> tuple[Any, ...]:
     if not state_value:
         return (
-            progress_panel_html({}, title="Evaluation ready"),
-            "Evaluation is idle.",
+            progress_panel_html({}, title="Ready"),
             "",
+            "",
+            gr.skip(),
             gr.skip(),
             gr.skip(),
             gr.skip(),
@@ -426,6 +696,7 @@ def checkpoint_eval_status_updates(
         tail_text(root / "log.txt", 60) or tail_text(root / "worker_console.log", 60),
         _adapter_context(adapter_dir)["info"] if payload else gr.skip(),
         payload["summary"] if payload else gr.skip(),
+        payload["reference_mode_line"] if payload else gr.skip(),
         payload["rows"] if payload else gr.skip(),
         checkpoint_update,
         payload["mapping"] if payload else gr.skip(),
@@ -446,7 +717,7 @@ def _parse_strengths(value: str) -> list[float]:
         if item not in strengths:
             strengths.append(item)
     if not strengths:
-        raise ValueError("Enter at least one adapter strength")
+        raise ValueError("Enter at least one LoRA / DoRA strength")
     return strengths
 
 
@@ -460,6 +731,7 @@ class GridTab:
     checkpoint_map: Any = None
     recommended: Any = None
     summary: Any = None
+    eval_reference_summary: Any = None
     chart: Any = None
     checkpoint_table: Any = None
     analyze_button: Any = None
@@ -473,6 +745,8 @@ class GridTab:
     generate_button: Any = None
     cancel_button: Any = None
     open_button: Any = None
+    calibrate_button: Any = None
+    calibration_result: Any = None
     runtime_summary: Any = None
     state: Any = None
     progress: Any = None
@@ -518,7 +792,7 @@ def build_grid_tab(
     tab.model_dir = str(Path(getattr(options, "model_dir", ROOT / "models")).expanduser().resolve())
     controls = tab.controls
     adapter_choices = _adapter_folders()
-    initial_adapter = adapter_choices[0][1] if adapter_choices else ""
+    initial_adapter = ""
     initial_payload = _analysis_payload(initial_adapter)
     initial_context = _adapter_context(initial_adapter)
 
@@ -526,9 +800,9 @@ def build_grid_tab(
         with gr.Row():
             tab.adapter = gr.Dropdown(
                 choices=adapter_choices,
-                value=initial_adapter or None,
+                value=None,
                 allow_custom_value=True,
-                label="Adapter folder",
+                label="LoRA / DoRA folder",
                 info="Choose one training run to analyze and compare.",
                 scale=10,
             )
@@ -561,6 +835,10 @@ def build_grid_tab(
                 },
             )
             tab.summary = gr.Markdown(initial_payload["summary"])
+            tab.eval_reference_summary = gr.Markdown(
+                initial_payload["reference_mode_line"],
+                elem_classes=["section-note"],
+            )
             tab.checkpoint_table = gr.Dataframe(
                 headers=[
                     "Checkpoint",
@@ -581,12 +859,47 @@ def build_grid_tab(
                 buttons=["fullscreen", "copy"],
             )
             with gr.Row():
-                tab.analyze_button = gr.Button("🔬  Analyze training log", elem_classes=btn("amber"))
-                tab.evaluate_button = gr.Button("📈  Evaluate checkpoints now", variant="primary", elem_classes=btn("blue"))
-                tab.use_generation = gr.Button("⭐  Use best checkpoint", elem_classes=btn("cyan"))
+                tab.analyze_button = gr.Button("🔬  Analyze training log", elem_classes=btn("orange"))
+                tab.evaluate_button = gr.Button("📈  Evaluate checkpoints now", variant="primary", elem_classes=btn("purple"))
+                tab.use_generation = gr.Button("⭐  Use best checkpoint", elem_classes=btn("green"))
+            with gr.Row():
+                eval_reference_mode = gr.Dropdown(
+                    choices=list(EVAL_REFERENCE_CHOICES),
+                    value=GRID_DEFAULTS["grid.eval_reference_mode"],
+                    label="Evaluation references",
+                    info="Same as training validation inherits that run's validation mode; other uses a different same-speaker clip like inference.",
+                )
+                eval_train_subset = gr.Number(
+                    value=GRID_DEFAULTS["grid.eval_train_subset"],
+                    minimum=0,
+                    maximum=100000,
+                    precision=0,
+                    label="Training subset",
+                    info="Deterministic training items measured beside validation; 0 disables the training subset.",
+                )
+                eval_include_base = gr.Checkbox(
+                    value=GRID_DEFAULTS["grid.eval_include_base"],
+                    label="Include base model",
+                    info="Adds Base model (no LoRA / DoRA), the reference-only comparison baseline.",
+                )
+            for key, component, kind, choices, minimum, maximum in (
+                ("grid.eval_reference_mode", eval_reference_mode, "choice", ["", "self", "other"], None, None),
+                ("grid.eval_train_subset", eval_train_subset, "int", None, 0, 100000),
+                ("grid.eval_include_base", eval_include_base, "bool", None, None, None),
+            ):
+                _register(
+                    registry,
+                    controls,
+                    key,
+                    component,
+                    kind=kind,
+                    choices=choices,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
             tab.eval_state = gr.State("")
-            tab.eval_progress = gr.HTML(progress_panel_html({}, title="Evaluation ready"))
-            tab.eval_status = gr.Markdown("Evaluation is idle.")
+            tab.eval_progress = gr.HTML(progress_panel_html({}, title="Ready"))
+            tab.eval_status = gr.Markdown("")
             tab.eval_log = gr.Textbox(
                 label="Evaluation log (last 60 lines)",
                 lines=8,
@@ -602,7 +915,7 @@ def build_grid_tab(
             choices=initial_payload["choices"],
             value=initial_payload["selected"],
             label="Checkpoints",
-            info="The base model, recommended checkpoint, and final checkpoint are selected first.",
+            info="Base model (no LoRA / DoRA), the recommended checkpoint, and the final checkpoint are selected first.",
         )
         tab.checkpoint_map = gr.State(initial_payload["mapping"])
         tab.recommended = gr.State(initial_payload["recommended"])
@@ -615,7 +928,7 @@ def build_grid_tab(
             strengths = gr.Textbox(
                 value="1.0",
                 label="Strengths",
-                info="Comma-separated adapter strengths from 0 to 4; the base model is generated once.",
+                info="Comma-separated LoRA / DoRA strengths from 0 to 4; Base model (no LoRA / DoRA) is generated once without a strength.",
             )
             seed = gr.Number(
                 value=-1,
@@ -644,7 +957,7 @@ def build_grid_tab(
             info="Every checkpoint uses these same references in the same order.",
         )
         with gr.Row():
-            use_reference = gr.Button("🎤  Use adapter reference", elem_classes=btn("fuchsia"))
+            use_reference = gr.Button("🎤  Use LoRA / DoRA reference", elem_classes=btn("fuchsia"))
             add_candidates = gr.Button("➕  Add dataset reference candidates", elem_classes=btn("lime"))
             reference_upload = gr.Audio(
                 label="Add a reference audio file",
@@ -674,21 +987,32 @@ def build_grid_tab(
                 temperature = gr.Slider(0.1, 2.0, value=0.8, step=0.05, label="Temperature", info="0.8 matches Voice Generation defaults.")
                 top_p = gr.Slider(0, 1, value=0.8, step=0.01, label="Top-p", info="Nucleus sampling threshold shared by every cell.")
                 top_k = gr.Slider(0, 100, value=30, step=1, label="Top-k", info="Token candidate cutoff; 0 disables it.")
+                num_beams = gr.Slider(1, 10, value=GRID_DEFAULTS["grid.num_beams"], step=1, label="Beams", info="Beam count strongly affects quality as well as generation time and VRAM.")
                 repetition = gr.Slider(1, 20, value=10.0, step=0.1, label="Repetition penalty", info="Keeps semantic-token loops under control.")
             with gr.Row():
                 diffusion = gr.Slider(2, 100, value=25, step=1, label="Diffusion steps", info="25 is the quality default.")
                 cfg_rate = gr.Slider(0, 2, value=0.7, step=0.05, label="CFG rate", info="Diffusion conditioning strength.")
                 max_tokens = gr.Slider(20, 300, value=60, step=1, label="Max text tokens per segment", info="Use the same segment size for a fair comparison.")
                 emotion_weight = gr.Slider(0, 1, value=0.65, step=0.05, label="Emotion weight (alpha)", info="Shared emotion-conditioning blend for every cell.")
+                speaking_rate = gr.Slider(
+                    0.5,
+                    1.5,
+                    value=GRID_DEFAULTS["grid.speaking_rate"],
+                    step=0.01,
+                    label="Speaking rate",
+                    info="1.0 is the model's natural pace; below 1.0 speaks slower, above 1.0 faster. A trained LoRA / DoRA can carry a calibrated value that matches the speaker's real pace.",
+                )
             for key, component, kind, minimum, maximum in (
                 ("grid.temperature", temperature, "float", 0.1, 2),
                 ("grid.top_p", top_p, "float", 0, 1),
                 ("grid.top_k", top_k, "int", 0, 100),
+                ("grid.num_beams", num_beams, "int", 1, 10),
                 ("grid.repetition_penalty", repetition, "float", 1, 20),
                 ("grid.diffusion_steps", diffusion, "int", 2, 100),
                 ("grid.inference_cfg_rate", cfg_rate, "float", 0, 2),
                 ("grid.max_text_tokens_per_segment", max_tokens, "int", 20, 300),
                 ("grid.emotion_weight", emotion_weight, "float", 0, 1),
+                ("grid.speaking_rate", speaking_rate, "float", 0.5, 1.5),
             ):
                 _register(registry, controls, key, component, kind=kind, minimum=minimum, maximum=maximum)
 
@@ -699,9 +1023,14 @@ def build_grid_tab(
             )
             tab.cancel_button = gr.Button("⛔  Cancel", variant="stop", elem_classes=btn("red"))
             tab.open_button = gr.Button("📁  Open grid folder", elem_classes=btn("indigo"))
+        tab.calibrate_button = gr.Button(
+            "🐢  Calibrate speaking rate from this grid",
+            elem_classes=btn("teal"),
+        )
         tab.state = gr.State("")
-        tab.progress = gr.HTML(progress_panel_html({}, title="Grid ready"))
-        tab.status = gr.Markdown("Ready.")
+        tab.progress = gr.HTML(progress_panel_html({}, title="Ready"))
+        tab.status = gr.Markdown("")
+        tab.calibration_result = gr.Markdown("")
         tab.log = gr.Textbox(
             label="Grid log (last 60 lines)",
             lines=10,
@@ -722,11 +1051,12 @@ def build_grid_tab(
         # drives @gr.render) for queued events, and the polling timer runs unqueued.
         tab.result_state = gr.Textbox(value="", visible=False, label="Grid result folder")
         with gr.Column(elem_classes=["grid-results"]):
-            @gr.render(inputs=tab.result_state)
+            @gr.render(inputs=tab.result_state, triggers=[tab.result_state.change])
             def render_grid(result_dir: str | None):
                 result = load_grid(result_dir) if result_dir else None
                 if result is None:
                     return
+                label_cache: dict[str, str] = {}
                 groups: list[tuple[tuple[str, float], list[Any]]] = []
                 for cell in result.cells:
                     key = (cell.checkpoint_label, cell.strength)
@@ -735,12 +1065,9 @@ def build_grid_tab(
                         match = (key, [])
                         groups.append(match)
                     match[1].append(cell)
-                for group_index, ((label, strength_value), cells_value) in enumerate(groups):
+                for group_index, ((_label, _strength), cells_value) in enumerate(groups):
                     first = cells_value[0]
-                    loss = f" | validation loss {first.val_loss:.4f}" if first.val_loss is not None else ""
-                    gr.Markdown(
-                        f"#### {label} @ {strength_value:g} | {_phase_label(first.verdict)}{loss}"
-                    )
+                    gr.Markdown(_grid_result_heading(first, label_cache))
                     for start in range(0, len(cells_value), 4):
                         with gr.Row():
                             for cell in cells_value[start : start + 4]:
@@ -754,8 +1081,8 @@ def build_grid_tab(
                                         key=f"grid-{group_index}-{cell.index}-{cell.audio_path}",
                                     )
         tab.result_table = gr.Dataframe(
-            headers=["Row", "Reference", "Text", "Seconds", "File"],
-            datatype=["number", "number", "str", "number", "str"],
+            headers=["Row", "Checkpoint", "Strength", "Reference", "Text", "Seconds", "Verdict", "File"],
+            datatype=["number", "str", "number", "number", "str", "number", "str", "str"],
             value=[],
             type="array",
             interactive=False,
@@ -769,6 +1096,7 @@ def build_grid_tab(
         tab.adapter_info,
         tab.chart,
         tab.summary,
+        tab.eval_reference_summary,
         tab.checkpoint_table,
         tab.checkpoint_group,
         tab.checkpoint_map,
@@ -788,7 +1116,7 @@ def build_grid_tab(
 
     def analyze_now(adapter_dir: str):
         if not adapter_dir:
-            raise gr.Error("Select an adapter folder first")
+            raise gr.Error("Select a LoRA / DoRA folder first")
         try:
             analysis = analyze_training_run(adapter_dir)
             write_training_analysis(analysis)
@@ -856,6 +1184,13 @@ def build_grid_tab(
         tab.status,
         queue=False,
     )
+    tab.calibrate_button.click(
+        calibrate_grid_speaking_rates,
+        [tab.result_state, tab.adapter, tab.recommended],
+        [tab.calibration_result, tab.status],
+        queue=False,
+        api_name="calibrate_grid_speaking_rate",
+    )
     grid_poll_outputs = [
         tab.state,
         tab.progress,
@@ -882,6 +1217,7 @@ def build_grid_tab(
             tab.eval_log,
             tab.adapter_info,
             tab.summary,
+            tab.eval_reference_summary,
             tab.checkpoint_table,
             tab.checkpoint_group,
             tab.checkpoint_map,
@@ -900,7 +1236,128 @@ def build_grid_tab(
             show_progress="hidden",
             api_name="attach_checkpoint_grid",
         )
+
+        def load_last_checkpoint_values():
+            adapter_dir = latest_lora_folder()
+            selection = adapter_selection_updates(adapter_dir or None)
+            eval_state = latest_checkpoint_eval_state(adapter_dir)
+            eval_updates = checkpoint_eval_status_updates(
+                eval_state,
+                adapter_dir,
+                _analysis_payload(adapter_dir)["selected"] if adapter_dir else [],
+            )
+            return (
+                gr.update(
+                    choices=_adapter_folders(),
+                    value=adapter_dir or None,
+                ),
+                *selection,
+                eval_state,
+                eval_updates[0],
+                eval_updates[1],
+                eval_updates[2],
+                eval_updates[-1],
+            )
+
+        load_hook(
+            load_last_checkpoint_values,
+            outputs=[
+                tab.adapter,
+                *tab.selection_outputs,
+                tab.eval_state,
+                tab.eval_progress,
+                tab.eval_status,
+                tab.eval_log,
+                tab.eval_timer,
+            ],
+            queue=False,
+            show_progress="hidden",
+            api_name="load_last_checkpoint_analysis",
+        )
     return tab
+
+
+def build_grid_config_from_ui(
+    mapping: Mapping[str, Any],
+    grid_values: Mapping[str, Any],
+    generation_values: Mapping[str, Any],
+    *,
+    model_dir: str,
+    output_root: str | Path,
+    grid_name: str,
+) -> GridConfig:
+    """Build a worker config from the live front-end generation and grid controls."""
+
+    adapter_dir = str(grid_values.get("grid.adapter_dir") or "")
+    checkpoints: list[GridCheckpoint] = []
+    for identifier in list(grid_values.get("grid.checkpoints") or []):
+        item = dict((mapping or {}).get(identifier) or {})
+        if item:
+            checkpoints.append(
+                GridCheckpoint(item.get("label", identifier), item.get("path", ""))
+            )
+
+    generation_request = build_generation_request(
+        generation_values,
+        model_dir=model_dir,
+    )
+    runtime = dict(generation_request["runtime"])
+    runtime["lora_path"] = ""
+    runtime["lora_strength"] = 1.0
+    runtime["lora_merge_into_base"] = False
+
+    infer_kwargs = dict(generation_request["infer_kwargs"])
+    grid_speaking_rate = min(
+        1.5,
+        max(0.5, float(grid_values.get("grid.speaking_rate", 1.0))),
+    )
+    infer_kwargs["latent_multiplier"] = round(
+        float(
+            generation_values.get(
+                "generation.latent_multiplier",
+                GENERATION_DEFAULTS["generation.latent_multiplier"],
+            )
+        )
+        / grid_speaking_rate,
+        4,
+    )
+    for key in _GRID_RUNNER_EXTRAS:
+        infer_kwargs[key] = generation_request[key]
+    top_k = int(grid_values["grid.top_k"])
+    infer_kwargs.update(
+        {
+            "temperature": float(grid_values["grid.temperature"]),
+            "top_p": float(grid_values["grid.top_p"]),
+            "top_k": top_k if top_k > 0 else None,
+            "num_beams": int(grid_values["grid.num_beams"]),
+            "repetition_penalty": float(grid_values["grid.repetition_penalty"]),
+            "diffusion_steps": int(grid_values["grid.diffusion_steps"]),
+            "inference_cfg_rate": float(grid_values["grid.inference_cfg_rate"]),
+            "max_text_tokens_per_segment": int(
+                grid_values["grid.max_text_tokens_per_segment"]
+            ),
+            "emo_alpha": float(grid_values["grid.emotion_weight"]),
+        }
+    )
+    return GridConfig(
+        adapter_dir=adapter_dir,
+        checkpoints=checkpoints,
+        strengths=_parse_strengths(str(grid_values["grid.strengths"])),
+        references=parse_multiline_paths(str(grid_values["grid.references"])),
+        texts=[
+            line.strip()
+            for line in str(grid_values["grid.texts"]).splitlines()
+            if line.strip()
+        ],
+        language=str(grid_values["grid.language"]),
+        seed=int(grid_values["grid.seed"]),
+        same_seed_for_all_cells=True,
+        output_root=str(Path(output_root).expanduser().resolve()),
+        grid_name=grid_name,
+        runtime=runtime,
+        infer_kwargs=infer_kwargs,
+        include_verdicts=True,
+    ).validate()
 
 
 def bind_grid_events(
@@ -943,7 +1400,7 @@ def bind_grid_events(
         seconds = cells * 9
         return (
             f"Resolved runtime: **{runtime.get('device', 'auto')}**, tier **{runtime.get('vram_tier', 'auto')}** | "
-            f"**{cells} cells** | rough 32 GB-tier time **{seconds // 60}m {seconds % 60}s**"
+            f"**{cells} cells** | rough estimate on a 32 GB tier: **{seconds // 60}m {seconds % 60}s**"
         )
 
     runtime_line_inputs = [
@@ -974,9 +1431,16 @@ def bind_grid_events(
             show_progress="hidden",
         )
 
-    def start_evaluation(adapter_dir: str, *items: Any):
+    def start_evaluation(
+        adapter_dir: str,
+        reference_mode: str,
+        train_subset: int,
+        include_base: bool,
+        strengths_text: str,
+        *items: Any,
+    ):
         if not adapter_dir:
-            raise gr.Error("Select an adapter folder first")
+            raise gr.Error("Select a LoRA / DoRA folder first")
         values = runtime_values(*items)
         runtime = runtime_config_from_values(values)
         device = str(runtime.get("device") or "auto")
@@ -984,7 +1448,14 @@ def bind_grid_events(
             device = "cuda:0" if list_gpus() else "cpu"
         job_dir = Path(adapter_dir) / "analysis" / "eval_jobs" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         job_dir.mkdir(parents=True, exist_ok=False)
-        config = CheckpointEvalConfig(adapter_dir=adapter_dir, device=device)
+        config = CheckpointEvalConfig(
+            adapter_dir=adapter_dir,
+            device=device,
+            reference_mode=str(reference_mode or ""),
+            train_subset=int(train_subset),
+            include_base=bool(include_base),
+            strengths=_parse_strengths(strengths_text),
+        )
         config_path = write_json_atomic(job_dir / "config.json", config.to_dict())
         write_json_atomic(
             job_dir / "status.json",
@@ -1008,7 +1479,14 @@ def bind_grid_events(
 
     tab.evaluate_button.click(
         start_evaluation,
-        [tab.adapter, *runtime_components],
+        [
+            tab.adapter,
+            tab.controls["grid.eval_reference_mode"],
+            tab.controls["grid.eval_train_subset"],
+            tab.controls["grid.eval_include_base"],
+            tab.controls["grid.strengths"],
+            *runtime_components,
+        ],
         [tab.eval_state, tab.eval_progress, tab.eval_status, tab.eval_log, tab.eval_timer],
         concurrency_limit=1,
         concurrency_id="checkpoint_eval",
@@ -1016,54 +1494,29 @@ def bind_grid_events(
 
     grid_keys = list(tab.controls)
     grid_components = [tab.controls[key] for key in grid_keys]
+    generation_keys = generation.request_keys
+    generation_components = generation.request_components
 
     def start_grid(
         mapping: Mapping[str, Any], *items: Any
     ):
         grid_values = dict(zip(grid_keys, items[: len(grid_keys)]))
-        runtime_value = runtime_values(*items[len(grid_keys) :])
-        adapter_dir = str(grid_values.get("grid.adapter_dir") or "")
-        selected = list(grid_values.get("grid.checkpoints") or [])
-        checkpoints = []
-        for identifier in selected:
-            item = dict((mapping or {}).get(identifier) or {})
-            if item:
-                checkpoints.append(GridCheckpoint(item.get("label", identifier), item.get("path", "")))
-        runtime = runtime_config_from_values(
-            runtime_value,
-            model_dir=tab.model_dir,
+        generation_values = dict(
+            zip(generation_keys, items[len(grid_keys) :])
         )
-        runtime["lora_path"] = ""
-        runtime["lora_strength"] = 1.0
-        infer_kwargs = {
-            "temperature": float(grid_values["grid.temperature"]),
-            "top_p": float(grid_values["grid.top_p"]),
-            "top_k": int(grid_values["grid.top_k"]),
-            "repetition_penalty": float(grid_values["grid.repetition_penalty"]),
-            "diffusion_steps": int(grid_values["grid.diffusion_steps"]),
-            "inference_cfg_rate": float(grid_values["grid.inference_cfg_rate"]),
-            "max_text_tokens_per_segment": int(grid_values["grid.max_text_tokens_per_segment"]),
-            "emo_alpha": float(grid_values["grid.emotion_weight"]),
-        }
+        adapter_dir = str(grid_values.get("grid.adapter_dir") or "")
         output_root = ROOT / "outputs" / "grids"
         output_root.mkdir(parents=True, exist_ok=True)
         name = f"{Path(adapter_dir).name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         state_dir = output_root / name
-        config = GridConfig(
-            adapter_dir=adapter_dir,
-            checkpoints=checkpoints,
-            strengths=_parse_strengths(str(grid_values["grid.strengths"])),
-            references=parse_multiline_paths(str(grid_values["grid.references"])),
-            texts=[line.strip() for line in str(grid_values["grid.texts"]).splitlines() if line.strip()],
-            language=str(grid_values["grid.language"]),
-            seed=int(grid_values["grid.seed"]),
-            same_seed_for_all_cells=True,
-            output_root=str(output_root),
+        config = build_grid_config_from_ui(
+            mapping,
+            grid_values,
+            generation_values,
+            model_dir=tab.model_dir,
+            output_root=output_root,
             grid_name=name,
-            runtime=runtime,
-            infer_kwargs=infer_kwargs,
-            include_verdicts=True,
-        ).validate()
+        )
         state_dir.mkdir(parents=True, exist_ok=False)
         config_path = write_json_atomic(state_dir / "config.json", config.to_dict())
         write_json_atomic(
@@ -1088,7 +1541,7 @@ def bind_grid_events(
 
     tab.generate_button.click(
         start_grid,
-        [tab.checkpoint_map, *grid_components, *runtime_components],
+        [tab.checkpoint_map, *grid_components, *generation_components],
         [tab.state, tab.progress, tab.status, tab.log, tab.timer],
         concurrency_limit=1,
         concurrency_id="grid_generation",
@@ -1165,8 +1618,12 @@ __all__ = [
     "adapter_selection_updates",
     "adopt_grid_state",
     "bind_grid_events",
+    "build_grid_config_from_ui",
     "build_grid_tab",
+    "calibrate_grid_speaking_rates",
     "checkpoint_eval_status_updates",
     "grid_status_updates",
+    "latest_checkpoint_eval_state",
     "latest_grid_state",
+    "latest_lora_folder",
 ]

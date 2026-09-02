@@ -10,7 +10,10 @@ from indextts.training.analysis import (
     ANALYSIS_SERIES,
     analysis_epoch_frame,
     analyze_training_run,
+    checkpoint_descriptor,
+    checkpoint_display_label,
     classify_epoch_phases,
+    display_legacy_report_text,
     load_training_analysis,
     write_training_analysis,
 )
@@ -80,6 +83,90 @@ def test_phase_classification_is_pure_and_uses_earliest_best() -> None:
     assert best_epoch == 2
     assert overfit_start == 4
     assert phases == {1: "improving", 2: "best", 3: "plateau", 4: "overfitting"}
+
+
+def test_legacy_report_wording_is_upgraded_only_for_display() -> None:
+    stored = "Base model (no adapter): the adapter beats other adapters."
+
+    displayed = display_legacy_report_text(stored)
+
+    assert stored == "Base model (no adapter): the adapter beats other adapters."
+    assert displayed == (
+        "Base model (no LoRA / DoRA): the LoRA / DoRA beats other LoRA / DoRA."
+    )
+    assert display_legacy_report_text("base model (no adapter)") == (
+        "Base model (no LoRA / DoRA)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "adapter_type", "epoch", "steps", "label", "file_label"),
+    [
+        ("best/voice.safetensors", "dora", 10, 100, "best (epoch 10 DoRA Checkpoint)", "best_ep10"),
+        ("voice_epoch_030.safetensors", "dora", 30, 300, "epoch 30 (DoRA Checkpoint)", "epoch_030"),
+        ("voice.safetensors", "dora", 40, 400, "final (epoch 40 DoRA Checkpoint)", "final_ep40"),
+        ("voice_interrupted.safetensors", "dora", 7, 70, "interrupted (epoch 7 DoRA Checkpoint)", "interrupted_ep07"),
+        ("voice_step_000500.safetensors", "dora", 0, 500, "step 500 (DoRA Checkpoint)", "step_000500"),
+        ("voice_epoch_002.safetensors", "unknown", 2, 20, "epoch 2 (LoRA / DoRA Checkpoint)", "epoch_002"),
+    ],
+)
+def test_checkpoint_descriptor_includes_saved_lora_or_dora_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    adapter_type: str,
+    epoch: int,
+    steps: int,
+    label: str,
+    file_label: str,
+) -> None:
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"checkpoint")
+    monkeypatch.setattr(
+        analysis_module,
+        "inspect_lora",
+        lambda _path: {
+            "adapter_type": adapter_type,
+            "epochs": epoch,
+            "steps": steps,
+            "train_config": {},
+        },
+    )
+
+    descriptor = checkpoint_descriptor(path)
+
+    assert descriptor["label"] == label
+    assert descriptor["file_label"] == file_label
+
+
+def test_legacy_checkpoint_display_label_upgrades_once_and_keeps_strength(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "voice_epoch_010.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    calls = 0
+
+    def inspect(_path):
+        nonlocal calls
+        calls += 1
+        return {
+            "adapter_type": "dora",
+            "epochs": 10,
+            "steps": 100,
+            "train_config": {},
+        }
+
+    monkeypatch.setattr(analysis_module, "inspect_lora", inspect)
+    cache: dict[str, str] = {}
+
+    assert checkpoint_display_label(
+        "epoch 10 @0.5", path=checkpoint, kind="epoch", cache=cache
+    ) == "epoch 10 (DoRA Checkpoint) @0.5"
+    assert checkpoint_display_label(
+        "epoch 10", path=checkpoint, kind="epoch", cache=cache
+    ) == "epoch 10 (DoRA Checkpoint)"
+    assert calls == 1
 
 
 def test_middle_best_detects_sustained_overfit_and_round_trips(

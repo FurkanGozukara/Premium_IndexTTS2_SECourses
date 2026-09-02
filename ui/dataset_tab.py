@@ -249,14 +249,14 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
     if not state_value:
         empty_hist = pd.DataFrame(columns=["bucket", "count"])
         return (
-            progress_panel_html({}, title="Dataset preparation ready"),
-            "Ready.",
+            progress_panel_html({}, title="Ready"),
+            "",
             "",
             "",
             empty_hist,
             [],
             [],
-            "No dataset warnings.",
+            "",
             [],
             gr.Timer(5.0, active=True),
             gr.skip(),
@@ -369,8 +369,8 @@ def build_dataset_tab(
     device_default = str(getattr(args, "device", "cuda:0") or "cuda:0")
     if device_default == "auto":
         device_default = "cuda:0"
-    # Each browser discovers its own current run through demo.load; a build-time
-    # snapshot would stay stale after reloads.
+    # Each browser discovers its previous run only when the header load control fires;
+    # a build-time snapshot would expose stale results after reloads.
     initial_state, initial_dataset_path = "", ""
 
     with gr.Tab("LoRA Dataset Preparation", id="dataset-preparation") as tab_block:
@@ -380,7 +380,7 @@ def build_dataset_tab(
                 info="Prepared datasets with dataset_info.json under datasets/.", scale=5,
             )
             refresh_existing = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
-            open_existing = gr.Button("📁  Open dataset folder", elem_classes=btn("sky"), scale=1)
+            open_existing = gr.Button("🗂️  Open dataset folder", elem_classes=btn("sky"), scale=1)
         existing_info = gr.Markdown("Select a dataset to inspect it.")
 
         with gr.Accordion("Inputs", open=True):
@@ -491,7 +491,7 @@ def build_dataset_tab(
 
         with gr.Accordion("Output", open=False):
             with gr.Row():
-                references = gr.Slider(0, 20, value=5, step=1, label="Reference candidates", info="Exports the cleanest segments for training samples and adapter use.")
+                references = gr.Slider(0, 20, value=5, step=1, label="Reference candidates", info="Exports the cleanest segments for training samples and LoRA / DoRA use.")
                 overwrite = gr.Checkbox(value=False, label="Overwrite dataset", info="Replaces an existing dataset directory with the same name.")
                 max_segments = gr.Number(value=0, minimum=0, precision=0, label="Maximum segments", info="0 processes all segments; use a small value for smoke tests.")
                 seed = gr.Number(value=0, precision=0, label="Preparation seed", info="Controls deterministic candidate ranking and randomized operations.")
@@ -517,8 +517,8 @@ def build_dataset_tab(
         segment_paths_state = gr.State([])
         reference_state = gr.State([])
         timer = gr.Timer(5.0, active=True)
-        progress = gr.HTML(progress_panel_html({}, title="Dataset preparation ready"))
-        status = gr.Markdown("Ready.")
+        progress = gr.HTML(progress_panel_html({}, title="Ready"))
+        status = gr.Markdown("")
         log = gr.Textbox(label="Preparation log", lines=10, max_lines=16, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
         stats = gr.HTML("")
         histogram = gr.BarPlot(
@@ -533,9 +533,9 @@ def build_dataset_tab(
             buttons=["fullscreen", "copy"],
         )
         selected_audio = gr.Audio(label="Selected segment", type="filepath", buttons=["download"])
-        warnings = gr.Markdown("No dataset warnings.")
+        warnings = gr.Markdown("")
         with gr.Column():
-            @gr.render(inputs=reference_state)
+            @gr.render(inputs=reference_state, triggers=[reference_state.change])
             def render_references(paths: list[str] | None):
                 values = list(paths or [])
                 if not values:

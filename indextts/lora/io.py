@@ -1,4 +1,4 @@
-"""Safetensors persistence and discovery for IndexTTS LoRA adapters."""
+"""Safetensors persistence and discovery for IndexTTS LoRA / DoRA files."""
 
 from __future__ import annotations
 
@@ -181,17 +181,17 @@ def save_lora(
     metadata: LoraMetadata | Mapping[str, Any],
     dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    """Atomically save adapters and optional fully-trained small modules."""
+    """Atomically save LoRA / DoRA and optional fully-trained small modules."""
 
     if dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("LoRA safetensors dtype must be torch.bfloat16 or torch.float32")
     if not adapters:
-        raise ValueError("at least one adapter is required")
+        raise ValueError("at least one LoRA / DoRA module is required")
 
     tensors: dict[str, torch.Tensor] = {}
     for module_path, adapter in adapters.items():
         if not module_path:
-            raise ValueError("adapter module paths cannot be empty")
+            raise ValueError("LoRA / DoRA module paths cannot be empty")
         tensors[f"{module_path}.lora_A.weight"] = _cast_for_save(
             adapter.lora_A.weight, dtype
         )
@@ -216,14 +216,14 @@ def save_lora(
     alphas = {adapter.alpha for adapter in adapters.values()}
     adapter_types = {"dora" if adapter.use_dora else "lora" for adapter in adapters.values()}
     if len(ranks) != 1 or len(alphas) != 1 or len(adapter_types) != 1:
-        raise ValueError("one LoRA file cannot contain mixed ranks, alphas, or adapter types")
+        raise ValueError("one LoRA / DoRA file cannot contain mixed ranks, alphas, or types")
     actual_rank = next(iter(ranks))
     actual_alpha = next(iter(alphas))
     actual_type = next(iter(adapter_types))
     if metadata_value.rank not in (0, actual_rank):
-        raise ValueError("metadata rank disagrees with the adapters being saved")
+        raise ValueError("metadata rank disagrees with the LoRA / DoRA modules being saved")
     if metadata_value.alpha > 0.0 and metadata_value.alpha != actual_alpha:
-        raise ValueError("metadata alpha disagrees with the adapters being saved")
+        raise ValueError("metadata alpha disagrees with the LoRA / DoRA modules being saved")
     metadata_value = replace(
         metadata_value,
         rank=actual_rank,
@@ -283,7 +283,7 @@ def _analyze_lora_structure(
         if key.endswith(".lora_A.weight")
     }
     if not module_paths:
-        raise ValueError(f"{source} does not contain LoRA adapter tensors")
+        raise ValueError(f"{source} does not contain LoRA / DoRA tensors")
 
     inferred_ranks: set[int] = set()
     magnitude_paths: set[str] = set()
@@ -291,30 +291,30 @@ def _analyze_lora_structure(
         a_key = f"{module_path}.lora_A.weight"
         b_key = f"{module_path}.lora_B.weight"
         if b_key not in shapes:
-            raise ValueError(f"adapter {module_path!r} is missing lora_B.weight")
+            raise ValueError(f"LoRA / DoRA module {module_path!r} is missing lora_B.weight")
         a_shape = shapes[a_key]
         b_shape = shapes[b_key]
         if len(a_shape) != 2 or len(b_shape) != 2:
-            raise ValueError(f"adapter {module_path!r} A/B tensors must be two-dimensional")
+            raise ValueError(f"LoRA / DoRA module {module_path!r} A/B tensors must be two-dimensional")
         if a_shape[0] != b_shape[1]:
-            raise ValueError(f"adapter {module_path!r} has incompatible A/B shapes")
+            raise ValueError(f"LoRA / DoRA module {module_path!r} has incompatible A/B shapes")
         inferred_ranks.add(int(a_shape[0]))
         magnitude_key = f"{module_path}.lora_magnitude"
         if magnitude_key in shapes:
             if shapes[magnitude_key] != (b_shape[0],):
                 raise ValueError(
-                    f"adapter {module_path!r} has an incompatible DoRA magnitude shape"
+                    f"LoRA / DoRA module {module_path!r} has an incompatible DoRA magnitude shape"
                 )
             magnitude_paths.add(module_path)
     if len(inferred_ranks) != 1:
-        raise ValueError(f"adapter file contains mixed ranks: {sorted(inferred_ranks)}")
+        raise ValueError(f"LoRA / DoRA file contains mixed ranks: {sorted(inferred_ranks)}")
     inferred_rank = next(iter(inferred_ranks))
 
     metadata = LoraMetadata.from_header(header)
     rank = metadata.rank if metadata.rank > 0 else inferred_rank
     if rank != inferred_rank:
         raise ValueError(
-            f"metadata rank {rank} disagrees with adapter tensor rank {inferred_rank}"
+            f"metadata rank {rank} disagrees with LoRA / DoRA tensor rank {inferred_rank}"
         )
     adapter_type = (
         metadata.adapter_type if metadata.adapter_type in {"lora", "dora"} else ""
@@ -366,7 +366,7 @@ def _read_lora_structure(source: Path) -> _LoraStructure:
 
 
 def load_lora(path: str | os.PathLike[str]) -> LoraFile:
-    """Load and normalize an IndexTTS or PEFT-style adapter file on CPU."""
+    """Load and normalize an IndexTTS or PEFT-style LoRA / DoRA file on CPU."""
 
     source = Path(path)
     structure = _read_lora_structure(source)
@@ -391,7 +391,7 @@ def load_lora(path: str | os.PathLike[str]) -> LoraFile:
 
 
 def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
-    """Return the compact adapter information used by the model manager UI."""
+    """Return compact LoRA / DoRA information used by the model manager UI."""
 
     source = Path(path)
     structure = _read_lora_structure(source)

@@ -49,6 +49,7 @@ indextts/training/           # dataset preparation + training (task TRAINING)
     features.py              # feature caching (text tokens, semantic codes, campplus emb, emo vec) using the loaded models
     dataset.py               # torch Dataset/collate over cached features
     trainer.py               # TrainConfig + LoRA/DoRA trainer loop (block swap aware, grad checkpointing, val, samples)
+    speaking_rate.py         # CPU-only words/s measurement and per-voice speaking-rate calibration
     analysis.py              # CPU-only metrics analysis, phase verdicts, recommended checkpoint
     checkpoint_eval.py       # teacher-forced base/checkpoint comparison on matching train/validation splits
     eval_worker.py           # isolated checkpoint-evaluation worker and status/progress contract
@@ -158,6 +159,12 @@ The request dict gains `"runtime": RuntimeConfig.to_dict()`, `"progress_file": <
 `create_tts(runtime_options)` builds `IndexTTS2(cfg_path, model_dir, runtime=RuntimeConfig.from_dict(...))`.
 `IndexTTS2` caches the loaded LoRA: switching LoRA path/strength must not reload base weights.
 
+`generation.speaking_rate` and `grid.speaking_rate` are UI-only values (0.5 through 1.5, default 1.0), and
+`generation.auto_lora_speaking_rate=True` is also UI-only; none is a runner or engine key. Request builders fold
+them into the existing contract as
+`infer_kwargs["latent_multiplier"] = round(latent_multiplier / speaking_rate, 4)`. Batch Generation reuses the
+Voice Generation request builder and therefore inherits the same fold.
+
 Inference extras may be supplied as top-level request keys (which override `infer_kwargs`) or directly in
 `infer_kwargs`: `segment_budget_scale_non_cjk=0.72` (`(0,1]`, `1.0` disables scaling),
 `cfm_temperature=1.0` (finite, `>=0`), `seed=None` (`None`/`-1` random),
@@ -195,11 +202,65 @@ append `state_dir/metrics.jsonl` (one JSON per logged step: step, epoch, loss, a
 append `state_dir/log.txt`, and honour `state_dir/stop.flag` (graceful: finish step, save, exit) and process kill.
 The parent UI uses the same `_terminate_process_tree` approach as webui.py for hard cancel.
 
+Quality-first `TrainConfig` defaults measured on the 31-minute reference dataset are rank 128, alpha 129,
+learning rate 5e-5, 20 epochs, speaker reference `other`, emotion reference `follow_speaker`, validation reference
+`other`, and `keep_last_n=0`. Dropout remains 0.05, weight decay 0.01, batch size 4 with accumulation 2, warmup
+50, cosine scheduling, BF16, gradient checkpointing, validation fraction 0.05 every 50 steps, samples every epoch,
+automatic analysis/evaluation, and disabled early stopping.
+
+`TrainConfig.epoch_train_state=False` omits the optimizer/scheduler/RNG `train_state.pt` sidecar from periodic
+epoch and step checkpoints, avoiding about 4x extra disk per checkpoint. Best, final, and interrupted checkpoints
+still carry train state when `save_train_state=True`, so Continue run remains available from those files.
+
+### Training reference conditioning
+
+`TrainConfig.speaker_ref_mode` controls the CAMPPlus source (`self`, `other`, or deterministic `mixed`).
+`TrainConfig.emo_ref_mode` independently controls the emotion-vector source:
+
+- `self` uses the target clip and preserves the legacy training behavior.
+- `other` uses a deterministic different clip from the same speaker, with a target-clip fallback when no other
+  clip exists.
+- `mixed` deterministically chooses self or other per item and epoch.
+- `follow_speaker` uses exactly the clip selected by `speaker_ref_mode` for both CAMPPlus and emotion. This is the
+  inference-aligned mode because one reference clip supplies both vectors at generation time.
+
+`TrainConfig.val_reference_mode` controls both validation vectors. `self` maps to speaker/emotion `self/self`;
+`other` maps to `other/follow_speaker`, so validation measures inference-like generalization from a different clip
+of the same speaker. Checkpoint evaluation uses the same mapping for its validation split and deterministic training
+subset. `CheckpointEvalConfig.reference_mode=""` inherits `val_reference_mode` from the adapter's
+`train_config.json` and falls back to `self` for older adapters. Reports persist the resolved reference mode and state
+the conditioning method in their Markdown summary.
+
+### Training sampling and evaluation settings
+
+The sampling fields are `sample_language="auto"`, `sample_seed=-1`, `sample_temperature=0.8`,
+`sample_top_p=0.8`, `sample_top_k=30`, `sample_repetition_penalty=10.0`, `sample_num_beams=3`,
+`sample_emo_alpha=0.65`, `sample_diffusion_steps=25`, `sample_inference_cfg_rate=0.7`,
+`sample_max_text_tokens=60`, `sample_length_penalty=0.0`, `sample_max_mel_tokens=1500`, and
+`sample_speaking_rate=1.0` (validated from 0.5 through 1.5). Their defaults mirror
+Voice Generation. `auto` language resolves from `dataset_info.json`, then the first manifest row, then `EN`.
+A seed of `-1` is resolved once when training starts and the resolved seed is reused for every epoch sample.
+`indextts.training.sampling` must build all user-controlled inference values from `TrainConfig`; only the documented
+`SAMPLE_FIXED_INFER_KWARGS` structural worker settings may be fixed in that module.
+
+Automatic checkpoint evaluation is controlled by `eval_train_subset=48` (`0` disables the training subset),
+`eval_strengths="1.0"` (comma-separated finite values from 0 through 4), and `eval_include_base=True`.
+Training `status.json` additionally persists the resolved `sample_seed`, `val_reference_mode`, and calibrated
+`recommended_speaking_rate` when available; every validation
+event in `metrics.jsonl` carries `reference_mode`.
+
 Completed and gracefully stopped training runs can write `loras/<name>/analysis/training_analysis.json`
 and `training_analysis.md`. Measured evaluation adds `checkpoint_eval.json` and `checkpoint_eval.md` in the
 same folder. `training_analysis` is derived only from `metrics.jsonl`; `checkpoint_eval` loads the base GPT,
 reconstructs the saved validation split, evaluates the base model first, and then hot-swaps adapters. Status
 records expose `analysis_path`, `evaluation_path`, and `recommended_checkpoint` when available.
+
+After a complete or graceful-stop run, epoch samples are measured by the CPU-only
+`indextts.training.speaking_rate` module. It strips pause tags, trims leading/trailing audio below 40 dB of peak,
+and compares aggregate generated words/s with `manifest.jsonl` words/duration. The recommended speaking rate is
+`round(clamp(dataset_words_per_second / generated_words_per_second, 0.5, 1.5), 3)`. Reports are atomically stored at
+`loras/<name>/analysis/speaking_rate.json`; Voice Generation can load the report from an adapter folder, a normal
+checkpoint, or a checkpoint below `best/`. A Checkpoint Grid can produce the same report with method `grid`.
 
 Checkpoint evaluation workers run as
 `python -m indextts.training.eval_worker --config <json> --state-dir <dir>`. Their state directory contains

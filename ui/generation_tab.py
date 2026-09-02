@@ -20,6 +20,7 @@ import gradio as gr
 
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
+from indextts.training.speaking_rate import load_speaking_rate
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
 from indextts.utils.subtitle_utils import (
     build_subtitle_render_units,
@@ -73,6 +74,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.max_text_tokens_per_segment": 60,
     "generation.use_caption_timing": False,
     "generation.auto_lora_reference": True,
+    "generation.auto_lora_speaking_rate": True,
     "generation.emotion_mode": EMOTION_MODES[0],
     "generation.emotion_weight": 0.65,
     "generation.emotion_random": False,
@@ -97,6 +99,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.interval_silence": 200,
     "generation.max_consecutive_silence": 0,
     "generation.latent_multiplier": 1.72,
+    "generation.speaking_rate": 1.0,
     "generation.target_duration_s": None,
     "generation.target_duration_mode": "off",
     "generation.enable_pause_tags": True,
@@ -276,7 +279,14 @@ def build_generation_request(
         "max_emotion_audio_length": float(_value(merged, "generation.max_emotion_audio_length")),
         "section_batch_size": int(_value(merged, "generation.section_batch_size")),
         "max_emotion_sum": float(_value(merged, "generation.max_emotion_sum")),
-        "latent_multiplier": float(_value(merged, "generation.latent_multiplier")),
+        "latent_multiplier": round(
+            float(_value(merged, "generation.latent_multiplier"))
+            / min(
+                1.5,
+                max(0.5, float(_value(merged, "generation.speaking_rate"))),
+            ),
+            4,
+        ),
         "max_consecutive_silence": int(_value(merged, "generation.max_consecutive_silence")),
         "semantic_layer": int(_value(merged, "generation.semantic_layer")),
         "cfm_cache_length": int(_value(merged, "generation.cfm_cache_length")),
@@ -612,21 +622,73 @@ def _lora_choices() -> list[tuple[str, str]]:
 
 def _lora_info(path: str | None) -> tuple[str, str | None]:
     if not path:
-        return "No adapter selected. The base voice model will be used.", None
+        return "No LoRA / DoRA selected. Base model (no LoRA / DoRA) will clone from the reference only.", None
     try:
         info = inspect_lora(path)
         targets = info.get("targets") or []
+        speaking_rate = load_speaking_rate(path)
+        if speaking_rate is None:
+            rate_line = (
+                "Speaking rate: **no calibrated speaking rate yet**; train with epoch "
+                "samples or use the Checkpoint Grid calibration button."
+            )
+        else:
+            rate_line = (
+                f"Speaking rate: **{speaking_rate.recommended_speaking_rate:.3f}** "
+                f"(recordings {speaking_rate.dataset_words_per_second:.2f} words/s, "
+                f"generated {speaking_rate.generated_words_per_second:.2f} words/s)."
+            )
         markdown = (
             f"**{str(info['adapter_type']).upper()}** | rank **{info['rank']}** | alpha **{info['alpha']}**  \n"
             f"Steps: **{info.get('steps', 0)}** | Dataset: **{info.get('dataset') or 'not recorded'}** | "
             f"Date: **{info.get('date') or 'not recorded'}**  \n"
             f"Targets: {len(targets)} | Size: **{info.get('size_mb', 0):.2f} MB**  \n"
+            f"{rate_line}  \n"
             f"Full path: `{Path(path).expanduser().resolve()}`"
         )
         reference = info.get("recommended_reference")
         return markdown, str(reference) if reference and Path(reference).is_file() else None
     except Exception as exc:
-        return f"Adapter inspection failed: {exc}", None
+        return f"LoRA / DoRA inspection failed: {exc}", None
+
+
+def lora_selection_updates(
+    path: str,
+    current_reference: str | None,
+    auto_reference: bool,
+    auto_speaking_rate: bool,
+) -> tuple[Any, Any, str, Any]:
+    """Apply adapter metadata to the reference and speaking-rate controls."""
+
+    info, recommended_reference = _lora_info(path)
+    reference_update: Any = gr.skip()
+    messages: list[str] = []
+    if auto_reference and not current_reference and recommended_reference:
+        reference_update = gr.update(value=recommended_reference)
+        messages.append(
+            f"Loaded recommended reference: {Path(recommended_reference).name}"
+        )
+
+    rate_update: Any = gr.skip()
+    if auto_speaking_rate:
+        if not path:
+            rate_update = 1.0
+            messages.append("Reset speaking rate to the model's natural pace (1.0).")
+        else:
+            report = load_speaking_rate(path)
+            if report is not None:
+                rate_update = report.recommended_speaking_rate
+                messages.append(
+                    f"Applied calibrated speaking rate {report.recommended_speaking_rate:.3f}."
+                )
+
+    if not messages:
+        messages.append(
+            "LoRA / DoRA selected."
+            if path
+            else "Base model (no LoRA / DoRA) selected."
+        )
+    return info, reference_update, " ".join(messages), rate_update
 
 
 def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int = 10) -> list[list[Any]]:
@@ -769,14 +831,14 @@ def generation_task_updates(
         return (
             "",
             progress_panel_html({}, title="Ready"),
-            "Ready.",
+            "",
             "",
             gr.skip(),
             gr.skip(),
             gr.skip(),
             gr.skip(),
             gr.skip(),
-            recent_outputs(output_root),
+            recent_outputs(output_root) if page_load else [],
             gr.Timer(5.0, active=True),
         )
 
@@ -1110,7 +1172,7 @@ def build_generation_tab(
                     )
                 open_outputs = gr.Button("📁  Open outputs folder", elem_classes=btn("indigo"))
                 tab.progress_html = gr.HTML(progress_panel_html({}, title="Ready"))
-                tab.status = gr.Markdown("Ready.")
+                tab.status = gr.Markdown("")
                 tab.log_tail = gr.Textbox(
                     label="Live log (last 60 lines)", lines=10, max_lines=16,
                     interactive=False, buttons=["copy"], elem_classes=["log-tail"],
@@ -1124,35 +1186,47 @@ def build_generation_tab(
             lora = gr.Dropdown(
                 choices=_lora_choices(),
                 value="",
-                label="Adapter",
-                info="Select a trained voice adapter, or None for the base model.",
+                label="LoRA / DoRA",
+                info="Select a trained LoRA / DoRA, or None for Base model (no LoRA / DoRA), which clones from the reference only.",
                 scale=12,
             )
             refresh_lora = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
         with gr.Row(equal_height=False):
             strength = gr.Slider(
                 0.0, 2.0, value=1.0, step=0.05,
-                label="Adapter strength",
+                label="LoRA / DoRA strength",
                 info="1.0 is the trained strength; lower is subtler and higher is stronger.",
                 scale=2,
             )
             auto_ref = gr.Checkbox(
-                value=True,
-                label="Auto-load the LoRA's recommended reference audio",
-                info="Loads the adapter's saved reference only when the speaker reference is empty.",
+                value=GENERATION_DEFAULTS["generation.auto_lora_reference"],
+                label="Auto-load the LoRA / DoRA recommended reference audio",
+                info="Loads the LoRA / DoRA's saved reference only when the speaker reference is empty.",
+                scale=2,
+            )
+            auto_rate = gr.Checkbox(
+                value=GENERATION_DEFAULTS["generation.auto_lora_speaking_rate"],
+                label="Auto-apply the LoRA / DoRA calibrated speaking rate",
+                info="Uses the selected voice's measured pace; selecting None resets speaking rate to 1.0.",
                 scale=2,
             )
             merge_lora = gr.Checkbox(
                 value=False,
-                label="Merge adapter into base weights for speed (BF16 only)",
-                info="Temporarily folds the selected adapter into floating GPT weights and restores them before switching.",
+                label="Merge LoRA / DoRA into base weights for speed (BF16 only)",
+                info="Temporarily folds the selected LoRA / DoRA into floating GPT weights and restores them before switching.",
                 scale=3,
             )
-        lora_info = gr.Markdown("No adapter selected.", elem_classes=["section-note"])
+        lora_info = gr.Markdown("No LoRA / DoRA selected.", elem_classes=["section-note"])
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
         _register(registry, "generation.auto_lora_reference", auto_ref, kind="bool")
+        _register(
+            registry,
+            "generation.auto_lora_speaking_rate",
+            auto_rate,
+            kind="bool",
+        )
 
         with gr.Accordion("Emotion Control", open=False):
             emotion_mode = gr.Radio(
@@ -1255,6 +1329,14 @@ def build_generation_tab(
                 interval = gr.Slider(0, 2000, value=200, step=10, label="Section silence (ms)", info="Silence inserted between generated text sections; cue timing overrides this to zero.")
                 max_silence = gr.Slider(0, 200, value=0, step=1, label="Max consecutive silence tokens", info="0 disables token trimming; use only to suppress unusually long model silences.")
                 latent = gr.Slider(0.5, 3.0, value=1.72, step=0.01, label="Latent multiplier", info="1.72 is natural duration; the runner converts this to the engine duration factor.")
+                speaking_rate = gr.Slider(
+                    0.5,
+                    1.5,
+                    value=GENERATION_DEFAULTS["generation.speaking_rate"],
+                    step=0.01,
+                    label="Speaking rate",
+                    info="1.0 is the model's natural pace; below 1.0 speaks slower, above 1.0 faster. A trained LoRA / DoRA can carry a calibrated value that matches the speaker's real pace.",
+                )
             with gr.Row():
                 target_duration = gr.Number(value=None, minimum=0.1, maximum=3600, step=0.1, label="Target duration (seconds)", info="Leave blank unless a whole-output duration target is needed.")
                 target_mode = gr.Dropdown(choices=["off", "natural", "pad", "trim"], value="off", label="Target duration mode", info="Natural regenerates timing; pad/trim only adjust the assembled result.")
@@ -1264,6 +1346,14 @@ def build_generation_tab(
             _register(registry, "generation.interval_silence", interval, kind="int", minimum=0, maximum=2000)
             _register(registry, "generation.max_consecutive_silence", max_silence, kind="int", minimum=0, maximum=200)
             _register(registry, "generation.latent_multiplier", latent, kind="float", minimum=0.5, maximum=3)
+            _register(
+                registry,
+                "generation.speaking_rate",
+                speaking_rate,
+                kind="float",
+                minimum=0.5,
+                maximum=1.5,
+            )
             _register(registry, "generation.target_duration_s", target_duration, kind="float", minimum=0.1, maximum=3600, nullable=True)
             _register(registry, "generation.target_duration_mode", target_mode, kind="choice", choices=["off", "natural", "pad", "trim"])
             _register(registry, "generation.enable_pause_tags", pause_tags, kind="bool")
@@ -1330,7 +1420,7 @@ def build_generation_tab(
             tab.output_video = gr.Video(label="Generated MP4", visible=False, buttons=["download"])
         tab.candidate_state = gr.State([])
         with gr.Column(elem_classes=["candidate-list"]):
-            @gr.render(inputs=tab.candidate_state)
+            @gr.render(inputs=tab.candidate_state, triggers=[tab.candidate_state.change])
             def render_candidates(paths: list[str] | None):
                 candidates_value = list(paths or [])
                 if len(candidates_value) <= 1:
@@ -1342,7 +1432,7 @@ def build_generation_tab(
         tab.recent_table = gr.Dataframe(
             headers=["Task", "Created", "Status", "Audio", "Folder"],
             datatype=["str", "str", "str", "str", "str"],
-            value=recent_outputs(), type="array", interactive=False, wrap=True,
+            value=[], type="array", interactive=False, wrap=True,
             label="Recent outputs (last 10)", max_height=300, buttons=["fullscreen"],
         )
         recent_audio = gr.State("")
@@ -1398,13 +1488,25 @@ def build_generation_tab(
 
     refresh_lora.click(lambda: gr.update(choices=_lora_choices()), outputs=lora, queue=False)
 
-    def select_lora(path: str, current_reference: str | None, auto: bool):
-        info, recommended = _lora_info(path)
-        if auto and not current_reference and recommended:
-            return info, gr.update(value=recommended), f"Loaded recommended reference: {Path(recommended).name}"
-        return info, gr.skip(), "Adapter selected." if path else "Base model selected."
-
-    lora.change(select_lora, [lora, tab.prompt_audio, auto_ref], [lora_info, tab.prompt_audio, reference_status], queue=False)
+    lora_selection_inputs = [lora, tab.prompt_audio, auto_ref, auto_rate]
+    lora_selection_outputs = [
+        lora_info,
+        tab.prompt_audio,
+        reference_status,
+        speaking_rate,
+    ]
+    lora.change(
+        lora_selection_updates,
+        lora_selection_inputs,
+        lora_selection_outputs,
+        queue=False,
+    )
+    auto_rate.change(
+        lora_selection_updates,
+        lora_selection_inputs,
+        lora_selection_outputs,
+        queue=False,
+    )
     auto_tokens.click(lambda lang: default_segment_tokens(lang), language, max_tokens, queue=False)
 
     preview_inputs = [tab.text, language, max_tokens, caption_timing, tab.subtitle_file, pause_tags, budget_scale]
@@ -1613,6 +1715,7 @@ __all__ = [
     "build_generation_request",
     "build_generation_tab",
     "generation_task_updates",
+    "lora_selection_updates",
     "prepare_generation_request",
     "preview_segments",
     "request_from_registry_defaults",

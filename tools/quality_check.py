@@ -1,4 +1,4 @@
-r"""Objective quality check for IndexTTS 2.5 variants and adapters.
+r"""Objective quality check for IndexTTS 2.5 variants and LoRA / DoRA files.
 
 For every configuration it synthesises a fixed sentence set, transcribes the result with Whisper and
 reports word error rate (WER) against the input text, plus CAMPPlus speaker-similarity (cosine) between
@@ -24,7 +24,7 @@ SENTENCES = [
     "Greetings everyone, today I am going to show you how to install and use this application step by step.",
     "The model downloader verifies every file with a hash, so a corrupted download is detected immediately.",
     "You can reduce the resolution if you get an out of memory error, and it will still work on lower VRAM GPUs.",
-    "This new version supports low rank adapters, block swapping, and an eight bit quantized model file.",
+    "This new version supports LoRA / DoRA, block swapping, and an eight bit quantized model file.",
     "Please check the README file for the complete list of features and the recommended settings.",
     "It works on both Windows and Linux, and the installers set up everything automatically.",
     "This is the low VRAM tier test. [pause:400ms] Everything should sound natural.",
@@ -73,9 +73,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reference", required=True)
     parser.add_argument("--config", action="append", default=[], help="bf16 | int8_convrot (repeatable)")
-    parser.add_argument("--lora", action="append", default=[], help="adapter safetensors to test on the bf16 base (repeatable)")
-    parser.add_argument("--lora-reference", default="", help="reference clip to use with the adapters (default: --reference)")
-    parser.add_argument("--lora-variant", default="bf16", help="base variant used for the adapter runs: bf16 | int8_convrot")
+    parser.add_argument("--lora", action="append", default=[], help="LoRA / DoRA safetensors to test on the BF16 base (repeatable)")
+    parser.add_argument("--lora-reference", default="", help="reference clip to use with LoRA / DoRA (default: --reference)")
+    parser.add_argument("--lora-variant", default="bf16", help="base variant used for LoRA / DoRA runs: bf16 | int8_convrot")
     parser.add_argument("--blocks-to-swap", type=int, default=0, help="GPT blocks to stream from CPU (block swap) for every run")
     parser.add_argument("--run-suffix", default="", help="suffix appended to run names (e.g. _int8_swap8)")
     parser.add_argument("--out", default=os.path.join("outputs", "_quality_check"))

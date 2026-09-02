@@ -262,6 +262,13 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 container=False,
             )
             with gr.Row(elem_classes=["header-actions"], scale=0):
+                last_values_button = gr.Button(
+                    "🕘  Load last values",
+                    elem_classes=btn("bronze"),
+                    scale=0,
+                    min_width=200,
+                    interactive=False,
+                )
                 sections_button = gr.Button(
                     "⇕  Open / close all sections",
                     elem_classes=btn("slate"),
@@ -309,11 +316,11 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             elem_id="main-tabs",
             elem_classes=["main-tabs"],
         ) as main_tabs:
-            generation = build_generation_tab(options, registry, load_hook=demo.load)
-            batch = build_batch_tab(options, registry, load_hook=demo.load)
-            dataset = build_dataset_tab(options, registry, load_hook=demo.load)
-            training = build_training_tab(options, registry, load_hook=demo.load)
-            grid = build_grid_tab(options, registry, load_hook=demo.load)
+            generation = build_generation_tab(options, registry, load_hook=last_values_button.click)
+            batch = build_batch_tab(options, registry, load_hook=last_values_button.click)
+            dataset = build_dataset_tab(options, registry, load_hook=last_values_button.click)
+            training = build_training_tab(options, registry, load_hook=last_values_button.click)
+            grid = build_grid_tab(options, registry, load_hook=last_values_button.click)
             models = build_models_tab(options, registry)
             build_help_tab()
 
@@ -323,6 +330,18 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         bind_dataset_events(dataset, training)
         bind_training_events(training, models, generation, main_tabs)
         bind_grid_events(grid, training, generation, models, main_tabs)
+
+        def loaded_last_values_notice() -> None:
+            message = "Loaded the last run of every tab."
+            print(">> " + message, flush=True)
+            gr.Info(message)
+
+        last_values_button.click(
+            loaded_last_values_notice,
+            queue=False,
+            show_progress="hidden",
+            api_name="load_last_values",
+        )
 
         store.ensure_system_presets()
         choices = store.list_presets()
@@ -431,11 +450,18 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             overlay = persisted_runtime if store.is_system(requested) else None
             return load_values(requested, overlay)
 
-        demo.load(
+        initial_load_event = demo.load(
             initial_load,
             browser_preset,
             [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
             queue=False,
+        )
+        initial_load_event.then(
+            lambda: gr.update(interactive=True),
+            outputs=last_values_button,
+            queue=False,
+            show_progress="hidden",
+            api_name=False,
         )
 
         def refresh_preset_choices(requested: str | None):

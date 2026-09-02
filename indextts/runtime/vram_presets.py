@@ -277,7 +277,7 @@ def describe(config: RuntimeConfig) -> str:
         f"{cfg.device} | {cfg.model_variant}/{cfg.gpt_dtype} | {cfg.attention_backend} | "
         f"{swap}, ring {cfg.swap_ring_size} | on-demand: {aux} | CPU: {cpu_aux} | "
         f"CFM cache {cfg.cfm_cache_length} | s2mel DiT BF16: {cfg.s2mel_estimator_autocast} | "
-        f"LoRA merge: {cfg.lora_merge_into_base}"
+        f"LoRA / DoRA merge: {cfg.lora_merge_into_base}"
     )
 
 

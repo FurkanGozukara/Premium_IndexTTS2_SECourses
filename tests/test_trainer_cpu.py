@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import wave
 
 import pytest
 import torch
 
 import indextts.training.trainer as trainer_module
 from indextts.training.charts import load_metrics, loss_frame
+from indextts.training.dataset_manifest import write_manifest
 from indextts.training.train_config import TrainConfig
-from indextts.training.trainer import BuiltTrainingModel, run_training
+from indextts.training.trainer import BuiltTrainingModel, LoraTrainer, run_training
 
 
 class _SyntheticDataset(torch.utils.data.Dataset):
+    calls: list[dict] = []
+
     def __init__(self, *_args, split="train", **_kwargs):
         self.split = split
+        self.calls.append({"split": split, **_kwargs})
         self.lengths = [1, 1, 1, 1]
         self.fingerprint = "synthetic-cpu-v1"
 
@@ -38,6 +44,7 @@ class _TinyTrainingModel(torch.nn.Module):
 @pytest.fixture
 def synthetic_cpu_trainer(monkeypatch):
     build_calls: list[tuple[str, str]] = []
+    _SyntheticDataset.calls.clear()
 
     def fake_build(config, *, log=None):
         model = _TinyTrainingModel()
@@ -196,6 +203,53 @@ def test_final_step_validation_is_not_duplicated(
     assert validation[0]["step"] == 2
 
 
+def test_conditioning_modes_and_resolved_sample_seed_are_reported(
+    tmp_path: Path, synthetic_cpu_trainer, monkeypatch
+) -> None:
+    sample_calls: list[dict] = []
+
+    def fake_sample(_config, **kwargs):
+        sample_calls.append(kwargs)
+        return SimpleNamespace(generated=True, path=str(tmp_path / "sample.wav"))
+
+    monkeypatch.setattr(trainer_module, "generate_training_sample", fake_sample)
+    monkeypatch.setattr(trainer_module.secrets, "randbelow", lambda _upper: 24680)
+    config = _config(tmp_path, "reference_modes", max_steps=5)
+    config.val_fraction = 0.25
+    config.speaker_ref_mode = "mixed"
+    config.emo_ref_mode = "follow_speaker"
+    config.val_reference_mode = "other"
+    config.sample_enabled = True
+    config.sample_seed = -1
+
+    result = run_training(config)
+    adapter_dir = Path(result.output_path).parent
+    log = (adapter_dir / "log.txt").read_text(encoding="utf-8")
+    status = json.loads((adapter_dir / "status.json").read_text(encoding="utf-8"))
+    metrics = [
+        json.loads(line)
+        for line in (adapter_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    validation = [row for row in metrics if row.get("event") == "validation"]
+
+    assert (
+        ">> conditioning | train speaker ref: mixed | train emotion ref: "
+        "follow_speaker | validation ref: other"
+    ) in log
+    assert ">> training samples use seed 24680" in log
+    assert validation and all(row["reference_mode"] == "other" for row in validation)
+    assert status["sample_seed"] == 24680
+    assert status["val_reference_mode"] == "other"
+    assert len(sample_calls) == 2
+    assert all(call["seed"] == 24680 for call in sample_calls)
+    train_call = next(call for call in _SyntheticDataset.calls if call["split"] == "train")
+    val_call = next(call for call in _SyntheticDataset.calls if call["split"] == "val")
+    assert train_call["speaker_ref_mode"] == "mixed"
+    assert train_call["emo_ref_mode"] == "follow_speaker"
+    assert val_call["speaker_ref_mode"] == "other"
+    assert val_call["emo_ref_mode"] == "follow_speaker"
+
+
 def test_zero_step_run_raises_nothing_to_train(
     tmp_path: Path, synthetic_cpu_trainer, monkeypatch
 ) -> None:
@@ -269,6 +323,97 @@ def test_early_stopping_writes_the_normal_final_adapter(
     assert "early stopping" in status["message"]
 
 
+@pytest.mark.parametrize(
+    ("keep_last_n", "expected_epochs"),
+    [(0, {1, 2, 3}), (1, {3})],
+)
+def test_epoch_checkpoint_retention_honors_zero_as_keep_everything(
+    tmp_path: Path,
+    synthetic_cpu_trainer,
+    keep_last_n: int,
+    expected_epochs: set[int],
+) -> None:
+    config = _config(tmp_path, f"keep_{keep_last_n}", max_steps=0)
+    config.epochs = 3
+    config.save_every_epochs = 1
+    config.keep_last_n = keep_last_n
+
+    result = run_training(config)
+
+    saved_epochs = {
+        int(path.stem.rsplit("_", 1)[-1])
+        for path in Path(result.output_path).parent.glob("*_epoch_*.safetensors")
+    }
+    assert saved_epochs == expected_epochs
+
+
+def test_periodic_checkpoints_skip_train_state_but_best_and_final_keep_it(
+    tmp_path: Path,
+    synthetic_cpu_trainer,
+) -> None:
+    config = _config(tmp_path, "compact_epochs", max_steps=0)
+    config.epochs = 2
+    config.val_fraction = 0.25
+    config.val_every_steps = 0
+    config.save_every_epochs = 1
+    config.save_every_steps = 1
+    config.save_best = True
+    config.save_train_state = True
+    config.epoch_train_state = False
+
+    result = run_training(config)
+    adapter_dir = Path(result.output_path).parent
+
+    periodic = [
+        *adapter_dir.glob("*_epoch_*.safetensors"),
+        *adapter_dir.glob("*_step_*.safetensors"),
+    ]
+    assert periodic
+    assert all(
+        not path.with_name(f"{path.stem}.train_state.pt").exists()
+        for path in periodic
+    )
+    final_state = Path(result.output_path).with_name(
+        f"{Path(result.output_path).stem}.train_state.pt"
+    )
+    best_path = Path(result.best_path)
+    best_state = best_path.with_name(f"{best_path.stem}.train_state.pt")
+    assert final_state.is_file()
+    assert best_path.is_file()
+    assert best_state.is_file()
+
+
+def test_trainer_persists_sample_calibration_in_status(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "paced_voice", max_steps=1)
+    config.sample_text = "one two three four"
+    dataset = Path(config.dataset_dir)
+    dataset.mkdir()
+    write_manifest(
+        dataset / "manifest.jsonl",
+        [{"id": "one", "words": 4, "duration_s": 2.0}],
+    )
+    trainer = LoraTrainer(config)
+    sample = trainer.adapter_dir / "samples" / "epoch_001.wav"
+    sample.parent.mkdir()
+    with wave.open(str(sample), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x00\x40" * 16000)
+
+    rate = trainer._write_speaking_rate_calibration()
+
+    assert rate == 1.0
+    status = json.loads(trainer.status_path.read_text(encoding="utf-8"))
+    assert status["recommended_speaking_rate"] == 1.0
+    assert (
+        trainer.adapter_dir / "analysis" / "speaking_rate.json"
+    ).is_file()
+    assert "matches your real pace" in trainer.log_path.read_text(encoding="utf-8")
+
+
 def test_auto_analysis_writes_report(
     tmp_path: Path, synthetic_cpu_trainer
 ) -> None:
@@ -282,3 +427,48 @@ def test_auto_analysis_writes_report(
     report = Path(result.output_path).parent / "analysis" / "training_analysis.json"
     assert report.is_file()
     assert json.loads(report.read_text(encoding="utf-8"))["best_epoch"] == 1
+
+
+def test_automatic_evaluation_uses_frontend_configured_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FinishedProcess:
+        returncode = 1
+        stdout = io.StringIO("")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -1
+
+    monkeypatch.setattr(trainer_module.subprocess, "Popen", lambda *_args, **_kwargs: FinishedProcess())
+    config = _config(tmp_path, "eval_settings", max_steps=1)
+    config.auto_evaluate_checkpoints = True
+    config.eval_include_base = False
+    config.eval_train_subset = 7
+    config.eval_strengths = "0.5, 1.25"
+    config.val_reference_mode = "other"
+    trainer = LoraTrainer(config)
+
+    trainer._run_automatic_evaluation(
+        terminal_phase="complete",
+        terminal_message="done",
+        recommended_checkpoint="",
+    )
+
+    payload = json.loads(
+        (trainer.adapter_dir / "analysis" / "eval_job" / "eval_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["include_base"] is False
+    assert payload["train_subset"] == 7
+    assert payload["strengths"] == [0.5, 1.25]
+    assert payload["reference_mode"] == "other"
+    assert "automatic checkpoint evaluation settings" in trainer.log_path.read_text(
+        encoding="utf-8"
+    )

@@ -1,4 +1,4 @@
-"""LoRA and DoRA adapter layers for the IndexTTS GPT projections."""
+"""LoRA / DoRA layers for the IndexTTS GPT projections."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _optional_fused_lora() -> Callable[..., torch.Tensor] | None:
 
 
 def _optional_fused_base_lora() -> Callable[..., torch.Tensor] | None:
-    """Resolve the optional fused base-plus-adapter kernel once."""
+    """Resolve the optional fused base-plus-LoRA / DoRA kernel once."""
 
     global _TRITON_FUSED_BASE_LORA
     if _TRITON_FUSED_BASE_LORA is False:
@@ -112,7 +112,7 @@ class LoRAAdapter(nn.Module):
         if not 0.0 <= float(dropout) < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         if not dtype.is_floating_point:
-            raise TypeError(f"adapter dtype must be floating point, got {dtype}")
+            raise TypeError(f"LoRA / DoRA dtype must be floating point, got {dtype}")
 
         self.base = base
         self.in_features, self.out_features, self._base_kind = self._base_shape(base)
@@ -623,7 +623,7 @@ class LoRAAdapter(nn.Module):
 
     @torch.no_grad()
     def merge_into_base(self) -> None:
-        """Fold the active adapter into an fp linear/Conv1D base and disable it."""
+        """Fold the active LoRA / DoRA into an fp linear/Conv1D base and disable it."""
 
         if self._base_kind == "int8":
             raise TypeError("LoRA/DoRA cannot be merged directly into an int8 base")
@@ -657,7 +657,7 @@ class LoRAAdapter(nn.Module):
 
     @torch.no_grad()
     def unmerge_from_base(self) -> None:
-        """Restore the exact pre-merge floating base weight and re-enable the adapter."""
+        """Restore the exact pre-merge floating base weight and re-enable LoRA / DoRA."""
 
         if not self._merged:
             return

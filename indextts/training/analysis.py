@@ -25,10 +25,18 @@ ANALYSIS_SERIES = (
     "validation (improving)",
     "validation (overfitting)",
 )
+BASE_CHECKPOINT_LABEL = "Base model (no LoRA / DoRA)"
+BASE_CHECKPOINT_CHOICE_LABEL = (
+    BASE_CHECKPOINT_LABEL
+    + " - plain voice clone from the reference audio only"
+)
+BASE_PHASE_LABEL = "Reference-only baseline (no LoRA / DoRA)"
+BASE_GRID_HEADER_DETAIL = "Plain voice clone: only the reference audio shapes the voice"
+_LEGACY_BASE_LABELS = frozenset({"base model", "base model (no adapter)"})
 GENERALIZATION_LEGEND = (
-    "Validation loss measures how well the adapter predicts sentences it never saw during "
+    "Validation loss measures how well the LoRA / DoRA predicts sentences it never saw during "
     "training (lower is better). Training loss measures the clips it trains on. When training "
-    "loss keeps falling but validation loss rises, the adapter is memorizing (overfitting)."
+    "loss keeps falling but validation loss rises, the LoRA / DoRA is memorizing (overfitting)."
 )
 
 _EPOCH_RE = re.compile(r"_epoch_(\d+)$", re.IGNORECASE)
@@ -68,7 +76,7 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
     return {
-        "adapter_type": str(header.get("adapter_type", "lora")).lower(),
+        "adapter_type": str(header.get("adapter_type", "")).lower(),
         "rank": _integer(header.get("rank")),
         "alpha": _finite_float(header.get("alpha")) or 0.0,
         "steps": _integer(header.get("trained_steps")),
@@ -189,7 +197,7 @@ def classify_epoch_phases(
 
 
 def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
-    """Describe an adapter file using its location, name, and saved metadata."""
+    """Describe a LoRA / DoRA file using its location, name, and saved metadata."""
 
     source = Path(path).expanduser().resolve()
     info = inspect_lora(source)
@@ -212,20 +220,37 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     steps = _integer(info.get("steps")) or (
         int(step_match.group(1)) if step_match else 0
     )
+    saved_type = str(info.get("adapter_type") or "").strip().lower()
+    checkpoint_type = {
+        "lora": "LoRA Checkpoint",
+        "dora": "DoRA Checkpoint",
+    }.get(saved_type, "LoRA / DoRA Checkpoint")
     if kind == "best":
-        label = f"best (epoch {epoch})" if epoch else "best"
+        label = (
+            f"best (epoch {epoch} {checkpoint_type})"
+            if epoch
+            else f"best ({checkpoint_type})"
+        )
         file_label = f"best_ep{epoch}" if epoch else "best"
     elif kind == "epoch":
-        label = f"epoch {epoch}"
+        label = f"epoch {epoch} ({checkpoint_type})"
         file_label = f"epoch_{epoch:03d}"
     elif kind == "step":
-        label = f"step {steps}"
+        label = f"step {steps} ({checkpoint_type})"
         file_label = f"step_{steps:06d}"
     elif kind == "interrupted":
-        label = f"interrupted (epoch {epoch})" if epoch else "interrupted"
+        label = (
+            f"interrupted (epoch {epoch} {checkpoint_type})"
+            if epoch
+            else f"interrupted ({checkpoint_type})"
+        )
         file_label = f"interrupted_ep{epoch:02d}" if epoch else "interrupted"
     else:
-        label = f"final (epoch {epoch})" if epoch else "final"
+        label = (
+            f"final (epoch {epoch} {checkpoint_type})"
+            if epoch
+            else f"final ({checkpoint_type})"
+        )
         file_label = f"final_ep{epoch}" if epoch else "final"
     return {
         "path": str(source),
@@ -236,6 +261,80 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
         "steps": steps,
         "metadata": info,
     }
+
+
+def checkpoint_display_label(
+    label: str | None,
+    *,
+    path: str | os.PathLike[str] | None = None,
+    kind: str | None = None,
+    cache: dict[str, str] | None = None,
+) -> str:
+    """Upgrade legacy checkpoint labels at display time without rewriting reports."""
+
+    value = str(label or "").strip()
+    if not path or str(kind or "").strip().lower() == "base":
+        if not value or value.lower() in _LEGACY_BASE_LABELS:
+            return BASE_CHECKPOINT_LABEL
+        return value
+
+    strength_match = re.search(
+        r"(?P<suffix>\s+@[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$", value
+    )
+    suffix = strength_match.group("suffix") if strength_match else ""
+    core = value[: strength_match.start()].rstrip() if strength_match else value
+    if core.endswith("Checkpoint)"):
+        return value
+
+    source = Path(path).expanduser()
+    if not source.is_file():
+        return value
+    cache_key = os.path.normcase(str(source.resolve()))
+    derived = cache.get(cache_key) if cache is not None else None
+    if derived is None:
+        try:
+            derived = str(checkpoint_descriptor(source)["label"])
+        except Exception:
+            return value
+        if cache is not None:
+            cache[cache_key] = derived
+    return derived + suffix
+
+
+def display_legacy_base_labels(text: str | None) -> str:
+    """Upgrade legacy base-row wording for display without changing saved data."""
+
+    value = re.sub(
+        r"\bbase model\s*\(no adapter\)",
+        BASE_CHECKPOINT_LABEL,
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\bbase model\b(?!\s*\(no LoRA / DoRA\))",
+        BASE_CHECKPOINT_LABEL,
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def display_legacy_report_text(text: str | None) -> str:
+    """Modernize legacy report prose only while it is being displayed."""
+
+    value = display_legacy_base_labels(text)
+    return re.sub(r"\badapters?\b", "LoRA / DoRA", value, flags=re.IGNORECASE)
+
+
+def phase_display_label(phase: str | None) -> str:
+    return {
+        "best": "Best generalization",
+        "improving": "Improving",
+        "plateau": "Plateau",
+        "overfitting": "Overfitting (memorizes training clips)",
+        "base": BASE_PHASE_LABEL,
+        "variant": "Strength variant",
+        "unknown": "Not measured",
+    }.get(str(phase or "").strip().lower(), "Not measured")
 
 
 def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -372,7 +471,7 @@ def _summary(
         elif status == "best_found" and overfit_start is not None:
             lines.append(
                 f"**Overfitting starts at epoch {overfit_start}.** From there validation loss rises while "
-                "training loss keeps falling, which means the adapter memorizes the training clips instead "
+                "training loss keeps falling, which means the LoRA / DoRA memorizes the training clips instead "
                 "of learning the voice."
             )
             final = by_epoch.get(final_epoch or -1)
@@ -613,15 +712,23 @@ def analysis_epoch_frame(analysis: TrainingAnalysis | None) -> pd.DataFrame:
 
 __all__ = [
     "ANALYSIS_SERIES",
+    "BASE_CHECKPOINT_CHOICE_LABEL",
+    "BASE_CHECKPOINT_LABEL",
+    "BASE_GRID_HEADER_DETAIL",
+    "BASE_PHASE_LABEL",
     "GENERALIZATION_LEGEND",
     "EpochSummary",
     "TrainingAnalysis",
     "analysis_epoch_frame",
     "analyze_training_run",
     "checkpoint_descriptor",
+    "checkpoint_display_label",
+    "display_legacy_base_labels",
+    "display_legacy_report_text",
     "classify_epoch_phases",
     "discover_checkpoints",
     "inspect_lora",
     "load_training_analysis",
+    "phase_display_label",
     "write_training_analysis",
 ]

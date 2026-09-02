@@ -555,7 +555,7 @@ class IndexTTS2:
         )
 
     def set_lora(self, path, strength=1.0, merge_into_base=None):
-        """Replace the active LoRA/DoRA adapter without reloading base weights."""
+        """Replace the active LoRA / DoRA without reloading base weights."""
         requested = str(path or "")
         strength = max(0.0, min(4.0, float(strength)))
         merge_requested = (
@@ -574,7 +574,7 @@ class IndexTTS2:
             )
         except ImportError:
             if requested:
-                print(">> LoRA support is not installed yet; continuing without an adapter.")
+                print(">> LoRA / DoRA support is not installed yet; continuing without one.")
             return None
         resolved = os.path.abspath(requested) if requested else ""
         if resolved and resolved == self._lora_path and self._lora_handle is not None:
@@ -602,7 +602,7 @@ class IndexTTS2:
             self.runtime.lora_merge_into_base = merge_requested
             return None
         if not os.path.isfile(requested):
-            raise FileNotFoundError(f"LoRA/DoRA adapter not found: {requested}")
+            raise FileNotFoundError(f"LoRA / DoRA not found: {requested}")
         self._lora_handle = apply_lora(self.gpt, requested, strength)
         move_adapters_to_device(self.gpt, self.device)
         self._lora_path = resolved
@@ -614,9 +614,9 @@ class IndexTTS2:
             merge_lora_for_inference(self.gpt)
             self._lora_merged = True
         elif merge_requested:
-            print(">> Adapter merge requested but skipped because the GPT base is INT8.")
+            print(">> LoRA / DoRA merge requested but skipped because the GPT base is INT8.")
         print(
-            f">> LoRA adapter active: {requested} (strength {strength:.3f}, "
+            f">> LoRA / DoRA active: {requested} (strength {strength:.3f}, "
             f"merged={'yes' if self._lora_merged else 'no'})"
         )
         return self._lora_handle
