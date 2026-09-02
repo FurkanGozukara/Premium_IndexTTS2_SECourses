@@ -28,6 +28,7 @@ from .common import (
     LAZY_ENGINE,
     PROCESS_MANAGER,
     ROOT,
+    btn,
     open_folder,
     runtime_config_from_values,
     tail_text,
@@ -194,7 +195,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         with gr.Row(equal_height=False):
             with gr.Column(scale=2):
                 with gr.Row():
-                    refresh_gpu = gr.Button("Refresh GPU inventory", elem_classes=["compact-button"])
+                    refresh_gpu = gr.Button("↻  Refresh GPU inventory", elem_classes=btn("violet"))
                     tab.refresh_gpu = refresh_gpu
                     tab.device = gr.Dropdown(
                         choices=_device_choices(), value=initial_device, label="Device",
@@ -213,8 +214,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             with gr.Column(scale=1):
                 tab.estimate = gr.HTML(_estimate_html(RuntimeConfig(device=initial_device), _gpu_total(initial_device)))
                 with gr.Row():
-                    apply_button = gr.Button("Apply runtime", variant="primary", elem_classes=["premium-primary"])
-                    unload_button = gr.Button("Unload model / free VRAM", variant="stop")
+                    apply_button = gr.Button("⚡  Apply runtime", variant="primary", elem_classes=btn("emerald"))
+                    unload_button = gr.Button("🧹  Unload model / free VRAM", variant="stop", elem_classes=btn("orange"))
                 tab.apply_status = gr.Markdown("Runtime settings are ready. Models remain unloaded until first generation.")
 
         # Keep the shipped preset portable even when this process was launched with
@@ -279,11 +280,11 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
 
         with gr.Accordion("Model Files & Downloads", open=False):
             with gr.Row():
-                int8_download = gr.Button("Download INT8 model")
-                base_download = gr.Button("Download / verify base models")
-                refresh_files = gr.Button("Refresh file status")
+                int8_download = gr.Button("⬇️  Download INT8 model", elem_classes=btn("sky"))
+                base_download = gr.Button("⬇️  Download / verify base models", elem_classes=btn("teal"))
+                refresh_files = gr.Button("↻  Refresh file status", elem_classes=btn("green"))
                 tab.refresh_files = refresh_files
-                open_models = gr.Button("Open model folder")
+                open_models = gr.Button("📁  Open model folder", elem_classes=btn("indigo"))
             download_status = gr.Markdown("Downloads are idle.")
             tab.model_status = gr.Dataframe(
                 headers=["File", "Status", "Size MB", "Type", "Path"],
@@ -297,7 +298,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             with gr.Row():
                 emulate = gr.Checkbox(value=False, label="Emulate tier cap", info="Caps the PyTorch allocator to tier minus reserve for a stricter fit test.")
                 subtitle_bench = gr.Checkbox(value=False, label="Exercise batch/subtitle path", info="Also runs the multi-text path used by caption generation.")
-                benchmark_button = gr.Button("Run VRAM benchmark", variant="primary")
+                benchmark_button = gr.Button("⏱️  Run VRAM benchmark", variant="primary", elem_classes=btn("purple"))
             benchmark_output = gr.Textbox(label="Benchmark log / result", lines=12, max_lines=20, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
 
     runtime_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("runtime.")]

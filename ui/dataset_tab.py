@@ -28,6 +28,7 @@ from .common import (
     PROCESS_MANAGER,
     ROOT,
     STATE_ROOT,
+    btn,
     dedupe_updates,
     open_folder,
     parse_multiline_paths,
@@ -378,8 +379,8 @@ def build_dataset_tab(
                 choices=scan_datasets(), value=None, label="Existing datasets",
                 info="Prepared datasets with dataset_info.json under datasets/.", scale=5,
             )
-            refresh_existing = gr.Button("Refresh", elem_classes=["compact-button"], scale=1)
-            open_existing = gr.Button("Open dataset folder", elem_classes=["compact-button"], scale=1)
+            refresh_existing = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
+            open_existing = gr.Button("📁  Open dataset folder", elem_classes=btn("sky"), scale=1)
         existing_info = gr.Markdown("Select a dataset to inspect it.")
 
         with gr.Accordion("Inputs", open=True):
@@ -500,11 +501,11 @@ def build_dataset_tab(
             _reg(registry, controls, "seed", seed, kind="int", minimum=0, maximum=4294967295)
 
         with gr.Row():
-            scan_button = gr.Button("Scan inputs")
-            prepare_button = gr.Button("Prepare dataset", variant="primary", elem_classes=["premium-primary"])
-            cancel_button = gr.Button("Cancel", variant="stop", elem_classes=["danger-button"])
-            cache_button = gr.Button("Cache features now")
-            open_button = gr.Button("Open dataset folder")
+            scan_button = gr.Button("🔍  Scan inputs", elem_classes=btn("purple"))
+            prepare_button = gr.Button("🛠️  Prepare dataset", variant="primary", elem_classes=btn("emerald"))
+            cancel_button = gr.Button("⛔  Cancel", variant="stop", elem_classes=btn("red"))
+            cache_button = gr.Button("💽  Cache features now", elem_classes=btn("lime"))
+            open_button = gr.Button("📁  Open dataset folder", elem_classes=btn("indigo"))
 
         discovered = gr.Dataframe(
             headers=["Media", "Duration s", "Type", "Sidecars", "Path"],

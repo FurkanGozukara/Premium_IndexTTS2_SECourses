@@ -17,7 +17,7 @@ import pandas as pd
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.gpu import gpu_total_gb
 from indextts.runtime.vram_presets import auto_tier, resolve_preset
-from indextts.training.charts import GRAD_SERIES, LOSS_SERIES, LR_SERIES, SPEED_SERIES, empty_series_frame, load_metrics, lr_frame, speed_frame
+from indextts.training.charts import GRAD_SERIES, LOSS_SERIES, LR_SERIES, SPEED_SERIES, downsample_series, empty_series_frame, load_metrics, lr_frame, speed_frame
 from indextts.training.analysis import ANALYSIS_SERIES, analysis_epoch_frame, load_training_analysis
 from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.train_config import TrainConfig
@@ -25,6 +25,7 @@ from indextts.training.train_config import TrainConfig
 from .common import (
     PROCESS_MANAGER,
     ROOT,
+    btn,
     dedupe_updates,
     open_folder,
     progress_panel_html,
@@ -160,7 +161,7 @@ def _loss_plot_frame(frame: pd.DataFrame, smoothing: float) -> pd.DataFrame:
             pieces.append(pd.DataFrame({"step": frame["step"], "value": pd.to_numeric(frame[column], errors="coerce"), "series": label}).dropna(subset=["value"]))
     if not pieces:
         return empty_series_frame(LOSS_SERIES)
-    plotted = (
+    plotted = downsample_series(
         pd.concat(pieces, ignore_index=True)
         .drop_duplicates(subset=["step", "series"], keep="last")
         .sort_values(["series", "step"], kind="stable")
@@ -172,7 +173,7 @@ def _loss_plot_frame(frame: pd.DataFrame, smoothing: float) -> pd.DataFrame:
 def _grad_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty or "grad_norm" not in frame:
         return empty_series_frame(GRAD_SERIES)
-    plotted = (
+    plotted = downsample_series(
         pd.DataFrame({"step": frame["step"], "value": pd.to_numeric(frame["grad_norm"], errors="coerce"), "series": "grad norm"})
         .dropna(subset=["value"])
         .drop_duplicates(subset=["step", "series"], keep="last")
@@ -453,7 +454,7 @@ def build_training_tab(
                 info="Prepared manifest dataset used for cached-feature training.",
                 scale=5,
             )
-            refresh_dataset = gr.Button("Refresh", elem_classes=["compact-button"], scale=1)
+            refresh_dataset = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
         dataset_info = gr.Markdown(_dataset_summary(initial_dataset if Path(initial_dataset).is_dir() else None))
         _reg(registry, controls, "dataset_dir", dataset, kind="str")
 
@@ -557,7 +558,7 @@ def build_training_tab(
                 blocks = gr.Slider(0, 24, value=0, step=1, label="Blocks to swap", info="Streams this many frozen GPT blocks from CPU; requires gradient checkpointing.")
                 ring = gr.Slider(1, 4, value=2, step=1, label="Swap ring size", info="2 balances overlap and VRAM; 1 uses the least memory.")
                 pinned = gr.Checkbox(value=True, label="Pinned swap memory", info="Recommended for faster CPU-to-GPU transfers.")
-                apply_tier = gr.Button("Apply VRAM tier defaults")
+                apply_tier = gr.Button("🎚️  Apply VRAM tier defaults", elem_classes=btn("orange"))
             _reg(registry, controls, "base_variant", base_variant, kind="choice", choices=["bf16", "int8_convrot"])
             _reg(registry, controls, "base_dtype", base_dtype, kind="choice", choices=["bf16", "fp16", "fp32"])
             _reg(registry, controls, "mixed_precision", precision, kind="choice", choices=["bf16", "fp16", "fp32"])
@@ -583,7 +584,7 @@ def build_training_tab(
                     label="Resume mode",
                     info="Weights only starts a fresh schedule at step 0; Continue run restores train state when available.",
                 )
-                refresh_resume = gr.Button("Refresh resume list", elem_classes=["compact-button"])
+                refresh_resume = gr.Button("↻  Refresh resume list", elem_classes=btn("sky"))
             with gr.Row():
                 auto_analyze = gr.Checkbox(
                     value=True,
@@ -650,12 +651,12 @@ def build_training_tab(
                 _reg(registry, controls, field_name, component, kind=kind, choices=choices, minimum=minimum, maximum=maximum)
 
         with gr.Row():
-            start = gr.Button("Start training", variant="primary", elem_classes=["premium-primary"])
-            stop = gr.Button("Stop", variant="stop", elem_classes=["danger-button"])
-            force = gr.Button("Force stop", variant="stop", elem_classes=["danger-button"])
-            open_output = gr.Button("Open output folder")
-            compare_grid = gr.Button("Compare checkpoints in grid")
-            use_generation = gr.Button("Use recommended checkpoint in Voice Generation")
+            start = gr.Button("🚀  Start training", variant="primary", elem_classes=btn("emerald"))
+            stop = gr.Button("⏹️  Stop", variant="stop", elem_classes=btn("red"))
+            force = gr.Button("⛔  Force stop", variant="stop", elem_classes=btn("crimson"))
+            open_output = gr.Button("📁  Open output folder", elem_classes=btn("indigo"))
+            compare_grid = gr.Button("📊  Compare in grid", elem_classes=btn("fuchsia"))
+            use_generation = gr.Button("⭐  Use best checkpoint", elem_classes=btn("cyan"))
 
         state_dir = gr.State(current_state)
         timer = gr.Timer(5.0, active=True)
@@ -711,9 +712,9 @@ def build_training_tab(
             )
             manager_details = gr.Markdown("Select an adapter row for details.")
             with gr.Row():
-                manager_refresh = gr.Button("Refresh")
-                manager_delete = gr.Button("Delete", variant="stop")
-                manager_open = gr.Button("Open folder")
+                manager_refresh = gr.Button("↻  Refresh", elem_classes=btn("green"))
+                manager_delete = gr.Button("🗑️  Delete", variant="stop", elem_classes=btn("pink"))
+                manager_open = gr.Button("📁  Open folder", elem_classes=btn("teal"))
 
     config_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("training.")]
     config_keys = [spec.key for spec in config_specs]

@@ -36,6 +36,7 @@ from indextts.training.grid import (
 from .common import (
     PROCESS_MANAGER,
     ROOT,
+    btn,
     open_folder,
     parse_multiline_paths,
     progress_panel_html,
@@ -531,7 +532,7 @@ def build_grid_tab(
                 info="Choose one training run to analyze and compare.",
                 scale=10,
             )
-            refresh_adapter = gr.Button("Refresh", elem_classes=["compact-button"], scale=1)
+            refresh_adapter = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
         tab.adapter_info = gr.Markdown(initial_context["info"])
         # The adapter selection is session state, not a preset value: a preset load must not
         # blank the dropdown or point it at a folder from another machine.
@@ -580,9 +581,9 @@ def build_grid_tab(
                 buttons=["fullscreen", "copy"],
             )
             with gr.Row():
-                tab.analyze_button = gr.Button("Analyze training log")
-                tab.evaluate_button = gr.Button("Evaluate checkpoints now", variant="primary")
-                tab.use_generation = gr.Button("Use recommended checkpoint in Voice Generation")
+                tab.analyze_button = gr.Button("🔬  Analyze training log", elem_classes=btn("amber"))
+                tab.evaluate_button = gr.Button("📈  Evaluate checkpoints now", variant="primary", elem_classes=btn("blue"))
+                tab.use_generation = gr.Button("⭐  Use best checkpoint", elem_classes=btn("cyan"))
             tab.eval_state = gr.State("")
             tab.eval_progress = gr.HTML(progress_panel_html({}, title="Evaluation ready"))
             tab.eval_status = gr.Markdown("Evaluation is idle.")
@@ -643,8 +644,8 @@ def build_grid_tab(
             info="Every checkpoint uses these same references in the same order.",
         )
         with gr.Row():
-            use_reference = gr.Button("Use adapter reference")
-            add_candidates = gr.Button("Add dataset reference candidates")
+            use_reference = gr.Button("🎤  Use adapter reference", elem_classes=btn("fuchsia"))
+            add_candidates = gr.Button("➕  Add dataset reference candidates", elem_classes=btn("lime"))
             reference_upload = gr.Audio(
                 label="Add a reference audio file",
                 type="filepath",
@@ -694,10 +695,10 @@ def build_grid_tab(
         tab.runtime_summary = gr.Markdown("Runtime is resolved from Models & Performance when the grid starts.")
         with gr.Row():
             tab.generate_button = gr.Button(
-                "Generate grid", variant="primary", elem_classes=["premium-primary"]
+                "🧩  Generate grid", variant="primary", elem_classes=btn("emerald")
             )
-            tab.cancel_button = gr.Button("Cancel", variant="stop", elem_classes=["danger-button"])
-            tab.open_button = gr.Button("Open grid folder")
+            tab.cancel_button = gr.Button("⛔  Cancel", variant="stop", elem_classes=btn("red"))
+            tab.open_button = gr.Button("📁  Open grid folder", elem_classes=btn("indigo"))
         tab.state = gr.State("")
         tab.progress = gr.HTML(progress_panel_html({}, title="Grid ready"))
         tab.status = gr.Markdown("Ready.")

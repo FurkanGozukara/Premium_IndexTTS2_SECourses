@@ -40,176 +40,326 @@ OUTPUT_TASK_TERMINAL_STATUSES = frozenset(
 )
 
 
-class PremiumTheme(gr.themes.Soft):
-    """A restrained crimson theme with deliberately designed light/dark surfaces."""
+def app_theme() -> gr.themes.Base:
+    """Return the stock Gradio 6 ``Origin`` theme, used exactly as shipped.
 
-    def __init__(self) -> None:
-        from gradio.themes.utils import colors, fonts, sizes
+    Every colour, radius, shadow and font in the interface comes from this
+    theme.  The stylesheet below adds no palette of its own beyond the button
+    colours; it is written against the theme's own CSS variables so light and
+    dark modes stay in sync automatically.
+    """
 
-        crimson = colors.Color(
-            name="premium_crimson",
-            c50="#fff1f3",
-            c100="#ffe3e8",
-            c200="#ffcbd5",
-            c300="#fda4b5",
-            c400="#f66a86",
-            c500="#df345b",
-            c600="#bd1f47",
-            c700="#a11236",
-            c800="#86132f",
-            c900="#73142c",
-            c950="#400615",
-        )
-        jade = colors.Color(
-            name="premium_jade",
-            c50="#effcf7",
-            c100="#d8f8ea",
-            c200="#b4efd8",
-            c300="#7cdebd",
-            c400="#3ec49d",
-            c500="#1ca881",
-            c600="#10866a",
-            c700="#106b57",
-            c800="#105546",
-            c900="#0d463b",
-            c950="#062820",
-        )
-        super().__init__(
-            primary_hue=crimson,
-            secondary_hue=jade,
-            neutral_hue=colors.slate,
-            spacing_size=sizes.spacing_md,
-            radius_size=sizes.radius_sm,
-            text_size=sizes.text_md,
-            font=(
-                fonts.GoogleFont("Plus Jakarta Sans", weights=(400, 500, 600, 700, 800)),
-                "Aptos",
-                "Segoe UI",
-                "ui-sans-serif",
-                "system-ui",
-                "sans-serif",
-            ),
-            font_mono=(
-                fonts.GoogleFont("JetBrains Mono", weights=(400, 500, 600)),
-                "Cascadia Code",
-                "Consolas",
-                "ui-monospace",
-                "monospace",
-            ),
-        )
-        self.name = "indextts_premium"
-        super().set(
-            body_background_fill="#f5f7fa",
-            body_background_fill_dark="#0b1018",
-            body_text_color="#1d2938",
-            body_text_color_dark="#e4eaf1",
-            background_fill_primary="#fbfcfd",
-            background_fill_primary_dark="#111925",
-            background_fill_secondary="#eef2f6",
-            background_fill_secondary_dark="#172230",
-            block_background_fill="#fbfcfd",
-            block_background_fill_dark="#111925",
-            block_border_color="#d7dee7",
-            block_border_color_dark="#2a3848",
-            block_radius="6px",
-            block_label_background_fill="#eef2f6",
-            block_label_background_fill_dark="#172230",
-            block_label_border_color="#d7dee7",
-            block_label_border_color_dark="#2a3848",
-            block_label_text_color="#5a1830",
-            block_label_text_color_dark="#ffcbd5",
-            input_background_fill="#ffffff",
-            input_background_fill_dark="#0d1520",
-            input_border_color="#c8d2de",
-            input_border_color_dark="#344457",
-            input_placeholder_color="#68778a",
-            input_placeholder_color_dark="#94a3b5",
-            button_primary_background_fill="#a11236",
-            button_primary_background_fill_hover="#bd1f47",
-            button_primary_text_color="#fff8fa",
-            button_primary_border_color="#86132f",
-            button_cancel_background_fill="#b4233f",
-            button_cancel_background_fill_hover="#d02c4b",
-            button_cancel_text_color="#fff8fa",
-            button_cancel_border_color="#861b32",
-            button_secondary_background_fill="#e5ebf1",
-            button_secondary_background_fill_dark="#253346",
-            button_secondary_background_fill_hover="#d8e1ea",
-            button_secondary_background_fill_hover_dark="#304158",
-            button_secondary_text_color="#263548",
-            button_secondary_text_color_dark="#e7edf4",
-            button_large_radius="6px",
-            button_small_radius="5px",
-            checkbox_label_background_fill_selected="#fff1f3",
-            checkbox_label_background_fill_selected_dark="#3a1622",
-            checkbox_label_text_color_selected="#86132f",
-            checkbox_label_text_color_selected_dark="#ffcbd5",
-            link_text_color="#a11236",
-            link_text_color_dark="#f18aa0",
-            shadow_drop="0 1px 2px rgba(28, 39, 54, 0.06)",
-            shadow_drop_lg="0 8px 22px rgba(28, 39, 54, 0.08)",
-        )
+    return gr.themes.Origin()
 
 
+# Dark is the default the first time the app is opened.  The choice is stored in
+# localStorage and mirrored into the ``__theme`` query parameter so a reload or a
+# bookmark restores it before Gradio paints the page.
 APP_HEAD = """
-<meta name="theme-color" content="#a11236">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="dark light">
+<script>
+(function () {
+  var KEY = "indextts.theme";
+  function resolve() {
+    var url = new URL(window.location.href);
+    var param = url.searchParams.get("__theme");
+    var stored = null;
+    try { stored = window.localStorage.getItem(KEY); } catch (e) {}
+    var mode = param || stored || "dark";
+    if (mode !== "light") { mode = "dark"; }
+    try { window.localStorage.setItem(KEY, mode); } catch (e) {}
+    if (param !== mode) {
+      url.searchParams.set("__theme", mode);
+      window.history.replaceState(null, "", url.toString());
+    }
+    return mode;
+  }
+  function paint(mode) {
+    if (!document.body) { return false; }
+    document.body.classList.toggle("dark", mode === "dark");
+    return true;
+  }
+  var mode = resolve();
+  if (!paint(mode)) {
+    document.addEventListener("DOMContentLoaded", function () { paint(mode); });
+  }
+})();
+</script>
 """
 
 
-APP_CSS = r"""
-/* Gradio 6 tab strip: at borderline widths the overflow logic can render the selected tab twice; hide the duplicate. */
-.tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"].selected ~ button[role="tab"].selected { display: none !important; }
-.tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"] { white-space: nowrap; }
-/* The main strip has exactly seven tabs; Gradio 6 occasionally appends a stray duplicate button after a tab switch. */
-#main-tabs > .tab-wrapper > .tab-container[role="tablist"] > button[role="tab"]:nth-child(n+8) { display: none !important; }
-
-.gradio-container { width: 100% !important; max-width: 1540px !important; margin: 0 auto !important; padding: 0 18px 40px !important; }
-.app-header { margin: 0 -18px 14px; padding: 18px 22px 15px; border-bottom: 3px solid #a11236; background: #eef2f6; }
-.dark .app-header { background: #111925; border-bottom-color: #df345b; }
-.app-header h1 { margin: 0 !important; font-size: 1.55rem !important; line-height: 1.25 !important; letter-spacing: 0 !important; }
-.app-header p { margin: 6px 0 0 !important; color: #546579; }
-.dark .app-header p { color: #aab8c8; }
-.preset-bar { padding: 10px 0 12px; border-bottom: 1px solid var(--block-border-color); margin-bottom: 8px; }
-.preset-status { min-height: 26px; font-size: 0.9rem; }
-.section-note { color: #5d6d80; font-size: .9rem; }
-.dark .section-note { color: #a7b5c5; }
-.premium-primary button, button.premium-primary { font-weight: 800 !important; min-height: 48px; box-shadow: 0 4px 0 #73142c, 0 9px 18px rgba(161,18,54,.18) !important; }
-.premium-primary button:hover, button.premium-primary:hover { transform: translateY(-1px); }
-.premium-primary button:active, button.premium-primary:active { transform: translateY(2px); box-shadow: 0 2px 0 #73142c !important; }
-.compact-button button, button.compact-button { min-height: 38px !important; padding: 6px 11px !important; }
-.danger-button button, button.danger-button { font-weight: 700 !important; }
-.log-tail textarea, .log-tail input { font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace !important; font-size: 12px !important; line-height: 1.45 !important; }
-.progress-shell { border: 1px solid var(--block-border-color); border-radius: 6px; padding: 11px 12px; background: var(--background-fill-secondary); }
-.progress-track { height: 9px; border-radius: 3px; background: #cbd5df; overflow: hidden; }
-.dark .progress-track { background: #2a394b; }
-.progress-fill { height: 100%; background: #a11236; transition: width .25s ease; }
-.dark .progress-fill { background: #df5a78; }
-.progress-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 125px), 1fr)); gap: 8px; margin-top: 9px; }
-.progress-metric { min-width: 0; }
-.progress-metric strong { display: block; font-size: .74rem; color: #617185; font-weight: 600; }
-.dark .progress-metric strong { color: #9bacbf; }
-.progress-metric span { display: block; margin-top: 2px; font-size: .9rem; font-weight: 700; color: var(--body-text-color); overflow-wrap: anywhere; }
-.status-ok { color: #106b57; font-weight: 700; }
-.dark .status-ok { color: #7cdebd; }
-.status-warn { color: #9a5b08; font-weight: 700; }
-.dark .status-warn { color: #f4c46b; }
-.status-error { color: #b4233f; font-weight: 700; }
-.dark .status-error { color: #ff93aa; }
-.summary-strip { padding: 10px 12px; border-left: 4px solid #10866a; background: var(--background-fill-secondary); border-radius: 4px; }
-.stats-grid { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 8px; }
-.stat-box { border-top: 3px solid #10866a; padding: 8px 2px 4px; }
-.stat-box b { font-size: 1.05rem; }
-.manager-table { font-size: .88rem; }
-@media (max-width: 900px) {
-  .progress-metrics, .stats-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 125px), 1fr)); }
-  .gradio-container { padding-left: 10px !important; padding-right: 10px !important; }
-  .app-header { margin-left: -10px; margin-right: -10px; }
+# Switching themes only swaps the ``dark`` class Gradio itself keys off, so it is
+# instant: no reload and no round trip to the server.
+TOGGLE_THEME_JS = """
+() => {
+  const dark = !document.body.classList.contains("dark");
+  document.body.classList.toggle("dark", dark);
+  const mode = dark ? "dark" : "light";
+  try { window.localStorage.setItem("indextts.theme", mode); } catch (e) {}
+  const url = new URL(window.location.href);
+  url.searchParams.set("__theme", mode);
+  window.history.replaceState(null, "", url.toString());
 }
+"""
+
+
+# Expand or collapse every accordion on the tab that is currently on screen.
+TOGGLE_SECTIONS_JS = """
+async () => {
+  const tabs = document.querySelector("#main-tabs");
+  const panel = tabs
+    ? Array.from(tabs.querySelectorAll(":scope > .tabitem")).find(
+        (item) => item.style.display !== "none"
+      )
+    : null;
+  const scope = panel || document;
+  const heads = () => Array.from(scope.querySelectorAll("button.label-wrap"));
+  const first = heads();
+  if (!first.length) { return; }
+  const expand = first.some((head) => !head.classList.contains("open"));
+  // A nested accordion only reaches the DOM once its parent is open, so keep
+  // sweeping until nothing is left in the wrong state.
+  for (let pass = 0; pass < 6; pass++) {
+    const pending = heads().filter(
+      (head) => head.classList.contains("open") !== expand
+    );
+    if (!pending.length) { break; }
+    pending.forEach((head) => head.click());
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+  }
+}
+"""
+
+
+# Every action button gets its own hue as a (deep, mid, bright) triple.  The
+# gradient runs deep -> mid -> bright so the face has depth, the glow is built
+# from the mid tone, and white text stays readable on all three stops.
+BUTTON_HUES: dict[str, tuple[str, str, str]] = {
+    "emerald": ("#065f46", "#059669", "#34d399"),
+    "green":   ("#166534", "#16a34a", "#4ade80"),
+    "lime":    ("#3f6212", "#65a30d", "#a3e635"),
+    "teal":    ("#115e59", "#0d9488", "#2dd4bf"),
+    "cyan":    ("#155e75", "#0891b2", "#22d3ee"),
+    "sky":     ("#075985", "#0284c7", "#38bdf8"),
+    "blue":    ("#1e40af", "#2563eb", "#60a5fa"),
+    "indigo":  ("#3730a3", "#4f46e5", "#818cf8"),
+    "violet":  ("#5b21b6", "#7c3aed", "#a78bfa"),
+    "purple":  ("#6b21a8", "#9333ea", "#c084fc"),
+    "fuchsia": ("#86198f", "#c026d3", "#e879f9"),
+    "pink":    ("#9d174d", "#db2777", "#f9a8d4"),
+    "rose":    ("#9f1239", "#e11d48", "#fda4af"),
+    "red":     ("#991b1b", "#dc2626", "#f87171"),
+    "crimson": ("#4c0519", "#9f1239", "#fb7185"),
+    "orange":  ("#9a3412", "#ea580c", "#fb923c"),
+    "amber":   ("#92400e", "#d97706", "#fbbf24"),
+    "slate":   ("#334155", "#475569", "#94a3b8"),
+    "gray":    ("#3f3f46", "#52525b", "#a1a1aa"),
+}
+BUTTON_COLORS = tuple(BUTTON_HUES)
+
+
+def btn(color: str, *extra: str) -> list[str]:
+    """Build the ``elem_classes`` list for a coloured action button.
+
+    ``color`` picks one of :data:`BUTTON_COLORS`.  Every button in the app is
+    the same size; only the hue changes, so a page never reads as a wall of
+    identical controls.
+    """
+
+    if color not in BUTTON_HUES:
+        raise ValueError(f"Unknown button colour: {color}")
+    return ["ax", f"ax-{color}", *extra]
+
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    digits = value.lstrip("#")
+    return tuple(int(digits[index: index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _button_palette_css() -> str:
+    """Generate the gradient, border and glow rules for every button hue."""
+
+    rules: list[str] = []
+    for name, (deep, mid, bright) in BUTTON_HUES.items():
+        red, green, blue = _rgb(mid)
+        bright_rgb = ", ".join(str(part) for part in _rgb(bright))
+        rules.append(
+            f"""
+button.ax-{name} {{
+  background: linear-gradient(135deg, {deep} 0%, {mid} 55%, {bright} 100%) !important;
+  border-color: rgba({bright_rgb}, .72) !important;
+  box-shadow: 0 8px 20px rgba({red}, {green}, {blue}, .30), inset 0 1px 0 rgba(255, 255, 255, .20) !important;
+}}
+button.ax-{name}:hover:not(:disabled) {{
+  border-color: rgba({bright_rgb}, .98) !important;
+  box-shadow: 0 12px 26px rgba({red}, {green}, {blue}, .44), inset 0 1px 0 rgba(255, 255, 255, .28) !important;
+}}
+body:not(.dark) button.ax-{name} {{
+  background: linear-gradient(135deg, {deep} 0%, {mid} 66%, {bright} 100%) !important;
+  border-color: {mid} !important;
+  box-shadow: 0 7px 17px rgba({red}, {green}, {blue}, .26), inset 0 1px 0 rgba(255, 255, 255, .26) !important;
+}}
+body:not(.dark) button.ax-{name}:hover:not(:disabled) {{
+  box-shadow: 0 11px 24px rgba({red}, {green}, {blue}, .38), inset 0 1px 0 rgba(255, 255, 255, .32) !important;
+}}"""
+        )
+    return "\n".join(rules)
+
+
+_BASE_CSS = r"""
+/* --------------------------------------------------------------------- *
+ * Accent tokens for everything that is not a button.  Only these two
+ * blocks know about light and dark; the rest of the sheet reads them.
+ * --------------------------------------------------------------------- */
+:root {
+  --ax-ok: #047857;
+  --ax-warn: #b45309;
+  --ax-error: #be123c;
+  --ax-accent: #0f766e;
+}
+:root.dark, :root .dark {
+  --ax-ok: #10b981;
+  --ax-warn: #f59e0b;
+  --ax-error: #fb7185;
+  --ax-accent: #14b8a6;
+}
+
+/* --------------------------------------------------------------------- *
+ * Action buttons.  Every one is the same height, weight and type size so
+ * rows of controls share a baseline; only the hue changes, and the hue is
+ * generated per colour further down.
+ * --------------------------------------------------------------------- */
+button.ax {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--size-2);
+  min-height: 44px;
+  padding: var(--size-2) var(--size-4) !important;
+  border-width: 1px !important;
+  border-style: solid !important;
+  border-radius: var(--radius-lg) !important;
+  color: #f8fafc !important;
+  font-size: var(--text-md) !important;
+  font-weight: 650 !important;
+  line-height: 1.25 !important;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(2, 6, 23, .45) !important;
+  transition: transform 140ms ease, filter 140ms ease, box-shadow 140ms ease;
+}
+button.ax:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.05); }
+button.ax:active:not(:disabled) { transform: translateY(1px); filter: brightness(.96); }
+button.ax:focus-visible { outline: 2px solid #bae6fd; outline-offset: 2px; }
+button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-shadow: none !important; }
+/* Inside a row a button would otherwise stretch to the tallest neighbour, which
+   is the one place the uniform height breaks down. */
+.row > button.ax { align-self: center; }
+
+/* --------------------------------------------------------------------- *
+ * Page furniture
+ * --------------------------------------------------------------------- */
+.app-header {
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: var(--size-4);
+  padding-bottom: var(--size-3);
+  border-bottom: 1px solid var(--border-color-primary);
+}
+.app-header > :first-child { flex: 1 1 auto; min-width: 0; }
+.app-header h1 { margin: 0 !important; line-height: 1.2; }
+.app-header p { margin: var(--size-1) 0 0 !important; color: var(--body-text-color-subdued); }
+/* Gradio's own row rule is scoped, so the header strip has to out-specify it. */
+.row.header-actions {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: var(--size-2);
+}
+.header-actions button.ax { flex: 0 0 auto; white-space: nowrap; }
+/* Line the preset buttons up with the fields they act on rather than with the
+   whole labelled block. */
+.preset-bar { align-items: flex-end; gap: var(--size-2); }
+.row.preset-bar > button.ax { align-self: flex-end !important; margin-bottom: 12px; }
+.preset-status { min-height: var(--size-6); font-size: var(--text-sm); color: var(--body-text-color-subdued); }
+.section-note { color: var(--body-text-color-subdued); font-size: var(--text-sm); }
+.log-tail textarea, .log-tail input { font-family: var(--font-mono) !important; font-size: var(--text-sm) !important; line-height: 1.5 !important; }
+.manager-table { font-size: var(--text-sm); }
+.help-prose { max-width: 1180px; }
+
+/* --------------------------------------------------------------------- *
+ * Job progress card, status words and dataset statistics
+ * --------------------------------------------------------------------- */
+.progress-shell {
+  border: 1px solid var(--block-border-color);
+  border-radius: var(--radius-lg);
+  padding: var(--size-3);
+  background: var(--background-fill-secondary);
+}
+.progress-track {
+  height: 8px;
+  margin-top: var(--size-2);
+  border-radius: var(--radius-full);
+  background: var(--border-color-primary);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: linear-gradient(90deg, #2563eb, #14b8a6, #22c55e);
+  transition: width 250ms ease;
+}
+.progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 128px), 1fr));
+  gap: var(--size-2);
+  margin-top: var(--size-3);
+}
+.progress-metric { min-width: 0; }
+.progress-metric strong {
+  display: block;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: .04em;
+  color: var(--body-text-color-subdued);
+}
+.progress-metric span {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-md);
+  font-weight: 700;
+  color: var(--body-text-color);
+  overflow-wrap: anywhere;
+}
+.status-ok { color: var(--ax-ok); font-weight: 700; }
+.status-warn { color: var(--ax-warn); font-weight: 700; }
+.status-error { color: var(--ax-error); font-weight: 700; }
+.summary-strip {
+  padding: var(--size-2) var(--size-3);
+  border-left: 4px solid var(--ax-accent);
+  border-radius: var(--radius-sm);
+  background: var(--background-fill-secondary);
+}
+.summary-strip.status-error { border-left-color: var(--ax-error); }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 128px), 1fr)); gap: var(--size-2); }
+.stat-box { padding: var(--size-2) 0 var(--size-1); border-top: 3px solid var(--ax-accent); }
+.stat-box span { font-size: var(--text-xs); color: var(--body-text-color-subdued); }
+.stat-box b { font-size: var(--text-lg); }
 
 /* Let Vega axis labels extend into the block padding instead of being clipped on narrow layouts. */
 .gradio-plot .vega-embed, .gradio-plot .vega-embed svg, .gradio-plot .vega-embed .chart-wrapper { overflow: visible !important; }
+
+@media (max-width: 900px) {
+  .app-header { flex-wrap: wrap; }
+  .header-actions { justify-content: flex-start; }
+}
 """
+
+
+APP_CSS = _BASE_CSS + _button_palette_css() + "\n"
 
 
 CONFIRM_CANCEL_JS = "(value) => [window.confirm('Cancel the running job?')]"
@@ -790,10 +940,13 @@ __all__ = [
     "FAVICON_PATH",
     "LAZY_ENGINE",
     "PROCESS_MANAGER",
-    "PremiumTheme",
     "ROOT",
     "STATE_ROOT",
+    "TOGGLE_SECTIONS_JS",
+    "TOGGLE_THEME_JS",
     "_terminate_process_tree",
+    "app_theme",
+    "btn",
     "extract_reference_audio",
     "format_exception",
     "latest_output_task",

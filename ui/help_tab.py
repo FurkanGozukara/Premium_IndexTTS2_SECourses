@@ -22,7 +22,7 @@ Use one speaker, natural pacing, little echo, and no music. A representative cli
 1. **Prepare:** add media and sidecar captions in **LoRA Dataset Preparation**, scan the files, then prepare clean 24 kHz segments.
 2. **Cache:** inspect segment statistics and audio, then select **Cache features now**. Training requires the cache index.
 3. **Train:** choose the dataset in **LoRA / DoRA Training**. DoRA, rank 32, BF16, gradient checkpointing, and validation are the recommended defaults.
-4. **Use:** after a checkpoint is saved, select **Use recommended checkpoint in Voice Generation**. Strength 1.0 reproduces the trained scale.
+4. **Use:** after a checkpoint is saved, select **Use best checkpoint**, which opens the Voice Generation tab with that adapter selected. Strength 1.0 reproduces the trained scale.
 
 ## Which checkpoint should I use?
 
@@ -90,7 +90,9 @@ Caption cue timing owns its own gaps and target slots. It overrides section sile
 
 def build_help_tab() -> None:
     with gr.Tab("Help", id="help"):
-        gr.Markdown(HELP_MARKDOWN)
+        # Long-form prose is capped to a comfortable measure; the rest of the app
+        # uses the full width because it is dense controls, not reading.
+        gr.Markdown(HELP_MARKDOWN, elem_classes=["help-prose"])
 
 
 __all__ = ["HELP_MARKDOWN", "build_help_tab"]

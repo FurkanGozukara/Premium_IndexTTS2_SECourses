@@ -297,7 +297,7 @@ Layout, top to bottom:
    - Runtime comes from the current Models & Performance values via `runtime_config_from_values` exactly like
      the generation tab (no adapter path inside; the grid sets it per cell). Show a Markdown line with the
      resolved device/tier and the number of cells + a rough time estimate (cells × 9 s at 32 GB tier).
-   - Buttons: "Generate grid" (primary, `premium-primary`), "Cancel" (confirm dialog; update the confirm-dialog
+   - Buttons: "Generate grid" (primary, emerald action button), "Cancel" (confirm dialog; update the confirm-dialog
      count in `tests/test_ui_build.py`), "Open grid folder".
    - Progress panel (`progress_panel_html`), status Markdown, log tail Textbox (`log-tail` class), polled by a
      `gr.Timer` while the `grid_generation` job runs; page reload re-attaches to a running grid job (same

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Sequence, Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,6 +35,38 @@ LR_SERIES = ("learning rate",)
 GRAD_SERIES = ("grad norm",)
 SPEED_SERIES = ("VRAM GB", "steps/s")
 
+# A 300px chart cannot show more marks than it has pixels, but Vega still emits
+# one SVG node per point, and a long run turns the training dashboard into tens
+# of thousands of nodes that the browser has to lay out on every tab switch.
+MAX_PLOT_POINTS = 150
+
+
+def downsample_series(frame: pd.DataFrame, limit: int = MAX_PLOT_POINTS) -> pd.DataFrame:
+    """Thin each series to at most ``limit`` evenly spaced points.
+
+    The first and last sample of every series are always kept so the axis range
+    and the latest value stay exact.
+    """
+
+    if frame.empty or "series" not in frame or limit <= 2:
+        return frame
+    kept = []
+    for _, group in frame.groupby("series", sort=False):
+        if len(group) <= limit:
+            kept.append(group)
+            continue
+        positions = np.unique(
+            np.concatenate(
+                [
+                    np.linspace(0, len(group) - 1, limit).round().astype(int),
+                    np.array([0, len(group) - 1]),
+                ]
+            )
+        )
+        kept.append(group.iloc[positions])
+    return pd.concat(kept, ignore_index=True) if kept else frame
+
+
 def _canonical_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
@@ -53,7 +86,7 @@ def _canonical_metrics(frame: pd.DataFrame) -> pd.DataFrame:
 def _plot_rows(frame: pd.DataFrame, series: Sequence[str]) -> pd.DataFrame:
     if frame.empty:
         return empty_series_frame(series)
-    plotted = (
+    plotted = downsample_series(
         frame.dropna(subset=["value"])
         .drop_duplicates(subset=["step", "series"], keep="last")
         .sort_values(["series", "step"], kind="stable")
@@ -156,7 +189,9 @@ __all__ = [
     "GRAD_SERIES",
     "LOSS_SERIES",
     "LR_SERIES",
+    "MAX_PLOT_POINTS",
     "SPEED_SERIES",
+    "downsample_series",
     "empty_series_frame",
     "load_metrics",
     "loss_frame",

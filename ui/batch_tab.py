@@ -25,6 +25,7 @@ from .common import (
     PROCESS_MANAGER,
     ROOT,
     adopt_output_task,
+    btn,
     open_folder,
     output_task_is_active,
     progress_panel_html,
@@ -299,9 +300,9 @@ def build_batch_tab(
                 })
 
         with gr.Row():
-            start = gr.Button("Generate batch", variant="primary", elem_classes=["premium-primary"])
-            cancel = gr.Button("Cancel batch", variant="stop", elem_classes=["danger-button"])
-            open_button = gr.Button("Open batch folder")
+            start = gr.Button("🎬  Generate batch", variant="primary", elem_classes=btn("emerald"))
+            cancel = gr.Button("⛔  Cancel batch", variant="stop", elem_classes=btn("red"))
+            open_button = gr.Button("📁  Open batch folder", elem_classes=btn("indigo"))
         progress = gr.HTML(progress_panel_html({}, title="Batch ready"))
         status = gr.Markdown("Ready.")
         results = gr.Dataframe(

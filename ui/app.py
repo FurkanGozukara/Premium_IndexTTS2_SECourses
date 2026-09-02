@@ -20,8 +20,11 @@ from .common import (
     APP_HEAD,
     APP_TITLE,
     APP_VERSION,
-    PremiumTheme,
     ROOT,
+    TOGGLE_SECTIONS_JS,
+    TOGGLE_THEME_JS,
+    app_theme,
+    btn,
     runtime_config_from_values,
 )
 from .dataset_tab import bind_dataset_events, build_dataset_tab
@@ -251,15 +254,30 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         initial_preset_display = SYSTEM_PREFIX + "default"
     persisted_runtime = load_persisted_runtime()
 
-    with gr.Blocks(
-        title=APP_TITLE,
-        fill_width=True,
-    ) as demo:
-        gr.Markdown(
-            f"# {APP_TITLE}\n"
-            f"Version {APP_VERSION} | [Premium release, tutorials, and support](https://www.patreon.com/posts/139297407)",
-            elem_classes=["app-header"],
-        )
+    with gr.Blocks(title=APP_TITLE) as demo:
+        with gr.Row(elem_classes=["app-header"]):
+            gr.Markdown(
+                f"# {APP_TITLE}\n"
+                f"Version {APP_VERSION} | [Premium release, tutorials, and support](https://www.patreon.com/posts/139297407)",
+                container=False,
+            )
+            with gr.Row(elem_classes=["header-actions"], scale=0):
+                sections_button = gr.Button(
+                    "⇕  Open / close all sections",
+                    elem_classes=btn("slate"),
+                    scale=0,
+                    min_width=230,
+                )
+                theme_button = gr.Button(
+                    "🌗  Light / dark theme",
+                    elem_classes=btn("gray"),
+                    scale=0,
+                    min_width=230,
+                )
+        # Both switches are pure client-side DOM work, so they stay instant even
+        # while a generation or training job is holding the queue.
+        sections_button.click(None, None, None, js=TOGGLE_SECTIONS_JS)
+        theme_button.click(None, None, None, js=TOGGLE_THEME_JS)
 
         with gr.Row(elem_classes=["preset-bar"]):
             preset_dropdown = gr.Dropdown(
@@ -276,10 +294,10 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 info="Enter a new user preset name or select an existing user preset to overwrite it.",
                 scale=3,
             )
-            save_button = gr.Button("Save", elem_classes=["compact-button"], scale=1)
-            load_button = gr.Button("Load", elem_classes=["compact-button"], scale=1)
-            delete_button = gr.Button("Delete", variant="stop", elem_classes=["compact-button"], scale=1)
-            reset_button = gr.Button("Reset", elem_classes=["compact-button"], scale=1)
+            save_button = gr.Button("💾  Save", elem_classes=btn("blue"), scale=1)
+            load_button = gr.Button("📥  Load", elem_classes=btn("cyan"), scale=1)
+            delete_button = gr.Button("🗑️  Delete", variant="stop", elem_classes=btn("rose"), scale=1)
+            reset_button = gr.Button("↺  Reset", elem_classes=btn("amber"), scale=1)
         preset_status = gr.Markdown("System and user presets are separate.", elem_classes=["preset-status"])
         # The preset store already persists the last-used name.  A regular State
         # avoids BrowserState attempting to parse an absent/corrupt localStorage
@@ -462,7 +480,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     demo.registry = registry
     demo.preset_store = store
     demo.request_coverage = coverage
-    demo.launch_theme = PremiumTheme()
+    demo.launch_theme = app_theme()
     demo.launch_css = APP_CSS
     demo.launch_head = APP_HEAD
     demo.ui_tabs = {

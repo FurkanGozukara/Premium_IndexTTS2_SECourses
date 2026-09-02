@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,8 +17,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="IndexTTS 2.5 Premium SECourses",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--port", type=int, default=7860, help="HTTP port")
-    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind address")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP port; omitted by default so Gradio takes the next free port from 7860",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="HTTP bind address; omitted by default so Gradio uses its own default",
+    )
     parser.add_argument("--share", action="store_true", help="Create a Gradio public share link")
     parser.add_argument("--model_dir", default=str(ROOT / "models"), help="IndexTTS 2.5 model directory")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose generation logging by default")
@@ -47,9 +57,17 @@ def main(argv: list[str] | None = None) -> int:
     demo = create_demo(args)
     from ui.common import FAVICON_PATH
 
+    # Only forward an address or port the caller actually asked for: leaving them
+    # unset lets Gradio scan upwards from 7860 instead of failing when that port
+    # is already taken by another app.
+    address: dict[str, Any] = {}
+    if args.host:
+        address["server_name"] = args.host
+    if args.port:
+        address["server_port"] = args.port
+
     demo.launch(
-        server_name=args.host,
-        server_port=args.port,
+        **address,
         share=args.share,
         inbrowser=not args.no_browser,
         favicon_path=str(FAVICON_PATH),
@@ -63,7 +81,12 @@ def main(argv: list[str] | None = None) -> int:
             str(ROOT / "loras"),
             str(ROOT / ".ui_state"),
         ],
+        prevent_thread_lock=True,
     )
+    # The port is chosen at launch when it was not requested, so repeat it on an
+    # unbuffered line that survives redirected output.
+    print(f">> IndexTTS 2.5 Premium SECourses is ready at {demo.local_url}", flush=True)
+    demo.block_thread()
     return 0
 
 

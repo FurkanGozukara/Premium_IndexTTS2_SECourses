@@ -42,6 +42,7 @@ from .common import (
     PROCESS_MANAGER,
     ROOT,
     adopt_output_task,
+    btn,
     extract_reference_audio,
     open_folder,
     output_task_is_active,
@@ -1019,13 +1020,13 @@ def build_generation_tab(
                     info="Optional start:end ranges to merge from the uploaded media.",
                 )
                 with gr.Row():
-                    extract_button = gr.Button("Extract ranges", elem_classes=["compact-button"])
-                    clear_reference = gr.Button("Clear", elem_classes=["compact-button"])
+                    extract_button = gr.Button("✂️  Extract ranges", elem_classes=btn("teal"))
+                    clear_reference = gr.Button("⌫  Clear", elem_classes=btn("orange"))
                 path_input = gr.Textbox(
                     label="Reference media path",
                     info="Load any local audio or video path without uploading it.",
                 )
-                load_path = gr.Button("Load path", elem_classes=["compact-button"])
+                load_path = gr.Button("📂  Load path", elem_classes=btn("sky"))
                 tab.prompt_audio = gr.Audio(
                     label="Speaker reference",
                     sources=["upload", "microphone"],
@@ -1059,7 +1060,7 @@ def build_generation_tab(
                         20, 300, value=60, step=1, label="Max tokens per segment",
                         info="Per-language defaults are recommended; shorter segments use less VRAM.",
                     )
-                    auto_tokens = gr.Button("Auto", elem_classes=["compact-button"])
+                    auto_tokens = gr.Button("✨  Auto", elem_classes=btn("lime"))
                 _register(registry, "generation.language", language, kind="choice", choices=LANGUAGES)
                 _register(registry, "generation.max_text_tokens_per_segment", max_tokens, kind="int", minimum=20, maximum=300)
                 gr.Markdown("Pause syntax: `[pause:500ms]`, `[pause:0.8s]`, or `<pause=0.5>`.", elem_classes=["section-note"])
@@ -1102,12 +1103,12 @@ def build_generation_tab(
                 gr.Markdown("### Run")
                 with gr.Row():
                     tab.generate_button = gr.Button(
-                        "Generate voice", variant="primary", elem_classes=["premium-primary"], scale=3,
+                        "🎙️  Generate voice", variant="primary", elem_classes=btn("emerald"), scale=3,
                     )
                     tab.cancel_button = gr.Button(
-                        "Cancel", variant="stop", elem_classes=["danger-button"], scale=1,
+                        "⛔  Cancel", variant="stop", elem_classes=btn("red"), scale=1,
                     )
-                open_outputs = gr.Button("Open outputs folder", elem_classes=["compact-button"])
+                open_outputs = gr.Button("📁  Open outputs folder", elem_classes=btn("indigo"))
                 tab.progress_html = gr.HTML(progress_panel_html({}, title="Ready"))
                 tab.status = gr.Markdown("Ready.")
                 tab.log_tail = gr.Textbox(
@@ -1127,7 +1128,7 @@ def build_generation_tab(
                 info="Select a trained voice adapter, or None for the base model.",
                 scale=12,
             )
-            refresh_lora = gr.Button("Refresh", elem_classes=["compact-button"], scale=1)
+            refresh_lora = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
         with gr.Row(equal_height=False):
             strength = gr.Slider(
                 0.0, 2.0, value=1.0, step=0.05,
@@ -1345,7 +1346,7 @@ def build_generation_tab(
             label="Recent outputs (last 10)", max_height=300, buttons=["fullscreen"],
         )
         recent_audio = gr.State("")
-        load_recent_reference = gr.Button("Load selected output into reference", elem_classes=["compact-button"])
+        load_recent_reference = gr.Button("🎯  Load selected output into reference", elem_classes=btn("fuchsia"))
 
         def select_recent(evt: gr.SelectData):
             row = list(evt.row_value or [])
