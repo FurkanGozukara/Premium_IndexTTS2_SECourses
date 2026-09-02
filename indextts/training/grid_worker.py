@@ -11,6 +11,7 @@ from typing import Any
 
 from indextts.runtime.progress import ProgressReporter
 from indextts.utils.atomic_json import read_json_retry, write_json_atomic
+from indextts.utils.console_encoding import configure_console_output
 
 from .grid import GridConfig, run_grid
 
@@ -60,6 +61,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_console_output()
     args = parse_args(argv)
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -95,4 +97,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

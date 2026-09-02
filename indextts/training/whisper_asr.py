@@ -13,6 +13,8 @@ import unicodedata
 import numpy as np
 import soundfile as sf
 
+from indextts.utils.text_encoding import read_text_resilient
+
 from .subtitles import CaptionWord, Segment
 
 
@@ -394,8 +396,7 @@ def save_word_timestamps(
 
 
 def load_word_timestamps(path: str | Path) -> Transcript:
-    with Path(path).open("r", encoding="utf-8-sig") as handle:
-        payload = json.load(handle)
+    payload = json.loads(read_text_resilient(path))
     raw_words = payload.get("words") if isinstance(payload, dict) else None
     if not isinstance(raw_words, list):
         raise ValueError(f"Whisper word cache has no words list: {path}")

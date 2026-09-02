@@ -6,11 +6,10 @@ import os
 import sys
 import traceback
 
+from indextts.utils.console_encoding import configure_console_output
+
 os.environ["PYTHONUNBUFFERED"] = "1"
-for stream in (sys.stdout, sys.stderr):
-    reconfigure = getattr(stream, "reconfigure", None)
-    if callable(reconfigure):
-        reconfigure(line_buffering=True, write_through=True)
+configure_console_output()
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:

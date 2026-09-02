@@ -10,6 +10,8 @@ import time
 import traceback
 from typing import Any
 
+from indextts.utils.console_encoding import configure_console_output
+
 from .dataset_manifest import atomic_write_json
 from .dataset_prep import DatasetPrepConfig, run_dataset_prep
 
@@ -172,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_console_output()
     args = build_parser().parse_args(argv)
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)

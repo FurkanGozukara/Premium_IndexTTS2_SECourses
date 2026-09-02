@@ -197,6 +197,7 @@ Decode speed on the same demo text (`max_text_tokens_per_segment=60`, batch 1, s
 ## Training/preparation worker contract (indextts/training)
 Workers are launched as `python -m indextts.training.train_worker --config <json> --state-dir <dir>`.
 Dataset preparation drops duplicate normalized sentences across all sources by default, retaining the best-aligned copy closest to the target duration.
+Dataset preparation accepts BOM-aware UTF-8, BOM-marked UTF-16/UTF-32, encodings detected by `charset_normalizer` (including Windows Turkish CP1254), and a CP1252/replacement fallback for captions, transcripts, and `metadata.csv`. Sanitized source keys remain ASCII and gain a stable six-hex hash suffix whenever the original stem required replacement, so segment IDs, Whisper caches, and reference-candidate names are repeatable. Mixed folders are handled per media file: SRT/VTT/SBV sidecars are preferred where present, caption-less media falls back to Whisper under `prefer_sidecar`, and orphan subtitles produce warnings without blocking the other inputs.
 They write `state_dir/status.json` (phase, step, total_steps, epoch, total_epochs, loss, avg_loss, val_loss, lr,
 grad_norm, it_s, eta_s, elapsed_s, vram_used_gb, message, updated_at, last_checkpoint, last_sample),
 append `state_dir/metrics.jsonl` (one JSON per logged step: step, epoch, loss, avg_loss, lr, grad_norm, it_s, val_loss?),

@@ -63,9 +63,10 @@ class AudioQuality:
 
 
 def _run(args: Sequence[str], operation: str) -> subprocess.CompletedProcess[str]:
+    command = [str(argument) for argument in args]
     try:
         result = subprocess.run(
-            list(args),
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -74,7 +75,7 @@ def _run(args: Sequence[str], operation: str) -> subprocess.CompletedProcess[str
             check=False,
         )
     except FileNotFoundError as exc:
-        executable = args[0] if args else operation
+        executable = command[0] if command else operation
         raise RuntimeError(f"{executable} was not found on PATH") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"

@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from indextts.utils.console_encoding import configure_console_output
+
 
 ROOT = Path(__file__).resolve().parent
 
@@ -53,6 +55,7 @@ def create_demo(args: argparse.Namespace):
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_console_output()
     args = build_parser().parse_args(argv)
     demo = create_demo(args)
     from ui.common import FAVICON_PATH

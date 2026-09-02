@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -17,6 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from indextts.utils.pause_tags import TextChunk, split_text_with_pauses
+from indextts.utils.text_encoding import read_text_resilient
 
 from .dataset_manifest import (
     DATASET_INFO_FILENAME,
@@ -282,16 +285,11 @@ def _cancelled(cancel_check: Callable[[], bool] | None) -> bool:
     return bool(cancel_check and cancel_check())
 
 
-def _read_text(path: Path) -> str:
-    last_error: Exception | None = None
-    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
-        try:
-            return path.read_text(encoding=encoding)
-        except UnicodeError as exc:
-            last_error = exc
-    if last_error:
-        raise last_error
-    return path.read_text(encoding="utf-8")
+def _read_text(
+    path: Path,
+    warning_callback: Callable[[str], None] | None = None,
+) -> str:
+    return read_text_resilient(path, warning_callback=warning_callback)
 
 
 @dataclass(frozen=True)
@@ -315,10 +313,10 @@ def _resolve_metadata_audio(folder: Path, value: str) -> Path:
 
 def _parse_metadata_csv(path: Path, warnings: list[str]) -> list[_ImportItem]:
     rows: list[list[str]] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.reader(handle, delimiter="|"):
-            if row and any(cell.strip() for cell in row):
-                rows.append(row)
+    content = _read_text(path, warnings.append)
+    for row in csv.reader(io.StringIO(content, newline=""), delimiter="|"):
+        if row and any(cell.strip() for cell in row):
+            rows.append(row)
     if not rows:
         warnings.append(f"Empty metadata file: {path}")
         return []
@@ -401,7 +399,7 @@ def _discover_import_items(config: DatasetPrepConfig, warnings: list[str]) -> li
             continue
         if find_sidecar_subtitles(audio):
             continue
-        text = _read_text(transcript).strip()
+        text = _read_text(transcript, warnings.append).strip()
         if text:
             items.append(_ImportItem(audio.resolve(), text, "", "wav_txt"))
     unique: dict[str, _ImportItem] = {}
@@ -446,7 +444,16 @@ def _orphan_subtitle_warnings(
 
 
 def _safe_key(path: Path, used: set[str]) -> str:
-    base = re.sub(r"[^A-Za-z0-9_-]+", "_", path.stem).strip("_") or "source"
+    stem = path.stem
+    replacement = re.search(r"[^A-Za-z0-9_-]", stem)
+    if replacement is not None:
+        base = stem[: replacement.start()].strip("_-") or "source"
+        digest = hashlib.sha256(stem.encode("utf-8", errors="surrogatepass")).hexdigest()[:6]
+        base = f"{base}_{digest}"
+    else:
+        base = stem.strip("_") or "source"
+        if not re.search(r"[A-Za-z0-9]", base):
+            base = "source"
     key = base
     suffix = 2
     while key.casefold() in used:
@@ -850,6 +857,11 @@ def run_dataset_prep(
     (output_dir / "segments").mkdir(parents=True, exist_ok=True)
 
     warnings: list[str] = []
+
+    def record_runtime_warning(message: str) -> None:
+        warnings.append(message)
+        _log(reporter, f"Warning: {message}")
+
     rows: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
@@ -1039,7 +1051,10 @@ def run_dataset_prep(
                         for candidate_raw in sidecars:
                             candidate = Path(candidate_raw)
                             try:
-                                parsed = parse_subtitle_file(str(candidate))
+                                parsed = parse_subtitle_file(
+                                    str(candidate),
+                                    warning_callback=record_runtime_warning,
+                                )
                                 if parsed:
                                     selected_sidecar = candidate
                                     raw_cues = parsed
@@ -1157,7 +1172,10 @@ def run_dataset_prep(
                             max_gap_ms=config.max_gap_ms,
                         )
                         if transcript_path is not None and config.subtitle_policy != "whisper_only":
-                            provided_text = _read_text(Path(transcript_path)).strip()
+                            provided_text = _read_text(
+                                Path(transcript_path),
+                                record_runtime_warning,
+                            ).strip()
                             segments = _segments_from_plain_transcript(provided_text, segments)
                             transcript_source = "sidecar_txt+whisper_aligned"
                         else:

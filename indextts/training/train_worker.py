@@ -8,6 +8,8 @@ import time
 import traceback
 from pathlib import Path
 
+from indextts.utils.console_encoding import configure_console_output
+
 from .dataset_manifest import atomic_write_json
 from .train_config import TrainConfig
 from .trainer import run_training
@@ -21,6 +23,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_console_output()
     args = parse_args()
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
