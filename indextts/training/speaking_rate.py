@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
+import unicodedata
 
 import numpy as np
 import soundfile as sf
@@ -24,6 +25,11 @@ _STRENGTH_SUFFIX_RE = re.compile(
     r"\s+@(?P<strength>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
 )
 _MIN_CLIP_SECONDS = 1.0
+_METHOD_LABELS = {
+    "training_samples": "training samples",
+    "grid": "grid",
+    "grid_matched": "grid (matched sentences)",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,8 +56,9 @@ class SpeakingRateReport:
         allowed = {item.name for item in fields(cls)}
         payload = {key: item for key, item in value.items() if key in allowed}
         report = cls(**payload)
-        if report.method not in {"training_samples", "grid"}:
-            raise ValueError("speaking-rate method must be training_samples or grid")
+        if report.method not in _METHOD_LABELS:
+            allowed_methods = ", ".join(_METHOD_LABELS)
+            raise ValueError(f"speaking-rate method must be one of: {allowed_methods}")
         for name in (
             "recommended_speaking_rate",
             "dataset_words_per_second",
@@ -82,6 +89,21 @@ def _text_word_count(text: str) -> int:
         if isinstance(chunk, TextChunk)
     )
     return len(_WORD_RE.findall(without_pauses))
+
+
+def _normalise_matching_text(text: str) -> str:
+    value = " ".join(str(text or "").casefold().split())
+    while value and unicodedata.category(value[0]).startswith("P"):
+        value = value[1:].lstrip()
+    while value and unicodedata.category(value[-1]).startswith("P"):
+        value = value[:-1].rstrip()
+    return value
+
+
+def speaking_rate_method_label(method: str) -> str:
+    """Return the human-readable source label used by speaking-rate UIs."""
+
+    return _METHOD_LABELS.get(str(method), str(method).replace("_", " "))
 
 
 def _trimmed_duration(audio_path: str | Path) -> float:
@@ -164,6 +186,45 @@ def _report(
     )
 
 
+def _matched_report(
+    *,
+    matched_words: int,
+    generated_duration: float,
+    real_duration: float,
+    clips_used: int,
+) -> SpeakingRateReport | None:
+    if (
+        matched_words <= 0
+        or generated_duration <= 0.0
+        or real_duration <= 0.0
+        or clips_used <= 0
+    ):
+        return None
+    real_wps = matched_words / real_duration
+    generated_wps = matched_words / generated_duration
+    rate = round(min(1.5, max(0.5, generated_duration / real_duration)), 3)
+    relative_speed = generated_wps / real_wps - 1.0
+    if abs(relative_speed) < 0.005:
+        comparison = "at the same pace as you"
+    else:
+        direction = "faster" if relative_speed > 0.0 else "slower"
+        comparison = f"{abs(relative_speed) * 100.0:.0f} % {direction} than you"
+    summary = (
+        f"Across {clips_used} sentences that exist in your recordings, this LoRA / "
+        f"DoRA spoke {comparison} at speaking rate 1.0, so {rate:.2f} matches your "
+        "real pace."
+    )
+    return SpeakingRateReport(
+        recommended_speaking_rate=rate,
+        dataset_words_per_second=float(real_wps),
+        generated_words_per_second=float(generated_wps),
+        clips_used=int(clips_used),
+        method="grid_matched",
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        summary=summary,
+    )
+
+
 def calibrate_from_samples(
     adapter_dir: str | Path,
     dataset_dir: str | Path,
@@ -218,9 +279,21 @@ def calibrate_from_grid(
         float(strength_match.group("strength")) if strength_match else None
     )
     target_core = target[: strength_match.start()].rstrip() if strength_match else target
+    dataset_root = Path(dataset_dir).expanduser().resolve()
+    manifest_by_text: dict[str, list[Mapping[str, Any]]] = {}
+    for row in load_manifest(dataset_root):
+        normalised = _normalise_matching_text(str(row.get("text") or ""))
+        if normalised:
+            manifest_by_text.setdefault(normalised, []).append(row)
+
     total_words = 0
     total_duration = 0.0
     clips_used = 0
+    matched_words = 0
+    matched_generated_duration = 0.0
+    matched_real_duration = 0.0
+    matched_clips = 0
+    recording_duration_cache: dict[Path, float] = {}
     for cell in payload.get("cells", []):
         if not isinstance(cell, Mapping) or not cell.get("checkpoint_path"):
             continue
@@ -244,8 +317,36 @@ def calibrate_from_grid(
         total_words += words
         total_duration += duration
         clips_used += 1
+
+        normalised = _normalise_matching_text(str(cell.get("text") or ""))
+        for row in manifest_by_text.get(normalised, []):
+            audio_value = str(row.get("audio") or "").strip()
+            if not audio_value:
+                continue
+            recording_path = Path(audio_value).expanduser()
+            if not recording_path.is_absolute():
+                recording_path = dataset_root / recording_path
+            recording_duration = recording_duration_cache.get(recording_path)
+            if recording_duration is None:
+                recording_duration = _trimmed_duration(recording_path)
+                recording_duration_cache[recording_path] = recording_duration
+            if recording_duration <= 0.0:
+                continue
+            matched_words += words
+            matched_generated_duration += duration
+            matched_real_duration += recording_duration
+            matched_clips += 1
+            break
+
+    if matched_clips >= 4:
+        return _matched_report(
+            matched_words=matched_words,
+            generated_duration=matched_generated_duration,
+            real_duration=matched_real_duration,
+            clips_used=matched_clips,
+        )
     return _report(
-        dataset_wps=dataset_words_per_second(dataset_dir),
+        dataset_wps=dataset_words_per_second(dataset_root),
         generated_words=total_words,
         generated_duration=total_duration,
         clips_used=clips_used,
@@ -296,6 +397,7 @@ __all__ = [
     "calibrate_from_samples",
     "dataset_words_per_second",
     "load_speaking_rate",
+    "speaking_rate_method_label",
     "words_per_second",
     "write_speaking_rate",
 ]

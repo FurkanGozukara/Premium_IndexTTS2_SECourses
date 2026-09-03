@@ -266,6 +266,8 @@ and compares aggregate generated words/s with `manifest.jsonl` words/duration. T
 `round(clamp(dataset_words_per_second / generated_words_per_second, 0.5, 1.5), 3)`. Reports are atomically stored at
 `loras/<name>/analysis/speaking_rate.json`; Voice Generation can load the report from an adapter folder, a normal
 checkpoint, or a checkpoint below `best/`. A Checkpoint Grid can produce the same report with method `grid`.
+When grid text comes from the dataset, calibration instead compares each generated sentence with its matched,
+identically trimmed recording and stores method `grid_matched`.
 
 Checkpoint evaluation workers run as
 `python -m indextts.training.eval_worker --config <json> --state-dir <dir>`. Their state directory contains

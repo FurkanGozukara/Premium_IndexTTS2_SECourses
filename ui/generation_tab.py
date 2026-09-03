@@ -20,7 +20,10 @@ import gradio as gr
 
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
-from indextts.training.speaking_rate import load_speaking_rate
+from indextts.training.speaking_rate import (
+    load_speaking_rate,
+    speaking_rate_method_label,
+)
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
 from indextts.utils.subtitle_utils import (
     build_subtitle_render_units,
@@ -636,7 +639,8 @@ def _lora_info(path: str | None) -> tuple[str, str | None]:
             rate_line = (
                 f"Speaking rate: **{speaking_rate.recommended_speaking_rate:.3f}** "
                 f"(recordings {speaking_rate.dataset_words_per_second:.2f} words/s, "
-                f"generated {speaking_rate.generated_words_per_second:.2f} words/s)."
+                f"generated {speaking_rate.generated_words_per_second:.2f} words/s; "
+                f"calibration: {speaking_rate_method_label(speaking_rate.method)})."
             )
         markdown = (
             f"**{str(info['adapter_type']).upper()}** | rank **{info['rank']}** | alpha **{info['alpha']}**  \n"

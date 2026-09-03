@@ -41,6 +41,7 @@ from indextts.training.grid import (
 )
 from indextts.training.speaking_rate import (
     calibrate_from_grid,
+    speaking_rate_method_label,
     write_speaking_rate,
 )
 
@@ -448,7 +449,8 @@ def calibrate_grid_speaking_rates(
         )
     message = (
         f"Saved speaking rate {selected_report.recommended_speaking_rate:.3f} from "
-        f"{selected_label} to {saved_path}."
+        f"{selected_label} to {saved_path} using "
+        f"{speaking_rate_method_label(selected_report.method)}."
     )
     print(">> " + message, flush=True)
     return "\n".join(lines), message
