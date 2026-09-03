@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import MISSING, fields
 import json
 from pathlib import Path
 import sys
@@ -13,6 +14,13 @@ if str(REPO_ROOT) not in sys.path:
 from indextts.training.dataset_prep import DatasetPrepConfig, run_dataset_prep
 
 
+DATASET_PREP_DEFAULTS = {
+    item.name: item.default
+    for item in fields(DatasetPrepConfig)
+    if item.default is not MISSING
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare clean 24 kHz mono IndexTTS LoRA training segments",
@@ -20,53 +28,91 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("inputs", nargs="+", help="Media files, folders, metadata.csv, or wav+txt folders")
     parser.add_argument("--name", required=True, help="Dataset directory name")
-    parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--language", default="EN")
-    parser.add_argument("--output-root", default="datasets")
+    parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["recursive"],
+    )
+    parser.add_argument("--language", default=DATASET_PREP_DEFAULTS["language"])
+    parser.add_argument("--output-root", default=DATASET_PREP_DEFAULTS["output_root"])
     parser.add_argument(
         "--subtitle-policy",
         choices=("prefer_sidecar", "whisper_only", "sidecar_only"),
-        default="prefer_sidecar",
+        default=DATASET_PREP_DEFAULTS["subtitle_policy"],
     )
-    parser.add_argument("--whisper-model", default="openai/whisper-large-v3-turbo")
-    parser.add_argument("--whisper-device", default="cuda:0")
-    parser.add_argument("--align-with-whisper", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--target-s", type=float, default=8.0)
-    parser.add_argument("--min-s", type=float, default=1.5)
-    parser.add_argument("--max-s", type=float, default=15.0)
-    parser.add_argument("--max-gap-ms", type=int, default=700)
+    parser.add_argument("--whisper-model", default=DATASET_PREP_DEFAULTS["whisper_model"])
+    parser.add_argument("--whisper-device", default=DATASET_PREP_DEFAULTS["whisper_device"])
+    parser.add_argument(
+        "--align-with-whisper",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["align_with_whisper"],
+    )
+    parser.add_argument("--target-s", type=float, default=DATASET_PREP_DEFAULTS["target_s"])
+    parser.add_argument("--min-s", type=float, default=DATASET_PREP_DEFAULTS["min_s"])
+    parser.add_argument("--max-s", type=float, default=DATASET_PREP_DEFAULTS["max_s"])
+    parser.add_argument("--max-gap-ms", type=int, default=DATASET_PREP_DEFAULTS["max_gap_ms"])
     parser.add_argument(
         "--boundary-mode",
         choices=("sentence", "sentence_or_pause"),
-        default="sentence",
+        default=DATASET_PREP_DEFAULTS["boundary_mode"],
     )
-    parser.add_argument("--min-pause-boundary-ms", type=int, default=400)
-    parser.add_argument("--pad-ms", type=int, default=60)
-    parser.add_argument("--snap-to-silence", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--snap-window-ms", type=int, default=200)
-    parser.add_argument("--trim-silence", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--trim-top-db", type=float, default=40.0)
-    parser.add_argument("--loudness-normalize", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--target-lufs", type=float, default=-20.0)
-    parser.add_argument("--sample-rate", type=int, default=24000)
-    parser.add_argument("--min-words", type=int, default=2)
-    parser.add_argument("--max-words", type=int, default=80)
+    parser.add_argument(
+        "--min-pause-boundary-ms",
+        type=int,
+        default=DATASET_PREP_DEFAULTS["min_pause_boundary_ms"],
+    )
+    parser.add_argument("--pad-ms", type=int, default=DATASET_PREP_DEFAULTS["pad_ms"])
+    parser.add_argument(
+        "--snap-to-silence",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["snap_to_silence"],
+    )
+    parser.add_argument(
+        "--snap-window-ms", type=int, default=DATASET_PREP_DEFAULTS["snap_window_ms"]
+    )
+    parser.add_argument(
+        "--trim-silence",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["trim_silence"],
+    )
+    parser.add_argument("--trim-top-db", type=float, default=DATASET_PREP_DEFAULTS["trim_top_db"])
+    parser.add_argument(
+        "--loudness-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["loudness_normalize"],
+    )
+    parser.add_argument("--target-lufs", type=float, default=DATASET_PREP_DEFAULTS["target_lufs"])
+    parser.add_argument("--sample-rate", type=int, default=DATASET_PREP_DEFAULTS["sample_rate"])
+    parser.add_argument("--min-words", type=int, default=DATASET_PREP_DEFAULTS["min_words"])
+    parser.add_argument("--max-words", type=int, default=DATASET_PREP_DEFAULTS["max_words"])
     parser.add_argument(
         "--remove-bracket-annotations",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DATASET_PREP_DEFAULTS["remove_bracket_annotations"],
     )
     parser.add_argument(
         "--dedupe-rolling-captions",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DATASET_PREP_DEFAULTS["dedupe_rolling_captions"],
     )
-    parser.add_argument("--export-reference-candidates", type=int, default=5)
-    parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--max-segments", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--speaker-name", default="")
-    parser.add_argument("--speaker-from-folder", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--export-reference-candidates",
+        type=int,
+        default=DATASET_PREP_DEFAULTS["export_reference_candidates"],
+    )
+    parser.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["overwrite"],
+    )
+    parser.add_argument("--max-segments", type=int, default=DATASET_PREP_DEFAULTS["max_segments"])
+    parser.add_argument("--seed", type=int, default=DATASET_PREP_DEFAULTS["seed"])
+    parser.add_argument("--speaker-name", default=DATASET_PREP_DEFAULTS["speaker_name"])
+    parser.add_argument(
+        "--speaker-from-folder",
+        action=argparse.BooleanOptionalAction,
+        default=DATASET_PREP_DEFAULTS["speaker_from_folder"],
+    )
     return parser
 
 

@@ -104,9 +104,9 @@ class DatasetPrepConfig:
     whisper_device: str = "cuda:0"
     align_with_whisper: bool = False
     segmentation_mode: str = field(default_factory=_default_segmentation_mode)
-    target_s: float = 8.0
+    target_s: float = 14.0
     min_s: float = 4.0
-    max_s: float = 12.0
+    max_s: float = 20.0
     max_gap_ms: int = 700
     boundary_mode: str = "sentence"
     min_pause_boundary_ms: int = 400

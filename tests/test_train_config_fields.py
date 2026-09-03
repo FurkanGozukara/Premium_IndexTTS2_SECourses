@@ -10,8 +10,11 @@ def test_reference_sampling_and_evaluation_defaults() -> None:
 
     assert config.rank == 128
     assert config.alpha == 129.0
-    assert config.learning_rate == 5e-5
-    assert config.epochs == 20
+    assert config.learning_rate == 2e-5
+    assert config.epochs == 15
+    assert config.warmup_steps == 200
+    assert config.batch_size == 1
+    assert config.grad_accumulation == 1
     assert config.speaker_ref_mode == "other"
     assert config.emo_ref_mode == "follow_speaker"
     assert config.val_reference_mode == "other"

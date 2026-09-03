@@ -90,12 +90,21 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         preset_values = json.loads(preset_path.read_text(encoding="utf-8"))["values"]
         assert preset_values["dataset.boundary_mode"] == "sentence"
         assert preset_values["dataset.min_pause_boundary_ms"] == 400
+        assert preset_values["dataset.target_s"] == 14.0
+        assert preset_values["dataset.min_s"] == 4.0
+        assert preset_values["dataset.max_s"] == 20.0
+    assert demo.preset_registry["dataset.target_s"].maximum == 30
+    assert demo.preset_registry["dataset.min_s"].maximum == 15
+    assert demo.preset_registry["dataset.max_s"].maximum == 40
 
     measured_fields = (
         "rank",
         "alpha",
+        "batch_size",
+        "grad_accumulation",
         "learning_rate",
         "epochs",
+        "warmup_steps",
         "speaker_ref_mode",
         "emo_ref_mode",
         "val_reference_mode",

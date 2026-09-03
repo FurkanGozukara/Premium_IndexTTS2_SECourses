@@ -27,6 +27,8 @@ from indextts.training.analysis import (
     phase_display_label,
 )
 from indextts.training.checkpoint_eval import load_checkpoint_eval
+from indextts.training.dataset_manifest import load_manifest
+from indextts.training.plan import training_plan, training_plan_line
 from indextts.training.train_config import TrainConfig
 
 from .common import (
@@ -152,6 +154,51 @@ def _dataset_summary(path: str | None) -> str:
         f"{float(info.get('total_duration_minutes', 0.0) or 0.0):.2f} minutes | "
         f"features **{'cached' if cache_index.is_file() else 'not cached'}**"
     )
+
+
+def _training_plan_markdown(
+    dataset_path: str | None,
+    batch_size: int,
+    grad_accumulation: int,
+    epochs: int,
+    max_steps: int,
+    val_fraction: float,
+    seed: int = 42,
+) -> str:
+    try:
+        if not dataset_path:
+            return "Select a dataset to see the training plan."
+        root = Path(dataset_path).expanduser()
+        if not root.is_absolute():
+            root = ROOT / root
+        manifest = root / "manifest.jsonl"
+        if not manifest.is_file():
+            return "Select a dataset to see the training plan."
+        rows = load_manifest(manifest)
+        record_ids = [str(row["id"]) for row in rows if row.get("id")]
+        if not record_ids:
+            return "Training plan unavailable: the manifest is empty."
+        plan = training_plan(
+            len(record_ids),
+            batch_size,
+            grad_accumulation,
+            epochs,
+            max_steps,
+            val_fraction,
+            record_ids=record_ids,
+            seed=seed,
+        )
+        total_updates = plan["total_optimizer_updates"]
+        if total_updates < 2_000:
+            advisory = "This is below 2,000 optimizer updates; consider increasing epochs."
+        elif total_updates > 40_000:
+            advisory = "This is a long run above 40,000 optimizer updates; you can reduce epochs."
+        else:
+            advisory = "This plan is between 2,000 and 40,000 optimizer updates."
+        return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}"
+    except Exception as exc:
+        message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        return f"Training plan unavailable: {message[:160]}"
 
 
 def _loss_plot_frame(frame: pd.DataFrame, smoothing: float) -> pd.DataFrame:
@@ -409,6 +456,7 @@ class TrainingTab:
     compare_grid: Any
     dataset: Any
     dataset_info: Any
+    training_plan: Any
     start_event: Any = None
 
 
@@ -492,18 +540,29 @@ def build_training_tab(
 
         with gr.Accordion("Optimization", open=False):
             with gr.Row():
-                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="5e-5 keeps validation loss flat after its best epoch instead of overfitting.")
+                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="2e-5 is the measured quality default for stable batch-1 training with cosine decay.")
                 optimizer = gr.Dropdown(choices=["adamw", "adamw_fused", "prodigy"], value=TRAIN_DEFAULTS["optimizer"], label="Optimizer", info="AdamW is portable; fused AdamW is faster on supported CUDA builds.")
                 scheduler = gr.Dropdown(choices=["cosine", "linear", "constant", "constant_with_warmup"], value=TRAIN_DEFAULTS["lr_scheduler"], label="Scheduler", info="Cosine decay is recommended for multi-epoch voice adaptation.")
-                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="Ramps the learning rate to avoid unstable early updates.")
+                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="200 steps eases batch-1 training into the 2e-5 learning rate.")
                 weight_decay = gr.Number(value=TRAIN_DEFAULTS["weight_decay"], minimum=0, maximum=1, label="Weight decay", info="0.01 is a mild regularizer; 0.05 showed no measured benefit.")
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
                 eps = gr.Number(value=TRAIN_DEFAULTS["eps"], minimum=1e-12, maximum=0.1, label="Adam epsilon", info="Numerical stability term for Adam-family optimizers.")
-                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="20 epochs with cosine decay reached the best measured checkpoint around epoch 8-11; every epoch is kept and the best one is recommended automatically")
+                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="15 epochs is the measured batch-1 quality default and provides more optimizer updates per clip.")
                 max_steps = gr.Number(value=TRAIN_DEFAULTS["max_steps"], minimum=0, precision=0, label="Maximum steps", info="0 derives steps from epochs; set 5 for a quick smoke run.")
-                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="4 is the quality default; lower it first when VRAM is tight.")
-                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="Effective batch is batch size times accumulation.")
+                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="1 is the measured quality default: one clip per step gives the most optimizer updates per epoch and the lowest VRAM; raise it only for speed.")
+                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="1 makes every micro-batch an optimizer update; raise it only to simulate a larger effective batch.")
+            training_plan_readout = gr.Markdown(
+                _training_plan_markdown(
+                    initial_dataset if Path(initial_dataset).is_dir() else None,
+                    TRAIN_DEFAULTS["batch_size"],
+                    TRAIN_DEFAULTS["grad_accumulation"],
+                    TRAIN_DEFAULTS["epochs"],
+                    TRAIN_DEFAULTS["max_steps"],
+                    TRAIN_DEFAULTS["val_fraction"],
+                    TRAIN_DEFAULTS["seed"],
+                )
+            )
             with gr.Row():
                 grad_clip = gr.Number(value=TRAIN_DEFAULTS["max_grad_norm"], minimum=0, label="Gradient clip", info="1.0 limits unstable gradient spikes; 0 disables clipping.")
                 smoothing = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["label_smoothing"], step=0.01, label="Label smoothing", info="0 is recommended; increase only for overconfident large datasets.")
@@ -1051,8 +1110,27 @@ def build_training_tab(
     force.click(force_stop, [force_confirm, state_dir], status_text, js="(value, state) => [window.confirm('Force stop training immediately? Unsaved work will be lost.'), state]", queue=False)
     open_output.click(lambda state: open_folder(state or _LAST_TRAINING_FOLDER), state_dir, status_text, queue=False)
 
-    refresh_dataset.click(lambda: gr.update(choices=_dataset_choices()), outputs=dataset, queue=False)
+    refresh_dataset_event = refresh_dataset.click(
+        lambda: gr.update(choices=_dataset_choices()), outputs=dataset, queue=False
+    )
     dataset.change(_dataset_summary, dataset, dataset_info, queue=False)
+    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed]
+    for plan_input in plan_inputs:
+        plan_input.change(
+            _training_plan_markdown,
+            plan_inputs,
+            training_plan_readout,
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+        )
+    refresh_dataset_event.then(
+        _training_plan_markdown,
+        plan_inputs,
+        training_plan_readout,
+        queue=False,
+        show_progress="hidden",
+    )
     refresh_resume.click(lambda: gr.update(choices=_resume_choices()), outputs=resume, queue=False)
 
     def inspect_resume(path: str, current_type: str, current_rank: int, current_alpha: float):
@@ -1131,19 +1209,20 @@ def build_training_tab(
     if expected != actual:
         raise RuntimeError(f"Training UI field mismatch: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
     return TrainingTab(
-        controls,
-        apply_tier,
-        base_variant,
-        precision,
-        blocks,
-        ring,
-        pinned,
-        state_dir,
-        use_generation,
-        compare_grid,
-        dataset,
-        dataset_info,
-        start_event,
+        controls=controls,
+        apply_tier_button=apply_tier,
+        base_variant=base_variant,
+        mixed_precision=precision,
+        blocks_to_swap=blocks,
+        swap_ring_size=ring,
+        pin_swap_memory=pinned,
+        state_dir=state_dir,
+        use_in_generation=use_generation,
+        compare_grid=compare_grid,
+        dataset=dataset,
+        dataset_info=dataset_info,
+        training_plan=training_plan_readout,
+        start_event=start_event,
     )
 
 

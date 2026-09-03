@@ -17,6 +17,7 @@ from torch.utils.data import BatchSampler, Dataset
 from indextts.utils.tokenizer import lang_to_token
 
 from .dataset_manifest import load_manifest
+from .plan import validation_split_ids
 
 
 def _stable_unit_interval(*parts: Any) -> float:
@@ -134,22 +135,11 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             self._speaker_records[str(record["speaker"])].append(record)
 
     def _validation_ids(self, records: Sequence[Mapping[str, Any]]) -> set[str]:
-        if self.val_fraction <= 0.0 or len(records) < 2:
-            return set()
-        selected = {
-            str(record["id"])
-            for record in records
-            if _stable_unit_interval(self.seed, record["id"], "split") < self.val_fraction
-        }
-        # Small datasets still need a useful validation sample, while preserving
-        # at least one training sample.
-        if not selected:
-            best = min(records, key=lambda record: _stable_unit_interval(self.seed, record["id"], "split"))
-            selected.add(str(best["id"]))
-        if len(selected) == len(records):
-            keep_train = max(records, key=lambda record: _stable_unit_interval(self.seed, record["id"], "split"))
-            selected.remove(str(keep_train["id"]))
-        return selected
+        return validation_split_ids(
+            [str(record["id"]) for record in records],
+            self.val_fraction,
+            self.seed,
+        )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = max(0, int(epoch))

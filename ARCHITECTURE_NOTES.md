@@ -199,16 +199,17 @@ Workers are launched as `python -m indextts.training.train_worker --config <json
 Dataset preparation drops duplicate normalized sentences across all sources by default, retaining the best-aligned copy closest to the target duration.
 Dataset preparation accepts BOM-aware UTF-8, BOM-marked UTF-16/UTF-32, encodings detected by `charset_normalizer` (including Windows Turkish CP1254), and a CP1252/replacement fallback for captions, transcripts, and `metadata.csv`. Sanitized source keys remain ASCII and gain a stable six-hex hash suffix whenever the original stem required replacement, so segment IDs, Whisper caches, and reference-candidate names are repeatable. Mixed folders are handled per media file: SRT/VTT/SBV sidecars are preferred where present, caption-less media falls back to Whisper under `prefer_sidecar`, and orphan subtitles produce warnings without blocking the other inputs.
 Sentence-aligned preparation defaults to `boundary_mode="sentence"`. The optional `sentence_or_pause` mode also accepts a non-sentence fragment when each edge is either a sentence edge or has at least `min_pause_boundary_ms=400` between adjacent aligned Whisper words. Pause-accepted rows carry `boundary="pause"` (`"sentence"` otherwise), and per-source and dataset summaries record them in `filter_keep_counts.pause_boundary`; rejected fragments remain in `filter_drop_counts.sentence_boundary`.
+Preparation targets 14-second clips within a 4-20 second range. This covers the model's 12-15 second inference segments, preserves more source audio than the old 12-second maximum, and avoids the measured quality loss at 30 seconds.
 They write `state_dir/status.json` (phase, step, total_steps, epoch, total_epochs, loss, avg_loss, val_loss, lr,
 grad_norm, it_s, eta_s, elapsed_s, vram_used_gb, message, updated_at, last_checkpoint, last_sample),
 append `state_dir/metrics.jsonl` (one JSON per logged step: step, epoch, loss, avg_loss, lr, grad_norm, it_s, val_loss?),
 append `state_dir/log.txt`, and honour `state_dir/stop.flag` (graceful: finish step, save, exit) and process kill.
 The parent UI uses the same `_terminate_process_tree` approach as webui.py for hard cancel.
 
-Quality-first `TrainConfig` defaults measured on the 31-minute reference dataset are rank 128, alpha 129,
-learning rate 5e-5, 20 epochs, speaker reference `other`, emotion reference `follow_speaker`, validation reference
-`other`, and `keep_last_n=0`. Dropout remains 0.05, weight decay 0.01, batch size 4 with accumulation 2, warmup
-50, cosine scheduling, BF16, gradient checkpointing, validation fraction 0.05 every 50 steps, samples every epoch,
+Quality-first `TrainConfig` defaults are rank 128, alpha 129, learning rate 2e-5, 15 epochs, speaker reference
+`other`, emotion reference `follow_speaker`, validation reference `other`, and `keep_last_n=0`. Dropout remains
+0.05, weight decay 0.01, batch size 1 with accumulation 1, warmup 200, cosine scheduling, BF16, gradient
+checkpointing, validation fraction 0.05 every 50 steps, samples every epoch,
 automatic analysis/evaluation, and disabled early stopping.
 
 `TrainConfig.epoch_train_state=False` omits the optimizer/scheduler/RNG `train_state.pt` sidecar from periodic

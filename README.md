@@ -10,7 +10,7 @@
 - Automatic generalization analysis identifies the lowest validation-loss epoch, marks the sustained overfitting region, and makes Voice Generation prefer the recommended checkpoint.
 - Optional validation-based early stopping and automatic measured checkpoint evaluation after the training model releases its memory.
 - Evaluation can use inference-like references from a different clip of the same speaker, matching the normal voice-cloning workflow more closely.
-- Measured quality-first training defaults use rank 128, alpha 129, learning rate 5e-5, 20 epochs, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`).
+- Measured quality-first training defaults use rank 128, alpha 129, batch size 1, no gradient accumulation, learning rate 2e-5, 15 epochs, 200 warmup steps, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`).
 - Per-voice speaking-rate calibration compares generated words/s with the training recordings and auto-applies the saved pace in Voice Generation; the Checkpoint Grid can calibrate older runs too.
 - Every LoRA / DoRA keeps machine-readable and plain-language reports under `loras/<lora-or-dora>/analysis/`; listening grids are saved under `outputs/grids/`.
 - The header's **🕘  Load last values** button restores the last run of every tab; earlier results stay hidden until it is clicked.
@@ -19,9 +19,9 @@
 - Cross-platform one-click installers and launchers for Windows, Massed Compute, RunPod, SimplePod, and other Linux hosts.
 - Models & Performance tab: pick your GPU VRAM tier (6/8/10/12/16/24/32 GB); every tier was calibrated to keep about 2 GB of VRAM free. Lower tiers switch to the INT8 ConvRot GPT and stream GPT blocks from CPU RAM (block swap); the INT8 file is downloaded automatically from Hugging Face when needed.
 - Presets: system presets live in `presets/system` (read-only, marked with a star) and your own presets in `presets/user`; a preset stores every parameter of every tab, and the last-used preset is restored at startup.
-- LoRA Dataset Preparation: drop any audio/video files (with optional SRT/VTT/SBV subtitles); audio is extracted with FFmpeg, transcribed with Whisper (word timestamps), cut into sentence-aligned segments with optional pause-based fragment boundaries, deduplicated by spoken sentence, loudness normalized, and cached as training features.
+- LoRA Dataset Preparation: drop any audio/video files (with optional SRT/VTT/SBV subtitles); audio is extracted with FFmpeg, transcribed with Whisper (word timestamps), cut into sentence-aligned segments using the measured 4-20 second range and 14 second target, deduplicated by spoken sentence, loudness normalized, and cached as training features.
 - Drop videos with or without captions, any file names, Windows and Linux.
-- LoRA / DoRA Training: rank/alpha/dropout, DoRA toggle, learning-rate schedule, gradient checkpointing, block swap for low VRAM, validation split, periodic audio samples, live loss/learning-rate charts, resume from an existing LoRA / DoRA, single `.safetensors` output that the Voice Generation tab loads (with a strength slider) from the LoRA / DoRA dropdown.
+- LoRA / DoRA Training: rank/alpha/dropout, DoRA toggle, learning-rate schedule, gradient checkpointing, block swap for low VRAM, validation split, a live optimizer-update plan, periodic audio samples, live loss/learning-rate charts, resume from an existing LoRA / DoRA, single `.safetensors` output that the Voice Generation tab loads (with a strength slider) from the LoRA / DoRA dropdown.
 - Cancel/Stop buttons ask for confirmation and really stop the worker process; every long task reports progress, it/s, ETA, and VRAM in both the UI and the console.
 - Resume training from any saved LoRA / DoRA: "Weights only" starts a fresh schedule from the LoRA / DoRA weights, "Continue run" restores the optimizer, scheduler and step counter and trains the extra epochs/steps you configure.
 - Reloading starts with clean result panels; finished jobs and outputs are not restored automatically.

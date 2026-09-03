@@ -264,6 +264,17 @@ def test_prepare_dataset_cli_maps_pause_boundary_options() -> None:
     assert config.min_pause_boundary_ms == 525
 
 
+def test_prepare_dataset_cli_uses_dataclass_defaults() -> None:
+    from tools.prepare_dataset import build_parser, config_from_args
+
+    args = build_parser().parse_args(["input.wav", "--name", "default_fixture"])
+
+    assert config_from_args(args).to_dict() == DatasetPrepConfig(
+        name="default_fixture",
+        inputs=["input.wav"],
+    ).to_dict()
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not VIDEO2.is_file(), reason="SECourses media fixture is not installed")
 def test_whisper_word_timestamps_on_sixty_second_slice(tmp_path: Path) -> None:

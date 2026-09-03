@@ -55,6 +55,7 @@ from indextts.utils.atomic_json import read_json_retry
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
 from .model_forward import enable_gradient_checkpointing, gpt_train_step_loss
+from .plan import training_plan, training_plan_line
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, write_speaking_rate
 from .train_config import TrainConfig
@@ -934,12 +935,20 @@ class LoraTrainer:
         if val_dataset is not None and len(val_dataset) == 0:
             val_dataset = None
 
-        micro_batches_per_epoch = max(1, math.ceil(len(train_dataset) / config.batch_size))
-        steps_per_epoch = max(
-            1, math.ceil(micro_batches_per_epoch / config.grad_accumulation)
+        val_count = len(val_dataset) if val_dataset is not None else 0
+        plan = training_plan(
+            len(train_dataset) + val_count,
+            config.batch_size,
+            config.grad_accumulation,
+            config.epochs,
+            config.max_steps,
+            config.val_fraction,
+            validation_count=val_count,
         )
-        epoch_capacity = config.epochs * steps_per_epoch
-        planned_steps = config.max_steps if config.max_steps else epoch_capacity
+        self.log(f">> training plan | {training_plan_line(plan)}")
+        micro_batches_per_epoch = plan["micro_batches_per_epoch"]
+        steps_per_epoch = plan["optimizer_updates_per_epoch"]
+        planned_steps = plan["total_optimizer_updates"]
         total_steps = planned_steps
         self.reporter = self.reporter or ProgressReporter(
             "training steps", total=total_steps, progress_file=self.state_dir / "progress.json"

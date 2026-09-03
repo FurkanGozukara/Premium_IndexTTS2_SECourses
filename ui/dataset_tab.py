@@ -451,9 +451,9 @@ def build_dataset_tab(
                     info="A fragment edge must have at least this much silence when punctuation does not provide the boundary.",
                 )
             with gr.Row():
-                target_s = gr.Slider(1, 20, value=8, step=0.25, label="Target seconds", info="8 seconds gives efficient, stable training segments.")
-                min_s = gr.Slider(0.5, 15, value=4, step=0.25, label="Minimum seconds", info="4 seconds is recommended for enough voice context.")
-                max_s = gr.Slider(2, 30, value=12, step=0.25, label="Maximum seconds", info="12 seconds limits memory while preserving sentences.")
+                target_s = gr.Slider(1, 30, value=DATASET_DEFAULTS["target_s"], step=0.25, label="Target seconds", info="14 seconds packs whole sentences into inference-length clips; measured best with a 20 second maximum.")
+                min_s = gr.Slider(0.5, 15, value=DATASET_DEFAULTS["min_s"], step=0.25, label="Minimum seconds", info="4 seconds keeps enough voice context while retaining the measured quality range.")
+                max_s = gr.Slider(2, 40, value=DATASET_DEFAULTS["max_s"], step=0.25, label="Maximum seconds", info="20 seconds covers 12-15-second inference segments and retains more source audio; 30 seconds measured worse.")
                 max_gap = gr.Slider(0, 3000, value=700, step=25, label="Maximum cue gap (ms)", info="Cues closer than this can merge into one sentence segment.")
             with gr.Row():
                 pad = gr.Slider(0, 500, value=60, step=10, label="Edge padding (ms)", info="Small context padding avoids clipped consonants.")
@@ -462,8 +462,8 @@ def build_dataset_tab(
                 min_words = gr.Slider(0, 30, value=2, step=1, label="Minimum words", info="Drops fragments with too little transcript context.")
                 max_words = gr.Slider(10, 200, value=80, step=1, label="Maximum words", info="Drops transcript segments that are implausibly dense.")
             for field_name, component, kind, minimum, maximum in (
-                ("target_s", target_s, "float", 1, 20), ("min_s", min_s, "float", 0.5, 15),
-                ("max_s", max_s, "float", 2, 30), ("max_gap_ms", max_gap, "int", 0, 3000),
+                ("target_s", target_s, "float", 1, 30), ("min_s", min_s, "float", 0.5, 15),
+                ("max_s", max_s, "float", 2, 40), ("max_gap_ms", max_gap, "int", 0, 3000),
                 ("pad_ms", pad, "int", 0, 500), ("snap_to_silence", snap, "bool", None, None),
                 ("snap_window_ms", snap_window, "int", 0, 1000), ("min_words", min_words, "int", 0, 30),
                 ("max_words", max_words, "int", 10, 200),
