@@ -34,6 +34,7 @@ from .generation_tab import (
     bind_generation_events,
     build_default_generation_request,
     build_generation_tab,
+    reference_selection_updates,
     validate_request_coverage,
 )
 from .help_tab import build_help_tab
@@ -459,6 +460,25 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         initial_load_event.then(
             lambda: gr.update(interactive=True),
             outputs=last_values_button,
+            queue=False,
+            show_progress="hidden",
+            api_name=False,
+        )
+        initial_load_event.then(
+            reference_selection_updates,
+            inputs=[
+                generation.prompt_audio,
+                generation.reference_audio_dropdown,
+                generation.reference_source,
+                generation.controls["runtime.lora_path"],
+                generation.controls["generation.auto_lora_reference"],
+            ],
+            outputs=[
+                generation.prompt_audio,
+                generation.reference_audio_dropdown,
+                generation.reference_source,
+                generation.reference_status,
+            ],
             queue=False,
             show_progress="hidden",
             api_name=False,

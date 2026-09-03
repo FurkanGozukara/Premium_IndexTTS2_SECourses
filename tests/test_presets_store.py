@@ -1,5 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -78,3 +80,37 @@ def test_registry_rejects_duplicate_keys():
     with pytest.raises(ValueError, match="Duplicate"):
         registry.register("same", default=2)
 
+
+def test_concurrent_last_used_updates_are_atomic(tmp_path: Path):
+    store = make_store(tmp_path)
+    store.ensure_system_presets()
+    names = ("default", "quality", "fast", "low_vram_8gb")
+    barrier = threading.Barrier(16)
+
+    def update(worker: int) -> None:
+        barrier.wait()
+        for offset in range(12):
+            assert store.set_last_used(names[(worker + offset) % len(names)])
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(update, range(16)))
+
+    persisted = store.last_used_path.read_text(encoding="utf-8").strip()
+    assert persisted in names
+    assert store.get_last_used() in names
+    assert not list(store.user_dir.glob(".*.tmp"))
+
+
+def test_loading_survives_last_used_bookmark_failure(tmp_path: Path, monkeypatch):
+    store = make_store(tmp_path)
+    store.ensure_system_presets()
+    original_write = store._write_atomic
+
+    def fail_bookmark(path: Path, text: str) -> None:
+        if path == store.last_used_path:
+            raise PermissionError("simulated sharing violation")
+        original_write(path, text)
+
+    monkeypatch.setattr(store, "_write_atomic", fail_bookmark)
+    assert store.load("quality") == store.registry.defaults()
+    assert store.get_last_used() == "quality"

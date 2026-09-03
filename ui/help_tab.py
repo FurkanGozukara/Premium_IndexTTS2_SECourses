@@ -8,7 +8,7 @@ import gradio as gr
 HELP_MARKDOWN = r"""
 ## Quick Start
 
-1. In **Voice Generation**, load a clean 3-15 second speaker reference.
+1. In **Voice Generation**, load a clean 3-15 second **Reference Voice**.
 2. Enter text, choose its language, and keep the per-language segment-token default.
 3. Leave the quality defaults in place and select **Generate voice**. Models load only on this first run.
 4. Watch section progress, elapsed time, ETA, realtime speed, VRAM, and the live console tail. Every task is saved below `outputs/`.

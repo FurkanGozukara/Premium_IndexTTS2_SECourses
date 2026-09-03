@@ -34,6 +34,7 @@ desktop.ini
 /loras/
 /models/
 /outputs/
+/reference_audios/
 *.partial
 /tests/_tmp/
 indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/

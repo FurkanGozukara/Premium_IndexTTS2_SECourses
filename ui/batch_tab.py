@@ -33,7 +33,11 @@ from .common import (
     tail_text,
     write_json_atomic,
 )
-from .generation_tab import GenerationTab, prepare_generation_request
+from .generation_tab import (
+    GenerationTab,
+    prepare_generation_request,
+    resolve_reference_selection,
+)
 from .presets_store import PresetRegistry
 
 
@@ -362,12 +366,28 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         paragraphs: str,
         folder: str,
         common_reference: str | None,
+        selected_library: str | None,
+        reference_source: str,
         *values: Any,
     ):
         global _LAST_BATCH_FOLDER
         _BATCH_CANCEL.clear()
         batch_values = dict(zip(batch_keys, values[:len(batch_keys)]))
         generation_values = dict(zip(generation_keys, values[len(batch_keys):]))
+        if batch_values["batch.reference_mode"] == "One reference for all":
+            selection = resolve_reference_selection(
+                common_reference,
+                selected_library,
+                reference_source,
+                str(generation_values.get("runtime.lora_path") or ""),
+                bool(generation_values.get("generation.auto_lora_reference", True)),
+            )
+            common_reference = selection.prompt
+            if selection.message:
+                if selection.prompt:
+                    gr.Info(selection.message, title="Batch Reference Voice")
+                else:
+                    gr.Warning(selection.message, title="Batch Reference Voice")
         items: list[dict[str, Any]] = []
         rows: list[list[Any]] = []
         started = time.perf_counter()
@@ -544,7 +564,16 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
 
     event = tab.start_button.click(
         run_batch,
-        inputs=[tab.files, tab.text, tab.folder, generation.prompt_audio, *batch_components, *generation_components],
+        inputs=[
+            tab.files,
+            tab.text,
+            tab.folder,
+            generation.prompt_audio,
+            generation.reference_audio_dropdown,
+            generation.reference_source,
+            *batch_components,
+            *generation_components,
+        ],
         outputs=[tab.task_state, tab.progress, tab.status, tab.results, tab.log, tab.task_timer],
         api_name="generate_batch",
         concurrency_limit=1,

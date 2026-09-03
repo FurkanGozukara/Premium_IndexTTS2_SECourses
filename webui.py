@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
             str(ROOT / "outputs"),
             str(ROOT / "datasets"),
             str(ROOT / "loras"),
+            str(ROOT / "reference_audios"),
             str(ROOT / ".ui_state"),
         ],
         prevent_thread_lock=True,

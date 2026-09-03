@@ -14,7 +14,12 @@ import math
 import os
 from pathlib import Path
 import re
+import tempfile
+import threading
+import time
 from typing import Any, Iterable, Mapping, Sequence
+
+from indextts.utils.atomic_json import read_json_retry, replace_with_retry
 
 
 PRESET_FORMAT = "indextts2_premium_universal"
@@ -33,6 +38,11 @@ class ControlSpec:
     minimum: float | int | None = None
     maximum: float | int | None = None
     nullable: bool = False
+
+
+# Gradio can dispatch preset events concurrently during startup and from multiple
+# browser sessions. Serialize these tiny transactions so their files stay coherent.
+_PRESET_IO_LOCK = threading.RLock()
 
 
 class PresetRegistry:
@@ -292,6 +302,7 @@ class PresetStore:
         self.system_dir = self.root / "system"
         self.user_dir = self.root / "user"
         self.last_used_path = self.user_dir / ".last_used_preset.txt"
+        self._last_used_memory: str | None = None
         self.system_dir.mkdir(parents=True, exist_ok=True)
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,10 +351,40 @@ class PresetStore:
 
     @staticmethod
     def _write_atomic(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, path)
+        """Durably replace a preset file without sharing a temporary filename."""
+
+        with _PRESET_IO_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                replace_with_retry(temporary, path)
+            finally:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _read_text_retry(path: Path, *, attempts: int = 8) -> str:
+        wait = 0.01
+        for attempt in range(attempts):
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                if attempt >= attempts - 1:
+                    raise
+                time.sleep(wait)
+                wait = min(0.15, wait * 1.75)
+        raise OSError(f"Could not read {path}")
 
     def write_system(self, name: str, values: Mapping[str, Any]) -> Path:
         path = self._path(name, system=True)
@@ -404,23 +445,24 @@ class PresetStore:
         self.write_system("low_vram_8gb", low)
 
     def save(self, name: str, values: Mapping[str, Any] | Sequence[Any]) -> str:
-        clean = sanitize_preset_name(name)
-        if self.is_system(clean):
-            raise PermissionError(f"System preset '{clean}' is read-only")
-        if not isinstance(values, Mapping):
-            values = self.registry.values_from_sequence(list(values))
-        payload = self._payload(clean, values, system=False)
-        self._write_atomic(self._path(clean, system=False), self._serialize(payload))
-        self.set_last_used(clean)
-        return clean
+        with _PRESET_IO_LOCK:
+            clean = sanitize_preset_name(name)
+            if self.is_system(clean):
+                raise PermissionError(f"System preset '{clean}' is read-only")
+            if not isinstance(values, Mapping):
+                values = self.registry.values_from_sequence(list(values))
+            payload = self._payload(clean, values, system=False)
+            self._write_atomic(self._path(clean, system=False), self._serialize(payload))
+            self.set_last_used(clean)
+            return clean
 
     def _read_payload(self, name: str) -> dict[str, Any] | None:
         clean = sanitize_preset_name(name)
         system_path = self._path(clean, system=True)
         path = system_path if system_path.is_file() else self._path(clean, system=False)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        missing = object()
+        payload = read_json_retry(path, missing)
+        if payload is missing:
             return None
         return payload if isinstance(payload, dict) else None
 
@@ -443,21 +485,22 @@ class PresetStore:
         return values
 
     def load(self, name: str | None) -> dict[str, Any]:
-        requested = sanitize_preset_name(name or "default")
-        payload = self._read_payload(requested)
-        if payload is None:
-            return self.registry.defaults()
-        if isinstance(payload.get("values"), Mapping):
-            values = dict(payload["values"])
-        elif payload.get("_meta", {}).get("format") == "indextts2_premium_ui" or any(
-            key in payload for key in ("audio_generation", "advanced_parameters")
-        ):
-            values = self._migrate_legacy(payload)
-        else:
-            values = {key: value for key, value in payload.items() if key != "_meta"}
-        result = self.registry.coerce(values)
-        self.set_last_used(requested)
-        return result
+        with _PRESET_IO_LOCK:
+            requested = sanitize_preset_name(name or "default")
+            payload = self._read_payload(requested)
+            if payload is None:
+                return self.registry.defaults()
+            if isinstance(payload.get("values"), Mapping):
+                values = dict(payload["values"])
+            elif payload.get("_meta", {}).get("format") == "indextts2_premium_ui" or any(
+                key in payload for key in ("audio_generation", "advanced_parameters")
+            ):
+                values = self._migrate_legacy(payload)
+            else:
+                values = {key: value for key, value in payload.items() if key != "_meta"}
+            result = self.registry.coerce(values)
+            self.set_last_used(requested)
+            return result
 
     load_values = load
 
@@ -466,34 +509,55 @@ class PresetStore:
         return [values[spec.key] for spec in self.registry.component_specs]
 
     def reset(self) -> dict[str, Any]:
-        self.set_last_used("default")
-        return self.registry.defaults()
+        with _PRESET_IO_LOCK:
+            self.set_last_used("default")
+            return self.registry.defaults()
 
     def delete(self, name: str) -> bool:
-        clean = sanitize_preset_name(name)
-        if self.is_system(clean):
-            raise PermissionError(f"System preset '{clean}' is read-only")
-        path = self._path(clean, system=False)
-        if not path.is_file():
-            return False
-        path.unlink()
-        self.set_last_used("default")
-        return True
+        with _PRESET_IO_LOCK:
+            clean = sanitize_preset_name(name)
+            if self.is_system(clean):
+                raise PermissionError(f"System preset '{clean}' is read-only")
+            path = self._path(clean, system=False)
+            if not path.is_file():
+                return False
+            path.unlink()
+            self.set_last_used("default")
+            return True
 
-    def set_last_used(self, name: str) -> None:
+    def set_last_used(self, name: str) -> bool:
         clean = sanitize_preset_name(name)
-        self._write_atomic(self.last_used_path, clean + "\n")
+        with _PRESET_IO_LOCK:
+            self._last_used_memory = clean
+            try:
+                current = self._read_text_retry(self.last_used_path).strip()
+            except OSError:
+                current = ""
+            if current == clean:
+                return True
+            try:
+                self._write_atomic(self.last_used_path, clean + "\n")
+            except OSError as exc:
+                # Loading a valid preset must not fail just because its small
+                # last-used bookmark is temporarily unavailable.
+                print(f">> Warning: could not persist last-used preset '{clean}': {exc}", flush=True)
+                return False
+            return True
 
     def get_last_used(self) -> str:
-        candidates = (self.last_used_path, self.user_dir / ".last_used_ui_preset.txt")
-        for path in candidates:
-            try:
-                value = sanitize_preset_name(path.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError):
-                continue
-            if self._read_payload(value) is not None:
-                return value
-        return "default"
+        with _PRESET_IO_LOCK:
+            candidates = (self.last_used_path, self.user_dir / ".last_used_ui_preset.txt")
+            for path in candidates:
+                try:
+                    value = sanitize_preset_name(self._read_text_retry(path).strip())
+                except (OSError, ValueError):
+                    continue
+                if self._read_payload(value) is not None:
+                    self._last_used_memory = value
+                    return value
+            if self._last_used_memory and self._read_payload(self._last_used_memory) is not None:
+                return self._last_used_memory
+            return "default"
 
 
 __all__ = [
