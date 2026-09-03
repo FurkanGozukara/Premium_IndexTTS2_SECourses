@@ -10,7 +10,7 @@
 - Automatic generalization analysis identifies the lowest validation-loss epoch, marks the sustained overfitting region, and makes Voice Generation prefer the recommended checkpoint.
 - Optional validation-based early stopping and automatic measured checkpoint evaluation after the training model releases its memory.
 - Evaluation can use inference-like references from a different clip of the same speaker, matching the normal voice-cloning workflow more closely.
-- Measured quality-first training defaults use rank 128, alpha 129, batch size 1, no gradient accumulation, learning rate 2e-5, 15 epochs, 200 warmup steps, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`).
+- Measured quality-first training defaults use rank 128, alpha 129, batch size 1, no gradient accumulation, learning rate 4e-5, 10 epochs, 200 warmup steps, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`). With batch size 1 and accumulation 1, each epoch gives one optimizer update per training clip.
 - Per-voice speaking-rate calibration compares generated words/s with the training recordings and auto-applies the saved pace in Voice Generation; the Checkpoint Grid can calibrate older runs too.
 - Every LoRA / DoRA keeps machine-readable and plain-language reports under `loras/<lora-or-dora>/analysis/`; listening grids are saved under `outputs/grids/`.
 - The header's **🕘  Load last values** button restores the last run of every tab; earlier results stay hidden until it is clicked.

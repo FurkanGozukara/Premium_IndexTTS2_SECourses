@@ -27,7 +27,7 @@ class TrainConfig:
 
     base_variant: str = "bf16"
     base_dtype: str = "bf16"
-    learning_rate: float = 2e-5
+    learning_rate: float = 4e-5
     lr_scheduler: str = "cosine"
     warmup_steps: int = 200
     weight_decay: float = 0.01
@@ -35,7 +35,7 @@ class TrainConfig:
     eps: float = 1e-8
     optimizer: str = "adamw"
 
-    epochs: int = 15
+    epochs: int = 10
     max_steps: int = 0
     batch_size: int = 1
     grad_accumulation: int = 1

@@ -10,8 +10,8 @@ def test_reference_sampling_and_evaluation_defaults() -> None:
 
     assert config.rank == 128
     assert config.alpha == 129.0
-    assert config.learning_rate == 2e-5
-    assert config.epochs == 15
+    assert config.learning_rate == 4e-5
+    assert config.epochs == 10
     assert config.warmup_steps == 200
     assert config.batch_size == 1
     assert config.grad_accumulation == 1

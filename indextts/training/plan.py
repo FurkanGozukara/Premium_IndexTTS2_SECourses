@@ -45,6 +45,29 @@ def _validation_count(manifest_count: int, val_fraction: float) -> int:
     return min(manifest_count - 1, max(1, int(manifest_count * fraction)))
 
 
+def suggested_epochs(
+    training_clips: int,
+    batch_size: int,
+    grad_accumulation: int,
+    target_updates: int = 10_000,
+    minimum: int = 3,
+    maximum: int = 200,
+) -> int:
+    """Return the fewest clamped epochs that reach the optimizer-update target."""
+
+    clips = max(0, int(training_clips))
+    if not clips:
+        return 0
+    batch = max(1, int(batch_size))
+    accumulation = max(1, int(grad_accumulation))
+    lower = max(0, int(minimum))
+    upper = max(lower, int(maximum))
+    micro_batches = math.ceil(clips / batch)
+    updates_per_epoch = max(1, math.ceil(micro_batches / accumulation))
+    epochs = math.ceil(max(0, int(target_updates)) / updates_per_epoch)
+    return min(upper, max(lower, epochs))
+
+
 def training_plan(
     manifest_count: int,
     batch_size: int,
@@ -112,4 +135,38 @@ def training_plan_line(plan: dict[str, int]) -> str:
     )
 
 
-__all__ = ["training_plan", "training_plan_line", "validation_split_ids"]
+def training_plan_advisory(
+    plan: dict[str, int],
+    batch_size: int,
+    grad_accumulation: int,
+) -> str:
+    """Describe how a plan compares with the measured optimizer-update range."""
+
+    total_updates = plan["total_optimizer_updates"]
+    epochs = suggested_epochs(
+        plan["training_clips"], batch_size, grad_accumulation
+    )
+    if total_updates < 5_000:
+        return (
+            f"Only {total_updates:,} optimizer updates; the measured sweet spot is about "
+            f"10,000. Suggested epochs for this dataset: {epochs:,}."
+        )
+    if total_updates <= 20_000:
+        return (
+            f"About {total_updates:,} optimizer updates, inside the measured 5,000-20,000 "
+            "range where the best checkpoints appeared."
+        )
+    return (
+        f"{total_updates:,} optimizer updates is more than the measured sweet spot of about "
+        f"10,000; every epoch is kept, so pick the best one in the Checkpoint Grid, or reduce "
+        f"epochs to about {epochs:,}."
+    )
+
+
+__all__ = [
+    "suggested_epochs",
+    "training_plan",
+    "training_plan_advisory",
+    "training_plan_line",
+    "validation_split_ids",
+]

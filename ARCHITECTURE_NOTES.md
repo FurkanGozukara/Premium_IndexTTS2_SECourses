@@ -206,11 +206,12 @@ append `state_dir/metrics.jsonl` (one JSON per logged step: step, epoch, loss, a
 append `state_dir/log.txt`, and honour `state_dir/stop.flag` (graceful: finish step, save, exit) and process kill.
 The parent UI uses the same `_terminate_process_tree` approach as webui.py for hard cancel.
 
-Quality-first `TrainConfig` defaults are rank 128, alpha 129, learning rate 2e-5, 15 epochs, speaker reference
+Quality-first `TrainConfig` defaults are rank 128, alpha 129, learning rate 4e-5, 10 epochs, speaker reference
 `other`, emotion reference `follow_speaker`, validation reference `other`, and `keep_last_n=0`. Dropout remains
 0.05, weight decay 0.01, batch size 1 with accumulation 1, warmup 200, cosine scheduling, BF16, gradient
 checkpointing, validation fraction 0.05 every 50 steps, samples every epoch,
 automatic analysis/evaluation, and disabled early stopping.
+With batch size 1 and accumulation 1, each epoch gives one optimizer update per training clip.
 
 `TrainConfig.epoch_train_state=False` omits the optimizer/scheduler/RNG `train_state.pt` sidecar from periodic
 epoch and step checkpoints, avoiding about 4x extra disk per checkpoint. Best, final, and interrupted checkpoints

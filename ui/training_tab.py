@@ -28,7 +28,7 @@ from indextts.training.analysis import (
 )
 from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.dataset_manifest import load_manifest
-from indextts.training.plan import training_plan, training_plan_line
+from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line
 from indextts.training.train_config import TrainConfig
 
 from .common import (
@@ -188,13 +188,7 @@ def _training_plan_markdown(
             record_ids=record_ids,
             seed=seed,
         )
-        total_updates = plan["total_optimizer_updates"]
-        if total_updates < 2_000:
-            advisory = "This is below 2,000 optimizer updates; consider increasing epochs."
-        elif total_updates > 40_000:
-            advisory = "This is a long run above 40,000 optimizer updates; you can reduce epochs."
-        else:
-            advisory = "This plan is between 2,000 and 40,000 optimizer updates."
+        advisory = training_plan_advisory(plan, batch_size, grad_accumulation)
         return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}"
     except Exception as exc:
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
@@ -540,18 +534,18 @@ def build_training_tab(
 
         with gr.Accordion("Optimization", open=False):
             with gr.Row():
-                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="2e-5 is the measured quality default for stable batch-1 training with cosine decay.")
+                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="4e-5 is the robust batch-1 default: it reached 5.061 held-out loss, while 8e-5 overfit within two epochs.")
                 optimizer = gr.Dropdown(choices=["adamw", "adamw_fused", "prodigy"], value=TRAIN_DEFAULTS["optimizer"], label="Optimizer", info="AdamW is portable; fused AdamW is faster on supported CUDA builds.")
                 scheduler = gr.Dropdown(choices=["cosine", "linear", "constant", "constant_with_warmup"], value=TRAIN_DEFAULTS["lr_scheduler"], label="Scheduler", info="Cosine decay is recommended for multi-epoch voice adaptation.")
-                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="200 steps eases batch-1 training into the 2e-5 learning rate.")
+                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="200 steps is the measured batch-1 default, easing training into the 4e-5 learning rate.")
                 weight_decay = gr.Number(value=TRAIN_DEFAULTS["weight_decay"], minimum=0, maximum=1, label="Weight decay", info="0.01 is a mild regularizer; 0.05 showed no measured benefit.")
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
                 eps = gr.Number(value=TRAIN_DEFAULTS["eps"], minimum=1e-12, maximum=0.1, label="Adam epsilon", info="Numerical stability term for Adam-family optimizers.")
-                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="15 epochs is the measured batch-1 quality default and provides more optimizer updates per clip.")
+                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="10 epochs is the measured batch-1 default; 20 epochs overfit after the held-out optimum around epoch 6.")
                 max_steps = gr.Number(value=TRAIN_DEFAULTS["max_steps"], minimum=0, precision=0, label="Maximum steps", info="0 derives steps from epochs; set 5 for a quick smoke run.")
-                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="1 is the measured quality default: one clip per step gives the most optimizer updates per epoch and the lowest VRAM; raise it only for speed.")
-                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="1 makes every micro-batch an optimizer update; raise it only to simulate a larger effective batch.")
+                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="1 is the measured quality default: every training clip becomes an optimizer update each epoch.")
+                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="1 is the measured default; accumulation 2 or 4 removed updates and performed worse at the same learning rate.")
             training_plan_readout = gr.Markdown(
                 _training_plan_markdown(
                     initial_dataset if Path(initial_dataset).is_dir() else None,

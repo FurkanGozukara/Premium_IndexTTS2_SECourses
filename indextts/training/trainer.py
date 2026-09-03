@@ -55,7 +55,7 @@ from indextts.utils.atomic_json import read_json_retry
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
 from .model_forward import enable_gradient_checkpointing, gpt_train_step_loss
-from .plan import training_plan, training_plan_line
+from .plan import suggested_epochs, training_plan, training_plan_line
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, write_speaking_rate
 from .train_config import TrainConfig
@@ -945,7 +945,13 @@ class LoraTrainer:
             config.val_fraction,
             validation_count=val_count,
         )
-        self.log(f">> training plan | {training_plan_line(plan)}")
+        epoch_suggestion = suggested_epochs(
+            plan["training_clips"], config.batch_size, config.grad_accumulation
+        )
+        self.log(
+            f">> training plan | {training_plan_line(plan)} "
+            f"suggested epochs for ~10,000 updates: {epoch_suggestion:,}"
+        )
         micro_batches_per_epoch = plan["micro_batches_per_epoch"]
         steps_per_epoch = plan["optimizer_updates_per_epoch"]
         planned_steps = plan["total_optimizer_updates"]

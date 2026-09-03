@@ -23,7 +23,7 @@ Use one speaker, natural pacing, little echo, and no music. A representative cli
 
 1. **Prepare:** add media and sidecar captions in **LoRA Dataset Preparation**, scan the files, then prepare clean 24 kHz segments with the measured 4-20 second range and 14 second target.
 2. **Cache:** inspect segment statistics and audio, then select **Cache features now**. Training requires the cache index.
-3. **Train:** choose the dataset in **LoRA / DoRA Training**. The measured quality defaults are DoRA, rank 128, alpha 129, batch size 1, gradient accumulation 1, learning rate 2e-5, 15 epochs, 200 warmup steps, speaker reference `other`, emotion reference `follow_speaker`, validation reference `other`, and every epoch checkpoint kept (`keep_last_n=0`) without its large optimizer sidecar (`epoch_train_state=False`); BF16 and gradient checkpointing stay on.
+3. **Train:** choose the dataset in **LoRA / DoRA Training**. The measured quality defaults are DoRA, rank 128, alpha 129, batch size 1, gradient accumulation 1, learning rate 4e-5, 10 epochs, 200 warmup steps, speaker reference `other`, emotion reference `follow_speaker`, validation reference `other`, and every epoch checkpoint kept (`keep_last_n=0`) without its large optimizer sidecar (`epoch_train_state=False`); BF16 and gradient checkpointing stay on. With batch size 1 and accumulation 1, each epoch gives one optimizer update per training clip.
 4. **Use:** after a checkpoint is saved, select **Use best checkpoint**, which opens the Voice Generation tab with that LoRA / DoRA selected. Strength 1.0 reproduces the trained scale.
 
 **Speaker reference mode:** `self` uses the target clip, `other` uses a deterministic different clip from the same speaker, and `mixed` alternates between them.
