@@ -56,6 +56,22 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         }
         assert {item.name for item in fields(config_type)}.issubset(registered)
     assert demo.request_coverage["ok"]
+    components = {
+        (component["type"], component["props"].get("label")): component
+        for component in demo.config["components"]
+    }
+    reference_source = components[("file", "Reference Voice (audio or video)")]
+    reference_audio = components[("audio", "Reference Voice audio preview")]
+    reference_video = components[("video", "Reference Voice video preview")]
+    assert {"audio", "video"}.issubset(reference_source["props"]["file_types"])
+    assert reference_source["props"].get("value") is None
+    assert reference_audio["props"].get("value") is None
+    assert reference_audio["props"]["visible"] is False
+    assert reference_audio["props"]["interactive"] is False
+    assert reference_video["props"]["visible"] is False
+    dependencies = {item.get("api_name"): item for item in demo.config["dependencies"]}
+    assert dependencies["generate_voice"]["trigger_only_on_success"] is True
+    assert dependencies["generate_voice"]["trigger_after"] is not None
     assert {
         "grid.adapter_dir",
         "grid.checkpoints",

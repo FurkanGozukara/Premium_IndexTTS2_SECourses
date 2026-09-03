@@ -36,7 +36,7 @@ from .common import (
 from .generation_tab import (
     GenerationTab,
     prepare_generation_request,
-    resolve_reference_selection,
+    prepare_reference_for_generation,
 )
 from .presets_store import PresetRegistry
 
@@ -366,28 +366,12 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         paragraphs: str,
         folder: str,
         common_reference: str | None,
-        selected_library: str | None,
-        reference_source: str,
         *values: Any,
     ):
         global _LAST_BATCH_FOLDER
         _BATCH_CANCEL.clear()
         batch_values = dict(zip(batch_keys, values[:len(batch_keys)]))
         generation_values = dict(zip(generation_keys, values[len(batch_keys):]))
-        if batch_values["batch.reference_mode"] == "One reference for all":
-            selection = resolve_reference_selection(
-                common_reference,
-                selected_library,
-                reference_source,
-                str(generation_values.get("runtime.lora_path") or ""),
-                bool(generation_values.get("generation.auto_lora_reference", True)),
-            )
-            common_reference = selection.prompt
-            if selection.message:
-                if selection.prompt:
-                    gr.Info(selection.message, title="Batch Reference Voice")
-                else:
-                    gr.Warning(selection.message, title="Batch Reference Voice")
         items: list[dict[str, Any]] = []
         rows: list[list[Any]] = []
         started = time.perf_counter()
@@ -562,15 +546,72 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 )
             yield emit(panel, f"Batch failed: {exc}", rows, "", running=False)
 
-    event = tab.start_button.click(
+    def prepare_common_reference(
+        reference_mode: str,
+        prompt: str | None,
+        media_path: str | None,
+        selected_library: str | None,
+        reference_source: str,
+        time_ranges: str,
+        lora_path: str,
+        auto_lora_reference: bool,
+    ):
+        if reference_mode != "One reference for all":
+            return (gr.skip(),) * 6
+        try:
+            prepared = prepare_reference_for_generation(
+                prompt,
+                media_path,
+                selected_library,
+                reference_source,
+                time_ranges,
+                lora_path,
+                auto_lora_reference,
+            )
+        except ValueError as exc:
+            gr.Warning(str(exc), title="Batch Reference Voice")
+            raise gr.Error(str(exc)) from exc
+        gr.Info(prepared.message, title="Batch Reference Voice")
+        return (
+            gr.update(value=prepared.prompt, visible=True),
+            gr.update(value=prepared.media),
+            gr.update(value=prepared.video, visible=bool(prepared.video)),
+            gr.update(choices=prepared.choices, value=prepared.library_value),
+            prepared.source,
+            prepared.message,
+        )
+
+    reference_event = tab.start_button.click(
+        prepare_common_reference,
+        inputs=[
+            tab.controls["batch.reference_mode"],
+            generation.prompt_audio,
+            generation.reference_media,
+            generation.reference_audio_dropdown,
+            generation.reference_source,
+            generation.reference_ranges,
+            generation.controls["runtime.lora_path"],
+            generation.controls["generation.auto_lora_reference"],
+        ],
+        outputs=[
+            generation.prompt_audio,
+            generation.reference_media,
+            generation.reference_video,
+            generation.reference_audio_dropdown,
+            generation.reference_source,
+            generation.reference_status,
+        ],
+        queue=False,
+        show_progress="minimal",
+        api_name="prepare_batch_reference",
+    )
+    event = reference_event.success(
         run_batch,
         inputs=[
             tab.files,
             tab.text,
             tab.folder,
             generation.prompt_audio,
-            generation.reference_audio_dropdown,
-            generation.reference_source,
             *batch_components,
             *generation_components,
         ],

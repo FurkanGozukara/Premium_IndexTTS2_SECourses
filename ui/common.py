@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -814,6 +815,62 @@ def parse_multiline_paths(value: str | None) -> list[str]:
     return result
 
 
+def _parse_media_timestamp(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("timestamp is empty")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"invalid timestamp '{text}'")
+    try:
+        numbers = [float(part.strip()) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"invalid timestamp '{text}'") from exc
+    if any(number < 0 for number in numbers):
+        raise ValueError("timestamps cannot be negative")
+    if len(numbers) > 1 and numbers[-1] >= 60:
+        raise ValueError(f"seconds must be below 60 in timestamp '{text}'")
+    if len(numbers) == 3 and numbers[-2] >= 60:
+        raise ValueError(f"minutes must be below 60 in timestamp '{text}'")
+    seconds = 0.0
+    for number in numbers:
+        seconds = seconds * 60.0 + number
+    return seconds
+
+
+def parse_reference_time_ranges(value: str | None) -> list[tuple[float, float]]:
+    """Parse ordered reference-media ranges.
+
+    The compact ``start:end`` form treats both values as seconds. Timestamp
+    ranges use a dash or arrow, for example ``01:02-01:08.5``.
+    """
+
+    ranges: list[tuple[float, float]] = []
+    for raw in re.split(r"[;\n]+", str(value or "")):
+        item = raw.strip()
+        if not item:
+            continue
+        compact = re.fullmatch(
+            r"([0-9]+(?:\.[0-9]+)?)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+            item,
+        )
+        if compact:
+            start = float(compact.group(1))
+            end = float(compact.group(2))
+        else:
+            match = re.fullmatch(r"(.+?)\s*(?:->|-)\s*(.+)", item)
+            if not match:
+                raise ValueError(
+                    f"Invalid range '{item}'. Use start:end (seconds) or MM:SS-MM:SS."
+                )
+            start = _parse_media_timestamp(match.group(1))
+            end = _parse_media_timestamp(match.group(2))
+        if end <= start:
+            raise ValueError(f"Range '{item}' must end after it starts.")
+        ranges.append((start, end))
+    return ranges
+
+
 def extract_reference_audio(
     media_path: str | os.PathLike[str],
     time_ranges: str = "",
@@ -827,47 +884,65 @@ def extract_reference_audio(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None, "FFmpeg is required to read reference media."
-    ranges: list[tuple[float, float]] = []
-    for raw in str(time_ranges or "").split(";"):
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            start_text, end_text = raw.split(":", 1)
-            start, end = float(start_text), float(end_text)
-        except (ValueError, TypeError):
-            continue
-        if start >= 0 and end > start:
-            ranges.append((start, end))
+    try:
+        ranges = parse_reference_time_ranges(time_ranges)
+    except ValueError as exc:
+        return None, str(exc)
     if require_ranges and not ranges:
-        return None, "Enter ranges such as 1:3; 4.5:9 before extracting."
-    destination = Path(tempfile.mkstemp(prefix="indextts_reference_", suffix=".wav")[1])
+        return None, "Enter ranges such as 1:3; 4.5:9 or 01:02-01:08 before extracting."
+    with tempfile.NamedTemporaryFile(
+        prefix="indextts_reference_", suffix=".wav", delete=False
+    ) as temporary:
+        destination = Path(temporary.name)
     try:
         if not ranges:
             command = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
-                "-ar", str(sample_rate), "-ac", "1", "-c:a", "pcm_s16le", str(destination),
+                "-map", "0:a:0", "-vn", "-ar", str(sample_rate), "-ac", "1",
+                "-c:a", "pcm_s16le", str(destination),
             ]
         else:
-            inputs: list[str] = []
             filters: list[str] = []
+            if len(ranges) > 1:
+                split_labels = "".join(f"[src{index}]" for index in range(len(ranges)))
+                filters.append(f"[0:a:0]asplit={len(ranges)}{split_labels}")
             for index, (start, end) in enumerate(ranges):
-                inputs.extend(["-i", str(source)])
+                source_label = f"src{index}" if len(ranges) > 1 else "0:a:0"
                 filters.append(
-                    f"[{index}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[s{index}]"
+                    f"[{source_label}]atrim=start={start:.6f}:end={end:.6f},"
+                    f"asetpts=PTS-STARTPTS[s{index}]"
                 )
             labels = "".join(f"[s{index}]" for index in range(len(ranges)))
             filters.append(f"{labels}concat=n={len(ranges)}:v=0:a=1[out]")
             command = [
-                ffmpeg, "-y", "-hide_banner", "-loglevel", "error", *inputs,
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
                 "-filter_complex", ";".join(filters), "-map", "[out]",
                 "-ar", str(sample_rate), "-ac", "1", "-c:a", "pcm_s16le", str(destination),
             ]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed.returncode != 0 or not destination.is_file():
+        has_samples = False
+        if completed.returncode == 0 and destination.is_file():
+            try:
+                import wave
+
+                with wave.open(str(destination), "rb") as output_wav:
+                    has_samples = output_wav.getnframes() > 0
+            except (OSError, wave.Error):
+                has_samples = False
+        if completed.returncode != 0 or not has_samples:
             destination.unlink(missing_ok=True)
-            return None, f"Reference extraction failed: {(completed.stderr or '').strip()[-800:]}"
-        detail = f" using {len(ranges)} selected range(s)" if ranges else ""
+            detail = (completed.stderr or "").strip()[-800:]
+            if not detail:
+                detail = "the selected media or ranges produced no audio"
+            return None, f"Reference extraction failed: {detail}"
+        detail = ""
+        if ranges:
+            total_seconds = sum(end - start for start, end in ranges)
+            noun = "range" if len(ranges) == 1 else "ranges"
+            detail = (
+                f" using {len(ranges)} selected {noun} "
+                f"({total_seconds:.2f}s total)"
+            )
         return str(destination), f"Loaded {source.name}{detail}."
     except Exception as exc:
         destination.unlink(missing_ok=True)
@@ -954,6 +1029,7 @@ __all__ = [
     "open_folder",
     "output_task_is_active",
     "parse_multiline_paths",
+    "parse_reference_time_ranges",
     "progress_from_file",
     "progress_panel_html",
     "read_json",

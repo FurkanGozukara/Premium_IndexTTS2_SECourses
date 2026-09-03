@@ -20,6 +20,7 @@ import gradio as gr
 
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
+from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
 from indextts.training.speaking_rate import (
     load_speaking_rate,
     speaking_rate_method_label,
@@ -72,7 +73,33 @@ EMOTION_LABELS = ("Joy", "Anger", "Sadness", "Fear", "Disgust", "Depression", "S
 EMOTION_BIAS_DEFAULTS = (0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625)
 REFERENCE_AUDIO_DIR = ROOT / "reference_audios"
 REFERENCE_AUDIO_EXTENSIONS = frozenset(
-    {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"}
+    {
+        ".aac",
+        ".ac3",
+        ".aif",
+        ".aiff",
+        ".alac",
+        ".amr",
+        ".ape",
+        ".au",
+        ".caf",
+        ".dts",
+        ".flac",
+        ".m4a",
+        ".mka",
+        ".mp2",
+        ".mp3",
+        ".oga",
+        ".ogg",
+        ".opus",
+        ".ra",
+        ".tta",
+        ".voc",
+        ".wav",
+        ".weba",
+        ".wma",
+        ".wv",
+    }
 )
 _AUTO_REFERENCE_SOURCES = frozenset({"library_auto", "lora_auto"})
 
@@ -80,6 +107,17 @@ _AUTO_REFERENCE_SOURCES = frozenset({"library_auto", "lora_auto"})
 @dataclass(frozen=True)
 class ReferenceSelection:
     prompt: str | None
+    library_value: str | None
+    source: str
+    message: str
+    choices: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class PreparedReference:
+    prompt: str
+    media: str
+    video: str | None
     library_value: str | None
     source: str
     message: str
@@ -637,6 +675,25 @@ def reference_audio_choices(
     ]
 
 
+def _latest_reference_choice(choices: Sequence[tuple[str, str]]) -> str | None:
+    candidates: list[tuple[int, str, str]] = []
+    for label, value in choices:
+        try:
+            modified = Path(value).stat().st_mtime_ns
+        except OSError:
+            continue
+        candidates.append((modified, label.casefold(), value))
+    return max(candidates, default=(0, "", None))[2]
+
+
+def latest_reference_audio(
+    root: str | os.PathLike[str] = REFERENCE_AUDIO_DIR,
+) -> str | None:
+    """Return the most recently modified audio in the reference library."""
+
+    return _latest_reference_choice(reference_audio_choices(root))
+
+
 def _path_key(value: Any) -> str:
     path = str(value) if isinstance(value, os.PathLike) else resolve_path_value(value)
     if not path:
@@ -650,6 +707,48 @@ def _existing_path(value: Any) -> str | None:
         return None
     resolved = Path(path).expanduser().resolve()
     return str(resolved) if resolved.is_file() else None
+
+
+def _same_reference_file(current: str | None, expected: str | None) -> bool:
+    """Match originals with Gradio's same-named cached file copies."""
+
+    if not current or not expected:
+        return False
+    return (
+        _path_key(current) == _path_key(expected)
+        or Path(current).name.casefold() == Path(expected).name.casefold()
+    )
+
+
+def load_reference_media(
+    media_path: Any,
+    time_ranges: str = "",
+    *,
+    require_ranges: bool = False,
+) -> tuple[str | None, str | None, str]:
+    """Validate any FFmpeg-readable media, extract its audio, and flag video preview."""
+
+    source = _existing_path(media_path)
+    if not source:
+        return None, None, "Choose an existing audio or video file."
+    try:
+        media = probe_media(source)
+    except Exception as exc:
+        return None, None, f"Could not read {Path(source).name}: {exc}"
+    if not media.has_audio:
+        return None, source if media.has_video else None, (
+            f"{Path(source).name} has no audio stream to use as a Reference Voice."
+        )
+    audio, message = extract_reference_audio(
+        source,
+        time_ranges,
+        require_ranges=require_ranges,
+    )
+    video = source if media.has_video else None
+    if audio:
+        media_type = "video" if media.has_video else "audio"
+        message = f"{message[:-1]} from {media_type}; its audio is shown below and ready to use."
+    return audio, video, message
 
 
 def _resolve_lora_reference_path(
@@ -711,13 +810,12 @@ def resolve_reference_selection(
     reference_root: str | os.PathLike[str] = REFERENCE_AUDIO_DIR,
     lora_reference: str | None = None,
 ) -> ReferenceSelection:
-    """Choose manual, LoRA, then library audio in that priority order."""
+    """Choose manual, LoRA, then newest library audio in that priority order."""
 
     choices = reference_audio_choices(reference_root)
     choice_values = {_path_key(value): value for _, value in choices}
     selected = choice_values.get(_path_key(selected_library))
-    if selected is None and choices:
-        selected = choices[0][1]
+    newest = _latest_reference_choice(choices)
 
     source = str(reference_source or "empty")
     current = _existing_path(current_reference)
@@ -730,15 +828,18 @@ def resolve_reference_selection(
             choices=choices,
         )
 
+    lora_name = ""
+    missing_lora_reference = False
     if lora_path and auto_lora_reference:
         recommended = _existing_path(lora_reference) or _recommended_lora_reference(lora_path)
+        adapter_dir = Path(lora_path).expanduser().resolve().parent
+        if adapter_dir.name.casefold() == "best":
+            adapter_dir = adapter_dir.parent
+        lora_name = adapter_dir.name
         if recommended:
-            unchanged = source == "lora_auto" and _path_key(current) == _path_key(recommended)
-            adapter_dir = Path(lora_path).expanduser().resolve().parent
-            if adapter_dir.name.casefold() == "best":
-                adapter_dir = adapter_dir.parent
+            unchanged = source == "lora_auto" and _same_reference_file(current, recommended)
             message = "" if unchanged else (
-                "No manual Reference Voice was selected. Automatically loaded and will use "
+                "No Reference Voice was provided. Automatically loaded and will use "
                 f"{Path(recommended).name} from LoRA / DoRA {adapter_dir.name}."
             )
             return ReferenceSelection(
@@ -748,16 +849,31 @@ def resolve_reference_selection(
                 message=message,
                 choices=choices,
             )
+        missing_lora_reference = True
 
-    if selected:
-        unchanged = source == "library_auto" and _path_key(current) == _path_key(selected)
-        message = "" if unchanged else (
-            "No manual Reference Voice was selected. Automatically loaded and will use "
-            f"{Path(selected).name} from reference_audios."
-        )
+    if newest:
+        unchanged = source == "library_auto" and _same_reference_file(current, newest)
+        if unchanged:
+            message = ""
+        elif missing_lora_reference:
+            message = (
+                f"The selected LoRA / DoRA {lora_name} has no saved reference audio. "
+                f"Automatically loaded and will use {Path(newest).name}, the latest modified "
+                "audio in reference_audios."
+            )
+        elif lora_path and not auto_lora_reference:
+            message = (
+                "Automatic LoRA / DoRA reference loading is disabled. Automatically loaded and "
+                f"will use {Path(newest).name}, the latest modified audio in reference_audios."
+            )
+        else:
+            message = (
+                "No Reference Voice was provided. Automatically loaded and will use "
+                f"{Path(newest).name}, the latest modified audio in reference_audios."
+            )
         return ReferenceSelection(
-            prompt=selected,
-            library_value=selected,
+            prompt=newest,
+            library_value=newest,
             source="library_auto",
             message=message,
             choices=choices,
@@ -768,8 +884,16 @@ def resolve_reference_selection(
         library_value=None,
         source="empty",
         message=(
-            "No Reference Voice is available. Add audio to reference_audios, choose a file, "
-            "load a media path, or select a LoRA / DoRA with a saved reference."
+            (
+                f"The selected LoRA / DoRA {lora_name} has no saved reference audio, and "
+                "reference_audios is empty. "
+            )
+            if missing_lora_reference
+            else "No Reference Voice is available. "
+        )
+        + (
+            "Add audio to reference_audios, choose audio or video, load a media path, or "
+            "select a LoRA / DoRA with a saved reference."
         ),
         choices=choices,
     )
@@ -807,6 +931,86 @@ def reference_selection_updates(
         gr.update(choices=selection.choices, value=selection.library_value),
         selection.source,
         selection.message or gr.skip(),
+    )
+
+
+def prepare_reference_for_generation(
+    current_reference: Any,
+    reference_media: Any,
+    selected_library: Any,
+    reference_source: str | None,
+    time_ranges: str,
+    lora_path: str | None,
+    auto_lora_reference: bool,
+    *,
+    reference_root: str | os.PathLike[str] = REFERENCE_AUDIO_DIR,
+    lora_reference: str | None = None,
+) -> PreparedReference:
+    """Resolve and, when requested, trim the visible Gradio Reference Voice."""
+
+    current_source = str(reference_source or "empty")
+    original_media = _existing_path(reference_media)
+    resolver_current = (
+        original_media
+        if current_source in _AUTO_REFERENCE_SOURCES and original_media
+        else current_reference
+    )
+    selection = resolve_reference_selection(
+        resolver_current,
+        selected_library,
+        reference_source,
+        lora_path,
+        auto_lora_reference,
+        reference_root=reference_root,
+        lora_reference=lora_reference,
+    )
+    if not selection.prompt:
+        raise ValueError(selection.message)
+
+    selected_prompt = selection.prompt
+    ranges_value = str(time_ranges or "").strip()
+    if selection.source in _AUTO_REFERENCE_SOURCES:
+        media_source = selected_prompt
+    else:
+        media_source = original_media or selected_prompt
+
+    video: str | None = None
+    if ranges_value:
+        trimmed_audio, video, extraction_message = load_reference_media(
+            media_source,
+            ranges_value,
+            require_ranges=True,
+        )
+        if not trimmed_audio:
+            raise ValueError(extraction_message)
+        selected_prompt = trimmed_audio
+        message = " ".join(
+            part
+            for part in (
+                selection.message,
+                extraction_message,
+                "The joined range audio is shown in Reference Voice and will be used.",
+            )
+            if part
+        )
+    else:
+        if original_media and selection.source not in _AUTO_REFERENCE_SOURCES:
+            try:
+                video = original_media if probe_media(original_media).has_video else None
+            except Exception:
+                video = None
+        message = selection.message or (
+            f"Using the selected Reference Voice: {Path(selected_prompt).name}."
+        )
+
+    return PreparedReference(
+        prompt=selected_prompt,
+        media=media_source,
+        video=video,
+        library_value=selection.library_value,
+        source=selection.source,
+        message=message,
+        choices=selection.choices,
     )
 
 
@@ -1268,6 +1472,9 @@ def _register(
 class GenerationTab:
     controls: dict[str, Any] = field(default_factory=dict)
     prompt_audio: Any = None
+    reference_media: Any = None
+    reference_video: Any = None
+    reference_ranges: Any = None
     reference_audio_dropdown: Any = None
     reference_source: Any = None
     reference_status: Any = None
@@ -1300,7 +1507,6 @@ def build_generation_tab(
 ) -> GenerationTab:
     model_dir = str(getattr(args, "model_dir", ROOT / "models"))
     initial_reference_choices = reference_audio_choices()
-    initial_library_value = initial_reference_choices[0][1] if initial_reference_choices else None
     tab = GenerationTab()
     c = tab.controls
 
@@ -1308,22 +1514,43 @@ def build_generation_tab(
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=300):
                 gr.Markdown("### Reference Voice")
-                tab.prompt_audio = gr.Audio(
-                    label="Reference Voice",
-                    sources=["upload", "microphone"],
-                    type="filepath",
-                    format="wav",
-                    buttons=["download"],
-                )
+                with gr.Group(elem_classes=["reference-voice-field"]):
+                    tab.reference_media = gr.File(
+                        label="Reference Voice (audio or video)",
+                        file_types=["audio", "video", *SUPPORTED_MEDIA_EXTENSIONS],
+                        type="filepath",
+                        height=130,
+                    )
+                    tab.prompt_audio = gr.Audio(
+                        label="Reference Voice audio preview",
+                        type="filepath",
+                        format="wav",
+                        interactive=False,
+                        visible=False,
+                        show_label=False,
+                        container=False,
+                        buttons=["download"],
+                    )
+                    tab.reference_video = gr.Video(
+                        label="Reference Voice video preview",
+                        include_audio=True,
+                        interactive=False,
+                        visible=False,
+                        show_label=False,
+                        container=False,
+                        buttons=["download"],
+                    )
                 gr.Markdown(
-                    "This is the single active voice reference used by generation and batch generation.",
+                    "The selected or automatically resolved file always appears in Reference Voice. "
+                    "Audio and video are decoded by FFmpeg, and the audio preview is exactly what generation uses.",
                     elem_classes=["section-note"],
                 )
-                ranges = gr.Textbox(
+                tab.reference_ranges = gr.Textbox(
                     label="Time ranges",
-                    placeholder="1:4; 7.5:12",
-                    info="Optional start:end ranges to extract from the active reference.",
+                    placeholder="1:4; 7.5:12 or 01:02-01:08",
+                    info="Optional ranges are joined in order and applied automatically before generation.",
                 )
+                ranges = tab.reference_ranges
                 with gr.Row():
                     extract_button = gr.Button("✂️  Extract ranges", elem_classes=btn("teal"))
                     clear_reference = gr.Button("⌫  Clear", elem_classes=btn("orange"))
@@ -1334,9 +1561,9 @@ def build_generation_tab(
                 with gr.Row():
                     tab.reference_audio_dropdown = gr.Dropdown(
                         choices=initial_reference_choices,
-                        value=initial_library_value,
+                        value=None,
                         label="Reference audio library",
-                        info="Audio files in reference_audios. A LoRA / DoRA saved reference has priority when no manual reference is selected.",
+                        info="Manual selection wins. Otherwise a LoRA / DoRA reference is preferred, then the latest modified audio in reference_audios.",
                         scale=8,
                     )
                     refresh_reference_audios = gr.Button(
@@ -1347,8 +1574,8 @@ def build_generation_tab(
                 load_path = gr.Button("📂  Load path", elem_classes=btn("sky"))
                 tab.reference_source = gr.State("empty")
                 library_note = (
-                    f"Found {len(initial_reference_choices)} file(s) in `reference_audios`; "
-                    "the first is preselected as the automatic fallback."
+                    f"Found {len(initial_reference_choices)} file(s) in `reference_audios`. "
+                    "Nothing is loaded at startup; Generate voice selects the latest modified fallback when needed."
                     if initial_reference_choices
                     else "`reference_audios` is ready but empty. Add audio there, then refresh the library."
                 )
@@ -1716,16 +1943,30 @@ def build_generation_tab(
         def use_recent_reference(path: str | None):
             if path and Path(path).is_file():
                 return (
+                    gr.update(value=path, visible=True),
                     gr.update(value=path),
+                    gr.update(value=None, visible=False),
                     f"Loaded recent output as a manual reference: {Path(path).name}",
                     "manual",
                 )
-            return gr.skip(), "Select a recent output first.", gr.skip()
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                "Select a recent output first.",
+                gr.skip(),
+            )
 
         load_recent_reference.click(
             use_recent_reference,
             recent_audio,
-            [tab.prompt_audio, reference_status, tab.reference_source],
+            [
+                tab.prompt_audio,
+                tab.reference_media,
+                tab.reference_video,
+                reference_status,
+                tab.reference_source,
+            ],
             queue=False,
         )
 
@@ -1735,133 +1976,312 @@ def build_generation_tab(
     c["runtime.lora_strength"] = strength
     c["runtime.lora_merge_into_base"] = merge_lora
 
-    def on_extract(path: str | None, value_ranges: str):
-        output, message = extract_reference_audio(path or "", value_ranges, require_ranges=True)
-        return gr.update(value=output) if output else gr.skip(), message, "manual" if output else gr.skip()
+    def media_updates(path: Any, value_ranges: str, *, require_ranges: bool = False):
+        output, video, message = load_reference_media(
+            path,
+            value_ranges,
+            require_ranges=require_ranges,
+        )
+        if not output:
+            gr.Warning(message, title="Reference Voice")
+            return gr.skip(), gr.skip(), message, gr.skip()
+        return (
+            gr.update(value=output, visible=True),
+            gr.update(value=video, visible=bool(video)),
+            message,
+            "manual_media",
+        )
+
+    def on_extract(
+        active_audio: str | None,
+        media_path: str | None,
+        selected_library: str | None,
+        current_source: str,
+        value_ranges: str,
+        lora_path: str,
+        auto_lora_reference: bool,
+    ):
+        if not str(value_ranges or "").strip():
+            message = "Enter one or more time ranges before extracting."
+            gr.Warning(message, title="Reference Voice")
+            return (gr.skip(),) * 4 + (message, gr.skip())
+        try:
+            prepared = prepare_reference_for_generation(
+                active_audio,
+                media_path,
+                selected_library,
+                current_source,
+                value_ranges,
+                lora_path,
+                auto_lora_reference,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            gr.Warning(message, title="Reference Voice")
+            return (gr.skip(),) * 4 + (message, gr.skip())
+        gr.Info(prepared.message, title="Reference Voice")
+        return (
+            gr.update(value=prepared.prompt, visible=True),
+            gr.update(value=prepared.media),
+            gr.update(value=prepared.video, visible=bool(prepared.video)),
+            gr.update(choices=prepared.choices, value=prepared.library_value),
+            prepared.message,
+            prepared.source,
+        )
 
     def on_load_path(path: str, value_ranges: str):
-        output, message = extract_reference_audio(path, value_ranges)
+        source = _existing_path(path)
+        output, video, message = load_reference_media(source, value_ranges)
         if not output:
-            gr.Warning(message)
-            return gr.skip(), message, gr.skip()
-        return output, message, "manual"
+            gr.Warning(message, title="Reference Voice")
+            return gr.skip(), gr.skip(), gr.skip(), message, gr.skip()
+        gr.Info(message, title="Reference Voice")
+        return (
+            gr.update(value=source),
+            gr.update(value=output, visible=True),
+            gr.update(value=video, visible=bool(video)),
+            message,
+            "manual_media",
+        )
 
-    def on_library_select(path: str | None, current_source: str):
+    def on_library_select(
+        path: str | None,
+        current_source: str,
+        value_ranges: str,
+    ):
         choices = reference_audio_choices()
         available = {_path_key(value): value for _, value in choices}
         selected = available.get(_path_key(path))
         if selected:
+            output, _, extraction_message = load_reference_media(selected, value_ranges)
+            if not output:
+                gr.Warning(extraction_message, title="Reference Voice")
+                return gr.skip(), gr.skip(), gr.skip(), extraction_message, gr.skip()
+            message = f"Loaded {Path(selected).name} as a manually selected library Reference Voice."
+            if value_ranges.strip():
+                message += " The entered ranges were extracted and joined."
             return (
+                gr.update(value=output, visible=True),
                 gr.update(value=selected),
-                f"Loaded {Path(selected).name} as a manually selected library reference.",
+                gr.update(value=None, visible=False),
+                message,
                 "library_manual",
             )
         if str(current_source or "").startswith("library"):
-            return gr.update(value=None), "Reference library selection cleared.", "empty"
-        return gr.skip(), "Reference library selection cleared; the active manual reference was kept.", gr.skip()
+            return (
+                gr.update(value=None, visible=False),
+                gr.update(value=None),
+                gr.update(value=None, visible=False),
+                "Reference library selection cleared.",
+                "empty",
+            )
+        return (
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            "Reference library selection cleared; the active manual reference was kept.",
+            gr.skip(),
+        )
 
-    def refresh_reference_library(
-        selected_library: str | None,
-        current_reference: str | None,
-        current_source: str,
-    ):
+    def refresh_reference_library(selected_library: str | None, current_source: str):
         choices = reference_audio_choices()
         available = {_path_key(value): value for _, value in choices}
         selected = available.get(_path_key(selected_library))
-        if selected is None and choices:
-            selected = choices[0][1]
-        dropdown_update = gr.update(choices=choices, value=selected)
-        current = _existing_path(current_reference)
         source = str(current_source or "empty")
-        if selected and (not current or (source == "library_auto" and _path_key(current) not in available)):
-            message = (
-                "No manual Reference Voice was selected. Automatically loaded and will use "
-                f"{Path(selected).name} from reference_audios."
-            )
-            gr.Info(message, title="Reference Voice")
-            return dropdown_update, gr.update(value=selected), "library_auto", message
+        dropdown_update = gr.update(choices=choices, value=selected)
         if not choices and source.startswith("library"):
-            message = "reference_audios is empty; the previous library reference was cleared."
-            return dropdown_update, gr.update(value=None), "empty", message
-        message = (
-            f"Found {len(choices)} audio file(s) in reference_audios."
-            if choices
-            else "reference_audios is ready but empty."
-        )
-        return dropdown_update, gr.skip(), gr.skip(), message
+            message = "reference_audios is empty; the previous library Reference Voice was cleared."
+            return (
+                dropdown_update,
+                gr.update(value=None, visible=False),
+                gr.update(value=None),
+                gr.update(value=None, visible=False),
+                "empty",
+                message,
+            )
+        if choices:
+            newest = _latest_reference_choice(choices)
+            message = (
+                f"Found {len(choices)} audio file(s) in reference_audios. "
+                f"Latest modified fallback: {Path(newest).name if newest else 'none'}."
+            )
+        else:
+            message = "reference_audios is ready but empty."
+        return dropdown_update, gr.skip(), gr.skip(), gr.skip(), gr.skip(), message
 
     def on_direct_reference_input(path: str | None):
         current = _existing_path(path)
         if current:
-            return "manual", f"Loaded manual Reference Voice: {Path(current).name}"
-        return "empty", "Reference Voice cleared; an automatic reference will be chosen when available."
+            return (
+                gr.update(value=current),
+                gr.update(value=None, visible=False),
+                "manual",
+                f"Loaded manual Reference Voice audio: {Path(current).name}",
+            )
+        return (
+            gr.update(value=None),
+            gr.update(value=None, visible=False),
+            "empty",
+            "Reference Voice cleared; an automatic reference will be chosen on generation.",
+        )
 
+    tab.reference_media.upload(
+        media_updates,
+        [tab.reference_media, ranges],
+        [tab.prompt_audio, tab.reference_video, reference_status, tab.reference_source],
+        queue=False,
+        show_progress="minimal",
+    )
+    tab.reference_media.clear(
+        lambda: (
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "empty",
+            "Reference Voice source cleared; an automatic reference will be chosen on generation.",
+        ),
+        outputs=[tab.prompt_audio, tab.reference_video, tab.reference_source, reference_status],
+        queue=False,
+    )
     extract_button.click(
         on_extract,
-        [tab.prompt_audio, ranges],
-        [tab.prompt_audio, reference_status, tab.reference_source],
+        [
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_audio_dropdown,
+            tab.reference_source,
+            ranges,
+            lora,
+            auto_ref,
+        ],
+        [
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_video,
+            tab.reference_audio_dropdown,
+            reference_status,
+            tab.reference_source,
+        ],
         queue=False,
     )
     load_path.click(
         on_load_path,
         [path_input, ranges],
-        [tab.prompt_audio, reference_status, tab.reference_source],
+        [
+            tab.reference_media,
+            tab.prompt_audio,
+            tab.reference_video,
+            reference_status,
+            tab.reference_source,
+        ],
         queue=False,
     )
     tab.reference_audio_dropdown.input(
         on_library_select,
-        [tab.reference_audio_dropdown, tab.reference_source],
-        [tab.prompt_audio, reference_status, tab.reference_source],
+        [tab.reference_audio_dropdown, tab.reference_source, ranges],
+        [
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_video,
+            reference_status,
+            tab.reference_source,
+        ],
         queue=False,
     )
     refresh_reference_audios.click(
         refresh_reference_library,
-        [tab.reference_audio_dropdown, tab.prompt_audio, tab.reference_source],
-        [tab.reference_audio_dropdown, tab.prompt_audio, tab.reference_source, reference_status],
+        [tab.reference_audio_dropdown, tab.reference_source],
+        [
+            tab.reference_audio_dropdown,
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_video,
+            tab.reference_source,
+            reference_status,
+        ],
         queue=False,
     )
     tab.prompt_audio.input(
         on_direct_reference_input,
         tab.prompt_audio,
-        [tab.reference_source, reference_status],
+        [tab.reference_media, tab.reference_video, tab.reference_source, reference_status],
         queue=False,
         show_progress="hidden",
     )
     clear_reference.click(
         lambda: (
             None,
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
             "",
-            "Manual reference cleared; automatic LoRA / DoRA or reference_audios fallback is ready.",
+            "",
+            None,
+            "Reference Voice cleared; automatic LoRA / DoRA or latest-library fallback is ready.",
             "empty",
         ),
-        outputs=[tab.prompt_audio, path_input, reference_status, tab.reference_source],
+        outputs=[
+            tab.reference_media,
+            tab.prompt_audio,
+            tab.reference_video,
+            path_input,
+            ranges,
+            tab.reference_audio_dropdown,
+            reference_status,
+            tab.reference_source,
+        ],
         queue=False,
     )
 
     refresh_lora.click(lambda: gr.update(choices=_lora_choices()), outputs=lora, queue=False)
 
     lora_selection_inputs = [lora, tab.prompt_audio, auto_ref, auto_rate, tab.reference_source]
+
+    def on_lora_selection(*items: Any):
+        info, audio_update, message, rate_update, source_update = lora_selection_updates(*items)
+        media_update: Any = gr.skip()
+        video_update: Any = gr.skip()
+        if source_update == "lora_auto":
+            recommended = _recommended_lora_reference(str(items[0] or ""))
+            if recommended:
+                audio_update = gr.update(value=recommended, visible=True)
+            media_update = gr.update(value=recommended) if recommended else gr.skip()
+            video_update = gr.update(value=None, visible=False)
+        elif source_update == "empty":
+            audio_update = gr.update(value=None, visible=False)
+            media_update = gr.update(value=None)
+            video_update = gr.update(value=None, visible=False)
+        return (
+            info,
+            audio_update,
+            media_update,
+            video_update,
+            message,
+            rate_update,
+            source_update,
+        )
+
     lora_selection_outputs = [
         lora_info,
         tab.prompt_audio,
+        tab.reference_media,
+        tab.reference_video,
         reference_status,
         speaking_rate,
         tab.reference_source,
     ]
     lora.change(
-        lora_selection_updates,
+        on_lora_selection,
         lora_selection_inputs,
         lora_selection_outputs,
         queue=False,
     )
     auto_rate.change(
-        lora_selection_updates,
+        on_lora_selection,
         lora_selection_inputs,
         lora_selection_outputs,
         queue=False,
     )
     auto_ref.change(
-        lora_selection_updates,
+        on_lora_selection,
         lora_selection_inputs,
         lora_selection_outputs,
         queue=False,
@@ -1947,8 +2367,6 @@ def bind_generation_events(
 
     def generate(
         prompt: str,
-        selected_library: str | None,
-        reference_source: str,
         text: str,
         subtitle_file: str | None,
         image_path: str | None,
@@ -1959,33 +2377,10 @@ def bind_generation_events(
         values = dict(zip(tab.request_keys, component_values))
         started = time.perf_counter()
         request: dict[str, Any] | None = None
-        selection = resolve_reference_selection(
-            prompt,
-            selected_library,
-            reference_source,
-            str(values.get("runtime.lora_path") or ""),
-            bool(values.get("generation.auto_lora_reference", True)),
-        )
-        if selection.message:
-            if selection.prompt:
-                gr.Info(selection.message, title="Reference Voice")
-            else:
-                gr.Warning(selection.message, title="Reference Voice")
-        prompt_update = (
-            gr.skip()
-            if selection.prompt and _path_key(prompt) == _path_key(selection.prompt)
-            else gr.update(value=selection.prompt)
-        )
-        pending_reference_updates: list[Any] = [
-            prompt_update,
-            gr.update(choices=selection.choices, value=selection.library_value),
-            selection.source,
-            selection.message or gr.skip(),
-        ]
         try:
             request = prepare_generation_request(
                 values,
-                prompt=selection.prompt or "",
+                prompt=prompt,
                 text=text,
                 subtitle_file=subtitle_file,
                 image_path=image_path,
@@ -2001,12 +2396,10 @@ def bind_generation_events(
             ):
                 running = output_task_is_active(task_folder)
                 yield (
-                    *pending_reference_updates,
                     task_folder,
                     *updates,
                     gr.Timer(1.0 if running else 5.0, active=True),
                 )
-                pending_reference_updates = [gr.skip()] * 4
             print(f">> Generation finished in {time.perf_counter() - started:.2f}s", flush=True)
         except Exception as exc:
             traceback.print_exc()
@@ -2022,13 +2415,9 @@ def bind_generation_events(
                 if request
                 else gr.skip()
             )
-            yield *pending_reference_updates, task_folder, *terminal, gr.Timer(5.0, active=True)
+            yield task_folder, *terminal, gr.Timer(5.0, active=True)
 
     generation_outputs = [
-        tab.prompt_audio,
-        tab.reference_audio_dropdown,
-        tab.reference_source,
-        tab.reference_status,
         tab.task_state,
         tab.progress_html,
         tab.status,
@@ -2041,12 +2430,66 @@ def bind_generation_events(
         tab.recent_table,
         tab.task_timer,
     ]
-    generation_event = tab.generate_button.click(
+
+    def prepare_visible_reference(
+        prompt: str | None,
+        media_path: str | None,
+        selected_library: str | None,
+        reference_source: str,
+        time_ranges: str,
+        lora_path: str,
+        auto_lora_reference: bool,
+    ):
+        try:
+            prepared = prepare_reference_for_generation(
+                prompt,
+                media_path,
+                selected_library,
+                reference_source,
+                time_ranges,
+                lora_path,
+                auto_lora_reference,
+            )
+        except ValueError as exc:
+            gr.Warning(str(exc), title="Reference Voice")
+            raise gr.Error(str(exc)) from exc
+        gr.Info(prepared.message, title="Reference Voice")
+        return (
+            gr.update(value=prepared.prompt, visible=True),
+            gr.update(value=prepared.media),
+            gr.update(value=prepared.video, visible=bool(prepared.video)),
+            gr.update(choices=prepared.choices, value=prepared.library_value),
+            prepared.source,
+            prepared.message,
+        )
+
+    reference_event = tab.generate_button.click(
+        prepare_visible_reference,
+        inputs=[
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_audio_dropdown,
+            tab.reference_source,
+            tab.reference_ranges,
+            tab.controls["runtime.lora_path"],
+            tab.controls["generation.auto_lora_reference"],
+        ],
+        outputs=[
+            tab.prompt_audio,
+            tab.reference_media,
+            tab.reference_video,
+            tab.reference_audio_dropdown,
+            tab.reference_source,
+            tab.reference_status,
+        ],
+        queue=False,
+        show_progress="minimal",
+        api_name="prepare_reference_voice",
+    )
+    generation_event = reference_event.success(
         generate,
         inputs=[
             tab.prompt_audio,
-            tab.reference_audio_dropdown,
-            tab.reference_source,
             tab.text,
             tab.subtitle_file,
             tab.image,
@@ -2112,6 +2555,7 @@ __all__ = [
     "GenerationTab",
     "INFER_KWARG_KEYS",
     "LANGUAGES",
+    "PreparedReference",
     "REFERENCE_AUDIO_DIR",
     "REFERENCE_AUDIO_EXTENSIONS",
     "RUNNER_REQUEST_KEYS",
@@ -2121,8 +2565,11 @@ __all__ = [
     "build_generation_request",
     "build_generation_tab",
     "generation_task_updates",
+    "latest_reference_audio",
+    "load_reference_media",
     "lora_selection_updates",
     "prepare_generation_request",
+    "prepare_reference_for_generation",
     "preview_segments",
     "reference_audio_choices",
     "reference_selection_updates",
