@@ -233,7 +233,7 @@ class AccelInferenceEngine:
         requests: List[Seq],
         *,
         temperature: float,
-        top_k: int,
+        top_k: Optional[int],
         top_p: float,
         repetition_penalty: float,
     ) -> torch.Tensor:
@@ -260,14 +260,14 @@ class AccelInferenceEngine:
             scores = scores / max(float(temperature), 1e-8)
 
         vocab_size = scores.shape[-1]
-        k = min(max(0, int(top_k)), vocab_size)
+        k = 0 if top_k is None else min(max(0, int(top_k)), vocab_size)
         if 0 < k < vocab_size:
             threshold = torch.topk(scores, k, dim=-1).values[..., -1, None]
             scores = scores.masked_fill(scores < threshold, -torch.inf)
 
         p = float(top_p)
-        if not 0 < p <= 1:
-            raise ValueError("top_p must be in (0, 1]")
+        if not 0 <= p <= 1:
+            raise ValueError("top_p must be in [0, 1]")
         if p < 1.0:
             sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
             cumulative = torch.softmax(sorted_scores, dim=-1).cumsum(dim=-1)
@@ -443,7 +443,7 @@ class AccelInferenceEngine:
         input_ids: torch.Tensor,
         max_new_tokens: int = 100,
         temperature: float = 1.0,
-        top_k: int = 50,
+        top_k: Optional[int] = 50,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         stop_tokens: Optional[List[int]] = None,

@@ -50,6 +50,20 @@ def test_accel_sampling_applies_repetition_top_k_and_top_p() -> None:
     assert filtered[0, 2].isneginf()
 
 
+def test_accel_sampling_accepts_gui_disabled_top_k_and_zero_top_p() -> None:
+    filtered = AccelInferenceEngine._process_sampling_logits(
+        torch.tensor([[1.0, 3.0, 2.0]]),
+        [Seq([0])],
+        temperature=1.0,
+        top_k=None,
+        top_p=0.0,
+        repetition_penalty=1.0,
+    )
+
+    assert torch.isfinite(filtered).sum().item() == 1
+    assert filtered.argmax(dim=-1).item() == 1
+
+
 def test_accel_generation_keeps_eos_in_returned_sequence() -> None:
     class Model(nn.Module):
         def __init__(self):
