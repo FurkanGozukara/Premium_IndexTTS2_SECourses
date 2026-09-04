@@ -38,6 +38,17 @@ def _runtime_payload(model_dir: Path) -> dict:
     }
 
 
+def test_int8_remote_filename_matches_distribution_downloader() -> None:
+    downloader = model_downloads._load_distribution_downloader()
+
+    assert model_downloads.INT8_GPT_REMOTE_FILENAME == "gpt_int8_convrot.safetensors"
+    assert downloader.INT8_MODEL_FILENAME == model_downloads.INT8_GPT_REMOTE_FILENAME
+    assert (
+        downloader.MODEL_CONFIGS["index_tts_2_5_int8"]["files"][0]["remote"]
+        == model_downloads.INT8_GPT_REMOTE_FILENAME
+    )
+
+
 def test_ensure_int8_uses_verified_local_file_without_network(
     tmp_path: Path, monkeypatch
 ) -> None:

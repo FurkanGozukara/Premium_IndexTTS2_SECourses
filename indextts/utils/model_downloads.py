@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 INT8_GPT_LOCAL_FILENAME = "gpt_int8_convrot.safetensors"
 INT8_GPT_REPO_ID = "MonsterMMORPG/Wan_GGUF"
-INT8_GPT_REMOTE_FILENAME = "IndexTTS-2.5_gpt_int8_convrot.safetensors"
+INT8_GPT_REMOTE_FILENAME = "gpt_int8_convrot.safetensors"
 
 _BYTE_PAIR_RE = re.compile(
     r"\(([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB)\s*/\s*"
