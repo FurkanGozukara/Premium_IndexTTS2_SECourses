@@ -51,7 +51,7 @@ from .models_tab import (
     load_persisted_runtime,
     runtime_registry_values,
 )
-from .presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
+from .presets_store import FRESH_INSTALL_PRESET, PresetRegistry, PresetStore, SYSTEM_PREFIX
 from .training_tab import bind_training_events, build_training_tab
 
 
@@ -254,11 +254,11 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     options = _args(args)
     registry = PresetRegistry()
     store = PresetStore(registry, ROOT / "presets")
-    initial_last = store.get_last_used() if (ROOT / "presets" / "system" / "default.json").is_file() else "default"
-    initial_preset_choices = store.list_presets() or [SYSTEM_PREFIX + "default"]
+    initial_last = store.get_last_used()
+    initial_preset_choices = store.list_presets() or [SYSTEM_PREFIX + FRESH_INSTALL_PRESET]
     initial_preset_display = _display_name(store, initial_last)
     if initial_preset_display not in initial_preset_choices:
-        initial_preset_display = SYSTEM_PREFIX + "default"
+        initial_preset_display = SYSTEM_PREFIX + FRESH_INSTALL_PRESET
     persisted_runtime = load_persisted_runtime()
 
     with gr.Blocks(title=APP_TITLE) as demo:

@@ -25,6 +25,7 @@ from indextts.utils.atomic_json import read_json_retry, replace_with_retry
 PRESET_FORMAT = "indextts2_premium_universal"
 PRESET_VERSION = 2
 SYSTEM_PREFIX = "★ "
+FRESH_INSTALL_PRESET = "quality"
 
 
 @dataclass(slots=True)
@@ -557,11 +558,12 @@ class PresetStore:
                     return value
             if self._last_used_memory and self._read_payload(self._last_used_memory) is not None:
                 return self._last_used_memory
-            return "default"
+            return FRESH_INSTALL_PRESET
 
 
 __all__ = [
     "ControlSpec",
+    "FRESH_INSTALL_PRESET",
     "LEGACY_KEY_MAP",
     "PRESET_FORMAT",
     "PRESET_VERSION",

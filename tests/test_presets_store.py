@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from ui.presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
+from ui.presets_store import FRESH_INSTALL_PRESET, PresetRegistry, PresetStore, SYSTEM_PREFIX
 
 
 def make_store(tmp_path: Path) -> PresetStore:
@@ -53,6 +53,14 @@ def test_default_regeneration_is_byte_identical(tmp_path: Path):
     first = path.read_bytes()
     store.ensure_system_presets()
     assert path.read_bytes() == first
+
+
+def test_fresh_install_selects_quality_preset(tmp_path: Path):
+    store = make_store(tmp_path)
+
+    assert store.get_last_used() == FRESH_INSTALL_PRESET
+    store.ensure_system_presets()
+    assert store.get_last_used() == "quality"
 
 
 def test_legacy_nested_preset_migration(tmp_path: Path):
