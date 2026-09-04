@@ -8,9 +8,15 @@ import subprocess
 import numpy as np
 import pytest
 import soundfile as sf
+from gradio.processing_utils import video_is_playable
 
 from ui.common import extract_reference_audio, parse_reference_time_ranges
-from ui.generation_tab import load_reference_media, prepare_reference_for_generation
+from ui.generation_tab import (
+    _browser_safe_media_path,
+    _browser_safe_video_path,
+    load_reference_media,
+    prepare_reference_for_generation,
+)
 
 
 def _tone(path: Path, duration_s: float = 4.0, sample_rate: int = 24000) -> Path:
@@ -161,9 +167,34 @@ def test_video_reference_has_video_preview_and_extracted_audio(tmp_path: Path) -
     output, preview, message = load_reference_media(video, "0.25:1.25")
     try:
         assert output is not None
-        assert preview == str(video.resolve())
+        assert preview is not None
+        assert Path(preview).is_file()
+        assert video_is_playable(preview)
+        alias = tmp_path / "same-video-different-path.mkv"
+        try:
+            os.link(video, alias)
+        except OSError:
+            shutil.copy2(video, alias)
+        assert _browser_safe_video_path(alias) == preview
         assert sf.info(output).duration == pytest.approx(1.0, abs=0.04)
         assert "from video" in message
     finally:
         if output:
             Path(output).unlink(missing_ok=True)
+
+
+def test_external_media_is_staged_in_an_allowed_directory(tmp_path: Path) -> None:
+    source = tmp_path / "outside.mp4"
+    source.write_bytes(b"representative video bytes")
+    cache = tmp_path / "allowed" / "previews"
+
+    preview = Path(
+        _browser_safe_media_path(source, allowed_roots=(), cache_root=cache)
+    )
+
+    assert preview.parent == cache.resolve()
+    assert preview.suffix == ".mp4"
+    assert preview.read_bytes() == source.read_bytes()
+    assert _browser_safe_media_path(
+        source, allowed_roots=(), cache_root=cache
+    ) == str(preview)

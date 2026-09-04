@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from typing import Any
 
+import soundfile as sf
+
 
 TUNING_PRESETS: dict[str, dict[str, Any]] = {
     "bypass": {},
@@ -97,6 +99,9 @@ def apply_audio_tuning(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required for audio tuning")
+    sample_rate = int(sf.info(str(source)).samplerate)
+    if sample_rate <= 0:
+        raise ValueError(f"Audio tuning input has an invalid sample rate: {source}")
 
     filters: list[str] = []
     if low_cut is not None and low_cut > 20.5:
@@ -125,6 +130,8 @@ def apply_audio_tuning(
         ",".join(filters),
         "-c:a",
         "pcm_s16le",
+        "-ar",
+        str(sample_rate),
         str(destination),
     ]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)

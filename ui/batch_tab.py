@@ -110,9 +110,13 @@ def _item_generation_values(
 
 
 def _batch_timer(running: bool) -> gr.Timer:
-    """Poll only while the aggregate batch result is still being built."""
+    """Keep polling off while the connected aggregate generator owns the card."""
 
-    return gr.Timer(1.0 if running else 5.0, active=running)
+    # A freshly loaded page starts with an active timer and batch_task_updates()
+    # can attach it to a live worker. During the originating click event, however,
+    # run_batch already streams richer aggregate progress; a second timer races it
+    # and briefly replaces the item count with a single-task progress card.
+    return gr.Timer(1.0 if running else 5.0, active=False)
 
 
 def _per_file_reference(item: dict[str, Any]) -> str | None:

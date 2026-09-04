@@ -80,7 +80,10 @@ def test_non_cjk_segmentation_budget_uses_real_tokenizer():
     assert default_segment_tokens("ZH") == 120
 
 
-def test_audio_tuning_processes_synthetic_wav(tmp_path):
+@pytest.mark.parametrize(
+    "preset", ["voice_clarity", "clear_narration", "deharsh", "warm", "normalize"]
+)
+def test_audio_tuning_processes_synthetic_wav(tmp_path, preset):
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg is required")
     sample_rate = 22050
@@ -94,7 +97,7 @@ def test_audio_tuning_processes_synthetic_wav(tmp_path):
         handle.setframerate(sample_rate)
         handle.writeframes(audio.tobytes())
 
-    assert apply_audio_tuning(source, output, "voice_clarity", gain_db=-1.0) == str(output)
+    assert apply_audio_tuning(source, output, preset, gain_db=-1.0) == str(output)
     with wave.open(str(output), "rb") as handle:
         assert handle.getframerate() == sample_rate
         assert handle.getnchannels() == 1

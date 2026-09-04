@@ -10,7 +10,17 @@ from ui.app import build_app
 from ui.batch_tab import _batch_items, _batch_timer, _item_generation_values
 from ui.common import APP_CSS
 from ui.generation_tab import GENERATION_DEFAULTS
+from ui.models_tab import _estimate_html, _gpu_total
 from ui.training_tab import TRAIN_DEFAULTS, _refresh_dataset_updates
+
+
+def test_cpu_runtime_does_not_report_a_gpu_vram_fit() -> None:
+    config = RuntimeConfig(device="cpu", gpt_dtype="fp32")
+    estimate = _estimate_html(config, _gpu_total("cpu"))
+
+    assert _gpu_total("cpu") == 0.0
+    assert "CPU diagnostics mode" in estimate
+    assert "Fits selected GPU" not in estimate
 
 
 def test_build_app_constructs_all_tabs_without_loading_models():
@@ -62,9 +72,12 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         for component in demo.config["components"]
     }
     reference_source = components[("file", "Reference Voice (audio or video)")]
+    reference_recording = components[("audio", "Microphone reference")]
     reference_audio = components[("audio", "Reference Voice audio preview")]
     reference_video = components[("video", "Reference Voice video preview")]
     assert {"audio", "video"}.issubset(reference_source["props"]["file_types"])
+    assert reference_recording["props"]["sources"] == ["microphone"]
+    assert reference_recording["props"]["format"] == "wav"
     assert reference_source["props"].get("value") is None
     assert reference_audio["props"].get("value") is None
     assert reference_audio["props"]["visible"] is False
@@ -184,7 +197,7 @@ def test_plain_text_batch_item_disables_caption_timing() -> None:
 
 
 def test_completed_batch_stops_item_polling_timer() -> None:
-    assert _batch_timer(True).active is True
+    assert _batch_timer(True).active is False
     assert _batch_timer(True).value == 1.0
     assert _batch_timer(False).active is False
     assert _batch_timer(False).value == 5.0

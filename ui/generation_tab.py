@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import hashlib
 import html
 import json
 import os
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -709,6 +712,177 @@ def _existing_path(value: Any) -> str | None:
     return str(resolved) if resolved.is_file() else None
 
 
+def _browser_safe_media_path(
+    source: str | os.PathLike[str],
+    *,
+    allowed_roots: Sequence[str | os.PathLike[str]] | None = None,
+    cache_root: str | os.PathLike[str] | None = None,
+) -> str:
+    """Return a media path that Gradio is permitted to serve to the browser.
+
+    Uploaded files already live in Gradio's temporary directory, while paths
+    entered by the user may be anywhere on disk. External media is staged in
+    the app-owned UI state directory. A hard link avoids copying large videos
+    when the source and app are on the same volume; copying is the portable
+    fallback.
+    """
+
+    resolved = Path(source).expanduser().resolve()
+    roots = allowed_roots
+    if roots is None:
+        roots = (
+            Path(tempfile.gettempdir()),
+            ROOT / "outputs",
+            ROOT / "datasets",
+            ROOT / "loras",
+            ROOT / "reference_audios",
+            ROOT / ".ui_state",
+        )
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    for root in roots:
+        allowed_root = Path(root).expanduser().resolve()
+        try:
+            resolved.relative_to(allowed_root)
+            if allowed_root != temp_root:
+                gr.set_static_paths(resolved)
+            return str(resolved)
+        except ValueError:
+            continue
+
+    stat = resolved.stat()
+    identity = f"{os.path.normcase(str(resolved))}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()[:20]
+    destination_root = Path(cache_root or (ROOT / ".ui_state" / "reference_media"))
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = destination_root / f"{digest}_{resolved.name}"
+    if destination.is_file() and destination.stat().st_size == stat.st_size:
+        gr.set_static_paths(destination)
+        return str(destination.resolve())
+
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    temporary.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(resolved, temporary)
+        except OSError:
+            shutil.copy2(resolved, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    # Large videos must be served in place. Otherwise Gradio copies the staged
+    # file into its component cache once per output, defeating the hard link.
+    gr.set_static_paths(destination)
+    return str(destination.resolve())
+
+
+def _browser_safe_video_path(source: str | os.PathLike[str]) -> str:
+    """Stage a directly-served, browser-playable preview for a video source."""
+
+    resolved = Path(source).expanduser().resolve()
+    from gradio.processing_utils import video_is_playable
+
+    if video_is_playable(str(resolved)):
+        return _browser_safe_media_path(resolved)
+
+    stat = resolved.stat()
+    identity = hashlib.sha256(
+        f"preview-v2\0{stat.st_size}\0{stat.st_mtime_ns}".encode("ascii")
+    )
+    with resolved.open("rb") as source_file:
+        identity.update(source_file.read(65536))
+        if stat.st_size > 65536:
+            source_file.seek(max(0, stat.st_size - 65536))
+            identity.update(source_file.read(65536))
+    digest = identity.hexdigest()[:20]
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(resolved),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    codec = probe.stdout.strip().lower() if probe.returncode == 0 else ""
+    if codec in {"vp8", "vp9", "av1"}:
+        suffix = ".webm"
+        video_args = ["-c:v", "copy"]
+    elif codec == "h264":
+        suffix = ".mp4"
+        video_args = ["-c:v", "copy", "-movflags", "+faststart"]
+    elif codec == "theora":
+        suffix = ".ogg"
+        video_args = ["-c:v", "copy"]
+    else:
+        suffix = ".mp4"
+        video_args = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+
+    destination_root = ROOT / ".ui_state" / "reference_video_previews"
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = destination_root / f"{digest}_preview{suffix}"
+    if destination.is_file() and destination.stat().st_size > 0:
+        gr.set_static_paths(destination)
+        return str(destination.resolve())
+
+    temporary = destination.with_name(
+        f".{destination.stem}.{os.getpid()}.{threading.get_ident()}.tmp{suffix}"
+    )
+    temporary.unlink(missing_ok=True)
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(resolved),
+                "-map",
+                "0:v:0",
+                "-an",
+                *video_args,
+                str(temporary),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+            detail = (completed.stderr or completed.stdout or "FFmpeg produced no preview").strip()
+            raise OSError(f"video preview conversion failed: {detail[-800:]}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    gr.set_static_paths(destination)
+    return str(destination.resolve())
+
+
 def _same_reference_file(current: str | None, expected: str | None) -> bool:
     """Match originals with Gradio's same-named cached file copies."""
 
@@ -744,10 +918,19 @@ def load_reference_media(
         time_ranges,
         require_ranges=require_ranges,
     )
-    video = source if media.has_video else None
+    video = None
+    preview_warning = ""
+    if media.has_video:
+        try:
+            video = _browser_safe_video_path(source)
+        except OSError as exc:
+            preview_warning = f" Video preview could not be staged: {exc}"
     if audio:
         media_type = "video" if media.has_video else "audio"
-        message = f"{message[:-1]} from {media_type}; its audio is shown below and ready to use."
+        message = (
+            f"{message[:-1]} from {media_type}; its audio is shown below and ready to use."
+            f"{preview_warning}"
+        )
     return audio, video, message
 
 
@@ -996,7 +1179,11 @@ def prepare_reference_for_generation(
     else:
         if original_media and selection.source not in _AUTO_REFERENCE_SOURCES:
             try:
-                video = original_media if probe_media(original_media).has_video else None
+                video = (
+                    _browser_safe_video_path(original_media)
+                    if probe_media(original_media).has_video
+                    else None
+                )
             except Exception:
                 video = None
         message = selection.message or (
@@ -1005,7 +1192,7 @@ def prepare_reference_for_generation(
 
     return PreparedReference(
         prompt=selected_prompt,
-        media=media_source,
+        media=_browser_safe_media_path(media_source),
         video=video,
         library_value=selection.library_value,
         source=selection.source,
@@ -1175,6 +1362,25 @@ def _summary_html(result: Mapping[str, Any]) -> str:
     )
 
 
+def _candidate_state_value(paths: Sequence[Any] | None) -> str:
+    """Serialize candidate paths for the hidden render trigger component."""
+
+    return json.dumps([str(path) for path in paths or [] if path], ensure_ascii=True)
+
+
+def _candidate_paths_from_state(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = []
+    else:
+        decoded = value
+    if not isinstance(decoded, Sequence) or isinstance(decoded, (str, bytes)):
+        return []
+    return [str(path) for path in decoded if path]
+
+
 def _result_updates(result: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[Any, ...]:
     output = result.get("output_path")
     video = result.get("video_path")
@@ -1201,7 +1407,9 @@ def _result_updates(result: Mapping[str, Any], request: Mapping[str, Any]) -> tu
         tail_text(Path(str(request["task_layout"]["task_folder"])) / "generation.log", 60),
         gr.update(value=output, visible=bool(output)),
         gr.update(value=video, visible=bool(video)),
-        list(result.get("candidate_paths") or ([output] if output else [])),
+        _candidate_state_value(
+            result.get("candidate_paths") or ([output] if output else [])
+        ),
         gr.update(value=caption, visible=bool(caption)),
         _summary_html(result),
         recent_outputs(),
@@ -1473,6 +1681,7 @@ class GenerationTab:
     controls: dict[str, Any] = field(default_factory=dict)
     prompt_audio: Any = None
     reference_media: Any = None
+    reference_recording: Any = None
     reference_video: Any = None
     reference_ranges: Any = None
     reference_audio_dropdown: Any = None
@@ -1539,6 +1748,13 @@ def build_generation_tab(
                         show_label=False,
                         container=False,
                         buttons=["download"],
+                    )
+                with gr.Accordion("Record from microphone", open=False):
+                    tab.reference_recording = gr.Audio(
+                        label="Microphone reference",
+                        sources=["microphone"],
+                        type="filepath",
+                        format="wav",
                     )
                 gr.Markdown(
                     "The selected or automatically resolved file always appears in Reference Voice. "
@@ -1907,11 +2123,15 @@ def build_generation_tab(
         gr.Markdown("### Outputs")
         with gr.Row(equal_height=False):
             tab.output_video = gr.Video(label="Generated MP4", visible=False, buttons=["download"])
-        tab.candidate_state = gr.State([])
+        # A queued generation or header restore updates this textbox. Unlike
+        # gr.State, its change event reliably retriggers gr.render after reload.
+        tab.candidate_state = gr.Textbox(
+            value="", visible=False, label="Candidate audio paths"
+        )
         with gr.Column(elem_classes=["candidate-list"]):
             @gr.render(inputs=tab.candidate_state, triggers=[tab.candidate_state.change])
-            def render_candidates(paths: list[str] | None):
-                candidates_value = list(paths or [])
+            def render_candidates(paths: str | None):
+                candidates_value = _candidate_paths_from_state(paths)
                 if len(candidates_value) <= 1:
                     return
                 gr.Markdown(f"#### Candidates ({len(candidates_value)})")
@@ -2035,9 +2255,36 @@ def build_generation_tab(
         if not output:
             gr.Warning(message, title="Reference Voice")
             return gr.skip(), gr.skip(), gr.skip(), message, gr.skip()
+        try:
+            browser_source = _browser_safe_media_path(source)
+        except OSError as exc:
+            message = f"Reference media could not be staged for the browser: {exc}"
+            gr.Warning(message, title="Reference Voice")
+            return gr.skip(), gr.skip(), gr.skip(), message, gr.skip()
         gr.Info(message, title="Reference Voice")
         return (
-            gr.update(value=source),
+            gr.update(value=browser_source),
+            gr.update(value=output, visible=True),
+            gr.update(value=video, visible=bool(video)),
+            message,
+            "manual_media",
+        )
+
+    def on_recording(path: str | None, value_ranges: str):
+        source = _existing_path(path)
+        output, video, message = load_reference_media(source, value_ranges)
+        if not output:
+            gr.Warning(message, title="Reference Voice")
+            return (gr.skip(),) * 3 + (message, gr.skip())
+        try:
+            browser_source = _browser_safe_media_path(source)
+        except OSError as exc:
+            message = f"Microphone recording could not be staged for the browser: {exc}"
+            gr.Warning(message, title="Reference Voice")
+            return (gr.skip(),) * 3 + (message, gr.skip())
+        gr.Info(message, title="Reference Voice")
+        return (
+            gr.update(value=browser_source),
             gr.update(value=output, visible=True),
             gr.update(value=video, visible=bool(video)),
             message,
@@ -2136,11 +2383,31 @@ def build_generation_tab(
         lambda: (
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
+            gr.update(value=None),
             "empty",
             "Reference Voice source cleared; an automatic reference will be chosen on generation.",
         ),
-        outputs=[tab.prompt_audio, tab.reference_video, tab.reference_source, reference_status],
+        outputs=[
+            tab.prompt_audio,
+            tab.reference_video,
+            tab.reference_recording,
+            tab.reference_source,
+            reference_status,
+        ],
         queue=False,
+    )
+    tab.reference_recording.stop_recording(
+        on_recording,
+        [tab.reference_recording, ranges],
+        [
+            tab.reference_media,
+            tab.prompt_audio,
+            tab.reference_video,
+            reference_status,
+            tab.reference_source,
+        ],
+        queue=False,
+        show_progress="minimal",
     )
     extract_button.click(
         on_extract,
@@ -2210,6 +2477,7 @@ def build_generation_tab(
     clear_reference.click(
         lambda: (
             None,
+            None,
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
             "",
@@ -2220,6 +2488,7 @@ def build_generation_tab(
         ),
         outputs=[
             tab.reference_media,
+            tab.reference_recording,
             tab.prompt_audio,
             tab.reference_video,
             path_input,

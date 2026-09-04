@@ -198,6 +198,23 @@ def _dataset_result(dataset_dir: str | Path) -> tuple[str, pd.DataFrame, list[li
     return stats_html(summary), hist_frame, table, references, warning_text, paths
 
 
+def _path_list_state_value(paths: Sequence[Any] | None) -> str:
+    return json.dumps([str(path) for path in paths or [] if path], ensure_ascii=True)
+
+
+def _path_list_from_state(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            decoded = []
+    else:
+        decoded = value
+    if not isinstance(decoded, Sequence) or isinstance(decoded, (str, bytes)):
+        return []
+    return [str(path) for path in decoded if path]
+
+
 def dataset_status_to_panel(value: Mapping[str, Any]) -> tuple[str, str]:
     """Map the preparation status contract to the shared card and status line."""
 
@@ -255,7 +272,7 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
             "",
             empty_hist,
             [],
-            [],
+            "",
             "",
             [],
             gr.Timer(5.0, active=True),
@@ -292,7 +309,7 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
         stats_value,
         hist,
         table,
-        refs,
+        _path_list_state_value(refs),
         warning_text,
         paths,
         gr.Timer(5.0, active=True),
@@ -550,7 +567,11 @@ def build_dataset_tab(
         state_dir = gr.State(initial_state)
         dataset_path_state = gr.State(initial_dataset_path)
         segment_paths_state = gr.State([])
-        reference_state = gr.State([])
+        # A hidden textbox provides a reliable change trigger for the dynamic
+        # reference players when a completed dataset is restored after reload.
+        reference_state = gr.Textbox(
+            value="", visible=False, label="Dataset reference audio paths"
+        )
         timer = gr.Timer(5.0, active=True)
         progress = gr.HTML(progress_panel_html({}, title="Ready"))
         status = gr.Markdown("")
@@ -571,8 +592,8 @@ def build_dataset_tab(
         warnings = gr.Markdown("")
         with gr.Column():
             @gr.render(inputs=reference_state, triggers=[reference_state.change])
-            def render_references(paths: list[str] | None):
-                values = list(paths or [])
+            def render_references(paths: str | None):
+                values = _path_list_from_state(paths)
                 if not values:
                     return
                 gr.Markdown("#### Reference candidates")
@@ -763,24 +784,52 @@ def build_dataset_tab(
         while job.running:
             elapsed = time.perf_counter() - started
             yield (
+                progress_panel_html(
+                    {"elapsed_s": elapsed, "desc": "Caching training features"},
+                    title="Caching features",
+                ),
                 f"Caching features | elapsed {elapsed:.1f}s",
                 tail_text(job.log_path, 60),
                 str(dataset_dir),
+                gr.Timer(5.0, active=False),
+                gr.skip(),
+                gr.skip(),
             )
             time.sleep(1)
         output = tail_text(job.log_path, 80)
         if job.process.returncode != 0:
             raise gr.Error(f"Feature caching failed with code {job.process.returncode}: {output[-1200:]}")
+        elapsed = time.perf_counter() - started
         yield (
-            f"Feature caching complete for {dataset_dir.name} in {time.perf_counter() - started:.1f}s.",
+            progress_panel_html(
+                {
+                    "fraction": 1.0,
+                    "elapsed_s": elapsed,
+                    "eta_s": 0,
+                    "desc": "Feature caching complete",
+                },
+                title="Feature cache complete",
+            ),
+            f"Feature caching complete for {dataset_dir.name} in {elapsed:.1f}s.",
             output,
             str(dataset_dir),
+            gr.Timer(5.0, active=False),
+            gr.update(choices=scan_datasets(), value=str(dataset_dir)),
+            dataset_summary_line(dataset_dir),
         )
 
     cache_event = cache_button.click(
         cache_features,
         [existing, name, output_root],
-        [status, log, dataset_path_state],
+        [
+            progress,
+            status,
+            log,
+            dataset_path_state,
+            timer,
+            existing,
+            existing_info,
+        ],
         concurrency_limit=1,
         concurrency_id="dataset-cache",
     )
@@ -788,11 +837,20 @@ def build_dataset_tab(
     def load_existing(path: str | None):
         global _LAST_DATASET_FOLDER
         if not path:
-            return "Select a dataset.", "", pd.DataFrame(columns=["bucket", "count"]), [], [], "", [], ""
+            return "Select a dataset.", "", pd.DataFrame(columns=["bucket", "count"]), [], "", "", [], ""
         _LAST_DATASET_FOLDER = Path(path)
         stats_value, hist, table, refs, warning_text, paths = _dataset_result(path)
         summary = dataset_summary_line(path)
-        return summary, stats_value, hist, table, refs, warning_text, paths, str(Path(path).resolve())
+        return (
+            summary,
+            stats_value,
+            hist,
+            table,
+            _path_list_state_value(refs),
+            warning_text,
+            paths,
+            str(Path(path).resolve()),
+        )
 
     existing.change(load_existing, existing, [existing_info, stats, histogram, segments, reference_state, warnings, segment_paths_state, dataset_path_state], queue=False)
     refresh_existing.click(lambda: gr.update(choices=scan_datasets()), outputs=existing, queue=False)

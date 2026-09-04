@@ -16,12 +16,18 @@ from indextts.training.charts import (
 from ui.batch_tab import batch_task_updates
 from ui.common import adopt_output_task, latest_output_task, output_task_is_active
 from ui.dataset_tab import (
+    _path_list_from_state,
+    _path_list_state_value,
     adopt_dataset_state,
     dataset_poll_updates,
     dataset_summary_line,
     scan_datasets,
 )
-from ui.generation_tab import generation_task_updates
+from ui.generation_tab import (
+    _candidate_paths_from_state,
+    _candidate_state_value,
+    generation_task_updates,
+)
 from ui.grid_tab import adopt_grid_state
 from ui.training_tab import adopt_training_state, training_poll_updates
 
@@ -198,6 +204,19 @@ def test_idle_timers_do_not_adopt_finished_runs_without_page_load(tmp_path: Path
         str(grid.resolve()),
         False,
     )
+
+
+def test_dynamic_audio_path_states_round_trip_as_textbox_json() -> None:
+    paths = [r"C:\audio\candidate_01.wav", r"C:\audio\candidate_02.wav"]
+    candidate_state = _candidate_state_value(paths)
+    dataset_state = _path_list_state_value(paths)
+
+    assert isinstance(candidate_state, str)
+    assert isinstance(dataset_state, str)
+    assert _candidate_paths_from_state(candidate_state) == paths
+    assert _path_list_from_state(dataset_state) == paths
+    assert _candidate_paths_from_state("not json") == []
+    assert _path_list_from_state("not json") == []
 
 
 def test_dataset_wording_and_chart_placeholders_keep_frontend_contract(tmp_path: Path) -> None:

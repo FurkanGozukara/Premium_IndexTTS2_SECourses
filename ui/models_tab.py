@@ -89,6 +89,8 @@ def _gpu_rows() -> list[list[Any]]:
 
 
 def _gpu_total(device: str | None) -> float:
+    if str(device or "").strip().lower() == "cpu":
+        return 0.0
     gpus = list_gpus()
     match = re.search(r"(\d+)$", str(device or ""))
     index = int(match.group(1)) if match else 0
@@ -97,6 +99,8 @@ def _gpu_total(device: str | None) -> float:
 
 
 def _gpu_free(device: str | None) -> float:
+    if str(device or "").strip().lower() == "cpu":
+        return 0.0
     gpus = list_gpus()
     match = re.search(r"(\d+)$", str(device or ""))
     index = int(match.group(1)) if match else 0
@@ -143,6 +147,11 @@ def _model_status_rows(model_dir: str | Path) -> list[list[Any]]:
 
 
 def _estimate_html(config: RuntimeConfig, total_gb: float) -> str:
+    if str(config.device).strip().lower() == "cpu":
+        return (
+            '<div class="summary-strip status-ok"><b>CPU diagnostics mode</b> | '
+            "GPU VRAM limits do not apply | FP32 is recommended for compatibility</div>"
+        )
     if total_gb <= 0:
         total_gb = 32.0
     estimate = estimate_vram_gb(config, total_gb)

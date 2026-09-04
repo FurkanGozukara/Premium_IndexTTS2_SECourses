@@ -1494,7 +1494,7 @@ class LoraTrainer:
             terminal_status.get("message")
             or ("training complete" if result_status == "complete" else "training stopped")
         )
-        if config.auto_evaluate_checkpoints:
+        if config.auto_evaluate_checkpoints and val_count > 0:
             del built
             del optimizer, scheduler, scaler
             del train_loader, val_loader, batch, loss, values
@@ -1517,6 +1517,13 @@ class LoraTrainer:
                     message=terminal_message,
                     recommended_checkpoint=recommended_checkpoint,
                 )
+        elif config.auto_evaluate_checkpoints:
+            self.log(
+                ">> automatic checkpoint evaluation skipped: the validation split "
+                "contains no items"
+            )
+            if recommended_checkpoint:
+                self.write_status(recommended_checkpoint=recommended_checkpoint)
         elif recommended_checkpoint:
             self.write_status(recommended_checkpoint=recommended_checkpoint)
         return TrainingResult(

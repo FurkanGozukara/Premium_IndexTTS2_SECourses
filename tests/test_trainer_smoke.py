@@ -67,6 +67,9 @@ def test_real_dora_training_resume_and_files(tmp_path: Path, blocks_to_swap: int
     losses = _losses(metrics)
     assert len(losses) == 30
     assert min(losses[-10:]) < sum(losses[:5]) / 5
+    log_text = (adapter.parent / "log.txt").read_text(encoding="utf-8")
+    assert "automatic checkpoint evaluation skipped" in log_text
+    assert not (adapter.parent / "analysis" / "eval_job" / "status.json").exists()
 
     resumed = TrainConfig.from_dict(config.to_dict())
     resumed.name = name + "_resumed"
@@ -112,3 +115,6 @@ def test_stop_flag_saves_interrupted_adapter(tmp_path: Path) -> None:
     assert interrupted.with_name(interrupted.stem + ".train_state.pt").is_file()
     status = json.loads((state_dir / "status.json").read_text(encoding="utf-8"))
     assert status["phase"] == "stopped"
+    assert "automatic checkpoint evaluation skipped" in (
+        state_dir / "log.txt"
+    ).read_text(encoding="utf-8")
