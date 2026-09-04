@@ -4,6 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+
+install_native_enum_pytree_compatibility()
+
 import transformers
 from transformers import GPT2Config, GPT2Model, GPT2PreTrainedModel, LogitsProcessorList
 from transformers.generation.utils import GenerationMixin

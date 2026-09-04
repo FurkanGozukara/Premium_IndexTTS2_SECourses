@@ -9,6 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
 
+from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+
+# Transformers currently imports TorchAO code that still registers Enum classes
+# as pytree constants. New PyTorch releases handle those enums natively.
+install_native_enum_pytree_compatibility()
+
 import gradio as gr
 
 from indextts.runtime.gpu import list_gpus
