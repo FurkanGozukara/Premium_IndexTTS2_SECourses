@@ -76,12 +76,19 @@ class GPT2AccelAttention(nn.Module):
         k_flat = key.transpose(1, 2).contiguous().view(-1, num_heads, head_dim)
         v_flat = value.transpose(1, 2).contiguous().view(-1, num_heads, head_dim)
 
-        # ensure fp16
-        if q_flat.device.type == "cuda" and q_flat.dtype != torch.float16:
+        # FlashAttention accepts FP16 and BF16. Preserve the model's compute
+        # dtype so BF16 runtime output does not drift at every autoregressive
+        # step; only FP32 acceleration needs a half-precision bridge.
+        target_dtype = (
+            q_flat.dtype
+            if q_flat.dtype in {torch.float16, torch.bfloat16}
+            else torch.float16
+        )
+        if q_flat.device.type == "cuda" and q_flat.dtype != target_dtype:
             orig_dtype = q_flat.dtype
-            q_flat = q_flat.to(torch.float16)
-            k_flat = k_flat.to(torch.float16)
-            v_flat = v_flat.to(torch.float16)
+            q_flat = q_flat.to(target_dtype)
+            k_flat = k_flat.to(target_dtype)
+            v_flat = v_flat.to(target_dtype)
         else:
             orig_dtype = q_flat.dtype
 
@@ -148,10 +155,21 @@ class GPT2AccelModel(GPT2Model):
         return_dict=None,
     ):
         if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+            # IndexTTS supplies its learned text/mel position embeddings before
+            # entering GPT and replaces GPT-2's own position embedding with
+            # zeros.  The acceleration model must not add its freshly
+            # initialized ``wpe`` weights here.
+            hidden_states = self.drop(inputs_embeds)
 
             for block in self.h:
-                hidden_states = block(hidden_states)[0]
+                block_output = block(hidden_states)
+                # Transformers 5 returns the hidden-state tensor directly while
+                # older releases returned it as the first tuple item.
+                hidden_states = (
+                    block_output[0]
+                    if isinstance(block_output, (tuple, list))
+                    else block_output
+                )
 
             hidden_states = self.ln_f(hidden_states)
 

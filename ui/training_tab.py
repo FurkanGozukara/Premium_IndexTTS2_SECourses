@@ -156,6 +156,12 @@ def _dataset_summary(path: str | None) -> str:
     )
 
 
+def _refresh_dataset_updates(path: str | None) -> tuple[Any, str]:
+    """Refresh dataset choices and recompute mutable cache status."""
+
+    return gr.update(choices=_dataset_choices()), _dataset_summary(path)
+
+
 def _training_plan_markdown(
     dataset_path: str | None,
     batch_size: int,
@@ -1105,7 +1111,10 @@ def build_training_tab(
     open_output.click(lambda state: open_folder(state or _LAST_TRAINING_FOLDER), state_dir, status_text, queue=False)
 
     refresh_dataset_event = refresh_dataset.click(
-        lambda: gr.update(choices=_dataset_choices()), outputs=dataset, queue=False
+        _refresh_dataset_updates,
+        dataset,
+        [dataset, dataset_info],
+        queue=False,
     )
     dataset.change(_dataset_summary, dataset, dataset_info, queue=False)
     plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed]

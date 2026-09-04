@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from functools import lru_cache
 import os
-import traceback
 import re
 from typing import List, Union, overload
 import warnings
@@ -173,9 +172,14 @@ class TextNormalizer:
             replaced_text, original_name_list = self.save_names(replaced_text)
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
-            except Exception:
-                result = ""
-                print(traceback.format_exc())
+            except Exception as exc:
+                # WeText can reject otherwise usable punctuation-heavy fragments.
+                # Preserve the source instead of dropping the whole Chinese segment.
+                result = replaced_text
+                print(
+                    f"Warning: Chinese text normalization failed ({type(exc).__name__}); "
+                    "using the original text."
+                )
             # 恢复人名
             result = self.restore_names(result, original_name_list)
             # 恢复拼音声调
@@ -195,9 +199,12 @@ class TextNormalizer:
                 result = self.en_normalizer.normalize(replaced_text)
                 # 恢复技术术语
                 result = self.restore_tech_terms(result, tech_list)
-            except Exception:
+            except Exception as exc:
                 result = text
-                print(traceback.format_exc())
+                print(
+                    f"Warning: English text normalization failed ({type(exc).__name__}); "
+                    "using the original text."
+                )
             pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
             result = pattern.sub(lambda x: self.char_rep_map[x.group()], result)
 

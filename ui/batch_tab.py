@@ -109,6 +109,12 @@ def _item_generation_values(
     return values
 
 
+def _batch_timer(running: bool) -> gr.Timer:
+    """Poll only while the aggregate batch result is still being built."""
+
+    return gr.Timer(1.0 if running else 5.0, active=running)
+
+
 def _per_file_reference(item: dict[str, Any]) -> str | None:
     if not item.get("path"):
         return None
@@ -145,6 +151,18 @@ def batch_task_updates(
         scope="batch",
         page_load=page_load,
     )
+    if task_value and not running and not page_load:
+        # The aggregate generator owns the final summary/table. A timer tick
+        # can race with its last yield after the final item writes terminal
+        # metadata, so leave those aggregate components untouched.
+        return (
+            task_value,
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.Timer(5.0, active=False),
+        )
     if not task_value:
         return (
             "",
@@ -396,7 +414,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 message,
                 result_rows,
                 log_value,
-                gr.Timer(1.0 if running else 5.0, active=True),
+                _batch_timer(running),
             )
 
         try:

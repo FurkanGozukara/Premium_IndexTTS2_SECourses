@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from indextts.training.train_config import TrainConfig
 from indextts.training.trainer import run_training
+
+
+def _cached_training_dataset() -> Path:
+    dataset = Path(
+        os.environ.get("INDEXTTS_TEST_TRAINING_DATASET", "datasets/secourses_demo")
+    )
+    if not (dataset / "manifest.jsonl").is_file() or not (
+        dataset / "cache_index.json"
+    ).is_file():
+        pytest.skip(
+            "Cached training dataset is unavailable; set "
+            "INDEXTTS_TEST_TRAINING_DATASET"
+        )
+    return dataset
 
 
 def _losses(metrics_path: Path) -> list[float]:
@@ -21,9 +36,7 @@ def _losses(metrics_path: Path) -> list[float]:
 @pytest.mark.gpu
 @pytest.mark.parametrize("blocks_to_swap", [0, 12])
 def test_real_dora_training_resume_and_files(tmp_path: Path, blocks_to_swap: int) -> None:
-    dataset = Path("datasets/secourses_demo")
-    if not (dataset / "cache_index.json").is_file():
-        pytest.skip("secourses_demo cached features are unavailable")
+    dataset = _cached_training_dataset()
     use_int8 = blocks_to_swap > 0 and Path("models/gpt_int8_convrot.safetensors").is_file()
     name = f"smoke_swap_{blocks_to_swap}"
     config = TrainConfig(
@@ -71,11 +84,12 @@ def test_real_dora_training_resume_and_files(tmp_path: Path, blocks_to_swap: int
 
 @pytest.mark.gpu
 def test_stop_flag_saves_interrupted_adapter(tmp_path: Path) -> None:
+    dataset = _cached_training_dataset()
     state_dir = tmp_path / "stop_state"
     state_dir.mkdir(parents=True)
     (state_dir / "stop.flag").touch()
     config = TrainConfig(
-        dataset_dir="datasets/secourses_demo",
+        dataset_dir=str(dataset),
         output_dir=str(tmp_path),
         name="stop_smoke",
         rank=8,

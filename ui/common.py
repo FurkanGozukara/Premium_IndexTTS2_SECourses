@@ -356,7 +356,18 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
 
 @media (max-width: 900px) {
   .app-header { flex-wrap: wrap; }
-  .header-actions { justify-content: flex-start; }
+  .row.header-actions {
+    flex: 1 1 100% !important;
+    width: 100% !important;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+  .header-actions button.ax {
+    flex: 1 1 180px;
+    width: auto !important;
+    min-width: 0 !important;
+    white-space: normal;
+  }
 }
 """
 

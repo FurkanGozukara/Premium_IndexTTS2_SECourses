@@ -7,9 +7,10 @@ from indextts.runtime.vram_presets import RuntimeConfig
 from indextts.training.dataset_prep import DatasetPrepConfig
 from indextts.training.train_config import TrainConfig
 from ui.app import build_app
-from ui.batch_tab import _batch_items, _item_generation_values
+from ui.batch_tab import _batch_items, _batch_timer, _item_generation_values
+from ui.common import APP_CSS
 from ui.generation_tab import GENERATION_DEFAULTS
-from ui.training_tab import TRAIN_DEFAULTS
+from ui.training_tab import TRAIN_DEFAULTS, _refresh_dataset_updates
 
 
 def test_build_app_constructs_all_tabs_without_loading_models():
@@ -180,6 +181,42 @@ def test_plain_text_batch_item_disables_caption_timing() -> None:
     assert plain["generation.use_caption_timing"] is False
     assert captioned["generation.use_caption_timing"] is True
     assert values["generation.use_caption_timing"] is True
+
+
+def test_completed_batch_stops_item_polling_timer() -> None:
+    assert _batch_timer(True).active is True
+    assert _batch_timer(True).value == 1.0
+    assert _batch_timer(False).active is False
+    assert _batch_timer(False).value == 5.0
+
+
+def test_mobile_header_actions_wrap_within_the_viewport() -> None:
+    mobile_rules = APP_CSS.split("@media (max-width: 900px)", 1)[1]
+
+    assert ".app-header { flex-wrap: wrap; }" in mobile_rules
+    assert ".row.header-actions" in mobile_rules
+    assert "flex: 1 1 100% !important;" in mobile_rules
+    assert "width: 100% !important;" in mobile_rules
+    assert ".header-actions button.ax" in mobile_rules
+    assert "min-width: 0 !important;" in mobile_rules
+    assert "white-space: normal;" in mobile_rules
+
+
+def test_training_dataset_refresh_recomputes_cache_status(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "prepared"
+    dataset.mkdir()
+    (dataset / "dataset_info.json").write_text(
+        json.dumps({"segment_count": 2, "total_duration_minutes": 0.5}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("ui.training_tab._dataset_choices", lambda: [])
+
+    _, before = _refresh_dataset_updates(str(dataset))
+    assert before.endswith("features **not cached**")
+    (dataset / "cache").mkdir()
+    (dataset / "cache" / "index.jsonl").write_text("", encoding="utf-8")
+    _, after = _refresh_dataset_updates(str(dataset))
+    assert after.endswith("features **cached**")
 
 
 def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():

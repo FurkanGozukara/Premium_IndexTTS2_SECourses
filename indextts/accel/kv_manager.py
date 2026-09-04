@@ -91,7 +91,6 @@ class KVCacheManager:
         self.used_block_ids: Set[int] = set()
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        cache_dtype = torch.float16 if device == "cuda" else dtype
         self.kv_cache = torch.empty(
             2,
             num_layers,
@@ -99,7 +98,7 @@ class KVCacheManager:
             block_size,
             num_heads,
             head_dim,
-            dtype=cache_dtype,
+            dtype=dtype,
             device=device,
         )
 

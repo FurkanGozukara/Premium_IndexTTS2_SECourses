@@ -64,13 +64,19 @@ class AccelInferenceEngine:
             if hasattr(model, "config")
             else head_dim * num_heads
         )
+        model_dtype = next(model.parameters()).dtype
+        cache_dtype = (
+            model_dtype
+            if model_dtype in {torch.float16, torch.bfloat16}
+            else torch.float16
+        )
         self.kv_manager = KVCacheManager(
             num_layers=num_layers,
             num_heads=num_heads,
             head_dim=head_dim,
             block_size=block_size,
             num_blocks=num_blocks,
-            dtype=torch.float16,  # Force fp16 for FlashAttention
+            dtype=cache_dtype,
         )
         self.kv_manager.wire_kv_cache_to_model(model)
         self.sampler = Sampler()
@@ -165,7 +171,10 @@ class AccelInferenceEngine:
 
             pos = len(req) - 1
             if hasattr(self, "_tts_mode") and self._tts_mode:
-                pos = pos - (self._tts_prompt_len - 1)
+                # GPT2InferenceModel numbers the start-mel embedding at zero,
+                # then derives cached decode positions from
+                # ``attention_mask_length - cached_prompt_length``.
+                pos = len(req) - (self._tts_prompt_len - 1)
             positions.append(pos)
 
             context_lens.append(len(req))
@@ -217,6 +226,59 @@ class AccelInferenceEngine:
             temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)
         return temperatures
+
+    @staticmethod
+    def _process_sampling_logits(
+        logits: torch.Tensor,
+        requests: List[Seq],
+        *,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> torch.Tensor:
+        """Apply the single-sequence Hugging Face sampling controls."""
+
+        scores = logits.float()
+        penalty = float(repetition_penalty)
+        if penalty <= 0:
+            raise ValueError("repetition_penalty must be greater than 0")
+        if penalty != 1.0:
+            scores = scores.clone()
+            for row, request in enumerate(requests):
+                generated = request.token_ids[request.num_prompt_tokens :]
+                if not generated:
+                    continue
+                token_ids = torch.tensor(
+                    sorted(set(generated)), dtype=torch.long, device=scores.device
+                )
+                selected = scores[row, token_ids]
+                selected = torch.where(selected < 0, selected * penalty, selected / penalty)
+                scores[row, token_ids] = selected
+
+        if temperature > 0:
+            scores = scores / max(float(temperature), 1e-8)
+
+        vocab_size = scores.shape[-1]
+        k = min(max(0, int(top_k)), vocab_size)
+        if 0 < k < vocab_size:
+            threshold = torch.topk(scores, k, dim=-1).values[..., -1, None]
+            scores = scores.masked_fill(scores < threshold, -torch.inf)
+
+        p = float(top_p)
+        if not 0 < p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if p < 1.0:
+            sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+            cumulative = torch.softmax(sorted_scores, dim=-1).cumsum(dim=-1)
+            remove = cumulative > p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            sorted_scores = sorted_scores.masked_fill(remove, -torch.inf)
+            scores = torch.full_like(scores, -torch.inf).scatter(
+                -1, sorted_indices, sorted_scores
+            )
+        return scores
 
     def _capture_cuda_graphs(self, tts_mel_embedding=None, tts_text_pos_embedding=None):
         print("Capturing CUDA graphs for decode optimization...")
@@ -329,7 +391,8 @@ class AccelInferenceEngine:
                 pos_emb = tts_text_pos_embedding.emb(pos_clamped)
                 inputs_embeds = inputs_embeds + pos_emb
                 out = self.model(
-                    inputs_embeds=inputs_embeds.unsqueeze(1), return_dict=True
+                    inputs_embeds=inputs_embeds.unsqueeze(1),
+                    return_dict=True,
                 ).last_hidden_state
             else:
                 out = self.model(
@@ -382,6 +445,7 @@ class AccelInferenceEngine:
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         stop_tokens: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         tts_embeddings: Optional[
@@ -477,9 +541,7 @@ class AccelInferenceEngine:
                 torch.tensor([[start_token_id]], device="cuda")
             )  # [1, 1, hidden_dim]
 
-            start_pos = torch.tensor(
-                [[tts_embeddings.size(1)]], device="cuda", dtype=torch.long
-            )
+            start_pos = torch.zeros((1, 1), device="cuda", dtype=torch.long)
             pos_emb = tts_text_pos_embedding.emb(start_pos)
             start_emb = start_emb + pos_emb
             start_emb = start_emb.repeat(batch_size, 1, 1)
@@ -534,7 +596,15 @@ class AccelInferenceEngine:
         else:
             logits = self.model.compute_logits(last_hidden)  # [batch_size, vocab_size]
 
-        temperatures = self._prepare_sample(sequences, temperature)
+        logits = self._process_sampling_logits(
+            logits,
+            sequences,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+        temperatures = self._prepare_sample(sequences, 1.0)
         if temperature > 0:
             first_token = self.sampler(logits, temperatures)
         else:
@@ -548,6 +618,7 @@ class AccelInferenceEngine:
         for i, token_id in enumerate(first_token_list):
             if stop_tokens and token_id in stop_tokens:
                 is_finished[i] = True
+                generated_tokens[i].append(token_id)
             else:
                 generated_tokens[i].append(token_id)
                 sequences[i].append_token(token_id)
@@ -590,7 +661,15 @@ class AccelInferenceEngine:
 
             reset_forward_context()
 
-            temperatures = self._prepare_sample(sequences, temperature)
+            logits = self._process_sampling_logits(
+                logits,
+                sequences,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            temperatures = self._prepare_sample(sequences, 1.0)
             if temperature > 0:
                 next_token = self.sampler(logits, temperatures)
             else:
@@ -602,6 +681,7 @@ class AccelInferenceEngine:
                     continue
                 elif stop_tokens and token_id in stop_tokens:
                     is_finished[i] = True
+                    generated_tokens[i].append(token_id)
                 else:
                     sequences[i].append_token(token_id)
                     self.kv_manager.append_to_seq(sequences[i])

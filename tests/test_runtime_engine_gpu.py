@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import time
 
@@ -7,8 +8,21 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = ROOT.parent / "demo_voice_for_test.mp3"
-DEMO_LORA = ROOT / "loras" / "secourses_demo_dora_smoke" / "best" / "secourses_demo_dora_smoke.safetensors"
+DEMO = Path(
+    os.environ.get(
+        "INDEXTTS_TEST_REFERENCE_AUDIO", ROOT.parent / "demo_voice_for_test.mp3"
+    )
+)
+DEMO_LORA = Path(
+    os.environ.get(
+        "INDEXTTS_TEST_DORA",
+        ROOT
+        / "loras"
+        / "secourses_demo_dora_smoke"
+        / "best"
+        / "secourses_demo_dora_smoke.safetensors",
+    )
+)
 DEMO_TEXT = (
     "Every voice carries a history of tiny choices: a pause before an important word, a smile hidden inside a "
     "sentence, and a rhythm learned over many years. This benchmark asks the model to preserve those details "

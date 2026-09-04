@@ -1182,35 +1182,33 @@ class IndexTTS2:
                 **generation_kwargs
             )
         else:
-            try:
-                return list(self.infer_generator(
-                    spk_audio_prompt, text, output_path, lang,
-                    emo_audio_prompt, emo_alpha,
-                    emo_vector,
-                    use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
-                    duration_factor=duration_factor,
-                    text_normalization=text_normalization,
-                    max_speaker_audio_length=max_speaker_audio_length,
-                    max_emotion_audio_length=max_emotion_audio_length,
-                    max_consecutive_silence=max_consecutive_silence,
-                    semantic_layer=semantic_layer,
-                    cfm_cache_length=cfm_cache_length,
-                    diffusion_steps=diffusion_steps,
-                    inference_cfg_rate=inference_cfg_rate,
-                    reset_beam_cache_per_segment=reset_beam_cache_per_segment,
-                    segment_budget_scale_non_cjk=segment_budget_scale_non_cjk,
-                    cfm_temperature=cfm_temperature,
-                    seed=seed,
-                    reuse_spk_cond_for_emo=reuse_spk_cond_for_emo,
-                    enable_pause_tags=enable_pause_tags,
-                    trim_silence_ms_threshold=trim_silence_ms_threshold,
-                    target_duration_s=target_duration_s,
-                    target_duration_mode=target_duration_mode,
-                    **generation_kwargs
-                ))[0]
-            except IndexError:
-                return None
+            results = list(self.infer_generator(
+                spk_audio_prompt, text, output_path, lang,
+                emo_audio_prompt, emo_alpha,
+                emo_vector,
+                use_emo_text, emo_text, use_random, interval_silence,
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                duration_factor=duration_factor,
+                text_normalization=text_normalization,
+                max_speaker_audio_length=max_speaker_audio_length,
+                max_emotion_audio_length=max_emotion_audio_length,
+                max_consecutive_silence=max_consecutive_silence,
+                semantic_layer=semantic_layer,
+                cfm_cache_length=cfm_cache_length,
+                diffusion_steps=diffusion_steps,
+                inference_cfg_rate=inference_cfg_rate,
+                reset_beam_cache_per_segment=reset_beam_cache_per_segment,
+                segment_budget_scale_non_cjk=segment_budget_scale_non_cjk,
+                cfm_temperature=cfm_temperature,
+                seed=seed,
+                reuse_spk_cond_for_emo=reuse_spk_cond_for_emo,
+                enable_pause_tags=enable_pause_tags,
+                trim_silence_ms_threshold=trim_silence_ms_threshold,
+                target_duration_s=target_duration_s,
+                target_duration_mode=target_duration_mode,
+                **generation_kwargs
+            ))
+            return results[0] if results else None
 
     def infer_texts(self, spk_audio_prompt, texts, on_text_complete=None, lang="EN", **kwargs):
         """Generate text units in real micro-batches with shared reference conditioning."""

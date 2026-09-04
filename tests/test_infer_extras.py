@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 import wave
 
 import numpy as np
@@ -16,7 +18,11 @@ from indextts.utils.text_segmentation import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = ROOT.parent / "demo_voice_for_test.mp3"
+DEMO = Path(
+    os.environ.get(
+        "INDEXTTS_TEST_REFERENCE_AUDIO", ROOT.parent / "demo_voice_for_test.mp3"
+    )
+)
 
 
 def test_pause_tag_parsing_and_description():
@@ -93,6 +99,21 @@ def test_audio_tuning_processes_synthetic_wav(tmp_path):
         assert handle.getframerate() == sample_rate
         assert handle.getnchannels() == 1
         assert abs(handle.getnframes() - audio.size) <= 2
+
+
+def test_non_streaming_infer_does_not_hide_internal_index_errors() -> None:
+    from indextts.infer_v2_5 import IndexTTS2
+
+    engine = IndexTTS2.__new__(IndexTTS2)
+    engine.runtime = SimpleNamespace(cfm_cache_length=8192)
+
+    def broken_generator(*_args, **_kwargs):
+        yield from ()
+        raise IndexError("internal accelerator failure")
+
+    engine.infer_generator = broken_generator
+    with pytest.raises(IndexError, match="internal accelerator failure"):
+        engine.infer("reference.wav", "hello", "output.wav")
 
 
 def test_null_position_embeddings_follow_embedding_dtype_and_device():

@@ -155,6 +155,14 @@ def test_idle_timers_do_not_adopt_finished_runs_without_page_load(tmp_path: Path
         "", root=tmp_path / "outputs", scope="generation", page_load=True
     ) == (str(output.resolve()), False)
 
+    batch_output = tmp_path / "outputs" / "batch" / "0001"
+    _write_task(batch_output, status="complete", task_id="0001", modified=110.0)
+    batch_updates = batch_task_updates(
+        str(batch_output), output_root=tmp_path / "outputs", page_load=False
+    )
+    assert batch_updates[0] == str(batch_output.resolve())
+    assert batch_updates[-1].active is False
+
     dataset_state = tmp_path / "dataset_states" / "finished"
     _write_json(
         dataset_state / "config.json",

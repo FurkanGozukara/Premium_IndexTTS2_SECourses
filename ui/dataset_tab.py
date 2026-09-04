@@ -336,6 +336,7 @@ class DatasetTab:
     existing_info: Any
     dataset_path_state: Any
     prep_event: Any = None
+    cache_event: Any = None
 
 
 def _reg(
@@ -761,14 +762,28 @@ def build_dataset_tab(
         started = time.perf_counter()
         while job.running:
             elapsed = time.perf_counter() - started
-            yield f"Caching features | elapsed {elapsed:.1f}s", tail_text(job.log_path, 60)
+            yield (
+                f"Caching features | elapsed {elapsed:.1f}s",
+                tail_text(job.log_path, 60),
+                str(dataset_dir),
+            )
             time.sleep(1)
         output = tail_text(job.log_path, 80)
         if job.process.returncode != 0:
             raise gr.Error(f"Feature caching failed with code {job.process.returncode}: {output[-1200:]}")
-        yield f"Feature caching complete for {dataset_dir.name} in {time.perf_counter() - started:.1f}s.", output
+        yield (
+            f"Feature caching complete for {dataset_dir.name} in {time.perf_counter() - started:.1f}s.",
+            output,
+            str(dataset_dir),
+        )
 
-    cache_button.click(cache_features, [existing, name, output_root], [status, log], concurrency_limit=1, concurrency_id="dataset-cache")
+    cache_event = cache_button.click(
+        cache_features,
+        [existing, name, output_root],
+        [status, log, dataset_path_state],
+        concurrency_limit=1,
+        concurrency_id="dataset-cache",
+    )
 
     def load_existing(path: str | None):
         global _LAST_DATASET_FOLDER
@@ -798,13 +813,20 @@ def build_dataset_tab(
     actual = {key for key in controls if key.startswith("dataset.")}
     if expected != actual:
         raise RuntimeError(f"Dataset UI field mismatch: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
-    return DatasetTab(controls, existing, existing_info, dataset_path_state, prep_event)
+    return DatasetTab(
+        controls,
+        existing,
+        existing_info,
+        dataset_path_state,
+        prep_event,
+        cache_event,
+    )
 
 
 def bind_dataset_events(tab: DatasetTab, training: Any) -> None:
     """Refresh and select the completed dataset in the Training tab."""
 
-    if tab.prep_event is None:
+    if tab.prep_event is None and tab.cache_event is None:
         return
 
     def refresh_training_dataset(dataset_value: str):
@@ -821,12 +843,25 @@ def bind_dataset_events(tab: DatasetTab, training: Any) -> None:
         )
         return gr.update(choices=choices, value=str(path.resolve())), summary
 
-    tab.prep_event.then(
-        refresh_training_dataset,
-        tab.dataset_path_state,
-        [training.dataset, training.dataset_info],
-        queue=False,
-    )
+    if tab.prep_event is not None:
+        tab.prep_event.then(
+            refresh_training_dataset,
+            tab.dataset_path_state,
+            [training.dataset, training.dataset_info],
+            queue=False,
+        )
+
+    if tab.cache_event is not None:
+        def refresh_cached_dataset(dataset_value: str):
+            dataset_update, summary = refresh_training_dataset(dataset_value)
+            return summary, dataset_update, summary
+
+        tab.cache_event.then(
+            refresh_cached_dataset,
+            tab.dataset_path_state,
+            [tab.existing_info, training.dataset, training.dataset_info],
+            queue=False,
+        )
 
 
 __all__ = [
