@@ -125,7 +125,7 @@
     "generation.tuning_loudnorm_i": null,
     "generation.tuning_low_cut_hz": null,
     "generation.use_caption_timing": false,
-    "generation.use_subprocess": true,
+    "generation.use_subprocess": false,
     "generation.verbose": false,
     "grid.diffusion_steps": 25,
     "grid.emotion_weight": 0.65,

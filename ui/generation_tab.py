@@ -174,7 +174,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.tuning_loudnorm_i": None,
     "generation.tuning_deess": None,
     "generation.trim_silence_ms_threshold": 0,
-    "generation.use_subprocess": True,
+    "generation.use_subprocess": False,
     "generation.section_batch_size": 1,
     "generation.low_memory_mode": False,
     "generation.prevent_vram_accumulation": False,
@@ -2391,7 +2391,7 @@ def bind_generation_events(
             task_folder = str(request["task_layout"]["task_folder"])
             for updates in stream_generation_request(
                 request,
-                use_subprocess=bool(values.get("generation.use_subprocess", True)),
+                use_subprocess=bool(values.get("generation.use_subprocess", False)),
                 gr_progress=progress,
             ):
                 running = output_task_is_active(task_folder)
