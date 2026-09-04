@@ -51,6 +51,7 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "Checkpoint Grid",
         "Models & Performance",
         "Help",
+        "📜 Changelog",
     ]
     keys = demo.preset_registry.keys
     assert len(keys) == len(set(keys))
@@ -71,6 +72,7 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         (component["type"], component["props"].get("label")): component
         for component in demo.config["components"]
     }
+    assert components[("tabitem", "📜 Changelog")]["props"]["render_children"] is False
     reference_source = components[("file", "Reference Voice (audio or video)")]
     reference_recording = components[("audio", "Microphone reference")]
     reference_audio = components[("audio", "Reference Voice audio preview")]

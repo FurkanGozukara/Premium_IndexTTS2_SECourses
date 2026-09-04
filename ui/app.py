@@ -22,6 +22,7 @@ from indextts.runtime.gpu import list_gpus
 from indextts.runtime.vram_presets import RuntimeConfig, auto_tier, describe, resolve_preset
 
 from .batch_tab import bind_batch_events, build_batch_tab
+from .changelog_tab import build_changelog_tab
 from .common import (
     APP_CSS,
     APP_HEAD,
@@ -330,6 +331,8 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             grid = build_grid_tab(options, registry, load_hook=last_values_button.click)
             models = build_models_tab(options, registry)
             build_help_tab()
+            with gr.Tab("📜 Changelog", id="changelog", render_children=False):
+                build_changelog_tab()
 
         # Cross-tab events are wired only after every component exists.
         bind_generation_events(generation, options, registry)
@@ -523,6 +526,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         "Checkpoint Grid": grid,
         "Models & Performance": models,
         "Help": True,
+        "📜 Changelog": True,
     }
     LAST_REGISTRY = registry
     LAST_STORE = store

@@ -1,0 +1,108 @@
+"""Product release history and SECourses project links."""
+
+from __future__ import annotations
+
+import gradio as gr
+
+
+CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
+    (
+        "v6.0",
+        "2026-09-04",
+        """
+### Reliable reference previews, restored results, and release history
+
+- Record a reference voice directly from the microphone, or use audio and video from anywhere on disk. External media is staged safely for Gradio, and incompatible video is converted to a browser-playable preview without changing the source.
+- Generated candidates and prepared-dataset reference clips now render reliably after a task completes or a page reconnects. Dataset feature caching has live progress, refreshes the selected dataset, and immediately updates the Training tab.
+- Fixed competing batch progress updates, preserved the source sample rate during optional audio tuning, skipped automatic checkpoint evaluation cleanly when no validation items exist, and made CPU diagnostics independent of GPU VRAM estimates.
+- The accelerated decoder now honors disabled `top-k` and `top-p` limits instead of rejecting valid settings.
+- Added this lazy-rendered **Changelog** tab with the public IndexTTS Premium release history and project links.
+""".strip(),
+    ),
+    (
+        "v5.1",
+        "2026-09-04",
+        """
+### End-to-end reliability pass
+
+- Fresh installations now select the quality preset, while normal generation runs in the main process by default so the loaded model can be reused between jobs. Isolated subprocess generation remains available as an option.
+- Fixed accelerated generation regressions involving sampling, attention masks, end-of-sequence handling, and cache state, with parity checks covering the standard and accelerated paths.
+- Corrected the hosted INT8 ConvRot checkpoint name and kept automatic download with a clear BF16 fallback when the optimized file is unavailable.
+- Checkpoint Grid now ignores incomplete audio cells, avoids overlapping renders, and supports a custom reference file in the VRAM benchmark.
+- Improved mobile header wrapping, dataset-to-training refresh behavior, task reattachment, Unicode text handling, and compatibility with current PyTorch enum registration.
+""".strip(),
+    ),
+    (
+        "v5.0",
+        "2026-09-04",
+        """
+### IndexTTS 2.5, LoRA / DoRA training, and a complete app rebuild
+
+- Moved the application entirely to the official multilingual IndexTTS 2.5 model stack and removed the legacy IndexTTS 1.x and 2.0 execution paths.
+- Added calibrated 6, 8, 10, 12, 16, 24, and 32 GB VRAM tiers, GPT block swapping for smaller GPUs, and an optional INT8 ConvRot GPT checkpoint that downloads automatically when selected.
+- Rebuilt the interface on Gradio 6 with Voice Generation, Batch Generation, Models & Performance, reusable read-only system presets, editable user presets, live progress, real cancellation, and last-run value recovery.
+- Added subtitle-aware dataset preparation from audio or video, Whisper word timestamps, sentence and pause boundaries, duplicate removal, loudness normalization, cached training features, and dataset statistics.
+- Added full LoRA / DoRA training with quality-first defaults, resume modes, validation, early stopping, progress charts, periodic samples, and low-VRAM block swapping.
+- Added Checkpoint Grid listening comparisons, automatic generalization analysis, measured checkpoint evaluation, recommended-checkpoint selection, and per-voice speaking-rate calibration.
+- Unified reference audio and video handling across generation, training, and grid workflows, including automatic reference discovery and consistent preset behavior.
+""".strip(),
+    ),
+    (
+        "v4.2",
+        "2026-09-02",
+        """
+### Initial IndexTTS 2.5 migration
+
+- Added the official `IndexTeam/IndexTTS-2.5` multilingual inference stack and switched model loading to the repository-local `models` directory.
+- Added true section micro-batching, main-process and subprocess generation, cooperative cancellation, multilingual text segmentation, and caption-timing support.
+- Added speaker and emotion reference modes, emotion text and vector controls, optional audio tuning, and system/user preset separation so shipped defaults cannot be overwritten.
+- Centralized model downloads and local Hugging Face caches so required model components can be reused without unnecessary downloads.
+""".strip(),
+    ),
+    (
+        "v4.1",
+        "2026-05-11",
+        """
+### Turn generated speech into a ready-to-share video
+
+- Added an optional image input that combines a still image with the generated voice as a 1080p MP4.
+- The source image and final video are stored alongside the numbered task output, recorded in metadata, and shown in a dedicated video preview.
+- MP3 export can run in the same job without deleting the WAV before MP4 rendering completes.
+""".strip(),
+    ),
+    (
+        "v4.0",
+        "2026-04-05",
+        """
+### Major generation workflow and installer upgrade
+
+- Rebuilt the interface with a browser title and favicon, automatic model downloads, full preset save/load, cancellation, richer console status, speed, progress, and ETA reporting.
+- Added SRT subtitle input and optional cue-timed speech generation for matching existing caption timing.
+- Reference voices can come from uploaded audio, uploaded video, or a microphone recording.
+- Added subprocess generation that releases RAM and VRAM after completion, plus real section batch-size processing for higher throughput when memory allows.
+- Moved the one-click installers to `uv` and verified the workflow on Windows, RunPod, and Massed Compute.
+""".strip(),
+    ),
+]
+
+
+def build_changelog_tab() -> None:
+    """Render newest-first release notes and SECourses project details."""
+
+    gr.Markdown("## Release history")
+    for index, (version, release_date, markdown) in enumerate(CHANGELOG_ENTRIES):
+        with gr.Accordion(f"{version} · {release_date}", open=index == 0):
+            gr.Markdown(markdown)
+
+    gr.Markdown(
+        """
+### About IndexTTS 2.5 Premium SECourses
+
+Built by **SECourses** for local voice cloning, long-form speech generation, and LoRA / DoRA voice training.
+
+[Support SECourses on Patreon](https://www.patreon.com/SECourses) · [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses)
+""".strip(),
+    )
+
+
+__all__ = ["CHANGELOG_ENTRIES", "build_changelog_tab"]
