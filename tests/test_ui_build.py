@@ -7,7 +7,7 @@ from indextts.runtime.vram_presets import RuntimeConfig
 from indextts.training.dataset_prep import DatasetPrepConfig
 from indextts.training.train_config import TrainConfig
 from ui.app import build_app
-from ui.batch_tab import _batch_items
+from ui.batch_tab import _batch_items, _item_generation_values
 from ui.generation_tab import GENERATION_DEFAULTS
 from ui.training_tab import TRAIN_DEFAULTS
 
@@ -143,6 +143,14 @@ def test_build_app_constructs_all_tabs_without_loading_models():
     assert registry_defaults["generation.auto_lora_speaking_rate"] is True
     assert registry_defaults["grid.speaking_rate"] == 1.0
 
+    checkpoint_group = demo.ui_tabs["Checkpoint Grid"].checkpoint_group
+    assert checkpoint_group.get_block_name() == "checkboxgroup"
+    assert checkpoint_group.choices == []
+    assert checkpoint_group.preprocess(["base", "epoch_001"]) == [
+        "base",
+        "epoch_001",
+    ]
+
 
 def test_blank_batch_folder_does_not_scan_working_directory(tmp_path, monkeypatch):
     (tmp_path / "unrelated.txt").write_text("must not be included", encoding="utf-8")
@@ -151,6 +159,17 @@ def test_blank_batch_folder_does_not_scan_working_directory(tmp_path, monkeypatc
     items = _batch_items(None, "first\n\nsecond", "")
 
     assert [item["text"] for item in items] == ["first", "second"]
+
+
+def test_plain_text_batch_item_disables_caption_timing() -> None:
+    values = {"generation.use_caption_timing": True, "generation.temperature": 0.8}
+
+    plain = _item_generation_values(values, {"subtitle": None})
+    captioned = _item_generation_values(values, {"subtitle": "sample.srt"})
+
+    assert plain["generation.use_caption_timing"] is False
+    assert captioned["generation.use_caption_timing"] is True
+    assert values["generation.use_caption_timing"] is True
 
 
 def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():

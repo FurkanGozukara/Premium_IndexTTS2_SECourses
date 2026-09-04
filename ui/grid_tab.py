@@ -117,6 +117,14 @@ _GRID_RUNNER_EXTRAS = (
 )
 
 
+def _preprocess_dynamic_checkpoint_ids(
+    payload: list[str | int | float] | None,
+) -> list[str | int | float]:
+    """Accept IDs supplied by the selected adapter's client-side choice update."""
+
+    return list(payload or [])
+
+
 def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]:
     base = Path(root).expanduser().resolve()
     choices: list[tuple[str, str]] = []
@@ -441,8 +449,9 @@ def calibrate_grid_speaking_rates(
         "|---|---:|---:|---:|",
     ]
     for _cell, (label, report) in rows:
+        escaped_label = str(label).replace("|", "\\|")
         lines.append(
-            f"| {str(label).replace('|', '\\|')} | "
+            f"| {escaped_label} | "
             f"{report.generated_words_per_second:.2f} | "
             f"{report.dataset_words_per_second:.2f} | "
             f"{report.recommended_speaking_rate:.3f} |"
@@ -617,10 +626,10 @@ def grid_status_updates(
         return (
             "",
             progress_panel_html({}, title="Ready"),
-            "",
-            "",
-            "",
-            [],
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
             gr.update(choices=_saved_grid_choices(output_root)),
             gr.Timer(5.0, active=True),
         )
@@ -919,6 +928,10 @@ def build_grid_tab(
             label="Checkpoints",
             info="Base model (no LoRA / DoRA), the recommended checkpoint, and the final checkpoint are selected first.",
         )
+        # Gradio preprocesses against the Python component's startup choices, but this
+        # list is intentionally filled later when an adapter is selected.  The mapping
+        # used to build a grid remains the authority and ignores unknown identifiers.
+        tab.checkpoint_group.preprocess = _preprocess_dynamic_checkpoint_ids  # type: ignore[method-assign]
         tab.checkpoint_map = gr.State(initial_payload["mapping"])
         tab.recommended = gr.State(initial_payload["recommended"])
         # Checkpoint identifiers are rebuilt for every adapter, so they stay out of presets too.
@@ -1049,8 +1062,8 @@ def build_grid_tab(
             label="Saved grids",
             info="Open any earlier listening grid without regenerating it.",
         )
-        # A hidden textbox instead of gr.State: Gradio only dispatches State.change (which
-        # drives @gr.render) for queued events, and the polling timer runs unqueued.
+        # A hidden textbox drives the dynamic audio-player render.  Source events are
+        # queued below so Gradio dispatches this component's change trigger reliably.
         tab.result_state = gr.Textbox(value="", visible=False, label="Grid result folder")
         with gr.Column(elem_classes=["grid-results"]):
             @gr.render(inputs=tab.result_state, triggers=[tab.result_state.change])
@@ -1178,7 +1191,7 @@ def build_grid_tab(
         lambda path: (path or "", _grid_rows(path), f"Opened saved grid {Path(path).name}." if path else "Select a saved grid."),
         tab.saved_grids,
         [tab.result_state, tab.result_table, tab.status],
-        queue=False,
+        queue=True,
     )
     tab.open_button.click(
         lambda result, state: open_folder(result or state or ROOT / "outputs" / "grids"),
@@ -1207,7 +1220,7 @@ def build_grid_tab(
         grid_status_updates,
         tab.state,
         grid_poll_outputs,
-        queue=False,
+        queue=True,
         show_progress="hidden",
     )
     tab.eval_timer.tick(

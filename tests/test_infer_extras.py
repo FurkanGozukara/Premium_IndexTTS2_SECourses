@@ -113,6 +113,21 @@ def test_null_position_embeddings_follow_embedding_dtype_and_device():
     assert actual.device == positions.device
 
 
+def test_batched_generation_drops_sequential_duration_options() -> None:
+    from indextts.infer_v2_5 import _batched_generation_kwargs
+
+    source = {
+        "target_duration_s": None,
+        "target_duration_mode": "off",
+        "temperature": 0.8,
+    }
+
+    result = _batched_generation_kwargs(source)
+
+    assert result == {"temperature": 0.8}
+    assert source["target_duration_mode"] == "off"
+
+
 def test_generation_request_plumbs_candidates_and_result_metadata(tmp_path):
     from webui_generation_runner import run_generation_request
 

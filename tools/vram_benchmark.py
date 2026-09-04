@@ -82,13 +82,18 @@ def _wait_for_idle(timeout_s: float = 1800.0) -> None:
             return
         total_gb, free_gb = float(row[1]) / 1024.0, float(row[2]) / 1024.0
         used = max(0.0, total_gb - free_gb)
-        if used <= 1.0:
+        # A display-connected WDDM GPU commonly holds 1-3 GB for the desktop,
+        # browser, and compositor even when no model workload is active.  Treat
+        # up to ten percent of a large card as the idle display baseline while
+        # retaining the original 1 GB limit on small cards.
+        idle_limit_gb = max(1.0, total_gb * 0.10)
+        if used <= idle_limit_gb:
             return
         elapsed = time.monotonic() - started
         if elapsed - reported_at >= 30.0 or reported_at == 0.0:
             print(
-                f">> Waiting for idle GPU 0 ({used:.2f} GB in use, "
-                f"{free_gb:.2f}/{total_gb:.2f} GB free)."
+                f">> Waiting for idle GPU 0 ({used:.2f} GB in use; idle limit "
+                f"{idle_limit_gb:.2f} GB; {free_gb:.2f}/{total_gb:.2f} GB free)."
             )
             reported_at = elapsed
         if elapsed >= timeout_s:
@@ -159,8 +164,13 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
 
         torch.cuda.reset_peak_memory_stats(0)
         generation_started = time.perf_counter()
+        reference_audio = ROOT / "examples" / "voice_01.wav"
+        if not reference_audio.is_file():
+            raise FileNotFoundError(
+                f"Bundled benchmark reference audio is missing: {reference_audio}"
+            )
         common = {
-            "spk_audio_prompt": str(ROOT.parent / "demo_voice_for_test.mp3"),
+            "spk_audio_prompt": str(reference_audio),
             "lang": "EN",
             "seed": 123,
             "max_text_tokens_per_segment": text_tokens,

@@ -119,15 +119,65 @@ def ensure_int8_gpt(
     models_dir: str | Path,
     progress_cb: Optional[Callable] = None,
 ) -> str:
-    """Ensure base models and the optional INT8 ConvRot GPT are available."""
+    """Ensure the optional INT8 ConvRot GPT is available.
+
+    Prefer a verified local checkpoint, then the distribution download.  If the
+    optional hosted artifact is temporarily unavailable, build the exact same
+    format from the official BF16 GPT instead of leaving the UI feature broken.
+    """
     models_path = Path(models_dir).expanduser().resolve()
+    target = int8_gpt_path(models_path)
+    if target.is_file():
+        from indextts.quant.convrot_int8 import is_int8_convrot_checkpoint
+
+        if is_int8_convrot_checkpoint(target):
+            if progress_cb is not None:
+                progress_cb(1.0, f"INT8 ConvRot GPT already ready: {target.name}")
+            return str(target)
+
     downloader = _load_distribution_downloader()
-    result = downloader.download_models(
-        str(models_path),
-        model_type="index_tts_2_5_int8",
-        progress_cb=progress_cb,
-    )
-    return str(result["int8_gpt"])
+    try:
+        result = downloader.download_models(
+            str(models_path),
+            model_type="index_tts_2_5_int8",
+            progress_cb=progress_cb,
+        )
+        return str(result["int8_gpt"])
+    except Exception as download_error:
+        source = models_path / "gpt.pth"
+        if not source.is_file():
+            raise RuntimeError(
+                f"INT8 download failed and the BF16 source is missing: {source}"
+            ) from download_error
+
+        from indextts.quant.convrot_int8 import convert_gpt_checkpoint
+
+        try:
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if progress_cb is not None:
+                progress_cb(
+                    0.0,
+                    "Hosted INT8 file unavailable; converting the local BF16 GPT instead",
+                )
+
+            def report(message: str) -> None:
+                if progress_cb is not None:
+                    progress_cb(0.0, str(message))
+
+            convert_gpt_checkpoint(
+                str(source),
+                str(target),
+                device=device,
+                progress=report,
+            )
+        except Exception as conversion_error:
+            raise RuntimeError(
+                "INT8 download failed and local BF16-to-INT8 conversion also failed. "
+                f"Download error: {download_error}; conversion error: {conversion_error}"
+            ) from conversion_error
+        return str(target)
 
 
 __all__ = [

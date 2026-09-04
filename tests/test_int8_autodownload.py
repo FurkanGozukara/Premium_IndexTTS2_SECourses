@@ -38,6 +38,51 @@ def _runtime_payload(model_dir: Path) -> dict:
     }
 
 
+def test_ensure_int8_uses_verified_local_file_without_network(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from indextts.quant import convrot_int8
+
+    target = model_downloads.int8_gpt_path(tmp_path)
+    target.write_bytes(b"verified int8")
+    monkeypatch.setattr(convrot_int8, "is_int8_convrot_checkpoint", lambda _path: True)
+    monkeypatch.setattr(
+        model_downloads,
+        "_load_distribution_downloader",
+        lambda: (_ for _ in ()).throw(AssertionError("network downloader should not load")),
+    )
+
+    assert model_downloads.ensure_int8_gpt(tmp_path) == str(target)
+
+
+def test_ensure_int8_converts_local_bf16_when_hosted_file_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from indextts.quant import convrot_int8
+
+    (tmp_path / "gpt.pth").write_bytes(b"bf16")
+
+    class OfflineDownloader:
+        @staticmethod
+        def download_models(*_args, **_kwargs):
+            raise OSError("hosted artifact unavailable")
+
+    converted: list[tuple[Path, Path]] = []
+
+    def fake_convert(src, dst, **_kwargs):
+        converted.append((Path(src), Path(dst)))
+        Path(dst).write_bytes(b"converted int8")
+        return {}
+
+    monkeypatch.setattr(model_downloads, "_load_distribution_downloader", lambda: OfflineDownloader())
+    monkeypatch.setattr(convrot_int8, "convert_gpt_checkpoint", fake_convert)
+
+    result = Path(model_downloads.ensure_int8_gpt(tmp_path))
+
+    assert result.read_bytes() == b"converted int8"
+    assert converted == [((tmp_path / "gpt.pth").resolve(), result.resolve())]
+
+
 def test_generation_factory_auto_downloads_missing_int8_on_cpu(
     tmp_path: Path, monkeypatch
 ) -> None:

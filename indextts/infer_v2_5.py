@@ -59,6 +59,14 @@ SAMPLE_RATE = 22050
 _TARGET_DURATION_MODES = {"off", "natural", "pad", "trim"}
 
 
+def _batched_generation_kwargs(kwargs):
+    """Remove duration options handled only by the sequential inference path."""
+    values = dict(kwargs)
+    values.pop("target_duration_s", None)
+    values.pop("target_duration_mode", None)
+    return values
+
+
 def _seed_everything(seed):
     """Resolve a request seed and seed every RNG used by the inference path."""
 
@@ -1288,6 +1296,8 @@ class IndexTTS2:
             if self.low_vram and section_batch_size > 1:
                 print(">> Low-VRAM mode uses section batch size 1")
             return run_sequential()
+
+        kwargs = _batched_generation_kwargs(kwargs)
 
         use_emo_text = bool(kwargs.pop("use_emo_text", False))
         emo_text = kwargs.pop("emo_text", None)

@@ -99,6 +99,16 @@ def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[
     return items
 
 
+def _item_generation_values(
+    generation_values: dict[str, Any], item: dict[str, Any]
+) -> dict[str, Any]:
+    """Adjust shared settings for one item in a mixed TXT/caption batch."""
+    values = dict(generation_values)
+    if not item.get("subtitle"):
+        values["generation.use_caption_timing"] = False
+    return values
+
+
 def _per_file_reference(item: dict[str, Any]) -> str | None:
     if not item.get("path"):
         return None
@@ -423,7 +433,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 try:
                     pattern = str(batch_values["batch.naming_pattern"] or "{index:03d}_{name}")
                     filename = pattern.format(index=index, name=item["name"], stem=item["name"])
-                    item_values = dict(generation_values)
+                    item_values = _item_generation_values(generation_values, item)
                     item_values["generation.output_filename"] = filename
                     request = prepare_generation_request(
                         item_values,

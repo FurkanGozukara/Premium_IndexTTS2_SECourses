@@ -470,7 +470,21 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             total = _gpu_total(device_value)
             resolved = str(auto_tier(total) if total else 6)
         state_dir = ROOT / "outputs" / "vram_benchmark" / f"ui_{int(time.time())}"
-        command = [sys.executable, str(ROOT / "tools" / "vram_benchmark.py"), "--tier", str(resolved)]
+        # The UI is an interactive fit/calibration check, so keep it short and
+        # deterministic.  The CLI still exposes full tier-stress defaults and
+        # explicit overrides for release benchmarking.
+        command = [
+            sys.executable,
+            str(ROOT / "tools" / "vram_benchmark.py"),
+            "--tier",
+            str(resolved),
+            "--beams",
+            "1",
+            "--text-tokens",
+            "60",
+            "--batch",
+            "1",
+        ]
         if emulate_value:
             command.append("--emulate")
         if subtitle_value:
