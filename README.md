@@ -26,6 +26,8 @@ Voice cloning, long-form narration, caption-timed audio and MP4, batch productio
 
 ### Windows one-click install or update
 
+![Installer Files](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/jXo3_Htdr-kvok9AA3dVF.png)
+
 Place the downloaded package in a short writable path such as `G:\Index_TTS_v4`. Before the first install, provide Python 3.12.10 or newer, Git, FFmpeg, CUDA 13.0, cuDNN 9.17 or newer, and Visual Studio Community with the C++ workload. Then run `Windows_Install_or_Update.bat`.
 
 The installer clones or updates `Premium_IndexTTS2_SECourses`, creates its Python 3.12 virtual environment, installs `uv`, resolves the requirements, and runs the model downloader. If it detects local source changes, it deliberately skips `git pull` rather than overwriting them.
