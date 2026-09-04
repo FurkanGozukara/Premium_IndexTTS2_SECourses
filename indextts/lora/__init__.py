@@ -1,0 +1,57 @@
+"""Public LoRA/DoRA API for IndexTTS 2.5."""
+
+from .apply import (
+    LoraHandle,
+    apply_lora,
+    get_lora_handle,
+    inject_adapters,
+    list_target_modules,
+    merge_lora_for_inference,
+    merge_lora_into_model,
+    move_adapters_to_device,
+    remove_lora,
+    set_lora_strength,
+    set_training_mode,
+    trainable_parameters,
+    unmerge_lora_from_model,
+)
+from .io import (
+    LoraEntry,
+    LoraFile,
+    LoraMetadata,
+    inspect_lora,
+    load_lora,
+    load_train_state,
+    resume_state_path_for,
+    save_lora,
+    save_train_state,
+    scan_lora_files,
+)
+from .layers import LoRAAdapter
+
+__all__ = [
+    "LoRAAdapter",
+    "LoraEntry",
+    "LoraFile",
+    "LoraHandle",
+    "LoraMetadata",
+    "apply_lora",
+    "get_lora_handle",
+    "inject_adapters",
+    "inspect_lora",
+    "list_target_modules",
+    "load_lora",
+    "load_train_state",
+    "merge_lora_for_inference",
+    "merge_lora_into_model",
+    "move_adapters_to_device",
+    "remove_lora",
+    "resume_state_path_for",
+    "save_lora",
+    "save_train_state",
+    "scan_lora_files",
+    "set_lora_strength",
+    "set_training_mode",
+    "trainable_parameters",
+    "unmerge_lora_from_model",
+]

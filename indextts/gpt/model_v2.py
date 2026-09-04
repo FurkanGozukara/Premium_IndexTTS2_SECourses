@@ -32,8 +32,21 @@ from indextts.utils.typical_sampling import TypicalLogitsWarper
 from indextts.utils.tokenizer import LANGUAGE_DICT
 
 
-def null_position_embeddings(range, dim):
-    return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
+def null_position_embeddings(range, dim, embedding=None):
+    """Return disabled position embeddings without promoting reduced precision inputs."""
+
+    reference = getattr(embedding, "weight", embedding)
+    if isinstance(reference, torch.Tensor):
+        dtype = reference.dtype
+        device = reference.device
+    else:
+        dtype = range.dtype if range.is_floating_point() else torch.get_default_dtype()
+        device = range.device
+    return torch.zeros(
+        (range.shape[0], range.shape[1], dim),
+        device=device,
+        dtype=dtype,
+    )
 
 
 class ResBlock(nn.Module):
@@ -113,9 +126,11 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
                 has_past = bool(first_layer) and first_layer[0].shape[-2] > 0
         # only last token for inputs_ids if past is defined in kwargs
         if has_past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
+            next_length = kwargs.get("next_sequence_length")
+            next_length = max(1, int(next_length)) if next_length is not None else 1
+            input_ids = input_ids[:, -next_length:]
             if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+                token_type_ids = token_type_ids[:, -next_length:]
 
         attention_mask = kwargs.get("attention_mask", None)
         position_ids = kwargs.get("position_ids", None)
@@ -125,13 +140,13 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             if has_past:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
+                position_ids = position_ids[:, -input_ids.shape[1]:]
         else:
             position_ids = None
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
+            "use_cache": kwargs.get("use_cache", self.kv_cache),
             "position_ids": position_ids,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
@@ -223,6 +238,10 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         :meth:`~transformers.PreTrainedModel.beam_search` or :meth:`~transformers.PreTrainedModel.beam_sample` is
         called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
         """
+        if hasattr(past, "reorder_cache"):
+            # transformers 5 cache objects reorder in place and return None.
+            past.reorder_cache(beam_idx)
+            return past
         return tuple(
             tuple(
                 past_state.index_select(0, beam_idx.to(past_state.device))
@@ -275,7 +294,28 @@ class LearnedPositionEmbeddings(nn.Module):
         return self.emb(torch.tensor([ind], device=dev)).unsqueeze(0)
 
 
-def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text_seq_len, checkpointing):
+def _resolve_attention_backend(attention_backend):
+    backend = str(attention_backend or "sdpa").strip().lower()
+    if backend not in {"sdpa", "flash_attention_2", "eager"}:
+        backend = "sdpa"
+    if backend == "flash_attention_2":
+        try:
+            import flash_attn  # noqa: F401
+        except (ImportError, OSError):
+            print(">> flash-attn is unavailable; GPT attention is falling back to SDPA.")
+            backend = "sdpa"
+    return backend
+
+
+def build_hf_gpt_transformer(
+    layers,
+    model_dim,
+    heads,
+    max_mel_seq_len,
+    max_text_seq_len,
+    checkpointing,
+    attention_backend="sdpa",
+):
     """
     GPT-2 implemented by the HuggingFace library.
     """
@@ -290,10 +330,13 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
                             eos_token_id=None,
                             gradient_checkpointing=checkpointing,
                             use_cache=not checkpointing)
+    gpt_config._attn_implementation = _resolve_attention_backend(attention_backend)
     gpt = GPT2Model(gpt_config)
     # Override the built in positional embeddings
     del gpt.wpe
-    gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
+    # LayerNorm stays registered when the unused token embedding below is removed,
+    # so its weight tracks the live GPT compute dtype and device.
+    gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim, embedding=gpt.ln_f)
     # Built-in token embeddings are unused.
     del gpt.wte
     return gpt, LearnedPositionEmbeddings(max_mel_seq_len, model_dim), LearnedPositionEmbeddings(max_text_seq_len, model_dim), \
@@ -330,7 +373,7 @@ class UnifiedVoice(nn.Module):
                  train_solo_embeddings=False, use_mel_codes_as_input=True,
                  checkpointing=True, types=1,
                  condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False,
-                 spk_cond_mode="conformer"):
+                 spk_cond_mode="conformer", attention_backend="sdpa"):
         """
         Args:
             layers: Number of layers in transformer stack.
@@ -418,7 +461,7 @@ class UnifiedVoice(nn.Module):
             self.mel_embedding = MelEncoder(model_dim, resblocks_per_reduction=1)
         self.gpt, self.mel_pos_embedding, self.text_pos_embedding, self.mel_layer_pos_embedding, self.text_layer_pos_embedding = \
             build_hf_gpt_transformer(layers, model_dim, heads, self.max_mel_tokens + 2 + self.max_conditioning_inputs,
-                                     self.max_text_tokens + 2, checkpointing)
+                                     self.max_text_tokens + 2, checkpointing, attention_backend)
         if train_solo_embeddings:
             self.mel_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
             self.text_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
@@ -438,9 +481,10 @@ class UnifiedVoice(nn.Module):
             module.weight.data.normal_(mean=0.0, std=.02)
 
         self.use_accel = use_accel
+        self.attention_backend = self.gpt.config._attn_implementation
         self.accel_engine = None  # Will be initialized in post_init_gpt2_config
 
-    def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):
+    def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False, dtype=None):
         seq_length = self.max_mel_tokens + self.max_text_tokens + 2
         gpt_config = GPT2Config(
             vocab_size=self.number_mel_codes,
@@ -454,6 +498,7 @@ class UnifiedVoice(nn.Module):
             gradient_checkpointing=False,
             use_cache=True,
         )
+        gpt_config._attn_implementation = self.attention_backend
 
         if self.use_accel and torch.cuda.is_available():
             # Check if flash attention is available
@@ -468,10 +513,8 @@ class UnifiedVoice(nn.Module):
             accel_gpt = GPT2AccelModel(gpt_config)
             accel_gpt.load_state_dict(self.gpt.state_dict(), strict=False)
 
-            if half:
-                accel_gpt = accel_gpt.half().cuda()
-            else:
-                accel_gpt = accel_gpt.cuda()
+            accel_dtype = dtype or (torch.float16 if half else next(self.gpt.parameters()).dtype)
+            accel_gpt = accel_gpt.to(device="cuda", dtype=accel_dtype)
             accel_gpt.eval()
 
             lm_head_with_norm = nn.Sequential(self.final_norm, self.mel_head)
@@ -842,12 +885,20 @@ class UnifiedVoice(nn.Module):
         max_length = (trunc_index + self.max_mel_tokens - 1) if max_generate_length is None else trunc_index + max_generate_length
 
         # Use accel engine if available (single sequence only)
-        if self.accel_engine is not None and num_return_sequences == 1:
+        if (
+            self.accel_engine is not None
+            and num_return_sequences == 1
+            and int(hf_generate_kwargs.get("num_beams", 1)) == 1
+        ):
             output = self.accel_engine.generate(
                 inputs,  # fake input_ids (all 1s + start_mel_token)
                 max_new_tokens=max_length - trunc_index,
                 attention_mask=attention_mask,
-                temperature=hf_generate_kwargs.get('temperature', 1),
+                temperature=(
+                    hf_generate_kwargs.get("temperature", 1.0)
+                    if hf_generate_kwargs.get("do_sample", True)
+                    else 0.0
+                ),
                 stop_tokens=[self.stop_mel_token],
                 tts_embeddings=inputs_embeds,  # [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
                 tts_mel_embedding=self.inference_model.embeddings,  # mel_embedding layer

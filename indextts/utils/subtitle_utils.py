@@ -5,12 +5,14 @@ import os
 import re
 import shutil
 import subprocess
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 import wave
 
 import librosa
 import numpy as np
 from scipy.signal import resample
+
+from indextts.utils.text_encoding import read_text_resilient
 
 
 TIMECODE_RE = re.compile(
@@ -70,24 +72,18 @@ def format_srt_timestamp(value_ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
-def read_subtitle_file(path: str) -> str:
-    last_error = None
-    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
-        try:
-            with open(path, "r", encoding=encoding) as handle:
-                return handle.read()
-        except UnicodeError as exc:
-            last_error = exc
-
-    if last_error is not None:
-        raise last_error
-
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
+def read_subtitle_file(
+    path: str,
+    warning_callback: Callable[[str], None] | None = None,
+) -> str:
+    return read_text_resilient(path, warning_callback=warning_callback)
 
 
-def read_srt_file(path: str) -> str:
-    return read_subtitle_file(path)
+def read_srt_file(
+    path: str,
+    warning_callback: Callable[[str], None] | None = None,
+) -> str:
+    return read_subtitle_file(path, warning_callback=warning_callback)
 
 
 def get_subtitle_extension(path: str | None) -> str:
@@ -223,10 +219,16 @@ def parse_subtitle(content: str, extension: str | None = None) -> List[SubtitleC
     )
 
 
-def parse_subtitle_file(path: str | None) -> List[SubtitleCue]:
+def parse_subtitle_file(
+    path: str | None,
+    warning_callback: Callable[[str], None] | None = None,
+) -> List[SubtitleCue]:
     if not path:
         return []
-    return parse_subtitle(read_subtitle_file(path), get_subtitle_extension(path))
+    return parse_subtitle(
+        read_subtitle_file(path, warning_callback=warning_callback),
+        get_subtitle_extension(path),
+    )
 
 
 def subtitle_cues_to_text(cues: Sequence[SubtitleCue]) -> str:

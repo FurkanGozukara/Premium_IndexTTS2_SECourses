@@ -1,28 +1,37 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Index TTS2 Premium SECourses App">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">IndexTTS 2.5 Premium</title>
+  <desc id="desc">A microphone and voice waveform with a 2.5 badge</desc>
   <defs>
-    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#7d0f26"/>
-      <stop offset="48%" stop-color="#be2348"/>
-      <stop offset="100%" stop-color="#ff7c72"/>
+    <linearGradient id="accent" x1="18" y1="12" x2="112" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#78102c"/>
+      <stop offset="0.5" stop-color="#a11236"/>
+      <stop offset="1" stop-color="#ff7568"/>
     </linearGradient>
-    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ffffff" stop-opacity=".42"/>
-      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    <linearGradient id="mic" x1="45" y1="24" x2="84" y2="82" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#ffe6df"/>
     </linearGradient>
-    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#fff7f5"/>
-      <stop offset="100%" stop-color="#ffe2cf"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#711127" flood-opacity=".28"/>
-    </filter>
   </defs>
-  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#panel)" filter="url(#shadow)"/>
-  <path d="M17 16h94c-5 20-21 30-47 30S22 36 17 16Z" fill="url(#gloss)"/>
-  <rect x="25" y="60" width="14" height="32" rx="7" fill="#fff6f4"/>
-  <rect x="89" y="60" width="14" height="32" rx="7" fill="#fff6f4"/>
-  <path d="M34 77c0-20 13.4-36 30-36s30 16 30 36" fill="none" stroke="#fff4f0" stroke-linecap="round" stroke-width="8"/>
-  <path d="M31 51h9v26h-9zM46 40h10v48H46zM62 33h10v62H62zM78 45h10v38H78z" fill="url(#wave)"/>
-  <circle cx="99" cy="29" r="12" fill="#fff0c4"/>
-  <path d="M99 19.5l2.4 5.4 5.9.5-4.4 4 1.3 5.8-5.2-3-5.2 3 1.2-5.8-4.3-4 5.9-.5z" fill="#b36300"/>
+
+  <rect x="5" y="5" width="118" height="118" rx="25" fill="url(#accent)"/>
+  <rect x="7.5" y="7.5" width="113" height="113" rx="22.5" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="5"/>
+
+  <g fill="#fff" opacity="0.9">
+    <rect x="20" y="53" width="6" height="21" rx="3"/>
+    <rect x="30" y="43" width="6" height="41" rx="3"/>
+    <rect x="92" y="43" width="6" height="41" rx="3"/>
+    <rect x="102" y="53" width="6" height="21" rx="3"/>
+  </g>
+
+  <rect x="43" y="22" width="42" height="59" rx="21" fill="url(#mic)"/>
+  <g fill="#a11236">
+    <rect x="54" y="34" width="20" height="4" rx="2"/>
+    <rect x="54" y="44" width="20" height="4" rx="2"/>
+    <rect x="54" y="54" width="20" height="4" rx="2"/>
+  </g>
+  <path d="M35 62v4c0 17 12.7 29 29 29s29-12 29-29v-4" fill="none" stroke="#fff" stroke-linecap="round" stroke-width="7"/>
+  <path d="M64 95v13M50 108h28" fill="none" stroke="#fff" stroke-linecap="round" stroke-width="7"/>
+
+  <rect x="76" y="87" width="43" height="29" rx="8" fill="#580820" stroke="#ffb0a4" stroke-width="3"/>
+  <text x="97.5" y="107.5" fill="#fff" font-family="Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle">2.5</text>
 </svg>

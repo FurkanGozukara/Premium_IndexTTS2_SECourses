@@ -456,6 +456,10 @@ class AccelInferenceEngine:
                 token_ids = input_ids[i].tolist()
             req = Seq(token_ids)
             self.kv_manager.allocate(req)
+            if tts_embeddings is not None:
+                # Synthetic prompt token IDs do not identify the real TTS embeddings.
+                # Never reuse their KV blocks across requests.
+                req.num_cached_tokens = 0
             sequences.append(req)
 
         self.current_sequences = sequences

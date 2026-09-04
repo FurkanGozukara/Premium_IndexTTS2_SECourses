@@ -1,11 +1,32 @@
 # IndexTTS2 SECourses Premium Voice Cloning and Generation App - 1-Click to Install on Windows, RunPod and Massed Compute - Generate Entire Audiobooks With Consistent High Quality Voice
 
-## 2 September 2026 IndexTTS 2.5 Upgrade
+## 2 September 2026 V5 IndexTTS 2.5 Upgrade
 
-- Uses the official `IndexTeam/IndexTTS-2.5` model and multilingual 2.5 inference stack.
-- Downloads and loads every model from the repository-relative `models` folder.
-- Stores read-only application defaults in `presets/system` and user global presets in `presets/user`, so a user preset cannot overwrite a system preset.
-- Supports real section micro-batching, subprocess cancellation, emotion reference/text/vector controls, caption timing, and main-process generation on IndexTTS 2.5.
+- IndexTTS 2.5-only inference using the official multilingual model stack, with all 1.x and 2.0 paths removed.
+- GPU VRAM presets for 6, 8, 10, 12, 16, 24, and 32 GB cards, including GPT block swapping for lower-VRAM GPUs.
+- Optional INT8 ConvRot GPT model for memory-efficient generation while retaining the required 2.5 codec and vocoder models.
+- LoRA / DoRA dataset preparation and training tabs, including subtitle-driven segmentation and training progress charts.
+- Checkpoint Grid tab for listening to Base model (no LoRA / DoRA), the recommended checkpoint, final file, saved epochs, and strength variants with identical text, references, and seed.
+- Automatic generalization analysis identifies the lowest validation-loss epoch, marks the sustained overfitting region, and makes Voice Generation prefer the recommended checkpoint.
+- Optional validation-based early stopping and automatic measured checkpoint evaluation after the training model releases its memory.
+- Evaluation can use inference-like references from a different clip of the same speaker, matching the normal voice-cloning workflow more closely.
+- Measured quality-first training defaults use rank 128, alpha 129, batch size 1, no gradient accumulation, learning rate 4e-5, 10 epochs, 200 warmup steps, and inference-like conditioning (`speaker_ref_mode=other`, `emo_ref_mode=follow_speaker`, `val_reference_mode=other`). With batch size 1 and accumulation 1, each epoch gives one optimizer update per training clip.
+- Per-voice speaking-rate calibration compares generated words/s with the training recordings and auto-applies the saved pace in Voice Generation; the Checkpoint Grid can calibrate older runs too.
+- Every LoRA / DoRA keeps machine-readable and plain-language reports under `loras/<lora-or-dora>/analysis/`; listening grids are saved under `outputs/grids/`.
+- The header's **🕘  Load last values** button restores the last run of every tab; earlier results stay hidden until it is clicked.
+- Batch voice generation with reusable system and user presets.
+- Live generation, download, dataset, and training progress with speed and ETA reporting.
+- Cross-platform one-click installers and launchers for Windows, Massed Compute, RunPod, SimplePod, and other Linux hosts.
+- Models & Performance tab: pick your GPU VRAM tier (6/8/10/12/16/24/32 GB); every tier was calibrated to keep about 2 GB of VRAM free. Lower tiers switch to the INT8 ConvRot GPT and stream GPT blocks from CPU RAM (block swap); the INT8 file is downloaded automatically from Hugging Face when needed.
+- Presets: system presets live in `presets/system` (read-only, marked with a star) and your own presets in `presets/user`; a preset stores every parameter of every tab, and the last-used preset is restored at startup.
+- LoRA Dataset Preparation: drop any audio/video files (with optional SRT/VTT/SBV subtitles); audio is extracted with FFmpeg, transcribed with Whisper (word timestamps), cut into sentence-aligned segments using the measured 4-20 second range and 14 second target, deduplicated by spoken sentence, loudness normalized, and cached as training features.
+- Drop videos with or without captions, any file names, Windows and Linux.
+- LoRA / DoRA Training: rank/alpha/dropout, DoRA toggle, learning-rate schedule, gradient checkpointing, block swap for low VRAM, validation split, a live optimizer-update plan, periodic audio samples, live loss/learning-rate charts, resume from an existing LoRA / DoRA, single `.safetensors` output that the Voice Generation tab loads (with a strength slider) from the LoRA / DoRA dropdown.
+- Cancel/Stop buttons ask for confirmation and really stop the worker process; every long task reports progress, it/s, ETA, and VRAM in both the UI and the console.
+- Resume training from any saved LoRA / DoRA: "Weights only" starts a fresh schedule from the LoRA / DoRA weights, "Continue run" restores the optimizer, scheduler and step counter and trains the extra epochs/steps you configure.
+- Reloading starts with clean result panels; finished jobs and outputs are not restored automatically.
+- Selecting the INT8 ConvRot model downloads it automatically on first use (with progress); if the download fails the app falls back to the BF16 model and tells you why.
+- Tested on Windows 11 with an RTX 5090 (all seven VRAM tiers verified with GPU 0 otherwise idle), Python 3.12, PyTorch CUDA 13.0, transformers 5, Gradio 6.
 
 ## This app is made only for SECourses Patreon users : https://www.patreon.com/posts/139297407
 

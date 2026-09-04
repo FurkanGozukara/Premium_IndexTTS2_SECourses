@@ -6,6 +6,10 @@ import os
 import sys
 import traceback
 
+from indextts.utils.console_encoding import configure_console_output
+
+os.environ["PYTHONUNBUFFERED"] = "1"
+configure_console_output()
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -31,7 +35,10 @@ def main() -> int:
         request = json.load(handle)
 
     try:
-        tts = create_tts(request["runtime"])
+        tts = create_tts(
+            request["runtime"],
+            progress_file=request.get("progress_file"),
+        )
         result = run_generation_request(request, tts, progress_callback=None)
         payload = {"status": "ok", **result}
         exit_code = 0
@@ -40,7 +47,9 @@ def main() -> int:
         payload = {"status": "error", "error": str(exc)}
         exit_code = 1
 
-    os.makedirs(os.path.dirname(args.result_file), exist_ok=True)
+    result_dir = os.path.dirname(args.result_file)
+    if result_dir:
+        os.makedirs(result_dir, exist_ok=True)
     with open(args.result_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
