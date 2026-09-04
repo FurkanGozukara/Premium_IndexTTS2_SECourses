@@ -40,11 +40,43 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-tokens", type=int)
     parser.add_argument("--batch", type=int)
     parser.add_argument("--lora-path", type=Path)
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        help="Reference audio; defaults to the bundled example, then reference_audios/demo_voice.mp3",
+    )
     parser.add_argument("--emulate", action="store_true")
     parser.add_argument("--subtitle", action="store_true", help="Also exercise the multi-text/subtitle path")
     parser.add_argument("--json-out", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     return parser
+
+
+def _resolve_reference_audio(
+    value: Path | None,
+    *,
+    root: Path = ROOT,
+) -> Path:
+    if value is not None:
+        candidate = value.expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        candidates = [candidate.resolve()]
+    else:
+        candidates = [
+            root / "examples" / "voice_01.wav",
+            root / "reference_audios" / "demo_voice.mp3",
+        ]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    attempted = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"VRAM benchmark reference audio is missing. Tried: {attempted}. "
+        "Pass --reference PATH to use another audio file."
+    )
 
 
 def _wait_for_idle(timeout_s: float = 1800.0) -> None:
@@ -102,11 +134,7 @@ def _wait_for_idle(timeout_s: float = 1800.0) -> None:
 
 
 def run_one(args: argparse.Namespace) -> dict[str, Any]:
-    import librosa
-    import torch
-
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    _wait_for_idle()
     config = resolve_preset(str(args.tier), float(args.tier))
     hints = generation_hints(args.tier)
     beams = max(1, int(args.beams if args.beams is not None else hints["num_beams_max"]))
@@ -141,6 +169,13 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     output_path = output_dir / f"tier_{args.tier}_{os.getpid()}.wav"
 
     try:
+        reference_audio = _resolve_reference_audio(args.reference)
+        result["reference_audio"] = str(reference_audio)
+
+        import librosa
+        import torch
+
+        _wait_for_idle()
         if args.emulate:
             cap_gb = max(0.5, args.tier - config.vram_reserve_gb)
             fraction = apply_vram_cap("cuda:0", cap_gb)
@@ -164,11 +199,6 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
 
         torch.cuda.reset_peak_memory_stats(0)
         generation_started = time.perf_counter()
-        reference_audio = ROOT / "examples" / "voice_01.wav"
-        if not reference_audio.is_file():
-            raise FileNotFoundError(
-                f"Bundled benchmark reference audio is missing: {reference_audio}"
-            )
         common = {
             "spk_audio_prompt": str(reference_audio),
             "lang": "EN",
@@ -263,6 +293,7 @@ def run_all(args: argparse.Namespace) -> int:
     output_dir = ROOT / "outputs" / "vram_benchmark"
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
+    reference_audio = _resolve_reference_audio(args.reference)
     for tier in VRAM_TIERS:
         command = [sys.executable, str(Path(__file__).resolve()), "--tier", str(tier), "--child"]
         for name, flag in (
@@ -280,6 +311,7 @@ def run_all(args: argparse.Namespace) -> int:
             command.append("--subtitle")
         if args.lora_path:
             command.extend(["--lora-path", str(args.lora_path)])
+        command.extend(["--reference", str(reference_audio)])
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "0"
         env["PYTHONUNBUFFERED"] = "1"

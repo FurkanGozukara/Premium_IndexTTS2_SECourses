@@ -121,6 +121,39 @@ def test_cpu_ui_flow_mappings_without_loading_models(tmp_path):
     mapped_grid = grid_status_updates(str(grid_state), output_root=tmp_path / "grids")
     assert "25.0%" in mapped_grid[1]
     assert "Attached to running grid" in mapped_grid[2]
+    partial_grid = {
+        "grid_dir": str(grid_state.resolve()),
+        "grid_name": "voice_grid",
+        "config": {},
+        "seed": 1,
+        "cells": [],
+        "status": "running",
+        "summary_markdown": "",
+        "generated_at": "2026-09-04T00:00:00+00:00",
+        "elapsed_s": 9.0,
+    }
+    (grid_state / "grid.json").write_text(
+        json.dumps(partial_grid), encoding="utf-8"
+    )
+    mapped_partial = grid_status_updates(
+        str(grid_state), output_root=tmp_path / "grids"
+    )
+    assert mapped_partial[4] == ""
+
+    complete_status = {
+        "phase": "complete",
+        "message": "Listening grid complete",
+        "completed": 4,
+        "total": 4,
+        "elapsed_s": 18.0,
+    }
+    (grid_state / "status.json").write_text(
+        json.dumps(complete_status), encoding="utf-8"
+    )
+    mapped_complete = grid_status_updates(
+        str(grid_state), output_root=tmp_path / "grids"
+    )
+    assert mapped_complete[4] == str(grid_state.resolve())
 
 
 def _write_output(folder: Path, task_id: str) -> None:

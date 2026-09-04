@@ -33,6 +33,7 @@ from ui.grid_tab import (
     _evaluation_reference_line,
     _grid_result_heading,
     _grid_rows,
+    _renderable_grid_cells,
     build_grid_config_from_ui,
     calibrate_grid_speaking_rates,
 )
@@ -147,6 +148,18 @@ def test_grid_result_headers_explain_checkpoint_type_and_base_model() -> None:
         "Evaluation references used by this report: **other (inference-like: a "
         "different clip of the same speaker)**."
     )
+
+
+def test_renderable_grid_cells_omit_blank_and_missing_audio(tmp_path: Path) -> None:
+    audio = tmp_path / "complete.wav"
+    _wav(audio)
+    complete = SimpleNamespace(audio_path=str(audio))
+    pending = SimpleNamespace(audio_path="")
+    missing = SimpleNamespace(audio_path=str(tmp_path / "missing.wav"))
+
+    result = SimpleNamespace(cells=[complete, pending, missing])
+
+    assert _renderable_grid_cells(result) == [complete]
 
 
 def test_legacy_evaluation_and_grid_labels_upgrade_only_when_rendered(

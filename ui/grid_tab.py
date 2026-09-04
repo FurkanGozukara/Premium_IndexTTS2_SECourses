@@ -587,6 +587,17 @@ def _grid_rows(grid_dir: str | Path | None) -> list[list[Any]]:
     ]
 
 
+def _renderable_grid_cells(result: Any) -> list[Any]:
+    """Return only cells whose audio is ready for a Gradio player."""
+    if result is None:
+        return []
+    return [
+        cell
+        for cell in result.cells
+        if cell.audio_path and Path(cell.audio_path).is_file()
+    ]
+
+
 def _grid_result_heading(
     cell: Any, label_cache: dict[str, str] | None = None
 ) -> str:
@@ -651,7 +662,11 @@ def grid_status_updates(
     message = str(status.get("message") or phase.replace("_", " ").title())
     if running:
         message = f"Attached to running grid {root.name} | {message}"
-    result_state = state if (root / "grid.json").is_file() else ""
+    result_state = (
+        state
+        if phase in GRID_TERMINAL_PHASES and (root / "grid.json").is_file()
+        else ""
+    )
     return (
         state,
         progress_panel_html(progress or status, title=title),
@@ -1069,11 +1084,12 @@ def build_grid_tab(
             @gr.render(inputs=tab.result_state, triggers=[tab.result_state.change])
             def render_grid(result_dir: str | None):
                 result = load_grid(result_dir) if result_dir else None
-                if result is None:
+                cells = _renderable_grid_cells(result)
+                if not cells:
                     return
                 label_cache: dict[str, str] = {}
                 groups: list[tuple[tuple[str, float], list[Any]]] = []
-                for cell in result.cells:
+                for cell in cells:
                     key = (cell.checkpoint_label, cell.strength)
                     match = next((item for item in groups if item[0] == key), None)
                     if match is None:
@@ -1187,7 +1203,9 @@ def build_grid_tab(
         references,
         queue=False,
     )
-    tab.saved_grids.change(
+    # Completion polling also updates this dropdown.  Listen only to direct user
+    # input so that a completed grid cannot trigger two overlapping renders.
+    tab.saved_grids.input(
         lambda path: (path or "", _grid_rows(path), f"Opened saved grid {Path(path).name}." if path else "Select a saved grid."),
         tab.saved_grids,
         [tab.result_state, tab.result_table, tab.status],

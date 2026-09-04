@@ -151,6 +151,16 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "epoch_001",
     ]
 
+    saved_grid = components[("dropdown", "Saved grids")]
+    saved_grid_targets = [
+        target
+        for dependency in demo.config["dependencies"]
+        for target in dependency["targets"]
+        if target[0] == saved_grid["id"]
+    ]
+    assert (saved_grid["id"], "input") in saved_grid_targets
+    assert (saved_grid["id"], "change") not in saved_grid_targets
+
 
 def test_blank_batch_folder_does_not_scan_working_directory(tmp_path, monkeypatch):
     (tmp_path / "unrelated.txt").write_text("must not be included", encoding="utf-8")
