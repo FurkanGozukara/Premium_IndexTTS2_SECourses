@@ -7,8 +7,6 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-> This guide was built from full source audits and real Chrome testing. The 62 annotated screenshots document the V5 control layout at native 3840 x 2160; V6 keeps that layout, and this maintenance pass re-audited the live V6 interface and source, rebuilt the 253-control inventory, and passed 288 tests with 37 environment-specific skips. Where behavior changed, the V6 text below takes precedence over the Version 5.0 label visible in the original captures.
-
 **V6 maintenance update:** the main workflows and registered settings remain compatible with the screenshots, while the following user-visible behavior is new or corrected.
 
 - Record a reference directly from the browser microphone, alongside upload, local-path, library, adapter, and recent-output sources.
