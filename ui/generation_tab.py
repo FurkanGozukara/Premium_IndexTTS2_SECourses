@@ -1893,7 +1893,7 @@ def build_generation_tab(
 
         with gr.Accordion("Execution", open=False):
             with gr.Row():
-                use_subprocess = gr.Checkbox(value=True, label="Use isolated subprocess", info="Recommended: cancellation can terminate the complete model process and release VRAM.")
+                use_subprocess = gr.Checkbox(value=False, label="Use isolated subprocess", info="Recommended: cancellation can terminate the complete model process and release VRAM.")
                 batch_size = gr.Slider(1, 16, value=1, step=1, label="Section batch size", info="1 is safest; use the active VRAM tier hint before increasing this.")
                 low_memory = gr.Checkbox(value=False, label="Low memory mode", info="Uses sequential paths and aggressive memory behavior for constrained GPUs.")
                 prevent = gr.Checkbox(value=False, label="Prevent VRAM accumulation", info="Clears autoregressive caches between segments; slower but useful for long jobs.")
