@@ -32,6 +32,7 @@ desktop.ini
 !/checkpoints/*.yaml
 /models/
 /outputs/
+/examples/
 indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
 a.png
 demo_voice_for_test.mp3
