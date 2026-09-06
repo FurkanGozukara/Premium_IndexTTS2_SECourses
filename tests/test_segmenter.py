@@ -55,4 +55,4 @@ def test_snap_boundaries_to_synthetic_silence() -> None:
     segment = Segment(1000, 3000, "A synthetic sentence.", (1,))
     snapped = snap_boundaries_to_silence(segment, envelope, hop_ms=10, window_ms=200)
     assert snapped.start_ms == 900
-    assert snapped.end_ms == 3100
+    assert snapped.end_ms == 3110

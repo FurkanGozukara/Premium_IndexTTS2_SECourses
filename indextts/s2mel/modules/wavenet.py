@@ -136,6 +136,9 @@ class WN(torch.nn.Module):
             self.res_skip_layers.append(res_skip_layer)
 
     def forward(self, x, x_mask, g=None, **kwargs):
+        # Padded transformer states must not enter the first temporal
+        # convolution and bleed into the last valid frames of shorter speech.
+        x = x * x_mask
         output = torch.zeros_like(x)
         n_channels_tensor = torch.IntTensor([self.hidden_channels])
 

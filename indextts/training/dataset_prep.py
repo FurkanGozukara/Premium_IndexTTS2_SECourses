@@ -498,6 +498,50 @@ def _split_overlong(
     return output
 
 
+def _shared_word_boundary(
+    previous: Segment,
+    current: Segment,
+    energy: np.ndarray,
+    config: DatasetPrepConfig,
+) -> int:
+    """Refine touching ASR word times within the two boundary words only."""
+    previous_word = previous.word_timestamps[-1]
+    current_word = current.word_timestamps[0]
+    previous_end = int(round(float(previous_word["end_s"]) * 1000.0))
+    current_start = int(round(float(current_word["start_s"]) * 1000.0))
+    boundary = (previous_end + current_start) // 2
+    if not config.snap_to_silence or config.snap_window_ms <= 0:
+        return boundary
+
+    # Whisper can assign the last word's release to the next word. Clamping
+    # both clips to that shared timestamp makes silence snapping ineffective.
+    # Search inside these two words, without reaching another word, and require
+    # a quiet run instead of mistaking an isolated in-word dip for a pause.
+    hop_ms = 10
+    radius = config.snap_window_ms + config.pad_ms
+    # Never move an end before its aligned final word: a plosive closure within
+    # that word can be quieter than the real pause that follows it.
+    low = max(boundary - radius, previous_end)
+    high = min(boundary + radius, int(round(float(current_word["end_s"]) * 1000.0)) - 1)
+    first = max(0, int(math.ceil(low / hop_ms)))
+    stop = min(len(energy), int(math.floor(high / hop_ms)))
+    window = np.asarray(energy[first:stop], dtype=np.float32)
+    if window.size < 3:
+        return boundary
+    threshold = min(10.0 ** (config.silence_threshold_dbfs / 20.0), float(window.max()) * 0.1)
+    quiet = window <= threshold
+    edges = np.diff(np.pad(quiet.astype(np.int8), (1, 1)))
+    runs = [
+        (first + start, first + end)
+        for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
+        if end - start >= 3
+    ]
+    if not runs:
+        return boundary
+    start, end = min(runs, key=lambda run: abs((run[0] + run[1]) * hop_ms / 2 - boundary))
+    return int((start + end) * hop_ms // 2)
+
+
 def _snap_segments(
     segments: Sequence[Segment],
     energy: np.ndarray,
@@ -505,15 +549,10 @@ def _snap_segments(
     *,
     protect_words: bool = False,
 ) -> list[Segment]:
-    if not config.snap_to_silence:
+    if not config.snap_to_silence and not protect_words:
         return [replace(segment) for segment in segments]
     snapped: list[Segment] = []
     for index, segment in enumerate(segments):
-        first_word_start = None
-        last_word_end = None
-        if protect_words and segment.word_timestamps:
-            first_word_start = int(round(float(segment.word_timestamps[0]["start_s"]) * 1000.0))
-            last_word_end = int(round(float(segment.word_timestamps[-1]["end_s"]) * 1000.0))
         if protect_words and index and segments[index - 1].word_timestamps:
             previous_end = int(
                 round(float(segments[index - 1].word_timestamps[-1]["end_s"]) * 1000.0)
@@ -526,16 +565,20 @@ def _snap_segments(
             )
         else:
             next_start = segments[index + 1].start_ms if index + 1 < len(segments) else None
-        candidate = snap_boundaries_to_silence(
-            segment,
-            energy,
-            hop_ms=10,
-            window_ms=config.snap_window_ms,
-            previous_end_ms=previous_end,
-            next_start_ms=next_start,
-            start_upper_ms=first_word_start,
-            end_lower_ms=last_word_end,
-        )
+        if config.snap_to_silence:
+            candidate = snap_boundaries_to_silence(
+                segment,
+                energy,
+                hop_ms=10,
+                window_ms=config.snap_window_ms,
+                previous_end_ms=previous_end,
+                next_start_ms=next_start,
+                # Padding protects audio beyond imperfect word timestamps.
+                start_upper_ms=segment.start_ms if protect_words else None,
+                end_lower_ms=segment.end_ms if protect_words else None,
+            )
+        else:
+            candidate = replace(segment)
         if protect_words:
             snapped.append(candidate)
         else:
@@ -553,14 +596,12 @@ def _snap_segments(
         for index in range(1, len(snapped)):
             previous = snapped[index - 1]
             current = snapped[index]
-            if previous.end_ms > current.start_ms:
-                previous_word_end = int(
-                    round(float(previous.word_timestamps[-1]["end_s"]) * 1000.0)
-                )
-                current_word_start = int(
-                    round(float(current.word_timestamps[0]["start_s"]) * 1000.0)
-                )
-                boundary = max(previous_word_end, min(current_word_start, (previous.end_ms + current.start_ms) // 2))
+            if (
+                previous.end_ms >= current.start_ms
+                and previous.word_timestamps
+                and current.word_timestamps
+            ):
+                boundary = _shared_word_boundary(previous, current, energy, config)
                 snapped[index - 1] = replace(previous, end_ms=boundary)
                 snapped[index] = replace(current, start_ms=boundary)
     return snapped

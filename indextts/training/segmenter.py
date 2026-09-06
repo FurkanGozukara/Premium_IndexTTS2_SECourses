@@ -100,23 +100,26 @@ def snap_boundaries_to_silence(
     if energy.size == 0 or hop_ms <= 0 or window_ms <= 0:
         return replace(segment)
 
-    max_time_ms = int((energy.size - 1) * hop_ms)
+    # Each RMS value describes [i * hop, (i + 1) * hop), not a point.
+    # End boundaries may include the final frame of the recording.
+    max_time_ms = int(energy.size * hop_ms)
 
-    def minimum_near(boundary_ms: int, lower_ms: int, upper_ms: int) -> int:
+    def minimum_near(boundary_ms: int, lower_ms: int, upper_ms: int, *, end=False) -> int:
         low = max(0, boundary_ms - window_ms, lower_ms)
         high = min(max_time_ms, boundary_ms + window_ms, upper_ms)
         if high < low:
             return max(lower_ms, min(boundary_ms, upper_ms))
-        low_i = max(0, int(math.ceil(low / hop_ms)))
-        high_i = min(energy.size - 1, int(math.floor(high / hop_ms)))
+        offset = 1 if end else 0
+        low_i = max(0, int(math.ceil(low / hop_ms)) - offset)
+        high_i = min(energy.size - 1, int(math.floor(high / hop_ms)) - offset)
         if high_i < low_i:
             return max(lower_ms, min(boundary_ms, upper_ms))
         window = energy[low_i : high_i + 1]
         minimum = float(np.min(window))
         candidates = np.flatnonzero(np.isclose(window, minimum, rtol=1e-5, atol=1e-12)) + low_i
-        original_i = boundary_ms / float(hop_ms)
+        original_i = boundary_ms / float(hop_ms) - offset
         best_i = int(candidates[np.argmin(np.abs(candidates - original_i))])
-        return best_i * hop_ms
+        return (best_i + offset) * hop_ms
 
     start_lower = max(0, int(previous_end_ms or 0))
     start_upper = max(
@@ -133,7 +136,7 @@ def snap_boundaries_to_silence(
         else snapped_start + 1,
     )
     end_upper = max(end_lower, min(max_time_ms, int(next_start_ms or max_time_ms)))
-    snapped_end = minimum_near(segment.end_ms, end_lower, end_upper)
+    snapped_end = minimum_near(segment.end_ms, end_lower, end_upper, end=True)
     if snapped_end <= snapped_start:
         return replace(segment)
     return replace(segment, start_ms=int(snapped_start), end_ms=int(snapped_end))

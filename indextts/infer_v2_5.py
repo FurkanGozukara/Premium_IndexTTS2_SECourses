@@ -1050,6 +1050,60 @@ class IndexTTS2:
         self._progress_log(">> ==========================")
         return stats
 
+    @staticmethod
+    def _groups_by_valid_length(batch, lengths):
+        lengths = lengths.tolist()
+        if len(lengths) != batch.size(0):
+            raise ValueError("Each batch item must have its own valid length")
+        groups = {}
+        for row, length in enumerate(lengths):
+            length = int(length)
+            if length <= 0:
+                raise RuntimeError("The model generated no speech before its stop token")
+            if length > batch.size(-1):
+                raise ValueError("A valid length exceeds the padded batch width")
+            groups.setdefault(length, []).append(row)
+        return groups
+
+    @torch.no_grad()
+    def _prepare_batched_conditioning(self, codes, code_lens, *, duration_factor):
+        # The codec has temporal convolutions and the regulator normalizes over
+        # time. Masking their outputs cannot undo synthetic padding at the end
+        # of a shorter utterance. Decode equal-length groups before padding.
+        groups = self._groups_by_valid_length(codes, code_lens)
+        decoded = []
+        with self.residency.use("semantic_codec"):
+            for length, rows in groups.items():
+                semantic = self.semantic_codec.decode(codes[rows, :length])
+                target = max(1, int(round(semantic.size(1) * 1.72 * float(duration_factor))))
+                decoded.append((rows, semantic, target))
+        conditions = [None] * codes.size(0)
+        target_lengths = torch.empty(codes.size(0), dtype=torch.long, device=codes.device)
+        with self._use_s2mel():
+            for rows, semantic, target in decoded:
+                lengths = torch.full((len(rows),), target, dtype=torch.long, device=codes.device)
+                cond = self.s2mel.models["length_regulator"](
+                    semantic, ylens=lengths, n_quantizers=3, f0=None,
+                )[0]
+                for row, item in zip(rows, cond.unbind(0)):
+                    conditions[row] = item
+                target_lengths[rows] = target
+        return pad_sequence(conditions, batch_first=True), target_lengths
+
+    @torch.no_grad()
+    def _vocode_batched_mels(self, mels, mel_lengths):
+        # BigVGAN also uses temporal convolutions. Cut the mel inputs at their
+        # real endpoints, rather than cutting contaminated waveforms afterward.
+        groups = self._groups_by_valid_length(mels, mel_lengths)
+        waveforms = [None] * mels.size(0)
+        with self.residency.use("bigvgan"):
+            for length, rows in groups.items():
+                decoded = self.bigvgan(mels[rows, :, :length].float()).squeeze(1)
+                decoded = torch.clamp(32767 * decoded, -32767.0, 32767.0)
+                for row, item in zip(rows, decoded.unbind(0)):
+                    waveforms[row] = item.unsqueeze(0)
+        return waveforms
+
     @torch.no_grad()
     def _render_codes_segment(
         self,
@@ -1644,37 +1698,16 @@ class IndexTTS2:
                         max_consecutive=max_consecutive_silence,
                     )
 
-                max_code_len = max(1, int(code_lens.max().item()))
-                codes = codes[:, :max_code_len].clone()
-                for row_index, code_len in enumerate(code_lens.tolist()):
-                    if code_len < max_code_len:
-                        codes[row_index, code_len:] = 52
-                codes[(codes < 0) | (codes >= self.semantic_codec.codebook_size)] = 52
-
                 s2mel_started = time.perf_counter()
                 with torch.amp.autocast(
                     text_tokens.device.type,
                     enabled=False,
                     dtype=None,
                 ):
-                    with self.residency.use("semantic_codec"):
-                        semantic = self.semantic_codec.decode(codes)
-                    semantic_scale = semantic.size(1) / float(max_code_len)
-                    semantic_lengths = torch.clamp(
-                        torch.round(code_lens.float() * semantic_scale).long(),
-                        min=1,
-                    )
-                    target_lengths = torch.clamp(
-                        torch.round(semantic_lengths.float() * 1.72 * duration_factor).long(),
-                        min=1,
+                    cond, target_lengths = self._prepare_batched_conditioning(
+                        codes, code_lens, duration_factor=duration_factor,
                     )
                     with self._use_s2mel():
-                        cond = self.s2mel.models['length_regulator'](
-                            semantic,
-                            ylens=target_lengths,
-                            n_quantizers=3,
-                            f0=None,
-                        )[0]
                         batch_prompt = prompt_condition.expand(batch_count, -1, -1)
                         batch_ref_mel = ref_mel.expand(batch_count, -1, -1)
                         batch_style = style.expand(batch_count, -1)
@@ -1696,16 +1729,12 @@ class IndexTTS2:
                         vc_target = vc_target[:, :, ref_mel.size(-1):]
                     s2mel_time += time.perf_counter() - s2mel_started
                     vocoder_started = time.perf_counter()
-                    with self.residency.use("bigvgan"):
-                        wav_batch = self.bigvgan(vc_target.float()).squeeze(1)
+                    wav_batch = self._vocode_batched_mels(vc_target, target_lengths)
                     vocoder_time += time.perf_counter() - vocoder_started
-                    wav_batch = torch.clamp(32767 * wav_batch, -32767.0, 32767.0)
 
-            samples_per_frame = wav_batch.size(-1) / float(vc_target.size(-1))
             completed_texts = set()
             for row_index, (text_index, segment_index, _) in enumerate(batch_jobs):
-                sample_count = max(1, int(round(target_lengths[row_index].item() * samples_per_frame)))
-                segment_wav = wav_batch[row_index, :sample_count].to(torch.int16).cpu().unsqueeze(0)
+                segment_wav = wav_batch[row_index].to(torch.int16).cpu()
                 segment_wav = trim_segment_silence(
                     segment_wav,
                     sampling_rate=sampling_rate,

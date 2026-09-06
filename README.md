@@ -7,7 +7,7 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6.2 final-word fix:** corrected a speech-decoder position error that could leave the last word unfinished, including with LoRA/DoRA voices. Standard and accelerated generation now follow the positions used during training, with regression checks for cached decoding and variable-length accelerated prompts. Existing adapters work without retraining. Restart the app after updating; the same seed may produce different audio with the corrected decoder.
+**V6.2 final-word fixes:** corrected speech positions in standard and accelerated generation, and prevented padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Regression checks cover decoding, unequal clip lengths, and training boundaries. Restart after updating; the same seed may produce different audio. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
 
 **V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
 
