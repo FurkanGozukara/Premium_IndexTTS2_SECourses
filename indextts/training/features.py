@@ -524,6 +524,7 @@ def cache_dataset_features(
         raise FileNotFoundError(f"manifest.jsonl is empty or missing in {dataset_dir}")
 
     active_reporter = reporter or ProgressReporter("segments", total=len(rows))
+    active_reporter.update(0, total=len(rows), desc="Preparing feature cache")
     active_reporter.set_stage("text preprocessing")
     started = time.perf_counter()
     text_pipeline = TextFeaturePipeline(resolved.model_dir)

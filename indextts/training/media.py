@@ -385,15 +385,56 @@ def compute_energy_envelope(audio: np.ndarray, sr: int, hop_ms: int = 10) -> np.
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim == 2:
         samples = np.mean(samples, axis=1, dtype=np.float32)
-    hop = max(1, int(round(sr * hop_ms / 1000.0)))
+    exact_hop = max(1.0, sr * hop_ms / 1000.0)
+    hop = int(round(exact_hop))
     if samples.size == 0:
         return np.zeros(0, dtype=np.float32)
+    if not exact_hop.is_integer():
+        # At 22.05 kHz a 10 ms frame is 220.5 samples. Repeating a rounded
+        # 220-sample hop drifts by over eight seconds per hour. Anchor every
+        # frame to its absolute timestamp instead; all samples remain covered.
+        count = int(math.ceil(samples.size / exact_hop))
+        boundaries = np.floor(np.arange(count + 1) * exact_hop).astype(np.intp)
+        boundaries[-1] = samples.size
+        sums = np.add.reduceat(np.square(samples), boundaries[:-1], dtype=np.float64)
+        rms = np.sqrt(sums / np.diff(boundaries))
+        return np.asarray(rms, dtype=np.float32)
     pad = (-samples.size) % hop
     if pad:
         samples = np.pad(samples, (0, pad))
     frames = samples.reshape(-1, hop)
     rms = np.sqrt(np.mean(np.square(frames), axis=1, dtype=np.float64))
     return np.asarray(rms, dtype=np.float32)
+
+
+def measure_edge_silence(
+    audio: np.ndarray,
+    sr: int,
+    threshold_dbfs: float = -40.0,
+) -> dict[str, float]:
+    """Measure actual quiet context at each cut, without padding the signal.
+
+    Frames are anchored independently to each edge. Appended zeros or a fade
+    would hide a bad cut, so callers must measure the final, unpadded samples.
+    This is a conservative acoustic screen, not proof of transcript accuracy.
+    """
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+    frame = max(1, round(sr * 0.01))
+    threshold = 10.0 ** (float(threshold_dbfs) / 20.0)
+    result: dict[str, float] = {}
+    for name, edge in (("leading_silence_ms", samples), ("trailing_silence_ms", samples[::-1])):
+        edge = edge[: min(samples.size, sr)]
+        count = edge.size // frame
+        if count == 0:
+            result[name] = 0.0
+            continue
+        rms = np.sqrt(np.mean(edge[:count * frame].reshape(count, frame) ** 2, axis=1))
+        active = np.flatnonzero(~np.isfinite(rms) | (rms > threshold))
+        quiet = int(active[0]) if active.size else count
+        result[name] = round(quiet * frame * 1000.0 / sr, 3)
+    return result
 
 
 def analyze_audio_quality(

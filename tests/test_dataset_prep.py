@@ -26,6 +26,7 @@ def test_dataset_prep_end_to_end_sidecar_path(tmp_path: Path) -> None:
         subtitle_policy="sidecar_only",
         align_with_whisper=False,
         segmentation_mode="cue_boundaries",
+        min_edge_silence_ms=0,  # Exercise the legacy cue-only path here.
         max_segments=12,
         export_reference_candidates=2,
     )

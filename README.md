@@ -9,6 +9,8 @@ Voice cloning, long-form narration, caption-timed audio and MP4, batch productio
 
 **V6.3 audio-ending improvements:** builds on v6.2's speech-position correction and prevents padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Verification includes 60 passing targeted checks and three reproduced training cuts that recovered 165–220 ms of source audio. Restart after updating. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
 
+Sentence-aligned preparation also repacks complete sentences at shared source pauses and checks both waveform edges after cleanup. The new **Voice and transcript audit** UI screens speaker consistency and transcript agreement, including the first and last words, before caching and training. Checkpoint comparisons preserve entered text and reference recordings when switching adapters.
+
 **V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
 
 - The automatic-stop checkbox is enabled by default, with adjustable patience and a warmup/minimum-training grace period. The live status shows the best update and stopping counter.
@@ -297,7 +299,9 @@ Sort through the prepared-segments table, inspect durations and warnings, and cl
 
 ### Precompute the feature cache
 
-For single-speaker narration that includes demonstrations or music, `tools/curate_voice_dataset.py` can audit a prepared dataset before caching. It checks subtitle/ASR agreement and CAMPPlus speaker similarity over whole clips and overlapping six-second windows. Clean speaker matches with disputed source transcripts receive a fresh transcription of the extracted clip. Every rejection is recorded; output must use a new directory. Reserve complete source recordings for validation and optionally final testing:
+For single-speaker narration that includes demonstrations or music, open **Voice and transcript audit** in the dataset tab before caching. Select the prepared dataset, enter a new audited dataset name and a verified speaker reference path, and reserve source filename stems for validation and optional final testing. **Audit and create training dataset** checks speaker similarity over whole clips and overlapping six-second windows. Its defaults transcribe each voice-matched clip and check the first and last two words separately, so an incorrect ending cannot hide inside a low overall word-error score. Completion selects the audited dataset for caching and training. Every rejection is recorded and the source clips are preserved.
+
+The command-line audit remains available. Add `--transcribe-all --check-boundary-words --min-edge-silence-ms 30` for the same additional checks:
 
 ```text
 python tools/curate_voice_dataset.py datasets/raw datasets/clean --reference reference.wav --validation-source held_out_tutorial --test-source final_test_tutorial
@@ -730,7 +734,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Batch Generation:** Upload text/caption files; generate the queue; cancel; open the batch folder; read progress; play results; inspect the per-item table.
 
-**Dataset Preparation:** Refresh/open existing datasets; upload media; scan; prepare; cancel; cache features; open output; inspect discovered media and stats; select and play prepared segments.
+**Dataset Preparation:** Refresh/open existing datasets; upload media; scan; prepare; cancel; audit voice and transcripts; stop an audit; cache features; open output; inspect discovered media and stats; select and play prepared segments. Preparation records unresolved sentences in `sentence_rejections.jsonl` and unsafe exported edges in `boundary_rejections.jsonl`; the separate audit records each clip's decision in `quality_audit.jsonl`.
 
 **Training:** Refresh datasets; apply tier defaults; refresh resume sources; start; graceful stop; force stop; open output; compare in grid; use best checkpoint; inspect charts/sample/checkpoints; refresh/open/delete adapter-manager entries.
 
@@ -744,7 +748,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 ## 17. Every Registered Setting
 
-The appendix below is generated directly from the app's preset registry. It covers all 253 registered controls, including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs.
+The appendix below covers all 267 registered controls, including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs.
 
 ### Voice Generation - 70 settings
 
@@ -900,7 +904,7 @@ The appendix below is generated directly from the app's preset registry. It cove
 
 **Continue after item errors** - `batch.continue_errors`. Records a failed row and proceeds to the next item instead of ending the batch. *(default true)*
 
-### Dataset Preparation - 45 settings
+### Dataset Preparation - 46 settings
 
 **Input files or folders** - `dataset.inputs`. Accepts media files, folders, metadata.csv, or pre-segmented WAV+TXT folders.
 
@@ -944,7 +948,9 @@ The appendix below is generated directly from the app's preset registry. It cove
 
 **Snap to silence** - `dataset.snap_to_silence`. Moves segment boundaries toward nearby low-energy points. *(default true)*
 
-**Silence snap window (ms)** - `dataset.snap_window_ms`. Search radius around a proposed boundary. *(default 200; minimum 0; maximum 1000)*
+**Silence snap window (ms)** - `dataset.snap_window_ms`. Search radius around a proposed boundary; 400 ms allows for late word releases. *(default 400; minimum 0; maximum 1000)*
+
+**Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
 
 **Minimum words** - `dataset.min_words`. Drops fragments with too little transcript context. *(default 2; minimum 0; maximum 30)*
 
@@ -992,7 +998,23 @@ The appendix below is generated directly from the app's preset registry. It cove
 
 **Preparation seed** - `dataset.seed`. Controls deterministic candidate ranking and randomized operations. *(default 0; minimum 0; maximum 4294967295)*
 
-### LoRA / DoRA Training - 87 settings
+### Voice and Transcript Audit - 11 settings
+
+| Setting | Preset key | Default and behavior |
+| --- | --- | --- |
+| Audited dataset name | `curation.name` | `voice_curated`; creates a new dataset folder. |
+| Verified speaker reference paths | `curation.references` | Blank; one clean recording path per line. |
+| Validation source recordings | `curation.validation_sources` | Blank; required source filename stems, one per line. Entire recordings are held out from training. |
+| Final-test source recordings | `curation.test_sources` | Blank; optional stems held in a separate dataset, outside checkpoint selection. |
+| Maximum transcript word error | `curation.max_wer` | 0.15; range 0–1. |
+| Minimum voice similarity | `curation.min_speaker_similarity` | 0.70; range 0–1. |
+| Minimum voice-window similarity | `curation.min_window_similarity` | 0.60; range 0–1. |
+| Transcribe every voice-matched clip | `curation.transcribe_all` | Enabled; transcribes the actual exported audio. |
+| Verify first and last words | `curation.check_boundary_words` | Enabled; compares the first and last two normalized words against fresh clip transcription. |
+| Audit minimum quiet edge (ms) | `curation.min_edge_silence_ms` | 30; range 0–500. Measures both waveform edges at −40 dBFS; 0 disables this check. |
+| Audit device | `curation.device` | `cuda:0`. |
+
+### LoRA / DoRA Training - 91 settings
 
 **Dataset** - `training.dataset_dir`. Prepared manifest dataset used for cached-feature training. *(default "datasets/secourses_demo")*
 
@@ -1176,7 +1198,7 @@ The appendix below is generated directly from the app's preset registry. It cove
 
 **Model config** - `training.model_config`. IndexTTS 2.5 YAML configuration path. *(default "models/config.yaml")*
 
-### Checkpoint Grid - 20 settings
+### Checkpoint Grid - 18 settings
 
 **LoRA / DoRA folder** - `grid.adapter_dir`. Choose one training run to analyze and compare.
 

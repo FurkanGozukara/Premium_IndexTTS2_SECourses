@@ -31,6 +31,7 @@ from .dataset_manifest import (
     write_manifest,
     write_preview_csv,
 )
+from .audio_boundaries import build_safe_sentence_segments
 from .media import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_SUBTITLE_EXTENSIONS,
@@ -40,6 +41,7 @@ from .media import (
     find_media_files,
     find_sidecar_subtitles,
     find_sidecar_transcript,
+    measure_edge_silence,
     measure_loudness_lufs,
     normalize_loudness,
     probe_media,
@@ -112,7 +114,8 @@ class DatasetPrepConfig:
     min_pause_boundary_ms: int = 400
     pad_ms: int = 60
     snap_to_silence: bool = True
-    snap_window_ms: int = 200
+    snap_window_ms: int = 400
+    min_edge_silence_ms: int = 30
     trim_silence: bool = True
     trim_top_db: float = 40.0
     loudness_normalize: bool = True
@@ -160,6 +163,8 @@ class DatasetPrepConfig:
             raise ValueError(f"Unsupported boundary_mode: {self.boundary_mode}")
         if self.min_pause_boundary_ms < 0:
             raise ValueError("min_pause_boundary_ms must be zero or positive")
+        if not 0 <= self.min_edge_silence_ms <= 500:
+            raise ValueError("min_edge_silence_ms must be between zero and 500")
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if not 0 < self.min_s <= self.target_s <= self.max_s:
@@ -534,7 +539,7 @@ def _shared_word_boundary(
     runs = [
         (first + start, first + end)
         for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
-        if end - start >= 3
+        if end - start >= max(3, 2 * math.ceil(config.min_edge_silence_ms / hop_ms))
     ]
     if not runs:
         return boundary
@@ -916,6 +921,8 @@ def run_dataset_prep(
         _log(reporter, f"Warning: {message}")
 
     rows: list[dict[str, Any]] = []
+    boundary_rejections: list[dict[str, Any]] = []
+    sentence_rejections: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
     filter_drop_counts: dict[str, int] = {
@@ -934,6 +941,7 @@ def run_dataset_prep(
             "empty_audio",
             "non_finite_loudness",
             "duplicate_sentence",
+            "unsafe_audio_boundary",
         )
     }
     filter_keep_counts: dict[str, int] = {"pause_boundary": 0}
@@ -1096,8 +1104,10 @@ def run_dataset_prep(
                     media_duration_ms = int(round(audio.size * 1000.0 / config.sample_rate))
                     if audio.size == 0:
                         raise RuntimeError("decoded audio is empty")
+                    energy = compute_energy_envelope(audio, config.sample_rate, hop_ms=10)
 
                     segments: list[Segment] = []
+                    acoustic_repacked = False
                     transcript_source = ""
                     sidecars = find_sidecar_subtitles(media_path)
                     transcript_path = find_sidecar_transcript(media_path)
@@ -1180,16 +1190,33 @@ def run_dataset_prep(
                                 segments = cue_segments
                                 transcript_source = sidecar_source
                             else:
-                                segments = build_sentence_aligned_segments(
-                                    caption,
-                                    alignment.words,
-                                    target_s=min(config.target_s, segmentation_max_s),
-                                    max_s=segmentation_max_s,
-                                    min_s=config.min_s,
-                                    max_gap_ms=config.max_gap_ms,
-                                    boundary_mode=config.boundary_mode,
-                                    min_pause_boundary_ms=config.min_pause_boundary_ms,
-                                )
+                                if config.min_edge_silence_ms and config.snap_to_silence and config.boundary_mode == "sentence":
+                                    _stage(reporter, "audio_boundaries")
+                                    segments, rejected_sentences = build_safe_sentence_segments(
+                                        caption, alignment.words, energy, config, audio=audio,
+                                        progress_cb=lambda message: _update(
+                                            reporter, processed_sources - 1, total_sources, message,
+                                            {"file_i": processed_sources, "file_n": total_sources},
+                                        ),
+                                    )
+                                    acoustic_repacked = True
+                                    sentence_rejections.extend(
+                                        {"source_media": _source_name(media_path), **item}
+                                        for item in rejected_sentences
+                                    )
+                                    _log(reporter, f"Repacked complete sentences at verified pauses: {len(segments)} clips; "
+                                         f"{len(rejected_sentences)} sentences could not form a safe group within the limits.")
+                                else:
+                                    segments = build_sentence_aligned_segments(
+                                        caption,
+                                        alignment.words,
+                                        target_s=min(config.target_s, segmentation_max_s),
+                                        max_s=segmentation_max_s,
+                                        min_s=config.min_s,
+                                        max_gap_ms=config.max_gap_ms,
+                                        boundary_mode=config.boundary_mode,
+                                        min_pause_boundary_ms=config.min_pause_boundary_ms,
+                                    )
                                 transcript_source = sidecar_source + "+whisper_sentence_aligned"
                             _log(
                                 reporter,
@@ -1247,9 +1274,10 @@ def run_dataset_prep(
                         raise RuntimeError("transcript produced no usable timed segments")
                     segments = sorted(segments, key=lambda item: (item.start_ms, item.end_ms))
                     preliminary_count = len(segments)
-                    energy = compute_energy_envelope(audio, config.sample_rate, hop_ms=10)
                     word_safe_boundaries = source_effective_mode == "sentence_aligned"
-                    if word_safe_boundaries:
+                    if acoustic_repacked:
+                        pass  # These edges already include real quiet source audio.
+                    elif word_safe_boundaries:
                         segments = apply_padding_and_limits(
                             segments,
                             config.pad_ms,
@@ -1348,6 +1376,23 @@ def run_dataset_prep(
                             continue
                         if config.loudness_normalize:
                             piece = normalize_loudness(piece, config.sample_rate, config.target_lufs)
+                        edge_quality = measure_edge_silence(
+                            piece, config.sample_rate, config.silence_threshold_dbfs
+                        )
+                        if config.min_edge_silence_ms and any(
+                            value < config.min_edge_silence_ms for value in edge_quality.values()
+                        ):
+                            _increment_reason(source_filter_counts, "unsafe_audio_boundary")
+                            _increment_reason(filter_drop_counts, "unsafe_audio_boundary")
+                            boundary_rejections.append({
+                                "source_media": _source_name(media_path),
+                                "source_start_s": source_start_s,
+                                "source_end_s": source_end_s,
+                                "text": segment.text,
+                                "reason": "unsafe_audio_boundary",
+                                **edge_quality,
+                            })
+                            continue
                         lufs = measure_loudness_lufs(piece, config.sample_rate)
                         if not math.isfinite(lufs):
                             _increment_reason(source_filter_counts, "non_finite_loudness")
@@ -1376,6 +1421,8 @@ def run_dataset_prep(
                             clipping_ratio=quality.clipping_ratio,
                             silence_ratio=quality.silence_ratio,
                         )
+                        row.update(edge_quality)
+                        row["boundary_method"] = "acoustic_sentence_repack" if acoustic_repacked else "silence_snap"
                         append_manifest_row(manifest_handle, row)
                         rows.append(row)
                         candidates.append(
@@ -1544,6 +1591,16 @@ def run_dataset_prep(
         "sentence_alignment": sentence_alignment,
         "filter_drop_counts": dict(sorted(filter_drop_counts.items())),
         "filter_keep_counts": dict(sorted(filter_keep_counts.items())),
+        "audio_boundaries": {
+            "algorithm": "shared_pause_sentence_repack_v1",
+            "applies_to": "automatically_cut_segments",
+            "minimum_quiet_ms": config.min_edge_silence_ms,
+            "threshold_dbfs": config.silence_threshold_dbfs,
+            "rejected_segments": len(boundary_rejections),
+            "rejections": "boundary_rejections.jsonl",
+            "unresolved_sentences": len(sentence_rejections),
+            "sentence_rejections": "sentence_rejections.jsonl",
+        },
         "warnings": warnings,
         "reference_candidates": references,
         "config": config.to_dict(),
@@ -1557,6 +1614,8 @@ def run_dataset_prep(
         "elapsed_s": round(time.monotonic() - started, 3),
     }
     atomic_write_json(info_path, info)
+    write_manifest(output_dir / "boundary_rejections.jsonl", boundary_rejections)
+    write_manifest(output_dir / "sentence_rejections.jsonl", sentence_rejections)
     write_preview_csv(preview_path, rows)
     _update(
         reporter,

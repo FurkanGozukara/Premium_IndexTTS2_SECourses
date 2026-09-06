@@ -4,7 +4,6 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import re
 import sys
 import time
 import traceback
@@ -60,13 +59,16 @@ class WorkerReporter:
         chunk_n = int(self._last.get("chunk_n", 0) or 0)
         if self.phase == "complete":
             fraction = 1.0
+        elif self.phase in {"cancelled", "canceled", "error", "failed"}:
+            fraction = self._fraction
         elif chunk_n > 0 and file_n > 0:
             fraction = (max(0, file_i - 1) + min(1.0, chunk_i / chunk_n)) / file_n
         elif file_n > 0:
             fraction = float(self._last.get("progress_completed", 0.0) or 0.0) / file_n
         else:
             fraction = 0.0
-        fraction = max(self._fraction, max(0.0, min(1.0, fraction)))
+        ceiling = 1.0 if self.phase == "complete" else 0.999
+        fraction = max(self._fraction, max(0.0, min(ceiling, fraction)))
         self._fraction = fraction
         eta = elapsed * (1.0 - fraction) / fraction if 0.0 < fraction < 1.0 else 0.0
         segment_count = int(self._last.get("segment_count", 0) or 0)
@@ -112,10 +114,14 @@ class WorkerReporter:
         values = dict(extra or {})
         if "phase" in values:
             self.phase = str(values.pop("phase"))
-        chunk_match = re.search(r"\bchunk\s+(\d+)\s*/\s*(\d+)\b", desc, re.IGNORECASE)
-        if chunk_match:
-            values["chunk_i"] = int(chunk_match.group(1))
-            values["chunk_n"] = int(chunk_match.group(2))
+        # Whisper reports chunk counts, including a final callback without
+        # "chunk" in its description. Those counts must never replace the
+        # outer source-file counters or latch the whole job at 100%.
+        if self.phase in {"whisper", "whisper_alignment"} and not any(
+            key in values for key in ("file_i", "file_n")
+        ):
+            values["chunk_i"] = max(0, int(completed))
+            values["chunk_n"] = max(0, int(total or 0))
         else:
             values["chunk_i"] = 0
             values["chunk_n"] = 0

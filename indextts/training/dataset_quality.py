@@ -28,6 +28,15 @@ def word_error_counts(reference: str, hypothesis: str) -> tuple[int, int]:
     return distances[-1], len(ref)
 
 
+def boundary_words_match(reference: str, hypothesis: str, count: int = 2) -> bool:
+    """Check both transcript edges independently of whole-clip WER."""
+    ref, hyp = normalized_words(reference), normalized_words(hypothesis)
+    if not ref or not hyp:
+        return False
+    edge = min(max(1, count), len(ref))
+    return len(hyp) >= edge and ref[:edge] == hyp[:edge] and ref[-edge:] == hyp[-edge:]
+
+
 class TimedTranscript:
     def __init__(self, words: Sequence[Mapping[str, Any]]) -> None:
         ordered = sorted(words, key=lambda word: (float(word["start_s"]) + float(word["end_s"])) / 2)

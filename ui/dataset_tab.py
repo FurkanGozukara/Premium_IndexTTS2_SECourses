@@ -354,6 +354,7 @@ class DatasetTab:
     dataset_path_state: Any
     prep_event: Any = None
     cache_event: Any = None
+    curation_path: Any = None
 
 
 def _reg(
@@ -476,7 +477,7 @@ def build_dataset_tab(
             with gr.Row():
                 pad = gr.Slider(0, 500, value=60, step=10, label="Edge padding (ms)", info="Small context padding avoids clipped consonants.")
                 snap = gr.Checkbox(value=True, label="Snap to silence", info="Moves segment boundaries toward nearby low-energy points.")
-                snap_window = gr.Slider(0, 1000, value=200, step=10, label="Silence snap window (ms)", info="Search radius around a proposed boundary.")
+                snap_window = gr.Slider(0, 1000, value=DATASET_DEFAULTS["snap_window_ms"], step=10, label="Silence snap window (ms)", info="Search radius around a proposed boundary; 400 ms allows for late word releases.")
                 min_words = gr.Slider(0, 30, value=2, step=1, label="Minimum words", info="Drops fragments with too little transcript context.")
                 max_words = gr.Slider(10, 200, value=80, step=1, label="Maximum words", info="Drops transcript segments that are implausibly dense.")
             for field_name, component, kind, minimum, maximum in (
@@ -524,6 +525,11 @@ def build_dataset_tab(
                 max_silence = gr.Number(value=None, minimum=0, maximum=1, step=0.01, label="Maximum silence ratio", info="Optional; blank disables whole-segment silence-ratio filtering.")
                 silence_db = gr.Slider(-80, -10, value=-40, step=1, label="Silence threshold dBFS", info="Frames below this level count as silence.")
                 silence_frame = gr.Slider(5, 200, value=20, step=5, label="Silence frame (ms)", info="20 ms gives stable silence estimates for speech.")
+            min_edge_silence = gr.Slider(
+                0, 500, value=DATASET_DEFAULTS["min_edge_silence_ms"], step=10,
+                label="Minimum quiet audio at cut edges (ms)",
+                info="Sentence alignment first repacks whole sentences at real pauses, recovering late word endings from the source. Then clips must retain this much quiet audio at both edges after cleanup. Uses the silence threshold above. 30 ms is recommended; 0 disables the check. Existing pre-segmented imports are preserved.",
+            )
             for field_name, component, kind, minimum, maximum, nullable in (
                 ("trim_silence", trim, "bool", None, None, False), ("trim_top_db", trim_db, "float", 10, 80, False),
                 ("loudness_normalize", loudnorm, "bool", None, None, False), ("target_lufs", lufs, "float", -30, -10, False),
@@ -538,6 +544,7 @@ def build_dataset_tab(
                 ("max_silence_ratio", max_silence, "float", 0, 1, True),
                 ("silence_threshold_dbfs", silence_db, "float", -80, -10, False),
                 ("silence_frame_ms", silence_frame, "int", 5, 200, False),
+                ("min_edge_silence_ms", min_edge_silence, "int", 0, 500, False),
             ):
                 _reg(registry, controls, field_name, component, kind=kind, minimum=minimum, maximum=maximum, nullable=nullable)
 
@@ -599,6 +606,13 @@ def build_dataset_tab(
                 gr.Markdown("#### Reference candidates")
                 for index, path in enumerate(values, start=1):
                     gr.Audio(value=path, label=f"Reference candidate {index}", type="filepath", buttons=["download"], key=f"dataset-ref-{index}-{path}")
+
+    from .dataset_curation import build_curation_controls
+    with tab_block:
+        curation_path = build_curation_controls(
+            registry, existing, dataset_path_state, load_hook=load_hook,
+            model_dir=str(getattr(args, "model_dir", ROOT / "models")),
+        )
 
     config_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("dataset.")]
     config_keys = [spec.key for spec in config_specs]
@@ -774,9 +788,10 @@ def build_dataset_tab(
         if not (dataset_dir / "manifest.jsonl").is_file():
             raise gr.Error(f"Dataset manifest not found: {dataset_dir}")
         state = DATASET_STATE / f"cache_{dataset_dir.name}_{int(time.time())}"
+        progress_path = state / "progress.json"
         job = PROCESS_MANAGER.start(
             "dataset_cache",
-            [sys.executable, str(ROOT / "tools" / "cache_dataset_features.py"), "--dataset-dir", str(dataset_dir), "--model-dir", str(getattr(args, "model_dir", ROOT / "models")), "--device", device_default],
+            [sys.executable, str(ROOT / "tools" / "cache_dataset_features.py"), "--dataset-dir", str(dataset_dir), "--model-dir", str(getattr(args, "model_dir", ROOT / "models")), "--device", device_default, "--progress-file", str(progress_path)],
             state_dir=state,
             log_path=state / "cache.log",
             cwd=ROOT,
@@ -784,12 +799,15 @@ def build_dataset_tab(
         started = time.perf_counter()
         while job.running:
             elapsed = time.perf_counter() - started
+            payload = {"elapsed_s": elapsed, "desc": "Loading training feature models",
+                       **(read_json(progress_path, {}) or {})}
+            count = f"{payload.get('completed', 0)}/{payload['total']} clips | " if payload.get("total") else ""
             yield (
                 progress_panel_html(
-                    {"elapsed_s": elapsed, "desc": "Caching training features"},
+                    payload,
                     title="Caching features",
                 ),
-                f"Caching features | elapsed {elapsed:.1f}s",
+                f"Caching features | {count}elapsed {format_duration(payload['elapsed_s'])}",
                 tail_text(job.log_path, 60),
                 str(dataset_dir),
                 gr.Timer(5.0, active=False),
@@ -804,6 +822,7 @@ def build_dataset_tab(
         yield (
             progress_panel_html(
                 {
+                    **(read_json(progress_path, {}) or {}),
                     "fraction": 1.0,
                     "elapsed_s": elapsed,
                     "eta_s": 0,
@@ -855,6 +874,11 @@ def build_dataset_tab(
         )
 
     existing.change(load_existing, existing, [existing_info, stats, histogram, segments, reference_state, warnings, segment_paths_state, dataset_path_state], queue=False)
+    def select_audited_dataset(path: str):
+        if not path:
+            return gr.skip(), gr.skip()
+        return gr.update(choices=scan_datasets(), value=path), path
+    curation_path.change(select_audited_dataset, curation_path, [existing, dataset_path_state], queue=False)
     refresh_existing.click(lambda: gr.update(choices=scan_datasets()), outputs=existing, queue=False)
     open_existing.click(lambda path: open_folder(path or _LAST_DATASET_FOLDER), existing, existing_info, queue=False)
     open_button.click(lambda path: open_folder(path or _LAST_DATASET_FOLDER), dataset_path_state, status, queue=False)
@@ -880,6 +904,7 @@ def build_dataset_tab(
         dataset_path_state,
         prep_event,
         cache_event,
+        curation_path,
     )
 
 
@@ -921,6 +946,11 @@ def bind_dataset_events(tab: DatasetTab, training: Any) -> None:
             tab.dataset_path_state,
             [tab.existing_info, training.dataset, training.dataset_info],
             queue=False,
+        )
+    if tab.curation_path is not None:
+        tab.curation_path.change(
+            refresh_training_dataset, tab.curation_path,
+            [training.dataset, training.dataset_info], queue=False,
         )
 
 

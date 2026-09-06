@@ -465,9 +465,16 @@ def calibrate_grid_speaking_rates(
     return "\n".join(lines), message
 
 
-def adapter_selection_updates(adapter_dir: str | None) -> tuple[Any, ...]:
+def adapter_selection_updates(
+    adapter_dir: str | None, current_references: str = "", current_texts: str = "",
+) -> tuple[Any, ...]:
     payload = _analysis_payload(adapter_dir)
     context = _adapter_context(adapter_dir)
+    # Keep comparison inputs stable across adapters. Fill an empty form from
+    # the run, while the explicit stored-reference button can replace a voice.
+    references = gr.skip() if str(current_references or "").strip() else context["reference"]
+    text_value = str(current_texts or "").strip()
+    texts = gr.skip() if text_value and text_value != GRID_DEFAULTS["grid.texts"].strip() else context["texts"]
     return (
         context["info"],
         payload["chart"],
@@ -476,8 +483,8 @@ def adapter_selection_updates(adapter_dir: str | None) -> tuple[Any, ...]:
         payload["rows"],
         gr.update(choices=payload["choices"], value=payload["selected"]),
         payload["mapping"],
-        context["reference"],
-        context["texts"],
+        references,
+        texts,
         payload["recommended"],
     )
 
@@ -1140,24 +1147,24 @@ def build_grid_tab(
     )
     tab.adapter.change(
         adapter_selection_updates,
-        tab.adapter,
+        [tab.adapter, references, texts],
         tab.selection_outputs,
         queue=False,
     )
 
-    def analyze_now(adapter_dir: str):
+    def analyze_now(adapter_dir: str, current_references: str, current_texts: str):
         if not adapter_dir:
             raise gr.Error("Select a LoRA / DoRA folder first")
         try:
             analysis = analyze_training_run(adapter_dir)
             write_training_analysis(analysis)
-            return adapter_selection_updates(adapter_dir)
+            return adapter_selection_updates(adapter_dir, current_references, current_texts)
         except Exception as exc:
             raise gr.Error(f"Training-log analysis failed: {exc}") from exc
 
     tab.analyze_button.click(
         analyze_now,
-        tab.adapter,
+        [tab.adapter, references, texts],
         tab.selection_outputs,
         queue=False,
         api_name="analyze_training_log",
@@ -1270,9 +1277,9 @@ def build_grid_tab(
             api_name="attach_checkpoint_grid",
         )
 
-        def load_last_checkpoint_values():
+        def load_last_checkpoint_values(current_references: str, current_texts: str):
             adapter_dir = latest_lora_folder()
-            selection = adapter_selection_updates(adapter_dir or None)
+            selection = adapter_selection_updates(adapter_dir or None, current_references, current_texts)
             eval_state = latest_checkpoint_eval_state(adapter_dir)
             eval_updates = checkpoint_eval_status_updates(
                 eval_state,
@@ -1294,6 +1301,7 @@ def build_grid_tab(
 
         load_hook(
             load_last_checkpoint_values,
+            inputs=[references, texts],
             outputs=[
                 tab.adapter,
                 *tab.selection_outputs,
@@ -1618,11 +1626,11 @@ def bind_grid_events(
 
     compare_button = getattr(training, "compare_grid", None)
     if compare_button is not None:
-        def compare_training_run(state_value: str):
+        def compare_training_run(state_value: str, current_references: str, current_texts: str):
             if not state_value:
                 raise gr.Error("No training run is attached")
             adapter_dir = str(Path(state_value).resolve())
-            updates = adapter_selection_updates(adapter_dir)
+            updates = adapter_selection_updates(adapter_dir, current_references, current_texts)
             return (
                 gr.update(choices=_adapter_folders(), value=adapter_dir),
                 gr.Tabs(selected="checkpoint-grid"),
@@ -1631,14 +1639,14 @@ def bind_grid_events(
 
         compare_button.click(
             compare_training_run,
-            training.state_dir,
+            [training.state_dir, tab.controls["grid.references"], tab.controls["grid.texts"]],
             [tab.adapter, main_tabs, *tab.selection_outputs],
             queue=False,
         )
         if getattr(training, "start_event", None) is not None:
             training.start_event.then(
                 compare_training_run,
-                training.state_dir,
+                [training.state_dir, tab.controls["grid.references"], tab.controls["grid.texts"]],
                 [tab.adapter, main_tabs, *tab.selection_outputs],
                 queue=False,
             )

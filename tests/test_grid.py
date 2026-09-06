@@ -49,6 +49,19 @@ def _wav(path: Path, frames: int = 2205) -> None:
         handle.writeframes(b"\0\0" * frames)
 
 
+def test_changing_adapters_preserves_comparison_text_and_reference(monkeypatch):
+    import gradio as gr
+    import ui.grid_tab as grid_ui
+
+    monkeypatch.setattr(grid_ui, "_adapter_context", lambda path: {
+        "info": "new adapter", "reference": "suggested.wav", "texts": "Suggested sample.",
+    })
+    updates = grid_ui.adapter_selection_updates(None, "reviewed.wav", "Same first prompt.\nSame second prompt.")
+    assert updates[7] == gr.skip() and updates[8] == gr.skip()
+    defaults = grid_ui.adapter_selection_updates(None, "", GRID_DEFAULTS["grid.texts"])
+    assert defaults[7:9] == ("suggested.wav", "Suggested sample.")
+
+
 def _audible_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as handle:

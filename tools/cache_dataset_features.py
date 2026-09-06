@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from indextts.training.features import FeatureCacheConfig, cache_dataset_features
+from indextts.runtime import ProgressReporter
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-count", type=int, default=None)
     parser.add_argument("--verify-output-dir", default=None)
     parser.add_argument("--no-skip-existing", action="store_true")
+    parser.add_argument("--progress-file", help="Optional JSON progress file for the browser")
     return parser.parse_args()
 
 
@@ -59,7 +61,8 @@ def main() -> int:
     if args.no_skip_existing:
         payload["skip_existing"] = False
     config = FeatureCacheConfig.from_dict(payload)
-    summary = cache_dataset_features(config)
+    reporter = ProgressReporter("segments", progress_file=args.progress_file) if args.progress_file else None
+    summary = cache_dataset_features(config, reporter=reporter)
     print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))
     return 0 if not summary.cancelled else 2
 
