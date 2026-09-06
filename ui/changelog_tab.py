@@ -21,9 +21,12 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Silence detection keeps frame timestamps aligned at 22.05 kHz, avoiding accumulated timing drift from repeatedly rounding fractional sample counts.
 - Verified with 60 passing targeted checks, including CUDA speech positions, unequal clip lengths, padded acoustic features, and dataset integration. Three optional demo-audio checks were skipped. Real-model checks matched individual conditioning exactly and recovered 165–220 ms of source audio in three reproduced training cuts.
 - Checkpoint comparisons now preserve entered text and reference recordings when switching adapters or refreshing analysis. Empty forms still use the selected run's suggestions, and **Use LoRA / DoRA reference** remains available.
+- Refresh reloads the selected run's checkpoint list and analysis as well as the folder labels. Training samples show their actual filenames, and checkpoint summaries distinguish different updates within the same epoch.
 - Fixed flashing progress and stats panels during voice generation, batch generation, dataset preparation, feature caching, and training. Live values, progress bars, charts, and logs update without the pulsing or fading overlay. Verified in Chrome with 24 simulated updates and 30 passing UI and progress checks.
 
 Restart the app after updating. Existing adapters remain compatible. The dataset fixes apply when preparing new clips; adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+
+[Read the V5 rebuild, Chrome workflow verification, and model comparisons](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses/blob/master/V5_TRAINING_REPORT_2026-09-06.md).
 """.strip(),
     ),
     (

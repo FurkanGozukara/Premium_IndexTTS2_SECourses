@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -156,6 +157,18 @@ def test_parse_strengths_matches_the_shared_text_contract() -> None:
         parse_strengths("4.01")
     with pytest.raises(ValueError, match="0 to 4"):
         parse_strengths("nan")
+
+
+def test_summary_does_not_call_a_later_same_epoch_checkpoint_an_improvement():
+    best = SimpleNamespace(label="best", path="best.safetensors", kind="best", epoch=5,
+                           steps=7750, strength=1.0, val_loss=4.9623, val_accuracy=.1062, phase="best")
+    final = SimpleNamespace(label="final", path="final.safetensors", kind="final", epoch=5,
+                            steps=8250, strength=1.0, val_loss=4.9654, val_accuracy=.1063, phase="best")
+    summary = eval_module._summary_markdown([best, final], best, "other")
+    assert "still improving" not in summary
+    assert "latest measured" not in summary.lower()
+    assert "plateau" in summary
+    assert "7,750" in summary
 
 
 def test_empty_reference_mode_inherits_training_config_or_legacy_default(

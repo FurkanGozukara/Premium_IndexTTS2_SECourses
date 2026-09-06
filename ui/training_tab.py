@@ -404,7 +404,7 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
     if sample and not Path(sample).is_file():
         sample = None
     sample_text_value = (
-        f"Latest sample: {Path(sample).name} | epoch {status.get('epoch', 0)}"
+        f"Latest sample: {Path(sample).name}"
         if sample
         else "No sample yet."
     )

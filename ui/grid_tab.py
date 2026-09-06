@@ -1144,6 +1144,11 @@ def build_grid_tab(
     ]
     refresh_adapter.click(
         lambda: gr.update(choices=_adapter_folders()), outputs=tab.adapter, queue=False
+    ).then(
+        adapter_selection_updates,
+        [tab.adapter, references, texts],
+        tab.selection_outputs,
+        queue=False,
     )
     tab.adapter.change(
         adapter_selection_updates,

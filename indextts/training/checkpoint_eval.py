@@ -376,8 +376,9 @@ def _summary_markdown(
         if best.val_accuracy is not None
         else ""
     )
+    selected_step = f" at update {best.steps:,}" if best.steps > 0 else ""
     lines.append(
-        f"**Best measured generalization: {best.label}** (validation loss {best.val_loss:.2f}{accuracy} "
+        f"**Best measured generalization: {best.label}{selected_step}** (validation loss {best.val_loss:.2f}{accuracy} "
         "on unseen sentences)."
     )
     overfit = sorted(
@@ -430,21 +431,21 @@ def _summary_markdown(
                 )
             lines.append(detail + ".")
     else:
-        measured_epochs = [
-            row.epoch
+        measured_positions = [
+            (row.epoch, row.steps)
             for row in rows
             if row.kind != "base"
             and row.epoch is not None
             and row.val_loss is not None
             and abs(row.strength - 1.0) < 1e-9
         ]
-        if best.epoch is not None and measured_epochs and best.epoch == max(measured_epochs):
+        if best.epoch is not None and measured_positions and (best.epoch, best.steps) == max(measured_positions):
             lines.append(
-                "The latest measured epoch is also the best, so training was still improving."
+                "The latest measured checkpoint has the lowest validation loss among the saved candidates."
             )
         else:
             lines.append(
-                "Later measured epochs stayed near the best score, so the run reached a plateau "
+                "Later measured checkpoints stayed near the best score, so the run reached a plateau "
                 "without a sustained overfitting rise."
             )
     lines.append(f"**Recommended checkpoint:** `{best.path}`.")
