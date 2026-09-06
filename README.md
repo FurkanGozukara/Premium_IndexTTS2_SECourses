@@ -45,11 +45,17 @@ The installer clones or updates `Premium_IndexTTS2_SECourses`, creates its Pytho
 3. Wait for the local URL, normally `http://127.0.0.1:7860`, and open it in a browser.
 4. For a specific GPU, add `set CUDA_VISIBLE_DEVICES=1` to the start BAT or launch `python webui.py --device cuda:1` from the activated environment.
 
-Useful launch flags are `--port`, `--host`, `--share`, `--model_dir`, `--verbose`, `--no-browser`, and `--device`. For example:
+The Windows BAT opens Google Chrome when installed and works regardless of the current working directory. Use `--browser default` to choose your system browser instead.
+
+Useful launch flags are `--port`, `--host`, `--share`, `--model_dir`, `--verbose`, `--browser`, `--no-browser`, and `--device`. For example:
 
 ```bat
 Windows_Start_App.bat --port 7861 --device cuda:0 --no-browser
 ```
+
+If another Gradio app previously used the same address, its old tabs can send events to IndexTTS after the port is reused. IndexTTS rejects these requests, as well as requests from a previous launch, before running a handler. Updated IndexTTS tabs show **Reload IndexTTS**; copy any unsaved text before reloading. For an old tab from a different app, reopen that app at the URL printed by its own launcher. Unknown event IDs, incorrect input counts, and missing table-selection data return clear errors instead of the reported Gradio tracebacks. Native API clients remain supported; after a restart, reconnect the client so it loads the current API definitions.
+
+If model loading or worker startup fails, the generation task is saved as failed so polling and page reloads retain its error instead of showing it as still running.
 
 ### Linux, RunPod, SimplePod, and Massed Compute
 

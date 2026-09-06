@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import shutil
 import sys
+import webbrowser
 from typing import Any
 
 from indextts.utils.console_encoding import configure_console_output
@@ -34,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_dir", default=str(ROOT / "models"), help="IndexTTS 2.5 model directory")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose generation logging by default")
     parser.add_argument("--no-browser", dest="no_browser", action="store_true", help="Do not open a browser window")
+    parser.add_argument("--browser", choices=("default", "chrome"), default="default", help="Browser to open after startup")
     parser.add_argument("--device", default="auto", help="Default runtime device, such as auto, cuda:0, or cpu")
     return parser
 
@@ -54,6 +57,22 @@ def create_demo(args: argparse.Namespace):
     return demo
 
 
+def open_app_browser(url: str, browser: str) -> None:
+    if browser == "chrome":
+        candidates = [shutil.which("chrome"), shutil.which("google-chrome")]
+        if os.name == "nt":
+            for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                folder = os.environ.get(variable)
+                if folder:
+                    candidates.append(str(Path(folder) / "Google/Chrome/Application/chrome.exe"))
+        for path in candidates:
+            if path and Path(path).is_file():
+                if webbrowser.BackgroundBrowser(path).open_new_tab(url):
+                    return
+        print(">> Google Chrome was not found or could not open; opening the default browser.", flush=True)
+    webbrowser.open_new_tab(url)
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
     args = build_parser().parse_args(argv)
@@ -72,12 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     demo.launch(
         **address,
         share=args.share,
-        inbrowser=not args.no_browser,
+        inbrowser=False,
         favicon_path=str(FAVICON_PATH),
         show_error=True,
         theme=demo.launch_theme,
         css=demo.launch_css,
         head=demo.launch_head,
+        app_kwargs=demo.launch_app_kwargs,
         allowed_paths=[
             str(ROOT / "outputs"),
             str(ROOT / "datasets"),
@@ -90,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     # The port is chosen at launch when it was not requested, so repeat it on an
     # unbuffered line that survives redirected output.
     print(f">> IndexTTS 2.5 Premium SECourses is ready at {demo.local_url}", flush=True)
+    if not args.no_browser:
+        open_app_browser(demo.local_url, args.browser)
     demo.block_thread()
     return 0
 

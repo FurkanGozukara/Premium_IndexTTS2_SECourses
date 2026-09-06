@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from indextts.training.charts import (
     GRAD_SERIES,
@@ -254,3 +255,48 @@ def test_training_state_discovery_ignores_evaluation_job_folders(tmp_path: Path)
     os.utime(sample / "status.json", (newer + 1, newer + 1))
 
     assert latest_training_state(tmp_path) == str(adapter.resolve())
+
+
+@pytest.mark.parametrize("use_subprocess", [False, True])
+def test_generation_startup_failure_stays_failed_when_polled(tmp_path, monkeypatch, use_subprocess):
+    import ui.generation_tab as generation
+
+    task = tmp_path / "outputs" / "0001"
+    request = {
+        "task_layout": {"task_folder": str(task)},
+        "metadata_path": str(task / "metadata.json"),
+        "progress_file": str(task / "progress.json"),
+        "runtime": {},
+    }
+    _write_json(task / "metadata.json", {"status": "in_progress", "processing": {"started_at": "earlier"}})
+    _write_json(task / "request.json", request)
+
+    def fail_startup(*args, **kwargs):
+        raise FileNotFoundError("missing model config or worker")
+
+    monkeypatch.setattr(generation.LAZY_ENGINE, "get", fail_startup)
+    monkeypatch.setattr(generation.PROCESS_MANAGER, "start", fail_startup)
+    with pytest.raises((RuntimeError, FileNotFoundError), match="missing model config or worker"):
+        list(generation.stream_generation_request(request, use_subprocess=use_subprocess))
+
+    metadata = json.loads((task / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert metadata["error"] == "missing model config or worker"
+    assert metadata["processing"]["started_at"] == "earlier"
+    assert metadata["processing"]["ended_at"]
+    assert metadata["processing"]["elapsed_ms"] >= 0
+    assert not output_task_is_active(task)
+    updates = generation_task_updates(str(task), output_root=task.parent)
+    assert "missing model config or worker" in updates[2]
+    assert "Failed" in updates[1]
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "canceled"])
+def test_render_failure_does_not_overwrite_terminal_generation_metadata(tmp_path, status):
+    from ui.generation_tab import _record_generation_failure
+
+    metadata_path = tmp_path / "metadata.json"
+    _write_json(metadata_path, {"status": status, "error": "original result"})
+    before = metadata_path.read_bytes()
+    _record_generation_failure({"metadata_path": str(metadata_path)}, "display error", 1.0)
+    assert metadata_path.read_bytes() == before

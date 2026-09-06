@@ -43,7 +43,7 @@ from indextts.utils.task_output_utils import (
     write_metadata_file,
 )
 from indextts.utils.text_segmentation import default_segment_tokens, split_text_by_tokens
-from webui_generation_runner import run_generation_request
+from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
 
 from .common import (
     LAZY_ENGINE,
@@ -1554,6 +1554,50 @@ def stream_generation_request(
 ):
     """Execute one prepared request and yield a shared nine-output dashboard tuple."""
 
+    started = time.perf_counter()
+    try:
+        yield from _stream_generation_request(
+            request,
+            use_subprocess=use_subprocess,
+            gr_progress=gr_progress,
+            process_kind=process_kind,
+        )
+    except Exception as exc:
+        # Model loading and worker startup happen before the runner's failure
+        # handler. Persist those failures too, or polling resurrects the task as
+        # "in progress" after the UI has already displayed its error.
+        try:
+            _record_generation_failure(request, str(exc), time.perf_counter() - started)
+        except OSError as metadata_error:
+            print(f">> Could not save generation failure: {metadata_error}", file=sys.stderr, flush=True)
+        raise
+
+
+def _record_generation_failure(request: Mapping[str, Any], error: str, elapsed: float) -> None:
+    metadata_path = request.get("metadata_path")
+    if not metadata_path:
+        return
+    metadata = read_json(metadata_path, {}) or {}
+    if not metadata or metadata.get("status") in {"completed", "complete", "failed", "error", "canceled", "cancelled"}:
+        return
+    ended_at = current_timestamp()
+    metadata.update(status="failed", error=error, updated_at=ended_at)
+    metadata.setdefault("processing", {}).update(
+        ended_at=ended_at,
+        elapsed_ms=round(elapsed * 1000),
+        elapsed_seconds=round(elapsed, 3),
+        elapsed_human=format_elapsed_duration(elapsed),
+    )
+    write_metadata_file(str(metadata_path), metadata)
+
+
+def _stream_generation_request(
+    request: Mapping[str, Any],
+    *,
+    use_subprocess: bool,
+    gr_progress: Any = None,
+    process_kind: str = "generation",
+):
     task_folder = Path(str(request["task_layout"]["task_folder"]))
     log_path = task_folder / "generation.log"
     progress_file = request.get("progress_file")

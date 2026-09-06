@@ -53,6 +53,7 @@ from .models_tab import (
     runtime_registry_values,
 )
 from .presets_store import FRESH_INSTALL_PRESET, PresetRegistry, PresetStore, SYSTEM_PREFIX
+from .request_guard import configure_request_guard
 from .training_tab import bind_training_events, build_training_tab
 
 
@@ -518,6 +519,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     demo.launch_theme = app_theme()
     demo.launch_css = APP_CSS
     demo.launch_head = APP_HEAD
+    configure_request_guard(demo)
     demo.ui_tabs = {
         "Voice Generation": generation,
         "Batch Generation": batch,
