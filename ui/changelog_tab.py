@@ -7,18 +7,29 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.3",
+        "2026-09-06",
+        """
+### More reliable audio endings and safer training clips
+
+- Batched generation now respects each clip's actual length through acoustic decoding. Padding for longer clips no longer leaks into shorter clips through the semantic decoder, length regulator, acoustic convolutions, or vocoder.
+- Dataset preparation preserves word padding, retains the final analysis frame, and refines touching word timestamps against sustained quiet intervals. Shared cuts stay within the boundary words and never move an ending before its aligned final word.
+- Verified with 60 passing targeted checks, including CUDA speech positions, unequal clip lengths, padded acoustic features, and dataset integration. Three optional demo-audio checks were skipped. Real-model checks matched individual conditioning exactly and recovered 165–220 ms of source audio in three reproduced training cuts.
+
+Restart the app after updating. Existing adapters remain compatible. The dataset fixes apply when preparing new clips; adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+""".strip(),
+    ),
+    (
         "v6.2",
         "2026-09-06",
         """
-### Complete word endings and safer audio boundaries
+### Fix for unfinished final words
 
 - Fixed a speech-decoder position error that could stop the final word before it finished, including with LoRA / DoRA voices. A reproduced generation ending in "uses" now completes the word with the same text, voice adapter, seed, and settings.
-- Corrected both standard and accelerated decoding, including accelerated batches with different prompt lengths.
-- Batched generation now respects each clip's actual length through acoustic decoding. Padding for longer clips no longer leaks into shorter clips through the semantic decoder, length regulator, acoustic convolutions, or vocoder.
-- Dataset preparation preserves word padding, retains the final analysis frame, and refines touching word timestamps against sustained quiet intervals. Shared cuts stay within the boundary words and never move an ending before its aligned final word.
-- Added regression checks for cached decoding, CUDA speech positions, unequal clip lengths, padded acoustic features, and dataset boundaries. Real-model checks matched individual conditioning exactly and recovered 165–220 ms of source audio in three reproduced training cuts.
+- Corrected both standard and accelerated decoding, including accelerated batches with different prompt lengths. Existing voice adapters work without retraining.
+- Added regression checks that compare cached decoding against full-sequence decoding and verify accelerated speech positions on CUDA.
 
-Restart the app after updating. Fixed seeds can produce different audio because generation now follows the positions used during training. Existing adapters remain compatible. The dataset fixes apply when preparing new clips; adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+Restart the app after updating. Fixed seeds can produce different audio because generation now follows the positions used during training.
 """.strip(),
     ),
     (

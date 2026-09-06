@@ -7,7 +7,7 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6.2 final-word fixes:** corrected speech positions in standard and accelerated generation, and prevented padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Regression checks cover decoding, unequal clip lengths, and training boundaries. Restart after updating; the same seed may produce different audio. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+**V6.3 audio-ending improvements:** builds on v6.2's speech-position correction and prevents padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Verification includes 60 passing targeted checks and three reproduced training cuts that recovered 165–220 ms of source audio. Restart after updating. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
 
 **V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
 
@@ -584,7 +584,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.2 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.3 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -714,7 +714,7 @@ The V6.1 training update passed **307 tests**, with 37 optional GPU cases skippe
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.2-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.3-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -740,7 +740,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.2-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.3-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
