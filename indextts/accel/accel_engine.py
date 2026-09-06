@@ -171,10 +171,10 @@ class AccelInferenceEngine:
 
             pos = len(req) - 1
             if hasattr(self, "_tts_mode") and self._tts_mode:
-                # GPT2InferenceModel numbers the start-mel embedding at zero,
-                # then derives cached decode positions from
-                # ``attention_mask_length - cached_prompt_length``.
-                pos = len(req) - (self._tts_prompt_len - 1)
+                # The prompt includes start-mel at position 0. Generated
+                # speech follows at 1, 2, ... exactly as in training. Use each
+                # sequence's unpadded prompt length for variable-length batches.
+                pos = len(req) - req.num_prompt_tokens
             positions.append(pos)
 
             context_lens.append(len(req))

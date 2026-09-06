@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.2 final-word fix:** corrected a speech-decoder position error that could leave the last word unfinished, including with LoRA/DoRA voices. Standard and accelerated generation now follow the positions used during training, with regression checks for cached decoding and variable-length accelerated prompts. Existing adapters work without retraining. Restart the app after updating; the same seed may produce different audio with the corrected decoder.
+
 **V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
 
 - The automatic-stop checkbox is enabled by default, with adjustable patience and a warmup/minimum-training grace period. The live status shows the best update and stopping counter.
@@ -582,7 +584,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.1 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.2 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -712,7 +714,7 @@ The V6.1 training update passed **307 tests**, with 37 optional GPU cases skippe
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.1-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.2-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -738,7 +740,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.1-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.2-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 

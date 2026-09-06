@@ -195,8 +195,11 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             emb = torch.cat([mel_emb, text_emb], dim=1)
         else:
             emb = self.embeddings(input_ids)
+            # The mask includes the current token. Start-mel uses position 0,
+            # so the first cached speech token must use 1 (not 2). Match the
+            # zero-based positions used by training and uncached decoding.
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
-                attention_mask.shape[1] - mel_len, attention_mask.device
+                attention_mask.shape[1] - mel_len - 1, attention_mask.device
             )
         transformer_outputs = self.transformer(
             inputs_embeds=emb,

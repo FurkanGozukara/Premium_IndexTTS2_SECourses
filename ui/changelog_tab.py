@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.2",
+        "2026-09-06",
+        """
+### Fix for unfinished final words
+
+- Fixed a speech-decoder position error that could stop the final word before it finished, including with LoRA / DoRA voices. A reproduced generation ending in "uses" now completes the word with the same text, voice adapter, seed, and settings.
+- Corrected both standard and accelerated decoding, including accelerated batches with different prompt lengths. Existing voice adapters work without retraining.
+- Added regression checks that compare cached decoding against full-sequence decoding and verify accelerated speech positions on CUDA.
+
+Restart the app after updating. Fixed seeds can produce different audio because generation now follows the positions used during training.
+""".strip(),
+    ),
+    (
         "v6.1",
         "2026-09-06",
         """
