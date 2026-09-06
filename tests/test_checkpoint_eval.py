@@ -124,7 +124,9 @@ def test_cpu_checkpoint_evaluation_and_report_files(
 
     report = evaluate_checkpoints(config)
 
-    assert [row.phase for row in report.rows] == ["base", "best", "variant"]
+    assert report.rows[0].val_loss < report.rows[1].val_loss
+    assert report.recommended_kind == "base"
+    assert [row.phase for row in report.rows] == ["base", "plateau", "variant"]
     assert report.rows[0].kind == "base"
     assert report.rows[0].label == BASE_CHECKPOINT_LABEL
     assert report.rows[1].label == "epoch 2 (LoRA Checkpoint)"
@@ -147,6 +149,16 @@ def test_cpu_checkpoint_evaluation_and_report_files(
     old_payload = report.to_dict()
     old_payload.pop("reference_mode")
     assert eval_module.CheckpointEvalReport.from_dict(old_payload).reference_mode == "self"
+    # Older reports marked every update in the best epoch as the lowest loss.
+    old_payload["rows"][0]["val_loss"] = 6.0
+    old_payload["rows"][1].update(val_loss=4.0, phase="best")
+    old_payload["rows"].append({**old_payload["rows"][1], "path": "later.safetensors",
+                                "steps": 3, "val_loss": 4.001})
+    corrected = eval_module.CheckpointEvalReport.from_dict(old_payload)
+    assert corrected.rows[1].phase == "best"
+    assert corrected.rows[-1].phase == "plateau"
+    old_payload["rows"][0]["val_loss"] = 3.0
+    assert all(row.phase != "best" for row in eval_module.CheckpointEvalReport.from_dict(old_payload).rows)
 
 
 def test_parse_strengths_matches_the_shared_text_contract() -> None:

@@ -7,9 +7,13 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6.3 audio-ending improvements:** builds on v6.2's speech-position correction and prevents padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Verification includes 60 passing targeted checks and three reproduced training cuts that recovered 165–220 ms of source audio. Restart after updating. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+**V6.4 automatic selection for each dataset:** fresh runs now freeze their own speech comparison, test several generation seeds, compare current checkpoints with a newly generated Base baseline, and optionally confirm the selected model on separate final-test recordings. Patience checks are spaced by training updates, and a plateau can receive one lower-learning-rate trial within the original budget. Recommendations, failures, and coverage limits are visible in the training dashboard. See the [training and checkpoint-selection guide](docs/TRAINING_SELECTION.md).
 
-Sentence-aligned preparation also repacks complete sentences at shared source pauses and checks both waveform edges after cleanup. The new **Voice and transcript audit** UI screens speaker consistency and transcript agreement, including the first and last words, before caching and training. Checkpoint comparisons preserve entered text and reference recordings when switching adapters. The [V5 dataset and training report](V5_TRAINING_REPORT_2026-09-06.md) documents the rebuilt clips, Chrome workflow verification, and controlled model comparisons.
+Restart after updating. Automatic speech evaluation now runs by default after training and takes additional time. Recommendations include comparison limits and remain separate from human listening ratings. Existing adapters remain compatible.
+
+**V6.3 audio-ending improvements:** builds on v6.2's speech-position correction and prevents padding in acoustic batches from changing shorter clips' endings. Dataset preparation now preserves word padding, refines touching word timestamps against sustained quiet intervals, and retains the source's final analysis frame. Existing adapters remain compatible, while adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
+
+Sentence-aligned preparation also repacks complete sentences at shared source pauses and checks both waveform edges after cleanup. The **Voice and transcript audit** UI screens speaker consistency and transcript agreement, including the first and last words, before caching and training. Checkpoint comparisons preserve entered text and reference recordings when switching adapters.
 
 **V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
 
@@ -17,7 +21,7 @@ Sentence-aligned preparation also repacks complete sentences at shared source pa
 - Validation holds out complete source recordings, uses training-only reference clips, and checks the full validation set every 250 updates and at epoch boundaries by default.
 - FP32 semantic feature extraction and content-aware cache fingerprints prevent stale or lower-precision training targets from being reused when features are recached.
 - Checkpoint analysis includes improvements between epoch boundaries; resume preserves the stopping state, and recoverable FP16 overflow does not advance the update schedule.
-- Optional command-line tools collect main video/SRT pairs, audit narration data, and measure generated checkpoint comparisons. The [completed training report](TRAINING_QUALITY_REPORT_2026-09-06.md) documents the 7.85-hour V4 experiment, 3.28% lower independent test loss versus V3, and the limits of the audio measurements.
+- Optional command-line tools collect main video/SRT pairs, audit narration data, and measure generated checkpoint comparisons.
 
 **V6.0 maintenance update:** the main workflows and registered settings remain compatible with the screenshots, while the following user-visible behavior is new or corrected.
 
@@ -299,7 +303,7 @@ Sort through the prepared-segments table, inspect durations and warnings, and cl
 
 ### Precompute the feature cache
 
-For single-speaker narration that includes demonstrations or music, open **Voice and transcript audit** in the dataset tab before caching. Select the prepared dataset, enter a new audited dataset name and a verified speaker reference path, and reserve source filename stems for validation and optional final testing. **Audit and create training dataset** checks speaker similarity over whole clips and overlapping six-second windows. Its defaults transcribe each voice-matched clip and check the first and last two words separately, so an incorrect ending cannot hide inside a low overall word-error score. Completion selects the audited dataset for caching and training. Every rejection is recorded and the source clips are preserved.
+For single-speaker narration that includes demonstrations or music, open **Voice and transcript audit** in the dataset tab before caching. Select the prepared dataset, enter a new audited dataset name and a verified speaker reference path, and reserve source filename stems for validation and optional final testing. **Audit and create training dataset** checks speaker similarity over whole clips and overlapping six-second windows. Its defaults transcribe each voice-matched clip and check both transcript edges separately, so an incorrect ending cannot hide inside a low overall error score. Transcript errors use words for English, Spanish and Arabic, and characters for Chinese and Japanese. Completion selects the audited dataset for caching and training. Every rejection is recorded and the source clips are preserved.
 
 The command-line audit remains available. Add `--transcribe-all --check-boundary-words --min-edge-silence-ms 30` for the same additional checks:
 
@@ -321,7 +325,7 @@ When caching completes in V6, the prepared dataset remains selected, its cached 
 
 ### Adapter architecture
 
-Select a prepared cached dataset, enter a safe adapter name, and choose LoRA or DoRA. DoRA is the measured quality default; LoRA uses slightly less compute. The recommended measured setup is rank 128 with alpha 129.
+Select a prepared cached dataset, enter a new safe adapter name, and choose LoRA or DoRA. DoRA, rank 128, and alpha 129 are starting defaults; the useful capacity and training length depend on the dataset. Leave **Resume from** set to **Start fresh** for a new run. An existing training history cannot be overwritten by a fresh launch.
 
 ![Annotated 4K LoRA and DoRA adapter setup](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/WNDpzWV-lwGmgxlXtqVcf.png)
 
@@ -331,7 +335,7 @@ Start with the default trainable modules. Increasing rank or enabling extra modu
 
 ### Optimizer, schedule, and effective updates
 
-The measured batch-1 baseline uses AdamW, cosine decay, learning rate `4e-5`, 200 warmup steps, 10 epochs, batch size 1, and accumulation 1. With that setup, every training clip produces one optimizer update per epoch.
+The defaults use AdamW, cosine decay, learning rate `4e-5`, 200 warmup steps, a maximum of 10 epochs, batch size 1, and accumulation 1. With that setup, every training clip produces one optimizer update per epoch. Validation controls the optional lower-rate trial and early stopping within this maximum budget.
 
 ![Annotated 4K optimizer and learning-rate schedule](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/JCYJ1fqw-ZrSDKMJdd1Oh.png)
 
@@ -350,7 +354,7 @@ Keep a validation split so the app measures unseen speech. The default holds out
 
 *Figure 23. Validation runs every 250 updates and at epoch boundaries by default. Maximum validation batches 0 evaluates the whole holdout; a positive cap uses a fixed shuffled subset.*
 
-**Automatically stop when progress stalls** starts checked. After at least 1,000 updates, completed warmup and two dataset passes, six validation checks without a loss improvement greater than 0.005 stop training, even before the chosen epochs or steps. The lowest-loss checkpoint is preserved, including smaller improvements that do not reset patience. Uncheck the control to disable automatic stopping; patience 0 also disables it. Saved training state preserves the best step and patience counter when continuing a run. Both training and validation draw alternative references only from training clips.
+**Automatically stop when progress stalls** starts checked. After at least 1,000 updates, completed warmup and two dataset passes, patience counts six spaced checks without a loss improvement greater than 0.005. Nearby epoch-end checks can save improvements without consuming extra patience. On the first plateau, the enabled lower-rate trial halves the remaining learning-rate schedule and gives it 1,000 grace updates when enough budget remains. Further sustained stalling stops the run; the original maximum budget still applies. The lowest-loss checkpoint is preserved, including smaller improvements that do not reset patience. Uncheck the control to disable automatic stopping; patience 0 also disables it. Saved training state preserves the best score, patience spacing and refinement state when continuing. Both training and validation draw alternative references only from training clips.
 
 When validation uses another clip as its reference, each held-out speaker needs at least one training clip. An invalid split reports the missing speakers instead of silently using the validation target as its own reference. Adjust the split or explicitly select self-reference validation if that is the intended evaluation.
 
@@ -379,13 +383,19 @@ Save an epoch checkpoint so the best-sounding voice is not forced to be the fina
 - Automatic evaluation may include the base model, a deterministic training subset, selected strengths, and a timeout that does not invalidate completed training.
 - The recommended checkpoint is written into machine-readable and plain-language analysis files.
 
+### Automatic speech comparison and final testing
+
+Before training, the app freezes held-out prompts, training-only voice references and deterministic generation seeds. After token-loss evaluation, it compares Base and up to three checkpoints from this run on 12 balanced prompts plus a longer prompt per voice, using three seeds by default. Transcript errors, speaker similarity and failure checks screen regressions against Base; Base can remain the recommendation. **Use best checkpoint** follows the completed speech recommendation.
+
+An optional **Final-test dataset** reserves separate source recordings. Its prompts are frozen before training, and only Base and the selected checkpoint are compared after selection is fixed. Final-test results do not reselect another checkpoint. The reports include paired uncertainty estimates, per-clip results and a blind listening-review file. Automated measures do not establish naturalness; see the [selection guide](docs/TRAINING_SELECTION.md) for the policy and limits.
+
 ### Per-epoch listening samples
 
 Enable training samples to hear progress at a fixed epoch interval. Keep one representative short sentence, one reference, one language, and one seed so differences come from the checkpoint rather than changing inputs.
 
 ![Annotated 4K primary training-sample settings](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/dbhbeyY5i_gQy6I7EmH_Y.png)
 
-*Figure 26. The isolated sampling worker uses its own runtime tier, free-VRAM threshold, and timeout. Blank reference selects the dataset's best candidate automatically; Auto language follows the prepared dataset.*
+*Figure 26. The isolated sampling worker uses its own runtime tier, free-VRAM threshold, and timeout. A blank reference selects a clip from this run's actual training split; Auto language follows the prepared dataset.*
 
 Training samples mirror the important Voice Generation parameters: beams, temperature, top-p, top-k, repetition, emotion weight, diffusion steps, CFG, text-token ceiling, length penalty, mel-token ceiling, and speaking rate.
 
@@ -415,7 +425,7 @@ The real smoke run completed two optimizer steps on a DoRA rank-8 adapter, with 
 
 *Figure 30. Use **Open output folder** for artifacts, **Compare in grid** for controlled listening, and **Use best checkpoint** to send the recommendation to Voice Generation. Completion alone is not a reason to choose the final epoch.*
 
-The completed run remains selected while analysis compares training and unseen loss. Read the recommendation, sustained-overfitting marker, and checkpoint table before deploying an adapter.
+The completed run remains selected while analysis compares training and unseen loss. Read the recommendation, validation-regression warning, speech-comparison results and checkpoint table before using an adapter. A rising validation loss is a warning, not proof of memorization.
 
 ![Annotated 4K training-to-checkpoint-analysis handoff](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/TITZWaenDBXo9Uv8FMSuO.png)
 
@@ -431,7 +441,7 @@ The manager inventories adapter type, rank, alpha, steps, dataset, recommendatio
 
 ### Generalization analysis and measured evaluation
 
-Select one adapter folder and press **Analyze training log**. The CPU-only analysis compares train and validation trends, identifies the lowest unseen loss, and detects a sustained overfitting region rather than assuming the newest file is best.
+Select one adapter folder and press **Analyze training log**. The CPU-only analysis compares train and validation trends, identifies the lowest unseen loss, and flags sustained validation regression. Token loss alone cannot determine which checkpoint sounds best.
 
 ![Annotated 4K checkpoint generalization analysis](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/PxQJJkB_8QuEh5MaVtgfr.png)
 
@@ -588,7 +598,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.3 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.4 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -702,11 +712,9 @@ All three active paths were generated. A 3-second Natural target produced about 
 3. Change exactly one control, generate one or more candidates, and record the output metadata.
 4. Use a listening grid when comparing checkpoints or strengths so every cell is locked automatically.
 
-## 15. Verified Behavior and Repairs Included in This Build
+## 15. Reliability Improvements Included in This Build
 
-This tutorial was not produced from screenshots alone. The original audit completed real synthesis, batching, preparation, feature caching, training, checkpoint evaluation, listening grids, calibration, model verification, and benchmarking. The V6 maintenance audit rebuilt the live interface, checked the changed controls and Changelog in Chrome, and passed **288 tests**, with 37 environment-specific cases skipped and 15 upstream PyTorch deprecation warnings.
-
-The V6.1 training update passed **307 tests**, with 37 optional GPU cases skipped. Separate CUDA checks, the full V4 training run, independent checkpoint evaluation, and 93 generated audio comparisons also completed. The [training quality report](TRAINING_QUALITY_REPORT_2026-09-06.md) records the dataset, evaluation protocol, results, and limitations.
+Reliability improvements cover generation, batching, dataset preparation, feature caching, training, checkpoint evaluation, and restored UI state. Automatic training selection uses each run's own data and records its results inside that training folder. The [training and checkpoint-selection guide](docs/TRAINING_SELECTION.md) explains the evaluation protocol, controls, and limits.
 
 - Mixed TXT/SRT batches now apply caption timing only to caption items instead of crashing the plain-text item.
 - Batched inference no longer leaks sequential target-duration arguments into the batch engine.
@@ -718,7 +726,7 @@ The V6.1 training update passed **307 tests**, with 37 optional GPU cases skippe
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.3-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.4-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -744,7 +752,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.3-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.4-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
@@ -1006,27 +1014,27 @@ The appendix below covers all 267 registered controls, including current default
 | Verified speaker reference paths | `curation.references` | Blank; one clean recording path per line. |
 | Validation source recordings | `curation.validation_sources` | Blank; required source filename stems, one per line. Entire recordings are held out from training. |
 | Final-test source recordings | `curation.test_sources` | Blank; optional stems held in a separate dataset, outside checkpoint selection. |
-| Maximum transcript word error | `curation.max_wer` | 0.15; range 0–1. |
+| Maximum transcript error | `curation.max_wer` | 0.15; range 0–1. |
 | Minimum voice similarity | `curation.min_speaker_similarity` | 0.70; range 0–1. |
 | Minimum voice-window similarity | `curation.min_window_similarity` | 0.60; range 0–1. |
 | Transcribe every voice-matched clip | `curation.transcribe_all` | Enabled; transcribes the actual exported audio. |
-| Verify first and last words | `curation.check_boundary_words` | Enabled; compares the first and last two normalized words against fresh clip transcription. |
+| Verify first and last words | `curation.check_boundary_words` | Enabled; compares both normalized transcript edges against fresh clip transcription. |
 | Audit minimum quiet edge (ms) | `curation.min_edge_silence_ms` | 30; range 0–500. Measures both waveform edges at −40 dBFS; 0 disables this check. |
 | Audit device | `curation.device` | `cuda:0`. |
 
-### LoRA / DoRA Training - 91 settings
+### LoRA / DoRA Training
 
-**Dataset** - `training.dataset_dir`. Prepared manifest dataset used for cached-feature training. *(default "datasets/secourses_demo")*
+**Dataset** - `training.dataset_dir`. Prepared manifest dataset used for cached-feature training. *(default "datasets/voice_dataset")*
 
 **LoRA / DoRA name** - `training.name`. Safe output folder and final safetensors basename. *(default "voice_adapter")*
 
 **LoRA / DoRA type** - `training.adapter_type`. DoRA is the quality default; LoRA uses slightly less compute. *(default "dora"; choices "lora", "dora")*
 
-**Rank** - `training.rank`. 128 with alpha 129 learned the voice fastest in measured runs; rank 32 reached the same floor more slowly. *(default 128; minimum 1; maximum 256)*
+**Rank** - `training.rank`. Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset. *(default 128; minimum 1; maximum 256)*
 
-**Alpha** - `training.alpha`. 129 is the measured companion scale for the recommended rank 128. *(default 129; minimum 1; maximum 1024)*
+**Alpha** - `training.alpha`. Scales the update relative to rank; the default gives a scale near one. *(default 129; minimum 1; maximum 1024)*
 
-**Dropout** - `training.dropout`. 0.05 remains the quality default; stronger measured regularization gave no benefit. *(default 0.05; minimum 0; maximum 0.5)*
+**Dropout** - `training.dropout`. Regularizes adapter inputs. Its useful strength depends on the dataset. *(default 0.05; minimum 0; maximum 0.5)*
 
 **Target attention** - `training.target_attention`. Adapts GPT attention projections; recommended. *(default true)*
 
@@ -1038,27 +1046,27 @@ The appendix below covers all 267 registered controls, including current default
 
 **Train mel embedding head** - `training.train_mel_embed_head`. Advanced: trains the mel token embedding/head modules. *(default false)*
 
-**Learning rate** - `training.learning_rate`. 4e-5 is the robust batch-1 default: it reached 5.061 held-out loss, while 8e-5 overfit within two epochs. *(default 0.00004; minimum 1e-8; maximum 1)*
+**Learning rate** - `training.learning_rate`. Starting update size; the optional plateau trial lowers it once when this dataset stops improving. *(default 0.00004; minimum 1e-8; maximum 1)*
 
 **Optimizer** - `training.optimizer`. AdamW is portable; fused AdamW is faster on supported CUDA builds. *(default "adamw"; choices "adamw", "adamw_fused", "prodigy")*
 
 **Scheduler** - `training.lr_scheduler`. Cosine decay is recommended for multi-epoch voice adaptation. *(default "cosine"; choices "cosine", "linear", "constant", "constant_with_warmup")*
 
-**Warmup steps** - `training.warmup_steps`. 200 steps is the measured batch-1 default, easing training into the 4e-5 learning rate. *(default 200; minimum 0; maximum 1000000)*
+**Warmup steps** - `training.warmup_steps`. Gradually increases the learning rate at the start. Early stopping waits until warmup finishes. *(default 200; minimum 0; maximum 1000000)*
 
-**Weight decay** - `training.weight_decay`. 0.01 is a mild regularizer; 0.05 showed no measured benefit. *(default 0.01; minimum 0; maximum 1)*
+**Weight decay** - `training.weight_decay`. Regularizes trainable weights; useful strength depends on the data and update budget. *(default 0.01; minimum 0; maximum 1)*
 
 **Adam betas** - `training.betas`. Two comma-separated momentum coefficients; 0.9, 0.99 is recommended. *(default "0.9, 0.99")*
 
 **Adam epsilon** - `training.eps`. Numerical stability term for Adam-family optimizers. *(default 1e-8; minimum 1e-12; maximum 0.1)*
 
-**Epochs** - `training.epochs`. 10 epochs is the measured batch-1 default; 20 epochs overfit after the held-out optimum around epoch 6. *(default 10; minimum 1; maximum 10000)*
+**Epochs** - `training.epochs`. Maximum dataset passes. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset. *(default 10; minimum 1; maximum 10000)*
 
 **Maximum steps** - `training.max_steps`. 0 derives steps from epochs; set 5 for a quick smoke run. *(default 0; minimum 0; maximum 100000000)*
 
-**Batch size** - `training.batch_size`. 1 is the measured quality default: every training clip becomes an optimizer update each epoch. *(default 1; minimum 1; maximum 128)*
+**Batch size** - `training.batch_size`. Clips per micro-batch. Larger batches need more memory and produce fewer updates per epoch. *(default 1; minimum 1; maximum 128)*
 
-**Gradient accumulation** - `training.grad_accumulation`. 1 is the measured default; accumulation 2 or 4 removed updates and performed worse at the same learning rate. *(default 1; minimum 1; maximum 128)*
+**Gradient accumulation** - `training.grad_accumulation`. Micro-batches combined into one optimizer update. Check the displayed update budget after changing it. *(default 1; minimum 1; maximum 128)*
 
 **Gradient clip** - `training.max_grad_norm`. 1.0 limits unstable gradient spikes; 0 disables clipping. *(default 1; minimum 0; maximum 100)*
 
@@ -1068,9 +1076,9 @@ The appendix below covers all 267 registered controls, including current default
 
 **Text loss weight** - `training.text_loss_weight`. Auxiliary text modeling loss weight. *(default 0.1; minimum 0; maximum 100)*
 
-**Speaker reference mode** - `training.speaker_ref_mode`. self uses the target clip, other uses a deterministic different same-speaker clip, and mixed alternates between them; other is the measured quality default. *(default "other"; choices "self", "other", "mixed")*
+**Speaker reference mode** - `training.speaker_ref_mode`. self uses the target clip; other uses a different same-speaker training clip, matching typical generation; mixed alternates between them. *(default "other"; choices "self", "other", "mixed")*
 
-**Emotion reference mode** - `training.emo_ref_mode`. self uses the target emotion, other uses another same-speaker clip, mixed alternates, and follow_speaker reuses the speaker-reference clip; follow_speaker is the measured inference-like default. *(default "follow_speaker"; choices "self", "other", "mixed", "follow_speaker")*
+**Emotion reference mode** - `training.emo_ref_mode`. self uses the target emotion; other uses another same-speaker training clip; mixed alternates; follow_speaker reuses the speaker-reference clip. *(default "follow_speaker"; choices "self", "other", "mixed", "follow_speaker")*
 
 **Maximum codes** - `training.max_codes`. Cached samples longer than this semantic-code limit are rejected. *(default 1500; minimum 1; maximum 100000)*
 
@@ -1084,17 +1092,25 @@ The appendix below covers all 267 registered controls, including current default
 
 **Maximum validation batches** - `training.val_max_batches`. 0 evaluates the entire holdout. A positive cap uses a fixed shuffled subset; loss is weighted by valid tokens. *(default 0; minimum 0; maximum 1000000)*
 
-**Validation reference** - `training.val_reference_mode`. self validates each target with itself, while other uses a different same-speaker clip for both vectors; other is inference-like and measured more accurately. *(default "other"; choices "self", "other")*
+**Validation reference** - `training.val_reference_mode`. self validates each target with itself; other uses a different same-speaker training clip for both vectors, matching typical generation. *(default "other"; choices "self", "other")*
 
 **Automatically stop when progress stalls** - `training.early_stop_enabled`. Stop after validation stalls beyond the initial learning period and retain the best checkpoint. *(default true)*
 
-**Early-stop patience** - `training.early_stop_patience`. 0 disables early stopping; otherwise stop after this many validations without a meaningful improvement. *(default 6; minimum 0; maximum 1000000)*
+**Early-stop patience** - `training.early_stop_patience`. 0 disables early stopping; otherwise this many spaced stalled checks trigger the optional lower-rate trial or stopping. *(default 6; minimum 0; maximum 1000000)*
 
 **Early-stop minimum improvement** - `training.early_stop_min_delta`. Validation loss must fall by more than this amount to reset patience. *(default 0.005; minimum 0; maximum 1000000)*
 
 **Minimum steps before early stopping** - `training.early_stop_min_steps`. Wait for this many updates and completed warmup before counting stalled checks. *(default 1000; minimum 0)*
 
 **Minimum epochs before early stopping** - `training.early_stop_min_epochs`. Give the dataset this many passes before counting stalled checks. *(default 2; minimum 0)*
+
+**Minimum updates between patience checks** - `training.early_stop_check_steps`. 0 uses the validation interval. Nearby epoch checks can save improvements without consuming extra patience. *(default 0)*
+
+**Try a lower learning rate before stopping** - `training.plateau_lr_enabled`. One refinement trial within the original budget, preserving the best checkpoint. *(default true)*
+
+**Plateau learning-rate multiplier** - `training.plateau_lr_factor`. Multiplies the current and remaining learning-rate schedule when the trial starts. *(default 0.5)*
+
+**Refinement grace updates** - `training.plateau_lr_grace_steps`. Wait this many updates after lowering the rate before resuming spaced patience checks. *(default 1000)*
 
 **Base variant** - `training.base_variant`. BF16 is the quality default; INT8 ConvRot reduces frozen base weight memory. *(default "bf16"; choices "bf16", "int8_convrot")*
 
@@ -1142,6 +1158,22 @@ The appendix below covers all 267 registered controls, including current default
 
 **Evaluation timeout (s)** - `training.eval_timeout_s`. Stops automatic checkpoint evaluation after this many seconds without failing the completed training run. *(default 900; minimum 1; maximum 100000)*
 
+**Compare generated speech automatically** - `training.speech_eval_enabled`. Compare Base and this run's shortlisted checkpoints after training. *(default true)*
+
+**Held-out speech prompts** - `training.speech_eval_prompts`. Balance validation texts across available recordings, speakers and lengths; add a longer prompt per voice when enough texts are available. *(default 12)*
+
+**Generation seeds per prompt** - `training.speech_eval_seeds`. Repeated deterministic seeds shared by every candidate. *(default 3)*
+
+**Speech checkpoint candidates** - `training.speech_eval_candidates`. Shortlist distinct updates with low validation losses plus the latest update; Base is also included. *(default 3)*
+
+**Speech comparison timeout (s)** - `training.speech_eval_timeout_s`. Total time allowed for generated-speech comparison and optional final testing. *(default 7200)*
+
+**Allowed transcript error increase over Base** - `training.speech_eval_max_wer_increase`. Absolute screening margin; 0.02 means two percentage points. Uses CER for Chinese/Japanese and WER for other supported languages. *(default 0.02)*
+
+**Allowed speaker-similarity drop from Base** - `training.speech_eval_max_speaker_drop`. Absolute screening margin for mean speaker similarity. *(default 0.03)*
+
+**Final-test dataset (optional)** - `training.final_test_dataset`. Separate prepared source recordings, checked only after selection is fixed. Feature caching is not required for this speech test. *(default blank)*
+
 **Generate training samples** - `training.sample_enabled`. Renders a short sample at the configured epoch interval. *(default true)*
 
 **Sample every epochs** - `training.sample_every_epochs`. 1 provides a sample after each completed epoch. *(default 1; minimum 1; maximum 10000)*
@@ -1154,7 +1186,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Sample text** - `training.sample_text`. Short representative phrase used to compare epochs. *(default "This is a training progress sample for the adapted voice.")*
 
-**Custom sample reference** - `training.sample_reference`. Optional audio path; blank uses the dataset's best reference candidate automatically.
+**Custom sample reference** - `training.sample_reference`. Optional audio path; blank selects a reference from this run's actual training split.
 
 **Sample language** - `training.sample_language`. Mirrors Voice Generation for per-epoch samples; auto uses the prepared dataset language. *(default "auto"; choices "auto", "ZH", "EN", "JA", "AR", "ES")*
 

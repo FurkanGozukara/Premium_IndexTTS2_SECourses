@@ -22,8 +22,8 @@ from .charts import empty_series_frame, load_metrics
 
 ANALYSIS_SERIES = (
     "train loss",
-    "validation (improving)",
-    "validation (overfitting)",
+    "validation",
+    "validation (regression)",
 )
 BASE_CHECKPOINT_LABEL = "Base model (no LoRA / DoRA)"
 BASE_CHECKPOINT_CHOICE_LABEL = (
@@ -36,7 +36,8 @@ _LEGACY_BASE_LABELS = frozenset({"base model", "base model (no adapter)"})
 GENERALIZATION_LEGEND = (
     "Validation loss measures how well the LoRA / DoRA predicts sentences it never saw during "
     "training (lower is better). Training loss measures the clips it trains on. When training "
-    "loss keeps falling but validation loss rises, the LoRA / DoRA is memorizing (overfitting)."
+    "loss keeps falling but validation loss rises, that can indicate overfitting. Loss alone does not "
+    "establish memorization or generated-speech quality; audio-token accuracy is not word accuracy."
 )
 
 _EPOCH_RE = re.compile(r"_epoch_(\d+)$", re.IGNORECASE)
@@ -327,10 +328,10 @@ def display_legacy_report_text(text: str | None) -> str:
 
 def phase_display_label(phase: str | None) -> str:
     return {
-        "best": "Best generalization",
+        "best": "Lowest validation loss",
         "improving": "Improving",
         "plateau": "Plateau",
-        "overfitting": "Overfitting (memorizes training clips)",
+        "overfitting": "Validation regression (possible overfitting)",
         "base": BASE_PHASE_LABEL,
         "variant": "Strength variant",
         "unknown": "Not measured",
@@ -461,23 +462,22 @@ def _summary(
         accuracy = best.val_accuracy if best is not None else None
         accuracy_text = f", {accuracy * 100:.1f}% next-token accuracy" if accuracy is not None else ""
         lines = [
-            f"**Best generalization: epoch {best_epoch}** (validation loss {best_val_loss:.2f}{accuracy_text} on unseen sentences)."
+            f"**Lowest logged validation loss: epoch {best_epoch}** (loss {best_val_loss:.2f}{accuracy_text} on held-out clips)."
         ]
         if status == "still_improving":
             lines.append(
-                "The best result is the last epoch, so training was still improving and could run longer; "
+                "The last epoch contains the lowest logged validation loss; "
                 "the final file is the best one available."
             )
         elif status == "best_found" and overfit_start is not None:
             lines.append(
-                f"**Overfitting starts at epoch {overfit_start}.** From there validation loss rises while "
-                "training loss keeps falling, which means the LoRA / DoRA memorizes the training clips instead "
-                "of learning the voice."
+                f"**Validation regression from epoch {overfit_start}.** The epoch minimum exceeds the tolerance "
+                "above the best value. This is an overfitting warning, not a statistical test or proof of memorization."
             )
             final = by_epoch.get(final_epoch or -1)
             if final_val_loss is not None and final_epoch is not None:
                 detail = (
-                    f"The final file (epoch {final_epoch}) is overfitted: validation loss "
+                    f"The final epoch {final_epoch} has logged validation loss "
                     f"{final_val_loss:.2f}"
                 )
                 if best_val_loss != 0:
@@ -490,20 +490,19 @@ def _summary(
                     and final.train_accuracy is not None
                 ):
                     detail += (
-                        f" while training-set accuracy climbed from {best.train_accuracy * 100:.1f}% "
+                        f"; training audio-token accuracy changed from {best.train_accuracy * 100:.1f}% "
                         f"to {final.train_accuracy * 100:.1f}%"
                     )
                 lines.append(detail + ".")
         else:
             lines.append(
                 f"Later epochs stayed within {tolerance * 100:.1f}% of the best validation loss, so the run reached a plateau "
-                "without a sustained overfitting rise."
+                "within this report's tolerance."
             )
         lines.append(f"**Recommended checkpoint:** `{checkpoint_text}` (epoch {best_epoch}).")
         if status == "best_found" and overfit_start is not None:
             lines.append(
-                f"Tip: stop training around epoch {best_epoch}-{overfit_start} next time, or keep every epoch "
-                "checkpoint (Keep last N = 0) and compare them in the Checkpoint Grid tab."
+                "Keep the lowest-loss checkpoint and compare generated speech. A different dataset may need a different training length."
             )
         verdict = "  \n".join(lines)
     return verdict + "\n\n" + GENERALIZATION_LEGEND
@@ -699,9 +698,9 @@ def analysis_epoch_frame(analysis: TrainingAnalysis | None) -> pd.DataFrame:
             rows.append({"step": epoch.epoch, "value": epoch.train_loss, "series": "train loss"})
         if epoch.val_loss is not None:
             series = (
-                "validation (overfitting)"
+                "validation (regression)"
                 if epoch.phase == "overfitting"
-                else "validation (improving)"
+                else "validation"
             )
             rows.append({"step": epoch.epoch, "value": epoch.val_loss, "series": series})
     if not rows:

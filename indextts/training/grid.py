@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -81,6 +81,7 @@ class GridConfig:
     texts: list[str] = field(default_factory=list)
     language: str = "EN"
     seed: int = -1
+    seeds: list[int] = field(default_factory=list)
     same_seed_for_all_cells: bool = True
     output_root: str = "outputs/grids"
     grid_name: str = ""
@@ -113,6 +114,9 @@ class GridConfig:
         self.seed = int(self.seed)
         if self.seed < -1:
             raise ValueError("seed must be -1 or a non-negative integer")
+        self.seeds = list(dict.fromkeys(int(value) for value in self.seeds))
+        if any(value < 0 or value >= 2**32 for value in self.seeds):
+            raise ValueError("grid seeds must be unsigned 32-bit integers")
         self.output_root = str(Path(self.output_root).expanduser().resolve())
         self.grid_name = _safe_name(self.grid_name, "") if self.grid_name else ""
         self.runtime = dict(self.runtime or {})
@@ -280,6 +284,15 @@ def build_grid_cells(config: GridConfig | Mapping[str, Any]) -> list[GridCell]:
                             seed=cfg.seed,
                         )
                     )
+    if cfg.seeds:
+        repeated = []
+        for cell in cells:
+            for seed in cfg.seeds:
+                filename = Path(cell.filename)
+                repeated.append(replace(cell, index=len(repeated) + 1, seed=seed,
+                                        filename=f"{filename.stem}__seed{seed}{filename.suffix}",
+                                        label=f"{cell.label} | seed {seed}"))
+        return repeated
     return cells
 
 
@@ -535,7 +548,8 @@ def run_grid(
     cells = build_grid_cells(cfg)
     resolved_seed = secrets.randbelow(2**32) if cfg.seed == -1 else cfg.seed % (2**32)
     for index, cell in enumerate(cells):
-        cell.seed = resolved_seed if cfg.same_seed_for_all_cells else (resolved_seed + index) % (2**32)
+        if not cfg.seeds:
+            cell.seed = resolved_seed if cfg.same_seed_for_all_cells else (resolved_seed + index) % (2**32)
     progress = reporter or ProgressReporter(
         "cells", total=len(cells), progress_file=grid_dir / "progress.json"
     )
@@ -568,6 +582,7 @@ def run_grid(
         runtime["lora_path"] = ""
         engine = create_tts(runtime)
         progress.set_stage("generating")
+        total_audio_seconds = 0.0
         for index, cell in enumerate(cells, start=1):
             if cancel_callback is not None and cancel_callback():
                 result.status = "cancelled"
@@ -614,6 +629,7 @@ def run_grid(
             cell.val_loss = float(val_loss) if val_loss is not None else None
             cell.status = "complete"
             elapsed = time.perf_counter() - cell_started
+            total_audio_seconds += cell.audio_seconds
             with cell_log_path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(
                     f">> complete | audio {cell.audio_seconds:.2f}s | elapsed {elapsed:.2f}s | "
@@ -623,7 +639,9 @@ def run_grid(
                 index,
                 total=len(cells),
                 desc=cell.label,
-                extra={"audio_seconds": cell.audio_seconds, "cell_elapsed_s": elapsed},
+                # ProgressReporter divides audio_seconds by the whole grid's elapsed time.
+                extra={"audio_seconds": total_audio_seconds, "cell_audio_seconds": cell.audio_seconds,
+                       "cell_elapsed_s": elapsed},
             )
             log(
                 f">> cell {index}/{len(cells)} {cell.filename} | audio {cell.audio_seconds:.2f}s | "

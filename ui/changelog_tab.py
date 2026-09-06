@@ -1,4 +1,4 @@
-"""Product release history and SECourses project links."""
+"""Public product release history; keep personal training results in local run reports."""
 
 from __future__ import annotations
 
@@ -6,6 +6,26 @@ import gradio as gr
 
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
+    (
+        "v6.4",
+        "2026-09-07",
+        """
+### Automatic checkpoint selection for each dataset
+
+- Fresh training starts from the installed base model and the selected dataset. Speech references and comparison plans come from that run's own data, and a new run cannot overwrite an existing training history. Earlier adapters and reports are not required.
+- Automatic stopping now spaces patience checks by optimizer updates, so nearby epoch boundaries do not consume extra patience. One optional lower-learning-rate trial can continue a plateau within the original budget while preserving the best checkpoint and resume state.
+- Automatic speech comparison freezes balanced validation prompts and several generation seeds before training, then compares up to three current-run checkpoints with freshly generated Base speech. It measures transcript errors, speaker similarity, possible truncation/repetition, and invalid audio; paired uncertainty estimates help resolve transcript comparisons.
+- **Use best checkpoint** follows the completed speech recommendation. Base can win, and unresolved transcript ties use measured validation loss. A missing recommended file raises a clear error.
+- Added an optional independent **Final-test dataset**. Its sources and audio must be separate from training/validation. The selected model is frozen before this test, and test results do not choose another checkpoint.
+- Reports retain settings, file hashes, coverage warnings, per-clip results, and a blind listening form. Automated measurements are screening signals; human naturalness ratings remain separate.
+- Subtitle sidecars remain part of the fresh preparation workflow. The voice/transcript audit now uses character errors for Chinese and Japanese and word errors for English, Spanish, and Arabic.
+- The dashboard shows audio and text validation losses separately, reports stalled checks and the learning-rate trial, and distinguishes the lowest-loss update from other checkpoints in the same epoch. Fixed evaluation startup percentages, cumulative grid throughput, and cramped checkpoint headers.
+
+Restart after updating. Existing adapters remain compatible. New training runs enable automatic speech comparison by default; this adds evaluation time after optimization. The optional independent test adds further generation work. Newly saved adapters now record the same release version shown in the app.
+
+[Training and checkpoint-selection guide](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses/blob/master/docs/TRAINING_SELECTION.md).
+""".strip(),
+    ),
     (
         "v6.3",
         "2026-09-06",
@@ -19,14 +39,12 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Fixed dataset progress reaching 100% when an individual Whisper transcription finished; stopping a partial run now preserves its actual progress.
 - Feature-cache progress now reads the worker's actual clip counts, percentage, speed, and ETA instead of staying at zero until completion.
 - Silence detection keeps frame timestamps aligned at 22.05 kHz, avoiding accumulated timing drift from repeatedly rounding fractional sample counts.
-- Verified with 60 passing targeted checks, including CUDA speech positions, unequal clip lengths, padded acoustic features, and dataset integration. Three optional demo-audio checks were skipped. Real-model checks matched individual conditioning exactly and recovered 165–220 ms of source audio in three reproduced training cuts.
 - Checkpoint comparisons now preserve entered text and reference recordings when switching adapters or refreshing analysis. Empty forms still use the selected run's suggestions, and **Use LoRA / DoRA reference** remains available.
 - Refresh reloads the selected run's checkpoint list and analysis as well as the folder labels. Training samples show their actual filenames, and checkpoint summaries distinguish different updates within the same epoch.
-- Fixed flashing progress and stats panels during voice generation, batch generation, dataset preparation, feature caching, and training. Live values, progress bars, charts, and logs update without the pulsing or fading overlay. Verified in Chrome with 24 simulated updates and 30 passing UI and progress checks.
+- Fixed flashing progress and stats panels during voice generation, batch generation, dataset preparation, feature caching, and training. Live values, progress bars, charts, and logs update without the pulsing or fading overlay.
 
 Restart the app after updating. Existing adapters remain compatible. The dataset fixes apply when preparing new clips; adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
 
-[Read the V5 rebuild, Chrome workflow verification, and model comparisons](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses/blob/master/V5_TRAINING_REPORT_2026-09-06.md).
 """.strip(),
     ),
     (
@@ -35,7 +53,7 @@ Restart the app after updating. Existing adapters remain compatible. The dataset
         """
 ### Fix for unfinished final words
 
-- Fixed a speech-decoder position error that could stop the final word before it finished, including with LoRA / DoRA voices. A reproduced generation ending in "uses" now completes the word with the same text, voice adapter, seed, and settings.
+- Fixed a speech-decoder position error that could stop the final word before it finished, including with LoRA / DoRA voices.
 - Corrected both standard and accelerated decoding, including accelerated batches with different prompt lengths. Existing voice adapters work without retraining.
 - Added regression checks that compare cached decoding against full-sequence decoding and verify accelerated speech positions on CUDA.
 
@@ -53,11 +71,9 @@ Restart the app after updating. Fixed seeds can produce different audio because 
 - Speech-token feature extraction now keeps the semantic encoder in FP32. Cache fingerprints detect changed audio, transcripts, model assets, and extraction settings so stale features are rebuilt when caching is requested.
 - Best-checkpoint selection includes every validation check, including improvements between epoch boundaries. Resume state preserves the best step and stopping counter; recoverable FP16 overflow skips an update without advancing the learning-rate schedule.
 - Added optional command-line tools for collecting main video/subtitle pairs, auditing speaker consistency and transcript agreement, and measuring generated checkpoint comparisons.
-- Updated training presets, help, and the guide. Verification includes **307 passing tests**, 37 optional GPU cases skipped, a completed CUDA training run, and **93 generated audio comparisons**.
+- Updated training presets, help, and the guide to explain validation, automatic stopping, and checkpoint selection.
 
-In the accompanying English voice experiment, 7.85 hours of curated training audio (about 75% more than V3) and the updated pipeline reduced independent test loss by **3.28%**. ASR-measured word error fell from **6.83% to 5.69%** across twelve test prompts. Training stopped at update 10,250 and retained update 9,195 as best. These are results from the combined data and pipeline update; automated scores are not human listening ratings.
-
-[Read the training report and comparison limits](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses/blob/master/TRAINING_QUALITY_REPORT_2026-09-06.md).
+For existing datasets, run feature caching again to rebuild older caches with the corrected extractor.
 """.strip(),
     ),
     (

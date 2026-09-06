@@ -157,6 +157,22 @@ class CheckpointEvalRow:
         return cls(**payload)
 
 
+def _mark_loss_best(rows: list[CheckpointEvalRow]) -> None:
+    """A best epoch can contain several updates; only minimum-loss files get that label."""
+    comparable = [row for row in rows if row.val_loss is not None and math.isfinite(row.val_loss)
+                  and (row.kind == "base" or abs(row.strength - 1.0) < 1e-9)]
+    if not comparable:
+        return
+    lowest = min(row.val_loss for row in comparable)
+    for row in comparable:
+        if row.kind == "base":
+            continue
+        if abs(row.val_loss - lowest) < 1e-9:
+            row.phase = "best"
+        elif row.phase == "best":
+            row.phase = "plateau"
+
+
 @dataclass
 class CheckpointEvalReport:
     adapter_dir: str
@@ -172,6 +188,7 @@ class CheckpointEvalReport:
     generated_at: str
     elapsed_s: float
     reference_mode: str = "self"
+    recommended_kind: str = "adapter"
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -186,6 +203,7 @@ class CheckpointEvalReport:
             for item in payload.get("rows", [])
             if isinstance(item, (CheckpointEvalRow, Mapping))
         ]
+        _mark_loss_best(payload["rows"])
         payload.setdefault("reference_mode", "self")
         allowed = {item.name for item in fields(cls)}
         return cls(**{key: item for key, item in payload.items() if key in allowed})
@@ -366,7 +384,7 @@ def _summary_markdown(
     if base is not None and base.val_loss is not None:
         lines.append(
             f"{BASE_CHECKPOINT_LABEL} scores {base.val_loss:.2f}; every checkpoint below "
-            "that number learned something from your data."
+            "that number predicts these held-out tokens better than Base."
         )
     if best is None or best.val_loss is None:
         lines.append("No LoRA / DoRA checkpoint produced a measurable validation score.")
@@ -378,8 +396,8 @@ def _summary_markdown(
     )
     selected_step = f" at update {best.steps:,}" if best.steps > 0 else ""
     lines.append(
-        f"**Best measured generalization: {best.label}{selected_step}** (validation loss {best.val_loss:.2f}{accuracy} "
-        "on unseen sentences)."
+        f"**Lowest measured validation loss: {best.label}{selected_step}** (loss {best.val_loss:.2f}{accuracy} "
+        "on held-out clips)."
     )
     overfit = sorted(
         (
@@ -395,15 +413,14 @@ def _summary_markdown(
         onset = getattr(analysis, "overfit_start_epoch", None)
         if onset is not None and int(onset) != int(overfit[0].epoch or 0):
             lines.append(
-                f"**Overfitting starts at epoch {int(onset)}** according to the training log; among the "
-                f"saved checkpoints, epoch {overfit[0].epoch} is the earliest one that is already overfitted. "
-                "Later checkpoints score worse on unseen sentences even while fitting the training clips "
-                "more closely."
+                f"**Validation regression from epoch {int(onset)}** in the training log; "
+                f"epoch {overfit[0].epoch} is the earliest saved checkpoint exceeding the loss tolerance. "
+                "This is a possible overfitting signal; generated speech is evaluated separately."
             )
         else:
             lines.append(
-                f"**Overfitting starts at epoch {overfit[0].epoch}.** Later checkpoints score worse on "
-                "unseen sentences even while fitting the training clips more closely."
+                f"**Validation regression from epoch {overfit[0].epoch}.** Later checkpoints exceed "
+                "the loss tolerance on held-out clips; this does not establish speech quality."
             )
         final = max(
             (
@@ -426,7 +443,7 @@ def _summary_markdown(
                 detail += f" ({increase:+.1f}% vs best)"
             if best.train_accuracy is not None and final.train_accuracy is not None:
                 detail += (
-                    f" while training-text accuracy climbed from {best.train_accuracy * 100:.1f}% "
+                    f"; training audio-token accuracy changed from {best.train_accuracy * 100:.1f}% "
                     f"to {final.train_accuracy * 100:.1f}%"
                 )
             lines.append(detail + ".")
@@ -446,7 +463,7 @@ def _summary_markdown(
         else:
             lines.append(
                 "Later measured checkpoints stayed near the best score, so the run reached a plateau "
-                "without a sustained overfitting rise."
+                "within the report's loss tolerance."
             )
     lines.append(f"**Recommended checkpoint:** `{best.path}`.")
     return "  \n".join(lines) + "\n\n" + GENERALIZATION_LEGEND
@@ -605,9 +622,11 @@ def evaluate_checkpoints(
             row.phase = "variant"
         else:
             row.phase = phase_map.get(int(row.epoch or 0), "unknown")
+    _mark_loss_best(rows)
     candidates = primary or [
         row for row in rows if row.kind != "base" and row.val_loss is not None
     ]
+    candidates = [*candidates, *(row for row in rows if row.kind == "base" and row.val_loss is not None)]
     best = min(candidates, key=lambda row: float(row.val_loss)) if candidates else None
     summary = _summary_markdown(
         rows, best, cfg.reference_mode, load_training_analysis(cfg.adapter_dir)
@@ -628,6 +647,7 @@ def evaluate_checkpoints(
         generated_at=_utc_now(),
         elapsed_s=elapsed,
         reference_mode=cfg.reference_mode,
+        recommended_kind="base" if best is not None and best.kind == "base" else "adapter",
     )
 
 

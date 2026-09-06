@@ -62,26 +62,23 @@ def test_suggested_epochs_returns_zero_without_training_clips() -> None:
 def test_training_plan_advisory_suggests_epochs_below_measured_range() -> None:
     plan = training_plan(1_000, 1, 1, 4, 0, 0)
 
-    assert training_plan_advisory(plan, 1, 1) == (
-        "Only 4,000 optimizer updates; the measured sweet spot is about 10,000. "
-        "Suggested epochs for this dataset: 10."
-    )
+    text = training_plan_advisory(plan, 1, 1)
+    assert "Maximum budget: 4,000" in text
+    assert "depends on this dataset" in text
+    assert "sweet spot" not in text
 
 
 def test_training_plan_advisory_identifies_measured_range() -> None:
     plan = training_plan(1_000, 1, 1, 10, 0, 0)
 
-    assert training_plan_advisory(plan, 1, 1) == (
-        "About 10,000 optimizer updates, inside the measured 5,000-20,000 range where "
-        "the best checkpoints appeared."
-    )
+    text = training_plan_advisory(plan, 1, 1)
+    assert "Maximum budget: 10,000" in text
+    assert "held-out validation controls" in text
 
 
 def test_training_plan_advisory_suggests_reduction_above_measured_range() -> None:
     plan = training_plan(1_000, 1, 1, 21, 0, 0)
 
-    assert training_plan_advisory(plan, 1, 1) == (
-        "21,000 optimizer updates is more than the measured sweet spot of about 10,000; "
-        "every epoch is kept, so pick the best one in the Checkpoint Grid, or reduce epochs "
-        "to about 10."
-    )
+    text = training_plan_advisory(plan, 1, 1)
+    assert "Maximum budget: 21,000" in text
+    assert "saved checkpoints and Base" in text

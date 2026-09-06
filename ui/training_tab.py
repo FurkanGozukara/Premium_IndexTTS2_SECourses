@@ -48,7 +48,7 @@ from .models_tab import ModelsTab
 from .presets_store import PresetRegistry
 
 
-TRAIN_DEFAULTS = TrainConfig(dataset_dir="datasets/secourses_demo", name="voice_adapter").to_dict()
+TRAIN_DEFAULTS = TrainConfig(dataset_dir="datasets/voice_dataset", name="voice_adapter").to_dict()
 TRAIN_BETAS_TEXT = ", ".join(str(value) for value in TRAIN_DEFAULTS["betas"])
 _LAST_TRAINING_FOLDER = ROOT / "loras"
 TRAINING_TERMINAL_PHASES = frozenset(
@@ -282,6 +282,39 @@ def _verdict_text(phase: str) -> str:
     return phase_display_label(phase)
 
 
+def recommended_generation_value(root: str | Path) -> str:
+    """An explicit Base recommendation is authoritative, even if a final file exists."""
+    from indextts.training.speech_eval import load_speech_evaluation
+    root = Path(root)
+    status = read_json(root / "status.json", {}) or {}
+    speech = load_speech_evaluation(root)
+    if speech is not None and status.get("speech_evaluation_status", "complete") == "complete":
+        if speech["recommended_kind"] == "base":
+            return ""
+        path = speech["recommended_checkpoint"]
+        if not Path(path).is_file():
+            raise ValueError("The speech-recommended checkpoint is missing; rerun evaluation or restore that file")
+        return str(Path(path).resolve())
+    measured = load_checkpoint_eval(root)
+    if measured is not None:
+        if measured.recommended_kind == "base":
+            return ""
+        path = measured.recommended_checkpoint
+        if not path or not Path(path).is_file():
+            raise ValueError("The measured checkpoint is missing; rerun evaluation or restore that file")
+        return str(Path(path).resolve())
+    analysis = load_training_analysis(root)
+    path = analysis.recommended_checkpoint if analysis is not None else status.get("recommended_checkpoint")
+    if not path or not Path(path).is_file():
+        path = status.get("last_checkpoint")
+    if not path or not Path(path).is_file():
+        candidates = sorted(root.glob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
+        path = str(candidates[0]) if candidates else ""
+    if not path:
+        raise ValueError("No completed checkpoint is available yet")
+    return str(Path(path).resolve())
+
+
 def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.DataFrame]:
     if not state_dir:
         return "", analysis_epoch_frame(None)
@@ -294,6 +327,14 @@ def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.Data
         summary = display_legacy_report_text(analysis.summary_markdown)
     else:
         summary = "Run training with validation enabled to identify the checkpoint that generalizes best."
+    from indextts.training.speech_eval import load_speech_evaluation
+    status = read_json(root / "status.json", {}) or {}
+    speech = load_speech_evaluation(root)
+    if speech is not None and status.get("speech_evaluation_status", "complete") == "complete":
+        summary = speech["summary_markdown"] + "\n\n" + summary
+    elif status.get("speech_evaluation_status"):
+        summary = (f"**Speech evaluation: {status['speech_evaluation_status']}** — "
+                   f"{status.get('speech_evaluation_message', '')}\n\n" + summary)
     return "### Generalization summary\n\n" + summary, analysis_epoch_frame(analysis)
 
 
@@ -306,6 +347,7 @@ def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> s
     parts = [str(value.get("phase", "idle")).replace("_", " ").title(), f"step {step}/{total}", f"epoch {epoch}/{epochs}"]
     for key, label, fmt in (
         ("loss", "loss", ".4f"), ("avg_loss", "avg", ".4f"), ("val_loss", "val", ".4f"),
+        ("val_mel_loss", "val audio loss", ".4f"), ("val_text_loss", "val text loss", ".4f"),
         ("lr", "lr", ".2e"), ("it_s", "speed", ".2f"), ("vram_used_gb", "VRAM", ".2f"),
     ):
         item = value.get(key)
@@ -315,7 +357,7 @@ def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> s
     if not metrics.empty and "mel_accuracy" in metrics:
         accuracy = pd.to_numeric(metrics["mel_accuracy"], errors="coerce").dropna()
         if not accuracy.empty:
-            parts.append(f"acc {accuracy.iloc[-1]:.3f}")
+            parts.append(f"audio-token accuracy {accuracy.iloc[-1]:.3f}")
     eta = value.get("eta_s")
     elapsed = value.get("elapsed_s")
     if elapsed is not None:
@@ -329,6 +371,9 @@ def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> s
         parts.append(f"best {float(tracking['best_loss']):.4f} at step {int(tracking.get('best_step', 0))}")
     if value.get("early_stop_enabled") and tracking:
         parts.append(f"stalled checks {int(tracking.get('bad_checks', 0))}/{int(value.get('early_stop_patience', 0))}")
+        parts.append(f"{max(0, step - int(tracking.get('last_meaningful_step', 0)))} updates since meaningful improvement")
+        if tracking.get("lr_reductions"):
+            parts.append(f"LR refinement used; grace until step {tracking.get('cooldown_until_step', 0)}")
     runtime_warning = str(value.get("runtime_warning") or "")
     if runtime_warning and runtime_warning != str(value.get("message") or ""):
         parts.append(runtime_warning)
@@ -388,11 +433,16 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
     }
     if phase == "evaluating":
         evaluation_progress = read_json(root / "analysis" / "eval_job" / "progress.json", {}) or {}
-        if evaluation_progress:
-            payload = dict(evaluation_progress)
+        payload = dict(evaluation_progress) or {"fraction": 0.0, "completed": 0, "total": None}
         payload["desc"] = str(status.get("message") or payload.get("desc") or "evaluating checkpoints")
+    if phase == "evaluating_speech":
+        payload = read_json(root / "analysis" / "speech_evaluation" / "eval_job" / "progress.json", {}) or {
+            "fraction": 0.0, "completed": 0, "total": None,
+        }
+        payload["desc"] = str(payload.get("desc") or status.get("message") or "comparing generated speech")
     titles = {
         "evaluating": "Evaluating checkpoints",
+        "evaluating_speech": "Comparing generated speech",
         "complete": "Training complete",
         "stopped": "Training stopped",
         "cancelled": "Training canceled",
@@ -523,9 +573,9 @@ def build_training_tab(
             with gr.Row():
                 name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="LoRA / DoRA name", info="Safe output folder and final safetensors basename.")
                 adapter_type = gr.Dropdown(choices=["lora", "dora"], value=TRAIN_DEFAULTS["adapter_type"], label="LoRA / DoRA type", info="DoRA is the quality default; LoRA uses slightly less compute.")
-                rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="128 with alpha 129 learned the voice fastest in measured runs; rank 32 reached the same floor more slowly.")
-                alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="129 is the measured companion scale for the recommended rank 128.")
-                dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="0.05 remains the quality default; stronger measured regularization gave no benefit.")
+                rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset.")
+                alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default is close to rank for a scale near one.")
+                dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="Regularizes training by randomly dropping adapter inputs. More dropout is not always better.")
             with gr.Row():
                 target_attention = gr.Checkbox(value=TRAIN_DEFAULTS["target_attention"], label="Target attention", info="Adapts GPT attention projections; recommended.")
                 target_mlp = gr.Checkbox(value=TRAIN_DEFAULTS["target_mlp"], label="Target MLP", info="Adapts GPT feed-forward projections; recommended for voice fidelity.")
@@ -547,18 +597,18 @@ def build_training_tab(
 
         with gr.Accordion("Optimization", open=False):
             with gr.Row():
-                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="4e-5 is the robust batch-1 default: it reached 5.061 held-out loss, while 8e-5 overfit within two epochs.")
+                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="Starting update size. The optional plateau trial lowers it once when this dataset stops improving.")
                 optimizer = gr.Dropdown(choices=["adamw", "adamw_fused", "prodigy"], value=TRAIN_DEFAULTS["optimizer"], label="Optimizer", info="AdamW is portable; fused AdamW is faster on supported CUDA builds.")
                 scheduler = gr.Dropdown(choices=["cosine", "linear", "constant", "constant_with_warmup"], value=TRAIN_DEFAULTS["lr_scheduler"], label="Scheduler", info="Cosine decay is recommended for multi-epoch voice adaptation.")
-                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="200 steps is the measured batch-1 default, easing training into the 4e-5 learning rate.")
-                weight_decay = gr.Number(value=TRAIN_DEFAULTS["weight_decay"], minimum=0, maximum=1, label="Weight decay", info="0.01 is a mild regularizer; 0.05 showed no measured benefit.")
+                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="Gradually increases the learning rate at the start. Early stopping waits until warmup finishes.")
+                weight_decay = gr.Number(value=TRAIN_DEFAULTS["weight_decay"], minimum=0, maximum=1, label="Weight decay", info="Regularizes trainable weights; its useful strength depends on the data and update budget.")
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
                 eps = gr.Number(value=TRAIN_DEFAULTS["eps"], minimum=1e-12, maximum=0.1, label="Adam epsilon", info="Numerical stability term for Adam-family optimizers.")
-                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="10 epochs is the measured batch-1 default; 20 epochs overfit after the held-out optimum around epoch 6.")
+                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="Maximum passes through this dataset. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset.")
                 max_steps = gr.Number(value=TRAIN_DEFAULTS["max_steps"], minimum=0, precision=0, label="Maximum steps", info="0 derives steps from epochs; set 5 for a quick smoke run.")
-                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="1 is the measured quality default: every training clip becomes an optimizer update each epoch.")
-                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="1 is the measured default; accumulation 2 or 4 removed updates and performed worse at the same learning rate.")
+                batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="Clips per micro-batch. Larger batches need more memory and produce fewer updates per epoch.")
+                accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="Micro-batches combined into one optimizer update. Check the displayed update budget after changing it.")
             training_plan_readout = gr.Markdown(
                 _training_plan_markdown(
                     initial_dataset if Path(initial_dataset).is_dir() else None,
@@ -576,12 +626,12 @@ def build_training_tab(
                 smoothing = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["label_smoothing"], step=0.01, label="Label smoothing", info="0 is recommended; increase only for overconfident large datasets.")
                 mel_weight = gr.Number(value=TRAIN_DEFAULTS["mel_loss_weight"], minimum=0, label="Mel loss weight", info="Primary autoregressive acoustic-token loss weight.")
                 text_weight = gr.Number(value=TRAIN_DEFAULTS["text_loss_weight"], minimum=0, label="Text loss weight", info="Auxiliary text modeling loss weight.")
-                speaker_mode = gr.Dropdown(choices=["self", "other", "mixed"], value=TRAIN_DEFAULTS["speaker_ref_mode"], label="Speaker reference mode", info="self uses the target clip, other uses a deterministic different same-speaker clip, and mixed alternates between them; other is the measured quality default.")
+                speaker_mode = gr.Dropdown(choices=["self", "other", "mixed"], value=TRAIN_DEFAULTS["speaker_ref_mode"], label="Speaker reference mode", info="self uses the target clip; other uses a different same-speaker training clip, matching typical generation; mixed alternates between them.")
                 emo_ref_mode = gr.Dropdown(
                     choices=["self", "other", "mixed", "follow_speaker"],
                     value=TRAIN_DEFAULTS["emo_ref_mode"],
                     label="Emotion reference mode",
-                    info="self uses the target emotion, other uses another same-speaker clip, mixed alternates, and follow_speaker reuses the speaker-reference clip; follow_speaker is the measured inference-like default.",
+                    info="self uses the target emotion, other uses another same-speaker training clip, mixed alternates, and follow_speaker uses the same reference for voice and emotion.",
                 )
             with gr.Row():
                 max_codes = gr.Number(value=TRAIN_DEFAULTS["max_codes"], minimum=1, precision=0, label="Maximum codes", info="Cached samples longer than this semantic-code limit are rejected.")
@@ -594,7 +644,7 @@ def build_training_tab(
                     choices=["self", "other"],
                     value=TRAIN_DEFAULTS["val_reference_mode"],
                     label="Validation reference",
-                    info="self validates each target with itself, while other uses a different same-speaker clip for both vectors; other is inference-like and measured more accurately.",
+                    info="self validates each target with itself; other uses a different same-speaker training clip for both vectors, matching typical generation.",
                 )
             with gr.Row():
                 early_enabled = gr.Checkbox(
@@ -620,6 +670,15 @@ def build_training_tab(
                     label="Minimum steps before early stopping", info="Patience starts after this many updates and after warmup.")
                 early_min_epochs = gr.Number(value=TRAIN_DEFAULTS["early_stop_min_epochs"], minimum=0,
                     label="Minimum epochs before early stopping", info="Give the dataset this many passes before counting stalled validation checks.")
+            with gr.Row():
+                early_spacing = gr.Number(value=TRAIN_DEFAULTS["early_stop_check_steps"], minimum=0, precision=0,
+                    label="Minimum updates between patience checks", info="0 uses the validation interval. Nearby epoch-end checks still save improvements but do not consume extra patience.")
+                plateau_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["plateau_lr_enabled"], label="Try a lower learning rate before stopping",
+                    info="One refinement trial within the original training budget, preserving the best checkpoint.")
+                plateau_factor = gr.Number(value=TRAIN_DEFAULTS["plateau_lr_factor"], minimum=0.01, maximum=0.99,
+                    label="Plateau learning-rate multiplier")
+                plateau_grace = gr.Number(value=TRAIN_DEFAULTS["plateau_lr_grace_steps"], minimum=1, precision=0,
+                    label="Refinement grace updates", info="Wait this many updates after lowering the learning rate before resuming patience.")
             optimization_fields = (
                 ("learning_rate", learning_rate, "float", None, 1e-8, 1), ("optimizer", optimizer, "choice", ["adamw", "adamw_fused", "prodigy"], None, None),
                 ("lr_scheduler", scheduler, "choice", ["cosine", "linear", "constant", "constant_with_warmup"], None, None),
@@ -641,6 +700,10 @@ def build_training_tab(
                 ("early_stop_min_delta", early_delta, "float", None, 0, 1000000),
                 ("early_stop_min_steps", early_min_steps, "int", None, 0, 100000000),
                 ("early_stop_min_epochs", early_min_epochs, "float", None, 0, 10000),
+                ("early_stop_check_steps", early_spacing, "int", None, 0, 1000000),
+                ("plateau_lr_enabled", plateau_enabled, "bool", None, None, None),
+                ("plateau_lr_factor", plateau_factor, "float", None, 0.01, 0.99),
+                ("plateau_lr_grace_steps", plateau_grace, "int", None, 1, 1000000),
             )
             for field_name, component, kind, choices, minimum, maximum in optimization_fields:
                 if field_name == "betas":
@@ -744,6 +807,35 @@ def build_training_tab(
             ):
                 _reg(registry, controls, field_name, component, kind=kind, choices=choices, minimum=minimum, maximum=maximum)
 
+        with gr.Accordion("Automatic speech comparison", open=False):
+            gr.Markdown("Freeze held-out texts and training-only voice references before training. Compare Base and this run's checkpoints with repeated seeds after training. The recommendation uses automated proxies; listen to the saved comparison clips to judge naturalness.")
+            with gr.Row():
+                speech_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["speech_eval_enabled"], label="Compare generated speech automatically")
+                speech_prompts = gr.Number(value=TRAIN_DEFAULTS["speech_eval_prompts"], minimum=1, maximum=100, precision=0, label="Held-out speech prompts",
+                    info="Balanced across available recordings, speakers and clip lengths. Adds a longer prompt per voice when enough texts are available.")
+                speech_seeds = gr.Number(value=TRAIN_DEFAULTS["speech_eval_seeds"], minimum=1, maximum=10, precision=0, label="Generation seeds per prompt")
+                speech_candidates = gr.Number(value=TRAIN_DEFAULTS["speech_eval_candidates"], minimum=1, maximum=10, precision=0, label="Speech checkpoint candidates",
+                    info="Lowest validation losses plus the latest distinct update, with Base always included.")
+            with gr.Row():
+                speech_timeout = gr.Number(value=TRAIN_DEFAULTS["speech_eval_timeout_s"], minimum=1, label="Speech comparison timeout (s)")
+                speech_wer = gr.Number(value=TRAIN_DEFAULTS["speech_eval_max_wer_increase"], minimum=0, maximum=1,
+                    label="Allowed transcript error increase over Base", info="Absolute fraction: 0.02 allows two percentage points. Uses CER for Chinese/Japanese and WER for other supported languages.")
+                speech_speaker = gr.Number(value=TRAIN_DEFAULTS["speech_eval_max_speaker_drop"], minimum=0, maximum=1,
+                    label="Allowed speaker-similarity drop from Base")
+            final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
+                info="A prepared dataset with separate source recordings. After selection is frozen, compare only the chosen checkpoint and Base. Blank skips final testing; feature caching is not required for this speech check.")
+            for name, component, kind, minimum, maximum in (
+                ("speech_eval_enabled", speech_enabled, "bool", None, None),
+                ("speech_eval_prompts", speech_prompts, "int", 1, 100),
+                ("speech_eval_seeds", speech_seeds, "int", 1, 10),
+                ("speech_eval_candidates", speech_candidates, "int", 1, 10),
+                ("speech_eval_timeout_s", speech_timeout, "float", 1, 100000),
+                ("speech_eval_max_wer_increase", speech_wer, "float", 0, 1),
+                ("speech_eval_max_speaker_drop", speech_speaker, "float", 0, 1),
+                ("final_test_dataset", final_test, "str", None, None),
+            ):
+                _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
+
         with gr.Accordion("Sampling", open=False):
             with gr.Row():
                 sample_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["sample_enabled"], label="Generate training samples", info="Renders a short sample at the configured epoch interval.")
@@ -752,7 +844,7 @@ def build_training_tab(
                 min_free = gr.Number(value=TRAIN_DEFAULTS["sample_min_free_vram_gb"], minimum=0, label="Minimum free VRAM (GB)", info="Skips sampling rather than risking training OOM below this free-memory threshold.")
                 timeout = gr.Number(value=TRAIN_DEFAULTS["sample_timeout_s"], minimum=1, label="Sample timeout (s)", info="Kills a stuck sampling subprocess after this time.")
             sample_text = gr.Textbox(value=TRAIN_DEFAULTS["sample_text"], label="Sample text", lines=3, info="Short representative phrase used to compare epochs.")
-            sample_reference = gr.Textbox(value=TRAIN_DEFAULTS["sample_reference"], label="Custom sample reference", info="Optional audio path; blank uses the dataset's best reference candidate automatically.")
+            sample_reference = gr.Textbox(value=TRAIN_DEFAULTS["sample_reference"], label="Custom sample reference", info="Optional audio path; blank chooses a reference from this run's training split.")
             sample_speaking_rate = gr.Slider(
                 0.5,
                 1.5,
@@ -927,6 +1019,7 @@ def build_training_tab(
             headers=["Checkpoint", "Type", "Rank", "Steps", "Epoch", "Validation loss", "Verdict", "Size MB", "Path"],
             datatype=["str", "str", "number", "number", "number", "number", "str", "number", "str"],
             value=[], type="array", interactive=False, wrap=True,
+            column_widths=[230, 70, 60, 85, 65, 120, 180, 90, 520],
             label="Checkpoints", max_height=320, buttons=["fullscreen", "copy"],
         )
         initial_generalization, initial_generalization_frame = _training_generalization(current_state)
@@ -945,8 +1038,8 @@ def build_training_tab(
             colors_in_legend=list(ANALYSIS_SERIES),
             color_map={
                 "train loss": "#6b7280",
-                "validation (improving)": "#1ca881",
-                "validation (overfitting)": "#df345b",
+                "validation": "#1ca881",
+                "validation (regression)": "#df345b",
             },
         )
 
@@ -979,9 +1072,9 @@ def build_training_tab(
             if len(pieces) != 2:
                 raise ValueError("Adam betas must contain exactly two comma-separated values")
             payload["betas"] = [float(piece) for piece in pieces]
-        for path_field in ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference"):
+        for path_field in ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset"):
             value = str(payload.get(path_field) or "")
-            if value and path_field in {"dataset_dir", "output_dir", "model_dir", "model_config"}:
+            if value and path_field in {"dataset_dir", "output_dir", "model_dir", "model_config", "final_test_dataset"}:
                 path = Path(value).expanduser()
                 if not path.is_absolute():
                     path = ROOT / path
@@ -999,6 +1092,8 @@ def build_training_tab(
             if not (dataset_root / "cache" / "index.jsonl").is_file():
                 raise ValueError("Dataset features are not cached. Use 'Cache features now' in Dataset Preparation first.")
             adapter_dir = Path(config.output_dir) / config.name
+            from indextts.training.run_guard import ensure_run_destination
+            ensure_run_destination(config)
             adapter_dir.mkdir(parents=True, exist_ok=True)
             _LAST_TRAINING_FOLDER = adapter_dir
             stop_flag = adapter_dir / "stop.flag"
@@ -1299,30 +1394,14 @@ def bind_training_events(
         def use_adapter(state_value: str):
             if not state_value:
                 raise gr.Error("No training state is attached")
-            root = Path(state_value)
-            measured = load_checkpoint_eval(root)
-            analysis = load_training_analysis(root)
-            status = read_json(root / "status.json", {}) or {}
-            path = (
-                measured.recommended_checkpoint
-                if measured is not None
-                else (
-                    analysis.recommended_checkpoint
-                    if analysis is not None
-                    else status.get("recommended_checkpoint")
-                )
-            )
-            if not path or not Path(path).is_file():
-                path = status.get("last_checkpoint")
-            if not path or not Path(path).is_file():
-                candidates = sorted(root.glob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
-                path = str(candidates[0]) if candidates else ""
-            if not path:
-                raise gr.Error("No completed checkpoint is available yet")
+            try:
+                path = recommended_generation_value(state_value)
+            except ValueError as exc:
+                raise gr.Error(str(exc)) from exc
             from .generation_tab import _lora_choices
 
             return (
-                gr.update(choices=_lora_choices(), value=str(Path(path).resolve())),
+                gr.update(choices=_lora_choices(), value=path),
                 gr.Tabs(selected="voice-generation"),
             )
 

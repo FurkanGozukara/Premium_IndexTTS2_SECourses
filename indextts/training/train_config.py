@@ -64,6 +64,10 @@ class TrainConfig:
     early_stop_min_delta: float = 0.005
     early_stop_min_steps: int = 1000
     early_stop_min_epochs: float = 2.0
+    early_stop_check_steps: int = 0
+    plateau_lr_enabled: bool = True
+    plateau_lr_factor: float = 0.5
+    plateau_lr_grace_steps: int = 1000
     save_every_epochs: int = 1
     save_every_steps: int = 0
     keep_last_n: int = 0
@@ -101,6 +105,14 @@ class TrainConfig:
     eval_strengths: str = "1.0"
     eval_include_base: bool = True
     eval_timeout_s: float = 900.0
+    speech_eval_enabled: bool = True
+    speech_eval_prompts: int = 12
+    speech_eval_seeds: int = 3
+    speech_eval_candidates: int = 3
+    speech_eval_timeout_s: float = 7200.0
+    speech_eval_max_wer_increase: float = 0.02
+    speech_eval_max_speaker_drop: float = 0.03
+    final_test_dataset: str = ""
 
     seed: int = 42
     num_workers: int = 2
@@ -186,6 +198,12 @@ class TrainConfig:
         self.early_stop_enabled = bool(self.early_stop_enabled)
         self.early_stop_min_steps = max(0, int(self.early_stop_min_steps))
         self.early_stop_min_epochs = max(0.0, _finite_float(self.early_stop_min_epochs, "early_stop_min_epochs"))
+        self.early_stop_check_steps = max(0, int(self.early_stop_check_steps))
+        self.plateau_lr_enabled = bool(self.plateau_lr_enabled)
+        self.plateau_lr_factor = _finite_float(self.plateau_lr_factor, "plateau_lr_factor")
+        if not 0.0 < self.plateau_lr_factor < 1.0:
+            raise ValueError("plateau_lr_factor must be between 0 and 1")
+        self.plateau_lr_grace_steps = max(0, int(self.plateau_lr_grace_steps))
         self.save_every_epochs = max(0, int(self.save_every_epochs))
         self.save_every_steps = max(0, int(self.save_every_steps))
         self.keep_last_n = max(0, int(self.keep_last_n))
@@ -259,6 +277,21 @@ class TrainConfig:
         parse_strengths(self.eval_strengths)
         self.eval_include_base = bool(self.eval_include_base)
         self.eval_timeout_s = max(1.0, float(self.eval_timeout_s))
+        self.speech_eval_enabled = bool(self.speech_eval_enabled)
+        self.final_test_dataset = str(self.final_test_dataset or "").strip()
+        for key, lower, upper in (("speech_eval_prompts", 1, 100),
+                                  ("speech_eval_seeds", 1, 10),
+                                  ("speech_eval_candidates", 1, 10)):
+            value = int(getattr(self, key))
+            if not lower <= value <= upper:
+                raise ValueError(f"{key} must be between {lower} and {upper}")
+            setattr(self, key, value)
+        self.speech_eval_timeout_s = max(1.0, _finite_float(self.speech_eval_timeout_s, "speech_eval_timeout_s"))
+        for key in ("speech_eval_max_wer_increase", "speech_eval_max_speaker_drop"):
+            value = _finite_float(getattr(self, key), key)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{key} must be between 0 and 1")
+            setattr(self, key, value)
         self.num_workers = max(0, int(self.num_workers))
         self.log_every_steps = max(1, int(self.log_every_steps))
         self.attention_backend = str(self.attention_backend).lower()

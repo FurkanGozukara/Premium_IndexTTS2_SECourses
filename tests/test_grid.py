@@ -118,6 +118,9 @@ def test_cell_order_names_seed_and_grid_round_trip(
     assert all(Path(cell.audio_path).is_file() for cell in result.cells)
     assert (Path(result.grid_dir) / "grid.json").is_file()
     assert (Path(result.grid_dir) / "grid.md").is_file()
+    progress = json.loads((Path(result.grid_dir) / "progress.json").read_text())
+    assert progress["extra"]["audio_seconds"] == pytest.approx(sum(cell.audio_seconds for cell in result.cells))
+    assert progress["speed"] == pytest.approx(1.2 / progress["elapsed_s"])
     assert BASE_CHECKPOINT_LABEL in result.summary_markdown
     assert BASE_PHASE_LABEL in result.summary_markdown
     assert "Base model (no adapter)" not in result.summary_markdown
@@ -151,7 +154,7 @@ def test_grid_result_headers_explain_checkpoint_type_and_base_model() -> None:
     )
 
     assert _grid_result_heading(checkpoint) == (
-        "#### best (epoch 10 DoRA Checkpoint) @ 1 | Best generalization | "
+        "#### best (epoch 10 DoRA Checkpoint) @ 1 | Lowest validation loss | "
         "validation loss 5.3628"
     )
     assert _grid_result_heading(base) == (

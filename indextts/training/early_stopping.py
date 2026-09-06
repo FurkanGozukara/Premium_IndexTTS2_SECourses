@@ -15,6 +15,12 @@ class EarlyStopping:
     bad_checks: int = 0
     checks: int = 0
     last_step: int = -1
+    last_patience_step: int = -1
+    last_meaningful_step: int = 0
+    patience_checks: int = 0
+    counted_check: bool = False
+    lr_reductions: int = 0
+    cooldown_until_step: int = 0
     reason: str = ""
 
     @classmethod
@@ -28,6 +34,7 @@ class EarlyStopping:
     def observe(
         self, loss: float, *, step: int, epoch: float, enabled: bool,
         patience: int, min_delta: float, min_steps: int, min_epochs: float,
+        check_interval: int = 0,
     ) -> tuple[bool, bool]:
         """Return (new absolute best, stop). Tiny gains do not reset patience.
 
@@ -36,6 +43,7 @@ class EarlyStopping:
         """
         if not math.isfinite(loss):
             raise FloatingPointError("validation loss is non-finite; refusing checkpoint selection")
+        self.counted_check = False
         if step == self.last_step:
             return False, bool(self.reason)
         self.last_step = step
@@ -47,8 +55,17 @@ class EarlyStopping:
         meaningful = self.meaningful_best is None or loss < self.meaningful_best - min_delta
         if meaningful:
             self.meaningful_best = loss
-        eligible = enabled and patience > 0 and step >= min_steps and epoch >= min_epochs
-        self.bad_checks = 0 if meaningful or not eligible else self.bad_checks + 1
+            self.last_meaningful_step = step
+        eligible = (enabled and patience > 0 and step >= min_steps
+                    and epoch >= min_epochs and step >= self.cooldown_until_step)
+        if meaningful or not eligible:
+            self.bad_checks = 0
+            self.last_patience_step = step
+        elif self.last_patience_step < 0 or step - self.last_patience_step >= check_interval:
+            self.bad_checks += 1
+            self.patience_checks += 1
+            self.counted_check = True
+            self.last_patience_step = step
         self.reason = ""
         if eligible and self.bad_checks >= patience:
             self.reason = (
@@ -57,3 +74,11 @@ class EarlyStopping:
                 f"at step {self.best_step} (epoch {self.best_epoch})"
             )
         return is_best, bool(self.reason)
+
+    def begin_refinement(self, step: int, grace_steps: int) -> None:
+        """Give a reduced learning rate time to work without losing the best score."""
+        self.lr_reductions += 1
+        self.cooldown_until_step = step + max(0, grace_steps)
+        self.last_patience_step = step
+        self.bad_checks = 0
+        self.reason = ""

@@ -184,26 +184,13 @@ def training_plan_advisory(
     batch_size: int,
     grad_accumulation: int,
 ) -> str:
-    """Describe how a plan compares with the measured optimizer-update range."""
+    """Describe a maximum budget without claiming a universal optimum."""
 
     total_updates = plan["total_optimizer_updates"]
-    epochs = suggested_epochs(
-        plan["training_clips"], batch_size, grad_accumulation
-    )
-    if total_updates < 5_000:
-        return (
-            f"Only {total_updates:,} optimizer updates; the measured sweet spot is about "
-            f"10,000. Suggested epochs for this dataset: {epochs:,}."
-        )
-    if total_updates <= 20_000:
-        return (
-            f"About {total_updates:,} optimizer updates, inside the measured 5,000-20,000 "
-            "range where the best checkpoints appeared."
-        )
     return (
-        f"{total_updates:,} optimizer updates is more than the measured sweet spot of about "
-        f"10,000; every epoch is kept, so pick the best one in the Checkpoint Grid, or reduce "
-        f"epochs to about {epochs:,}."
+        f"Maximum budget: {total_updates:,} optimizer updates. The useful training length depends on this dataset. "
+        "With early stopping enabled, held-out validation controls the lower-rate trial and stopping; "
+        "automatic speech comparison helps choose among saved checkpoints and Base."
     )
 
 

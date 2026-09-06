@@ -91,7 +91,8 @@ def build_curation_controls(registry: Any, existing: Any, dataset_path: Any, *, 
             register("test_sources", gr.Textbox(lines=2, label="Final-test source recordings",
                      info="Optional. Kept in a separate dataset, outside training and checkpoint selection."), "str")
         with gr.Row():
-            register("max_wer", gr.Slider(0, 1, value=.15, step=.01, label="Maximum transcript word error"), "float", minimum=0, maximum=1)
+            register("max_wer", gr.Slider(0, 1, value=.15, step=.01, label="Maximum transcript error",
+                     info="Word errors for EN/ES/AR; character errors for Chinese/Japanese."), "float", minimum=0, maximum=1)
             register("min_speaker_similarity", gr.Slider(0, 1, value=.70, step=.01, label="Minimum voice similarity"), "float", minimum=0, maximum=1)
             register("min_window_similarity", gr.Slider(0, 1, value=.60, step=.01, label="Minimum voice-window similarity"), "float", minimum=0, maximum=1)
         with gr.Row():

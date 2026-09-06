@@ -9,6 +9,7 @@ import os
 import random
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -51,12 +52,13 @@ from indextts.runtime import (
 )
 from indextts.utils import model_downloads
 from indextts.utils.atomic_json import read_json_retry
+from indextts.version import APP_VERSION
 
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
 from .early_stopping import EarlyStopping
 from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
-from .plan import suggested_epochs, training_plan, training_plan_line
+from .plan import training_plan, training_plan_line
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, write_speaking_rate
 from .train_config import TrainConfig
@@ -303,6 +305,34 @@ def _scheduler(
     )
 
 
+def reduce_learning_rate(optimizer: Any, scheduler: Any, factor: float) -> None:
+    """Scale both today's LR and the remaining schedule; state_dict preserves it."""
+    for group in optimizer.param_groups:
+        group["lr"] *= factor
+        if "initial_lr" in group:
+            group["initial_lr"] *= factor
+    scheduler.base_lrs = [value * factor for value in scheduler.base_lrs]
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+
+
+def _kill_evaluation_worker(process: subprocess.Popen) -> None:
+    """Bound the whole owned worker tree, including Windows Python launchers."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
 class LoraTrainer:
     def __init__(
         self,
@@ -312,6 +342,8 @@ class LoraTrainer:
         reporter: ProgressReporter | None = None,
     ) -> None:
         self.config = TrainConfig.from_dict(config)
+        from .run_guard import ensure_run_destination
+        ensure_run_destination(self.config, state_dir)
         self.dataset_dir = Path(self.config.dataset_dir).expanduser().resolve()
         self.adapter_dir = (
             Path(self.config.output_dir).expanduser().resolve() / self.config.name
@@ -334,6 +366,9 @@ class LoraTrainer:
         self.resolved_sample_seed: int | None = None
         self._checkpoint_history: list[Path] = []
         self.early_stopping = EarlyStopping()
+        self.last_validation_metrics: dict[str, Any] = {}
+        self.training_records: list[dict[str, Any]] = []
+        self.speech_plan_ready = False
 
     def log(self, message: str) -> None:
         line = str(message)
@@ -455,21 +490,14 @@ class LoraTrainer:
             return warning
 
     def _reference_candidate(self) -> Path | None:
-        info_path = self.dataset_dir / "dataset_info.json"
-        try:
-            info = json.loads(info_path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            info = {}
-        for value in info.get("reference_candidates", []):
-            candidate = Path(str(value))
-            if not candidate.is_absolute():
-                candidate = self.dataset_dir / candidate
-            if candidate.is_file():
-                return candidate
-        return None
+        from .evaluation_plan import audio_path, choose_training_reference
+        row = choose_training_reference(self.training_records, self.dataset_dir)
+        return audio_path(self.dataset_dir, row) if row is not None else None
 
     def _prepare_reference(self) -> Path | None:
         candidate = self._reference_candidate()
+        if candidate is not None:
+            self.reference_copy = self.reference_copy.with_suffix(candidate.suffix)
         if candidate is not None and candidate.resolve() != self.reference_copy.resolve():
             shutil.copy2(candidate, self.reference_copy)
         return self.reference_copy if self.reference_copy.is_file() else candidate
@@ -499,7 +527,7 @@ class LoraTrainer:
                     and analysis.final_val_loss is not None
                 ):
                     detail += (
-                        f"; the final epoch {analysis.final_epoch} LoRA / DoRA is overfitted "
+                        f"; the final epoch {analysis.final_epoch} has higher validation loss "
                         f"(validation {analysis.final_val_loss:.4f})"
                     )
                 if analysis.recommended_checkpoint:
@@ -530,6 +558,9 @@ class LoraTrainer:
         """Run checkpoint evaluation in a bounded child process after model cleanup."""
 
         config = self.config
+        if self.stop_path.exists():
+            self.log(">> checkpoint evaluation skipped after user cancellation")
+            return recommended_checkpoint
         if not config.auto_evaluate_checkpoints:
             self.log(">> automatic checkpoint evaluation is disabled")
             return recommended_checkpoint
@@ -599,6 +630,7 @@ class LoraTrainer:
             errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            start_new_session=os.name != "nt",
         )
 
         def pump() -> None:
@@ -624,13 +656,17 @@ class LoraTrainer:
             )
             if elapsed >= config.eval_timeout_s:
                 timed_out = True
-                process.kill()
+                _kill_evaluation_worker(process)
+                break
+            if self.stop_path.exists():
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
                 break
             time.sleep(0.5)
         try:
             process.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            process.kill()
+            _kill_evaluation_worker(process)
             process.wait()
         pump_thread.join(timeout=2.0)
         if timed_out:
@@ -645,8 +681,9 @@ class LoraTrainer:
             )
         else:
             report = load_checkpoint_eval(self.adapter_dir)
-            if report is not None and report.recommended_checkpoint:
+            if report is not None:
                 recommended_checkpoint = report.recommended_checkpoint
+                self.write_status(recommended_kind=report.recommended_kind)
             self.log(">> automatic checkpoint evaluation complete")
         self.write_status(
             phase=terminal_phase,
@@ -656,6 +693,59 @@ class LoraTrainer:
             if (self.adapter_dir / "analysis" / "checkpoint_eval.json").is_file()
             else "",
         )
+        return recommended_checkpoint
+
+    def _run_automatic_speech_evaluation(self, *, terminal_phase: str, terminal_message: str,
+                                         recommended_checkpoint: str) -> str:
+        from .speech_eval import load_speech_evaluation
+        config = self.config
+        if not config.speech_eval_enabled or not self.speech_plan_ready or self.stop_path.exists():
+            reason = "disabled" if not config.speech_eval_enabled else ("canceled" if self.stop_path.exists() else "no held-out speech plan")
+            self.write_status(speech_evaluation_status="skipped", speech_evaluation_message=reason)
+            self.log(f">> speech evaluation skipped: {reason}")
+            return recommended_checkpoint
+        job_dir = self.adapter_dir / "analysis" / "speech_evaluation" / "eval_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        config_path = job_dir / "train_config.json"
+        atomic_write_json(config_path, config.to_dict())
+        self.write_status(phase="evaluating_speech", speech_evaluation_status="running", message="Preparing speech comparison")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.speech_eval", "--config", str(config_path),
+                                    "--state-dir", str(job_dir)], cwd=str(Path(__file__).resolve().parents[2]),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                   bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="speech-evaluation-log")
+        thread.start()
+        started = time.perf_counter()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(phase="evaluating_speech", message=str(child.get("message") or "Comparing generated speech"))
+            if self.stop_path.exists() or time.perf_counter() - started > config.speech_eval_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else "evaluation timeout"
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
+                break
+            time.sleep(0.5)
+        process.wait(timeout=10)
+        thread.join(timeout=2)
+        report = load_speech_evaluation(self.adapter_dir) if process.returncode == 0 and not failure else None
+        if report:
+            recommended_checkpoint = report["recommended_checkpoint"]
+            self.write_status(recommended_kind=report["recommended_kind"], speech_evaluation_status="complete",
+                              speech_evaluation_message=report["scope"], speech_recommended_checkpoint=recommended_checkpoint)
+            self.log(f">> speech recommendation: {report['recommended_label']}. {report['scope']}")
+        else:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            failure = failure or str(child.get("message") or f"worker exited with code {process.returncode}")
+            self.write_status(speech_evaluation_status="failed", speech_evaluation_message=failure)
+            self.log(f">> speech evaluation did not complete: {failure}; saved training weights remain available")
+        self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
         return recommended_checkpoint
 
     def _write_speaking_rate_calibration(self) -> float | None:
@@ -699,7 +789,7 @@ class LoraTrainer:
             epochs=epochs,
             dataset_name=self.dataset_dir.name,
             created_at=datetime.now(timezone.utc).isoformat(),
-            app_version="5",
+            app_version=APP_VERSION,
             train_config=self.config.to_dict(),
             recommended_reference=self.reference_copy.name if self.reference_copy.is_file() else "",
             sample_rate=24000,
@@ -831,6 +921,10 @@ class LoraTrainer:
         model.train()
         set_training_mode(model, True)
         result = aggregate.result(self.config.mel_loss_weight, self.config.text_loss_weight)
+        self.last_validation_metrics = {
+            "val_mel_loss": result["mel_loss"], "val_text_loss": result["text_loss"],
+            "val_mel_tokens": aggregate.mel_tokens, "val_text_tokens": aggregate.text_tokens,
+        }
         if result["loss"] is None:
             return math.nan, math.nan
         return float(result["loss"]), float(result["accuracy"])
@@ -948,6 +1042,20 @@ class LoraTrainer:
         if len(val_dataset) == 0:
             val_dataset = None
 
+        self.training_records = list(getattr(train_dataset, "records", []))
+        if config.speech_eval_enabled and val_dataset is not None and self.training_records:
+            from .evaluation_plan import build_speech_plan, build_final_test_plan
+            speech_plan = build_speech_plan(config, self.training_records, val_dataset.records, self.adapter_dir)
+            self.speech_plan_ready = bool(speech_plan["groups"])
+            self.write_status(speech_evaluation_status="pending", speech_evaluation_message="Frozen held-out speech plan prepared")
+            self.log(f">> frozen speech benchmark: {sum(len(g['prompts']) for g in speech_plan['groups'])} prompts, "
+                     f"{len(speech_plan['seeds'])} seeds, training-only references")
+            for warning in speech_plan["warnings"]:
+                self.log(">> speech benchmark coverage: " + warning)
+            final_plan = build_final_test_plan(config, self.training_records, val_dataset.records, self.adapter_dir)
+            if final_plan is not None:
+                self.log(">> independent final-test prompts frozen; only Base and the selected checkpoint will be measured")
+
         val_count = len(val_dataset) if val_dataset is not None else 0
         plan = training_plan(
             len(train_dataset) + val_count,
@@ -958,12 +1066,9 @@ class LoraTrainer:
             config.val_fraction,
             validation_count=val_count,
         )
-        epoch_suggestion = suggested_epochs(
-            plan["training_clips"], config.batch_size, config.grad_accumulation
-        )
         self.log(
             f">> training plan | {training_plan_line(plan)} "
-            f"suggested epochs for ~10,000 updates: {epoch_suggestion:,}"
+            "the budget is a maximum; validation controls refinement and stopping"
         )
         micro_batches_per_epoch = plan["micro_batches_per_epoch"]
         steps_per_epoch = plan["optimizer_updates_per_epoch"]
@@ -1079,19 +1184,34 @@ class LoraTrainer:
         def update_early_stopping(validation_loss: float) -> bool:
             nonlocal early_stop_reason
             fraction_epoch = epoch_index + (batch_index + 1) / max(1, micro_batches_per_epoch)
+            check_interval = config.early_stop_check_steps or config.val_every_steps or steps_per_epoch
             _, should_stop = self.early_stopping.observe(
                 validation_loss, step=global_step, epoch=fraction_epoch,
                 enabled=config.early_stop_enabled, patience=config.early_stop_patience,
                 min_delta=config.early_stop_min_delta,
                 min_steps=max(config.warmup_steps, config.early_stop_min_steps),
                 min_epochs=config.early_stop_min_epochs,
+                check_interval=check_interval,
             )
+            if (should_stop and config.plateau_lr_enabled and self.early_stopping.lr_reductions == 0
+                    and total_steps - global_step > config.plateau_lr_grace_steps):
+                reduce_learning_rate(optimizer, scheduler, config.plateau_lr_factor)
+                self.early_stopping.begin_refinement(global_step, config.plateau_lr_grace_steps)
+                self.metric({"event": "lr_refinement", "step": global_step, "epoch": epoch_index + 1,
+                             "lr": float(optimizer.param_groups[0]["lr"]),
+                             "grace_until_step": self.early_stopping.cooldown_until_step})
+                self.log(f">> validation plateau: reducing learning rate by {config.plateau_lr_factor:g}; "
+                         f"patience resumes at step {self.early_stopping.cooldown_until_step}; "
+                         f"maximum budget remains {total_steps}")
+                should_stop = False
             early_stop_reason = self.early_stopping.reason
             tracking = self.early_stopping.to_dict()
             self.write_status(early_stopping=tracking, early_stop_patience=config.early_stop_patience,
                               early_stop_enabled=config.early_stop_enabled,
                               best_val_loss=self.early_stopping.best_loss,
-                              best_step=self.early_stopping.best_step)
+                              best_step=self.early_stopping.best_step,
+                              early_stop_check_steps=check_interval,
+                              **self.last_validation_metrics)
             atomic_write_json(self.adapter_dir / "analysis" / "checkpoint_selection.json", {
                 **tracking, "checkpoint": str(self.best_path) if config.save_best else "",
                 "metric": "token_weighted_validation_loss", "val_split_mode": config.val_split_mode,
@@ -1294,6 +1414,8 @@ class LoraTrainer:
                                 "val_loss": last_val_loss,
                                 "val_mel_accuracy": val_accuracy,
                                 "reference_mode": config.val_reference_mode,
+                                **self.last_validation_metrics,
+                                "patience_counted": self.early_stopping.counted_check,
                             }
                         )
                         self.log(
@@ -1367,6 +1489,8 @@ class LoraTrainer:
                             "val_loss": last_val_loss,
                             "val_mel_accuracy": val_accuracy,
                             "reference_mode": config.val_reference_mode,
+                            **self.last_validation_metrics,
+                            "patience_counted": self.early_stopping.counted_check,
                         }
                     )
                     self.log(
@@ -1541,7 +1665,7 @@ class LoraTrainer:
             terminal_status.get("message")
             or ("training complete" if result_status == "complete" else "training stopped")
         )
-        if config.auto_evaluate_checkpoints and val_count > 0:
+        if (config.auto_evaluate_checkpoints or config.speech_eval_enabled) and val_count > 0:
             del built
             del optimizer, scheduler, scaler
             del train_loader, val_loader, batch, loss, values
@@ -1564,6 +1688,14 @@ class LoraTrainer:
                     message=terminal_message,
                     recommended_checkpoint=recommended_checkpoint,
                 )
+            try:
+                recommended_checkpoint = self._run_automatic_speech_evaluation(
+                    terminal_phase=result_status, terminal_message=terminal_message,
+                    recommended_checkpoint=recommended_checkpoint)
+            except Exception as exc:
+                self.log(f">> speech evaluation failed but training weights are safe: {exc}")
+                self.write_status(phase=result_status, message=terminal_message,
+                                  speech_evaluation_status="failed", speech_evaluation_message=str(exc))
         elif config.auto_evaluate_checkpoints:
             self.log(
                 ">> automatic checkpoint evaluation skipped: the validation split "

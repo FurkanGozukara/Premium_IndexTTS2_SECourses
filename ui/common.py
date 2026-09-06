@@ -27,11 +27,11 @@ from indextts.runtime.progress import format_duration, format_rate, read_progres
 from indextts.utils.atomic_json import read_json_retry
 from indextts.utils.atomic_json import write_json_atomic as _write_json_atomic
 from indextts.runtime.vram_presets import RuntimeConfig
+from indextts.version import APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_TITLE = "IndexTTS 2.5 Premium SECourses"
-APP_VERSION = "6.3"
 FAVICON_PATH = ROOT / "ui_assets" / "indextts_premium_favicon.svg"
 STATE_ROOT = ROOT / ".ui_state"
 STATE_ROOT.mkdir(parents=True, exist_ok=True)

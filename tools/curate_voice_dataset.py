@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 import soundfile as sf
 from indextts.training.dataset_manifest import atomic_write_json, load_manifest, summarize_manifest, write_manifest, write_preview_csv
-from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript, boundary_words_match, word_error_counts
+from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript
+from indextts.training.speech_metrics import transcript_metrics
 from indextts.training.media import measure_edge_silence
 from indextts.training.features import _load_audio_16k, _read_audio
 from indextts.training.whisper_asr import _ensure_model
@@ -125,8 +126,13 @@ def run_curation(args: argparse.Namespace) -> None:
             transcript = transcripts.get(topic)
             reasons = []
             hypothesis = transcript.between(float(row["source_start_s"]) - .04, float(row["source_end_s"]) + .04) if transcript else ""
-            errors, words = word_error_counts(row["text"], hypothesis)
-            wer = errors / max(1, words)
+            language = str(row.get("language") or "EN").upper()
+            try:
+                agreement = transcript_metrics(row["text"], hypothesis, language)
+            except ValueError:
+                reasons.append("empty_normalized_transcript")
+                agreement = {"error_rate": 1.0, "start_matches": False, "end_matches": False, "error_unit": "unknown"}
+            wer = agreement["error_rate"]
             source_hypothesis, source_wer = hypothesis, wer
             rechecked = False
             if transcript is None and args.no_asr_recheck and not (args.transcribe_all or args.check_boundary_words):
@@ -153,18 +159,18 @@ def run_curation(args: argparse.Namespace) -> None:
                 result = asr_pipe({"array": waveform.squeeze().numpy(), "sampling_rate": 16000}, return_timestamps=True,
                                   generate_kwargs={"language": str(row.get("language", "EN")).lower(), "task": "transcribe", "do_sample": False})
                 hypothesis = str(result["text"]).strip()
-                errors, words = word_error_counts(row["text"], hypothesis)
-                wer = errors / max(1, words)
+                agreement = transcript_metrics(row["text"], hypothesis, language)
+                wer = agreement["error_rate"]
                 rechecked = True
                 asr_rechecked += 1
                 asr_recovered += int(source_wer > args.max_wer and wer <= args.max_wer)
             if wer > args.max_wer:
                 reasons.append("transcript_disagreement")
-            edge_match = boundary_words_match(row["text"], hypothesis)
+            edge_match = agreement["start_matches"] and agreement["end_matches"]
             if args.check_boundary_words and not edge_match:
                 reasons.append("transcript_boundary_mismatch")
             item = {"id": row["id"], "source": topic, "text": row["text"], "asr_text": hypothesis,
-                    "asr_wer": wer, "source_asr_wer": source_wer, "source_asr_text": source_hypothesis,
+                    "asr_wer": wer, "asr_error_unit": agreement["error_unit"], "source_asr_wer": source_wer, "source_asr_text": source_hypothesis,
                     "asr_rechecked": rechecked, "boundary_words_match": edge_match,
                     **edge_quality, **scores, "reasons": reasons, "audio": str(audio)}
             audit.append(item)
