@@ -15,6 +15,7 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - Batched generation now respects each clip's actual length through acoustic decoding. Padding for longer clips no longer leaks into shorter clips through the semantic decoder, length regulator, acoustic convolutions, or vocoder.
 - Dataset preparation preserves word padding, retains the final analysis frame, and refines touching word timestamps against sustained quiet intervals. Shared cuts stay within the boundary words and never move an ending before its aligned final word.
 - Verified with 60 passing targeted checks, including CUDA speech positions, unequal clip lengths, padded acoustic features, and dataset integration. Three optional demo-audio checks were skipped. Real-model checks matched individual conditioning exactly and recovered 165–220 ms of source audio in three reproduced training cuts.
+- Fixed flashing progress and stats panels during voice generation, batch generation, dataset preparation, feature caching, and training. Live values, progress bars, charts, and logs update without the pulsing or fading overlay. Verified in Chrome with 24 simulated updates and 30 passing UI and progress checks.
 
 Restart the app after updating. Existing adapters remain compatible. The dataset fixes apply when preparing new clips; adapters trained on clipped audio need a rebuilt dataset, refreshed feature cache, and retraining to benefit from corrected training boundaries. Sampled pronunciation can still vary.
 """.strip(),

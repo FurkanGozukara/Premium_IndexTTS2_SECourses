@@ -1083,6 +1083,9 @@ def build_training_tab(
         api_name="start_training",
         concurrency_limit=1,
         concurrency_id="training",
+        # The dashboard renders progress itself; Gradio's generator pulse
+        # otherwise flashes whenever polling updates these same outputs.
+        show_progress="hidden",
         stream_every=0.5,
     )
 

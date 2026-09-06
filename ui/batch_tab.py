@@ -651,6 +651,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         api_name="generate_batch",
         concurrency_limit=1,
         concurrency_id="generation",
+        show_progress="hidden",
         stream_every=0.5,
     )
     confirmation = gr.Checkbox(value=False, visible=False, label="Batch cancel confirmation")

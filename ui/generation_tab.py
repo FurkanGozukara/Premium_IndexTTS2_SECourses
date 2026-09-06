@@ -2813,7 +2813,7 @@ def bind_generation_events(
         api_name="generate_voice",
         concurrency_limit=1,
         concurrency_id="generation",
-        show_progress="minimal",
+        show_progress="hidden",
         stream_every=0.5,
     )
 

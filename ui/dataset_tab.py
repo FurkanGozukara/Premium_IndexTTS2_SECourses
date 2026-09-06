@@ -705,6 +705,7 @@ def build_dataset_tab(
         concurrency_limit=1,
         concurrency_id="dataset-prep",
         api_name="prepare_dataset",
+        show_progress="hidden",
         stream_every=0.5,
     )
 
@@ -832,6 +833,7 @@ def build_dataset_tab(
         ],
         concurrency_limit=1,
         concurrency_id="dataset-cache",
+        show_progress="hidden",
     )
 
     def load_existing(path: str | None):
