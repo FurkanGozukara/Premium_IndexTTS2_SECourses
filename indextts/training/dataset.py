@@ -17,7 +17,7 @@ from torch.utils.data import BatchSampler, Dataset
 from indextts.utils.tokenizer import lang_to_token
 
 from .dataset_manifest import load_manifest
-from .plan import validation_split_ids
+from .plan import validation_record_ids
 
 
 def _stable_unit_interval(*parts: Any) -> float:
@@ -62,6 +62,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         max_text_tokens: int = 600,
         speaker_ref_mode: str = "mixed",
         emo_ref_mode: str = "self",
+        val_split_mode: str = "record",
     ) -> None:
         self.dataset_dir = Path(dataset_dir).expanduser().resolve()
         self.split = str(split).lower()
@@ -80,6 +81,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
                 "emo_ref_mode must be self, other, mixed, or follow_speaker"
             )
         self.epoch = 0
+        self.val_split_mode = str(val_split_mode).lower()
 
         manifest_rows = load_manifest(self.dataset_dir)
         if not manifest_rows:
@@ -122,6 +124,10 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             for record in all_records
             if (record["id"] in val_ids) == (self.split == "val")
         ]
+        if self.split == "val":
+            # A capped validation run must sample the whole corpus, not just
+            # the first source's clips. Keep the order fixed across checkpoints.
+            self.records.sort(key=lambda record: _stable_unit_interval(self.seed, record["id"], "validation_order"))
         # A zero validation fraction intentionally produces an empty validation
         # dataset. Training must still contain every record.
         if not self.records and self.split == "train":
@@ -131,14 +137,31 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         self.dropped_count = dropped
         self._all_records = all_records
         self._speaker_records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Validation audio must never supply training conditioning. Validation
+        # uses the same training-only prompt pool as deployment would have.
         for record in all_records:
+            if record["id"] in val_ids:
+                continue
             self._speaker_records[str(record["speaker"])].append(record)
+        needs_other_reference = (
+            self.speaker_ref_mode in {"other", "mixed"}
+            or self.emo_ref_mode in {"other", "mixed"}
+        )
+        if self.split == "val" and needs_other_reference:
+            missing = sorted({str(record["speaker"]) for record in self.records} - self._speaker_records.keys())
+            if missing:
+                raise ValueError(
+                    "validation with other references needs a training clip for each speaker; "
+                    f"no training reference for: {', '.join(missing)}. "
+                    "Adjust the split or explicitly choose self-reference validation."
+                )
 
     def _validation_ids(self, records: Sequence[Mapping[str, Any]]) -> set[str]:
-        return validation_split_ids(
-            [str(record["id"]) for record in records],
+        return validation_record_ids(
+            records,
             self.val_fraction,
             self.seed,
+            self.val_split_mode,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -217,7 +240,22 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
 
     @property
     def fingerprint(self) -> str:
-        value = "\n".join(f"{record['id']}:{record['n_codes']}:{record['n_text_tokens']}" for record in self.records)
+        cache = load_cache_index(self.dataset_dir)
+        value = json.dumps({
+            "records": [
+                {key: str(record.get(key, "")) for key in (
+                    "id", "n_codes", "n_text_tokens", "text", "speaker", "source_media", "split"
+                )} for record in self._all_records
+            ],
+            "source_fingerprints": {
+                str(row["id"]): str(row.get("source_fingerprint", ""))
+                for row in cache.get("records", [])
+            },
+            "extraction": cache.get("extraction_fingerprint", ""),
+            "split": self.split, "val_split_mode": self.val_split_mode,
+            "val_fraction": self.val_fraction, "seed": self.seed,
+            "speaker_ref_mode": self.speaker_ref_mode, "emo_ref_mode": self.emo_ref_mode,
+        }, sort_keys=True)
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 

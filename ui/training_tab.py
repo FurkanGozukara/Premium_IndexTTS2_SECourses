@@ -28,7 +28,7 @@ from indextts.training.analysis import (
 )
 from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.dataset_manifest import load_manifest
-from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line
+from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line, validation_record_ids
 from indextts.training.train_config import TrainConfig
 
 from .common import (
@@ -170,6 +170,7 @@ def _training_plan_markdown(
     max_steps: int,
     val_fraction: float,
     seed: int = 42,
+    val_split_mode: str = "record",
 ) -> str:
     try:
         if not dataset_path:
@@ -193,6 +194,7 @@ def _training_plan_markdown(
             val_fraction,
             record_ids=record_ids,
             seed=seed,
+            validation_count=len(validation_record_ids(rows, val_fraction, seed, val_split_mode)),
         )
         advisory = training_plan_advisory(plan, batch_size, grad_accumulation)
         return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}"
@@ -322,6 +324,11 @@ def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> s
         parts.append(f"ETA {float(eta):.1f}s")
     if value.get("message"):
         parts.append(str(value["message"]))
+    tracking = value.get("early_stopping") or {}
+    if tracking.get("best_loss") is not None:
+        parts.append(f"best {float(tracking['best_loss']):.4f} at step {int(tracking.get('best_step', 0))}")
+    if value.get("early_stop_enabled") and tracking:
+        parts.append(f"stalled checks {int(tracking.get('bad_checks', 0))}/{int(value.get('early_stop_patience', 0))}")
     runtime_warning = str(value.get("runtime_warning") or "")
     if runtime_warning and runtime_warning != str(value.get("message") or ""):
         parts.append(runtime_warning)
@@ -561,6 +568,7 @@ def build_training_tab(
                     TRAIN_DEFAULTS["max_steps"],
                     TRAIN_DEFAULTS["val_fraction"],
                     TRAIN_DEFAULTS["seed"],
+                    TRAIN_DEFAULTS["val_split_mode"],
                 )
             )
             with gr.Row():
@@ -578,14 +586,21 @@ def build_training_tab(
             with gr.Row():
                 max_codes = gr.Number(value=TRAIN_DEFAULTS["max_codes"], minimum=1, precision=0, label="Maximum codes", info="Cached samples longer than this semantic-code limit are rejected.")
                 max_text = gr.Number(value=TRAIN_DEFAULTS["max_text_tokens"], minimum=1, precision=0, label="Maximum text tokens", info="Cached text length safety limit.")
-                val_fraction = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["val_fraction"], step=0.01, label="Validation fraction", info="5% provides useful validation without sacrificing much training data.")
+                val_fraction = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["val_fraction"], step=0.01, label="Validation fraction", info="Requested holdout fraction; whole-recording splits can differ substantially for small datasets. The training plan shows actual counts. Explicit manifest splits take precedence.")
+                val_split_mode = gr.Dropdown(choices=["source", "record"], value=TRAIN_DEFAULTS["val_split_mode"], label="Validation split", info="source holds out whole recordings to measure generalization; a single recording falls back to record splitting. Training references always come from the training split.")
                 val_steps = gr.Number(value=TRAIN_DEFAULTS["val_every_steps"], minimum=0, precision=0, label="Validate every steps", info="0 disables step validation; epoch validation still runs when a split exists.")
-                val_batches = gr.Number(value=TRAIN_DEFAULTS["val_max_batches"], minimum=1, precision=0, label="Maximum validation batches", info="Caps validation time on large datasets.")
+                val_batches = gr.Number(value=TRAIN_DEFAULTS["val_max_batches"], minimum=0, precision=0, label="Maximum validation batches", info="0 evaluates the entire holdout. A positive cap uses a fixed shuffled subset; loss is weighted by valid tokens.")
                 val_reference_mode = gr.Dropdown(
                     choices=["self", "other"],
                     value=TRAIN_DEFAULTS["val_reference_mode"],
                     label="Validation reference",
                     info="self validates each target with itself, while other uses a different same-speaker clip for both vectors; other is inference-like and measured more accurately.",
+                )
+            with gr.Row():
+                early_enabled = gr.Checkbox(
+                    value=TRAIN_DEFAULTS["early_stop_enabled"],
+                    label="Automatically stop when progress stalls",
+                    info="Enabled by default. After the initial learning period, stop when validation no longer improves meaningfully and keep the best checkpoint, even before the target epochs or steps.",
                 )
             with gr.Row():
                 early_patience = gr.Number(
@@ -599,8 +614,12 @@ def build_training_tab(
                     value=TRAIN_DEFAULTS["early_stop_min_delta"],
                     minimum=0,
                     label="Early-stop minimum improvement",
-                    info="Validation loss must fall by at least this amount to reset patience.",
+                    info="Validation loss must fall by more than this amount to reset patience.",
                 )
+                early_min_steps = gr.Number(value=TRAIN_DEFAULTS["early_stop_min_steps"], minimum=0, precision=0,
+                    label="Minimum steps before early stopping", info="Patience starts after this many updates and after warmup.")
+                early_min_epochs = gr.Number(value=TRAIN_DEFAULTS["early_stop_min_epochs"], minimum=0,
+                    label="Minimum epochs before early stopping", info="Give the dataset this many passes before counting stalled validation checks.")
             optimization_fields = (
                 ("learning_rate", learning_rate, "float", None, 1e-8, 1), ("optimizer", optimizer, "choice", ["adamw", "adamw_fused", "prodigy"], None, None),
                 ("lr_scheduler", scheduler, "choice", ["cosine", "linear", "constant", "constant_with_warmup"], None, None),
@@ -614,10 +633,14 @@ def build_training_tab(
                 ("emo_ref_mode", emo_ref_mode, "choice", ["self", "other", "mixed", "follow_speaker"], None, None),
                 ("max_codes", max_codes, "int", None, 1, 100000), ("max_text_tokens", max_text, "int", None, 1, 100000),
                 ("val_fraction", val_fraction, "float", None, 0, 0.5), ("val_every_steps", val_steps, "int", None, 0, 1000000),
-                ("val_max_batches", val_batches, "int", None, 1, 1000000),
+                ("val_split_mode", val_split_mode, "choice", ["source", "record"], None, None),
+                ("val_max_batches", val_batches, "int", None, 0, 1000000),
                 ("val_reference_mode", val_reference_mode, "choice", ["self", "other"], None, None),
                 ("early_stop_patience", early_patience, "int", None, 0, 1000000),
+                ("early_stop_enabled", early_enabled, "bool", None, None, None),
                 ("early_stop_min_delta", early_delta, "float", None, 0, 1000000),
+                ("early_stop_min_steps", early_min_steps, "int", None, 0, 100000000),
+                ("early_stop_min_epochs", early_min_epochs, "float", None, 0, 10000),
             )
             for field_name, component, kind, choices, minimum, maximum in optimization_fields:
                 if field_name == "betas":
@@ -1117,7 +1140,7 @@ def build_training_tab(
         queue=False,
     )
     dataset.change(_dataset_summary, dataset, dataset_info, queue=False)
-    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed]
+    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode]
     for plan_input in plan_inputs:
         plan_input.change(
             _training_plan_markdown,

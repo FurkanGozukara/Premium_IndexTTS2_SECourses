@@ -85,6 +85,29 @@ def test_phase_classification_is_pure_and_uses_earliest_best() -> None:
     assert phases == {1: "improving", 2: "best", 3: "plateau", 4: "overfitting"}
 
 
+def test_selection_keeps_best_mid_epoch_validation(tmp_path: Path, monkeypatch) -> None:
+    adapter = tmp_path / "mid_epoch"
+    _checkpoints(adapter, monkeypatch)
+    rows = [
+        {"event": "validation", "step": step, "epoch": epoch, "val_loss": loss}
+        for step, epoch, loss in [(10, 1, 5.0), (20, 1, 4.0), (30, 2, 3.0),
+                                  (40, 2, 4.5), (50, 3, 3.8), (60, 3, 4.0)]
+    ]
+    (adapter / "metrics.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(analysis_module, "inspect_lora", lambda path: {
+        "adapter_type": "dora", "rank": 2, "train_config": {},
+        "steps": 30 if Path(path).parent.name == "best" else (40 if "epoch_002" in str(path) else 60),
+        "epochs": 2 if Path(path).parent.name == "best" or "epoch_002" in str(path) else 3,
+    })
+    report = analyze_training_run(adapter)
+    assert report.best_step == 30
+    assert report.best_epoch == 2
+    assert report.best_val_loss == 3.0
+    assert report.final_val_loss == 4.0
+    assert Path(report.recommended_checkpoint).parent.name == "best"
+    assert next(c for c in report.checkpoints if c["kind"] == "best")["val_loss"] == 3.0
+
+
 def test_legacy_report_wording_is_upgraded_only_for_display() -> None:
     stored = "Base model (no adapter): the adapter beats other adapters."
 

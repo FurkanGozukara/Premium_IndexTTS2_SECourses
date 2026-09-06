@@ -68,7 +68,8 @@ def synthetic_cpu_trainer(monkeypatch):
         target = batch["value"].float().mean() / 4.0
         loss = (model.weight - target).square() + 0.01
         accuracy = torch.exp(-loss.detach())
-        return loss, {"mel_accuracy": accuracy}
+        return loss, {"mel_accuracy": accuracy, "mel_loss": loss,
+                      "text_loss": torch.tensor(0.0), "mel_tokens": 1, "text_tokens": 1}
 
     def fake_save_lora(path, *_args, **_kwargs):
         destination = Path(path)
@@ -146,6 +147,10 @@ def test_weights_only_resume_starts_a_fresh_two_step_run(
     assert result.step == result.total_steps == 2
     assert result.initial_loss is not None and result.final_loss is not None
     assert len(_training_rows(Path(result.output_path).parent / "metrics.jsonl")) == 2
+    saved_config = json.loads((Path(result.output_path).parent / "train_config.json").read_text(encoding="utf-8"))
+    assert saved_config["name"] == "weights_only"
+    assert saved_config["val_split_mode"] == resumed.val_split_mode
+    assert saved_config["early_stop_enabled"] == resumed.early_stop_enabled
     assert synthetic_cpu_trainer[-1] == (source.output_path, "weights_only")
     log = (Path(result.output_path).parent / "log.txt").read_text(encoding="utf-8")
     assert "fresh optimizer/scheduler at step 0" in log
@@ -201,6 +206,104 @@ def test_final_step_validation_is_not_duplicated(
     validation = [row for row in rows if row.get("event") == "validation"]
     assert len(validation) == 1
     assert validation[0]["step"] == 2
+
+
+def test_missing_validation_reference_fails_before_model_loading(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path, "invalid_holdout", max_steps=2)
+    dataset = Path(config.dataset_dir)
+    dataset.mkdir()
+    cache = dataset / "cache"
+    cache.mkdir()
+    for name in ("train", "holdout"):
+        torch.save(
+            {"codes": torch.tensor([1, 2, 3]), "text_tokens": torch.tensor([4, 5, 6]),
+             "campplus": torch.ones(192), "emo_raw": torch.ones(1024),
+             "emo_vec": torch.ones(1280), "language": "EN"},
+            cache / f"{name}.pt",
+        )
+    write_manifest(
+        dataset / "manifest.jsonl",
+        [
+            {"id": "train", "speaker": "training_voice", "split": "train", "n_codes": 3, "n_text_tokens": 3},
+            {"id": "holdout", "speaker": "held_out_voice", "split": "val", "n_codes": 3, "n_text_tokens": 3},
+        ],
+    )
+    monkeypatch.setattr(
+        trainer_module, "build_training_model",
+        lambda *_args, **_kwargs: pytest.fail("Invalid validation data must fail before loading a model"),
+    )
+
+    with pytest.raises(ValueError, match="no training reference for: held_out_voice"):
+        run_training(config)
+
+    status = json.loads((Path(config.output_dir) / config.name / "status.json").read_text(encoding="utf-8"))
+    assert status["phase"] == "failed"
+    assert "no training reference" in status["message"]
+
+
+def test_empty_validation_split_still_allows_training(
+    tmp_path: Path, synthetic_cpu_trainer, monkeypatch
+) -> None:
+    class NoValidationDataset(_SyntheticDataset):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if self.split == "val":
+                self.lengths = []
+
+    monkeypatch.setattr(trainer_module, "LoraTrainDataset", NoValidationDataset)
+    result = run_training(_config(tmp_path, "no_validation", max_steps=2))
+
+    assert result.status == "complete"
+    assert result.step == 2
+    rows = [json.loads(line) for line in (Path(result.output_path).parent / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert not any(row.get("event") == "validation" for row in rows)
+
+
+def test_fp16_scaler_recovers_overflow_without_counting_an_update(
+    tmp_path: Path, synthetic_cpu_trainer, monkeypatch
+) -> None:
+    original_scaler = torch.amp.GradScaler
+    monkeypatch.setattr(torch.amp, "GradScaler", lambda *_args, **_kwargs: original_scaler("cpu", enabled=True))
+    original_loss = trainer_module.gpt_train_step_loss
+    training_calls = 0
+
+    def overflow_once(*args, **kwargs):
+        nonlocal training_calls
+        loss, values = original_loss(*args, **kwargs)
+        if torch.is_grad_enabled():
+            training_calls += 1
+            if training_calls == 1:
+                loss.register_hook(lambda grad: torch.full_like(grad, float("inf")))
+        return loss, values
+
+    monkeypatch.setattr(trainer_module, "gpt_train_step_loss", overflow_once)
+    result = run_training(_config(tmp_path, "overflow_recovery", max_steps=3))
+    assert result.step == 3
+    assert training_calls == 4
+    rows = _training_rows(Path(result.output_path).parent / "metrics.jsonl")
+    assert len(rows) == 3
+    assert all(row["grad_norm"] < float("inf") for row in rows)
+    log = (Path(result.output_path).parent / "log.txt").read_text(encoding="utf-8")
+    assert "skipped overflowing FP16 update" in log
+
+
+def test_step_checkpoint_contains_same_step_validation_state(
+    tmp_path: Path, synthetic_cpu_trainer
+) -> None:
+    config = _config(tmp_path, "step_state", max_steps=3)
+    config.val_fraction = 0.25
+    config.val_every_steps = 2
+    config.save_every_steps = 2
+    config.epoch_train_state = True
+    config.save_best = True
+    result = run_training(config)
+    state_path = Path(result.output_path).parent / "step_state_step_000002.train_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert state["early_stopping"]["last_step"] == 2
+    assert state["early_stopping"]["checks"] == 1
+    assert state["best_val_loss"] == state["early_stopping"]["best_loss"]
 
 
 def test_conditioning_modes_and_resolved_sample_seed_are_reported(
@@ -313,6 +416,8 @@ def test_early_stopping_writes_the_normal_final_adapter(
     config.val_fraction = 0.25
     config.val_every_steps = 1
     config.early_stop_patience = 1
+    config.early_stop_min_steps = 0
+    config.early_stop_min_epochs = 0
 
     result = run_training(config)
 

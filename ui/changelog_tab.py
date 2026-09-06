@@ -7,6 +7,24 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.1",
+        "2026-09-06",
+        """
+### More reliable voice training and automatic stopping
+
+- **Automatically stop when progress stalls** is now enabled by default. Training can finish before its epoch or step limit while keeping the best checkpoint. The default allows six validation checks without a meaningful gain after warmup, at least 1,000 updates, and two dataset passes; you can adjust these controls or disable automatic stopping.
+- Validation now holds out complete source recordings by default and uses training-only clips for reference conditioning. It checks the full validation set every 250 updates and at epoch boundaries, with token-weighted scores for more consistent comparisons. Invalid validation references produce a clear error before model loading instead of silently disabling validation.
+- Speech-token feature extraction now keeps the semantic encoder in FP32. Cache fingerprints detect changed audio, transcripts, model assets, and extraction settings so stale features are rebuilt when caching is requested.
+- Best-checkpoint selection includes every validation check, including improvements between epoch boundaries. Resume state preserves the best step and stopping counter; recoverable FP16 overflow skips an update without advancing the learning-rate schedule.
+- Added optional command-line tools for collecting main video/subtitle pairs, auditing speaker consistency and transcript agreement, and measuring generated checkpoint comparisons.
+- Updated training presets, help, and the guide. Verification includes **307 passing tests**, 37 optional GPU cases skipped, a completed CUDA training run, and **93 generated audio comparisons**.
+
+In the accompanying English voice experiment, 7.85 hours of curated training audio (about 75% more than V3) and the updated pipeline reduced independent test loss by **3.28%**. ASR-measured word error fell from **6.83% to 5.69%** across twelve test prompts. Training stopped at update 10,250 and retained update 9,195 as best. These are results from the combined data and pipeline update; automated scores are not human listening ratings.
+
+[Read the training report and comparison limits](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses/blob/master/TRAINING_QUALITY_REPORT_2026-09-06.md).
+""".strip(),
+    ),
+    (
         "v6.0",
         "2026-09-04",
         """

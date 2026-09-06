@@ -55,11 +55,15 @@ class TrainConfig:
     max_text_tokens: int = 600
 
     val_fraction: float = 0.05
+    val_split_mode: str = "source"
     val_reference_mode: str = "other"
-    val_every_steps: int = 50
-    val_max_batches: int = 20
-    early_stop_patience: int = 0
-    early_stop_min_delta: float = 0.0
+    val_every_steps: int = 250
+    val_max_batches: int = 0
+    early_stop_enabled: bool = True
+    early_stop_patience: int = 6
+    early_stop_min_delta: float = 0.005
+    early_stop_min_steps: int = 1000
+    early_stop_min_epochs: float = 2.0
     save_every_epochs: int = 1
     save_every_steps: int = 0
     keep_last_n: int = 0
@@ -169,13 +173,19 @@ class TrainConfig:
         self.max_codes = max(1, int(self.max_codes))
         self.max_text_tokens = max(1, int(self.max_text_tokens))
         self.val_fraction = min(0.5, max(0.0, float(self.val_fraction)))
+        self.val_split_mode = str(self.val_split_mode).strip().lower()
+        if self.val_split_mode not in {"record", "source"}:
+            raise ValueError("val_split_mode must be record or source")
         self.val_reference_mode = str(self.val_reference_mode).strip().lower()
         if self.val_reference_mode not in {"self", "other"}:
             raise ValueError("val_reference_mode must be self or other")
         self.val_every_steps = max(0, int(self.val_every_steps))
-        self.val_max_batches = max(1, int(self.val_max_batches))
+        self.val_max_batches = max(0, int(self.val_max_batches))
         self.early_stop_patience = max(0, int(self.early_stop_patience))
         self.early_stop_min_delta = max(0.0, float(self.early_stop_min_delta))
+        self.early_stop_enabled = bool(self.early_stop_enabled)
+        self.early_stop_min_steps = max(0, int(self.early_stop_min_steps))
+        self.early_stop_min_epochs = max(0.0, _finite_float(self.early_stop_min_epochs, "early_stop_min_epochs"))
         self.save_every_epochs = max(0, int(self.save_every_epochs))
         self.save_every_steps = max(0, int(self.save_every_steps))
         self.keep_last_n = max(0, int(self.keep_last_n))

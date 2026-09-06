@@ -209,9 +209,21 @@ The parent UI uses the same `_terminate_process_tree` approach as webui.py for h
 Quality-first `TrainConfig` defaults are rank 128, alpha 129, learning rate 4e-5, 10 epochs, speaker reference
 `other`, emotion reference `follow_speaker`, validation reference `other`, and `keep_last_n=0`. Dropout remains
 0.05, weight decay 0.01, batch size 1 with accumulation 1, warmup 200, cosine scheduling, BF16, gradient
-checkpointing, validation fraction 0.05 every 50 steps, samples every epoch,
-automatic analysis/evaluation, and disabled early stopping.
+checkpointing, validation fraction 0.05 every 250 steps, samples every epoch,
+and automatic analysis/evaluation. Validation defaults to complete source recordings
+(`val_split_mode="source"`), evaluates the entire holdout (`val_max_batches=0`), and weights
+losses by valid tokens. Explicit `split=train|val` labels override the fraction and mode.
+The early-stop checkbox defaults to enabled: patience 6, minimum improvement 0.005,
+at least 1,000 updates, completed warmup, and two dataset passes before counting stalls.
+The absolute best validation checkpoint is retained even when a small improvement does
+not reset patience. Its exact step and resumable stopping state are saved in checkpoint
+state and `analysis/checkpoint_selection.json`.
 With batch size 1 and accumulation 1, each epoch gives one optimizer update per training clip.
+
+Feature cache format 2 runs the semantic encoder in FP32, matching inference, and binds each
+entry to the source audio/transcript and extraction assets/configuration. Requesting caching
+regenerates old or stale entries. FP16 overflow skips the affected update and reduces the
+gradient scale without advancing the scheduler; non-finite unscaled training fails explicitly.
 
 `TrainConfig.epoch_train_state=False` omits the optimizer/scheduler/RNG `train_state.pt` sidecar from periodic
 epoch and step checkpoints, avoiding about 4x extra disk per checkpoint. Best, final, and interrupted checkpoints
@@ -223,8 +235,8 @@ still carry train state when `save_train_state=True`, so Continue run remains av
 `TrainConfig.emo_ref_mode` independently controls the emotion-vector source:
 
 - `self` uses the target clip and preserves the legacy training behavior.
-- `other` uses a deterministic different clip from the same speaker, with a target-clip fallback when no other
-  clip exists.
+- `other` uses a deterministic different clip from the same speaker. Training can fall back to its target when
+  no other training clip exists; validation rejects a speaker with no training reference instead of falling back.
 - `mixed` deterministically chooses self or other per item and epoch.
 - `follow_speaker` uses exactly the clip selected by `speaker_ref_mode` for both CAMPPlus and emotion. This is the
   inference-aligned mode because one reference clip supplies both vectors at generation time.
@@ -235,6 +247,10 @@ of the same speaker. Checkpoint evaluation uses the same mapping for its validat
 subset. `CheckpointEvalConfig.reference_mode=""` inherits `val_reference_mode` from the adapter's
 `train_config.json` and falls back to `self` for older adapters. Reports persist the resolved reference mode and state
 the conditioning method in their Markdown summary.
+
+Reference candidates for both training and validation are restricted to training records.
+Older saved configurations without `val_split_mode` retain their historical record split
+in checkpoint evaluation. Positive validation caps use a fixed shuffled subset.
 
 ### Training sampling and evaluation settings
 

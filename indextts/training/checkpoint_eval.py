@@ -30,7 +30,7 @@ from .analysis import (
     load_training_analysis,
 )
 from .dataset import LoraTrainDataset, collate
-from .model_forward import gpt_train_step_loss
+from .model_forward import TokenMetrics, gpt_train_step_loss
 
 
 def _utc_now() -> str:
@@ -308,12 +308,7 @@ def _loader_metrics(
 ) -> dict[str, float | None]:
     if loader is None:
         return {"loss": None, "mel_loss": None, "text_loss": None, "accuracy": None}
-    values: dict[str, list[float]] = {
-        "loss": [],
-        "mel_loss": [],
-        "text_loss": [],
-        "accuracy": [],
-    }
+    aggregate = TokenMetrics()
     amp_enabled = device.type == "cuda"
     with torch.no_grad():
         for index, batch in enumerate(loader):
@@ -331,17 +326,8 @@ def _loader_metrics(
                     text_loss_weight=float(loss_options.get("text_loss_weight", 0.1)),
                     label_smoothing=float(loss_options.get("label_smoothing", 0.0)),
                 )
-            for key, tensor in (
-                ("loss", total),
-                ("mel_loss", metrics["mel_loss"]),
-                ("text_loss", metrics["text_loss"]),
-                ("accuracy", metrics["mel_accuracy"]),
-            ):
-                values[key].append(float(tensor.detach().float().cpu()))
-    return {
-        key: (sum(items) / len(items) if items else None)
-        for key, items in values.items()
-    }
+            aggregate.update(metrics)
+    return aggregate.result(float(loss_options.get("mel_loss_weight", 1.0)), float(loss_options.get("text_loss_weight", 0.1)))
 
 
 def _make_loader(dataset: Any, batch_size: int) -> DataLoader:
@@ -485,6 +471,7 @@ def evaluate_checkpoints(
         "seed": int(cfg.seed or 0),
         "max_codes": int(train_defaults.get("max_codes", 1500)),
         "max_text_tokens": int(train_defaults.get("max_text_tokens", 600)),
+        "val_split_mode": str(train_defaults.get("val_split_mode", "record")),
     }
     reference_options = (
         {"speaker_ref_mode": "other", "emo_ref_mode": "follow_speaker"}
@@ -503,7 +490,8 @@ def evaluate_checkpoints(
         train_dataset = LoraTrainDataset(
             cfg.dataset_dir, split="train", **reference_options, **dataset_options
         )
-        indices = list(range(min(cfg.train_subset, len(train_dataset))))
+        generator = torch.Generator().manual_seed(int(cfg.seed or 0))
+        indices = torch.randperm(len(train_dataset), generator=generator).tolist()[:cfg.train_subset]
         train_items = len(indices)
         if indices:
             train_loader = _make_loader(Subset(train_dataset, indices), cfg.batch_size)

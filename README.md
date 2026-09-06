@@ -7,13 +7,21 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6 maintenance update:** the main workflows and registered settings remain compatible with the screenshots, while the following user-visible behavior is new or corrected.
+**V6.1 training quality update:** train with more reliable validation, preserve the best checkpoint, and stop automatically when progress stalls.
+
+- The automatic-stop checkbox is enabled by default, with adjustable patience and a warmup/minimum-training grace period. The live status shows the best update and stopping counter.
+- Validation holds out complete source recordings, uses training-only reference clips, and checks the full validation set every 250 updates and at epoch boundaries by default.
+- FP32 semantic feature extraction and content-aware cache fingerprints prevent stale or lower-precision training targets from being reused when features are recached.
+- Checkpoint analysis includes improvements between epoch boundaries; resume preserves the stopping state, and recoverable FP16 overflow does not advance the update schedule.
+- Optional command-line tools collect main video/SRT pairs, audit narration data, and measure generated checkpoint comparisons. The [completed training report](TRAINING_QUALITY_REPORT_2026-09-06.md) documents the 7.85-hour V4 experiment, 3.28% lower independent test loss versus V3, and the limits of the audio measurements.
+
+**V6.0 maintenance update:** the main workflows and registered settings remain compatible with the screenshots, while the following user-visible behavior is new or corrected.
 
 - Record a reference directly from the browser microphone, alongside upload, local-path, library, adapter, and recent-output sources.
 - Local media paths are staged safely for browser playback, and unsupported video codecs receive an FFmpeg-generated browser preview without changing the audio used for cloning.
 - Voice Generation now defaults to in-process model reuse; isolated subprocess mode remains available when hard cancellation and complete VRAM release matter more than repeat-run speed.
 - Candidate players, dataset reference players, feature-cache handoff, completed batch summaries, CPU diagnostics, and narrow-screen header controls now restore or update reliably.
-- A lazy-rendered Changelog tab now keeps the public v6.0-to-v4.0 release history and official SECourses project links inside the app.
+- A lazy-rendered Changelog tab keeps the public release history and official SECourses project links inside the app.
 
 **Choose a route:**
 
@@ -281,7 +289,15 @@ Sort through the prepared-segments table, inspect durations and warnings, and cl
 
 ### Precompute the feature cache
 
-Feature caching runs the expensive base-model preprocessing once and lets training consume compact cached samples. Choose the intended model directory and device, then press **Cache features now**.
+For single-speaker narration that includes demonstrations or music, `tools/curate_voice_dataset.py` can audit a prepared dataset before caching. It checks subtitle/ASR agreement and CAMPPlus speaker similarity over whole clips and overlapping six-second windows. Clean speaker matches with disputed source transcripts receive a fresh transcription of the extracted clip. Every rejection is recorded; output must use a new directory. Reserve complete source recordings for validation and optionally final testing:
+
+```text
+python tools/curate_voice_dataset.py datasets/raw datasets/clean --reference reference.wav --validation-source held_out_tutorial --test-source final_test_tutorial
+```
+
+Source names are the media filename stems from the manifest. Similarity thresholds screen for contamination and can also reject quiet or atypical clean speech; inspect `quality_audit.jsonl` and `quality_summary.json`. The original dataset remains available. `tools/measure_grid_quality.py` measures a completed listening grid with ASR, speaker/style similarity, pitch and matched-text speaking rate when real target recordings are supplied.
+
+Feature caching runs the expensive base-model preprocessing once and lets training consume compact cached samples. Choose the intended model directory and device, then press **Cache features now**. The semantic encoder uses FP32 to match inference. Cache entries track the audio, transcript and extraction assets; caching regenerates entries made with an older format or changed inputs.
 
 ![Annotated 4K training feature-cache workflow](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/9jmwh812EicQJF8oMPO2v.png)
 
@@ -316,11 +332,15 @@ The measured batch-1 baseline uses AdamW, cosine decay, learning rate `4e-5`, 20
 
 ### Validation and early stopping
 
-Keep a validation split so the app measures unseen clips rather than only memorization. Five percent is the general default; tiny test datasets may need a larger fraction simply to contain at least one validation item.
+Keep a validation split so the app measures unseen speech. The default holds out complete source recordings, requesting five percent of clips. With few recordings, the actual fraction can differ substantially; the training plan shows the resulting counts. A single recording falls back to a clip split. Explicit `split=train` and `split=val` labels in every manifest row override these settings.
 
 ![Annotated 4K validation split and early-stop controls](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/0FAKnqFq1Vk3rI9ITrUrH.png)
 
-*Figure 23. Validation can run every N steps and/or at epoch boundaries, with a batch cap for large datasets. Early stopping requires both patience and a minimum improvement; patience 0 disables it.*
+*Figure 23. Validation runs every 250 updates and at epoch boundaries by default. Maximum validation batches 0 evaluates the whole holdout; a positive cap uses a fixed shuffled subset.*
+
+**Automatically stop when progress stalls** starts checked. After at least 1,000 updates, completed warmup and two dataset passes, six validation checks without a loss improvement greater than 0.005 stop training, even before the chosen epochs or steps. The lowest-loss checkpoint is preserved, including smaller improvements that do not reset patience. Uncheck the control to disable automatic stopping; patience 0 also disables it. Saved training state preserves the best step and patience counter when continuing a run. Both training and validation draw alternative references only from training clips.
+
+When validation uses another clip as its reference, each held-out speaker needs at least one training clip. An invalid split reports the missing speakers instead of silently using the validation target as its own reference. Adjust the split or explicitly select self-reference validation if that is the intended evaluation.
 
 Validation reference mode **other** uses a different same-speaker clip for both vectors and most closely matches real cloning. The training smoke test used four segments with a 25 percent split, producing three training items and one unseen validation item. If a tiny dataset produces zero validation items, V6 safely skips automatic measured checkpoint evaluation and records the reason in the log instead of starting an invalid evaluation job.
 
@@ -556,7 +576,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-V6 adds a lazy-rendered **Changelog** tab after Help. Open it to read the newest-first v6.0 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.1 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -674,6 +694,8 @@ All three active paths were generated. A 3-second Natural target produced about 
 
 This tutorial was not produced from screenshots alone. The original audit completed real synthesis, batching, preparation, feature caching, training, checkpoint evaluation, listening grids, calibration, model verification, and benchmarking. The V6 maintenance audit rebuilt the live interface, checked the changed controls and Changelog in Chrome, and passed **288 tests**, with 37 environment-specific cases skipped and 15 upstream PyTorch deprecation warnings.
 
+The V6.1 training update passed **307 tests**, with 37 optional GPU cases skipped. Separate CUDA checks, the full V4 training run, independent checkpoint evaluation, and 93 generated audio comparisons also completed. The [training quality report](TRAINING_QUALITY_REPORT_2026-09-06.md) records the dataset, evaluation protocol, results, and limitations.
+
 - Mixed TXT/SRT batches now apply caption timing only to caption items instead of crashing the plain-text item.
 - Batched inference no longer leaks sequential target-duration arguments into the batch engine.
 - Saved listening grids retain and render their audio players, and idle polling no longer clears a loaded result.
@@ -684,7 +706,7 @@ This tutorial was not produced from screenshots alone. The original audit comple
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The new Changelog tab renders only when opened and presents the public v6.0-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.1-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -710,7 +732,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.0-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.1-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
@@ -1024,17 +1046,25 @@ The appendix below is generated directly from the app's preset registry. It cove
 
 **Maximum text tokens** - `training.max_text_tokens`. Cached text length safety limit. *(default 600; minimum 1; maximum 100000)*
 
-**Validation fraction** - `training.val_fraction`. 5% provides useful validation without sacrificing much training data. *(default 0.05; minimum 0; maximum 0.5)*
+**Validation fraction** - `training.val_fraction`. Requested holdout fraction; whole-recording splits may differ substantially. The training plan shows actual counts. Explicit manifest splits take precedence. *(default 0.05; minimum 0; maximum 0.5)*
 
-**Validate every steps** - `training.val_every_steps`. 0 disables step validation; epoch validation still runs when a split exists. *(default 50; minimum 0; maximum 1000000)*
+**Validation split** - `training.val_split_mode`. source holds out whole recordings; a single recording falls back to record splitting. *(default "source"; choices "source", "record")*
 
-**Maximum validation batches** - `training.val_max_batches`. Caps validation time on large datasets. *(default 20; minimum 1; maximum 1000000)*
+**Validate every steps** - `training.val_every_steps`. 0 disables step validation; epoch validation still runs when a split exists. *(default 250; minimum 0; maximum 1000000)*
+
+**Maximum validation batches** - `training.val_max_batches`. 0 evaluates the entire holdout. A positive cap uses a fixed shuffled subset; loss is weighted by valid tokens. *(default 0; minimum 0; maximum 1000000)*
 
 **Validation reference** - `training.val_reference_mode`. self validates each target with itself, while other uses a different same-speaker clip for both vectors; other is inference-like and measured more accurately. *(default "other"; choices "self", "other")*
 
-**Early-stop patience** - `training.early_stop_patience`. 0 disables early stopping; otherwise stop after this many validations without a meaningful improvement. *(default 0; minimum 0; maximum 1000000)*
+**Automatically stop when progress stalls** - `training.early_stop_enabled`. Stop after validation stalls beyond the initial learning period and retain the best checkpoint. *(default true)*
 
-**Early-stop minimum improvement** - `training.early_stop_min_delta`. Validation loss must fall by at least this amount to reset patience. *(default 0; minimum 0; maximum 1000000)*
+**Early-stop patience** - `training.early_stop_patience`. 0 disables early stopping; otherwise stop after this many validations without a meaningful improvement. *(default 6; minimum 0; maximum 1000000)*
+
+**Early-stop minimum improvement** - `training.early_stop_min_delta`. Validation loss must fall by more than this amount to reset patience. *(default 0.005; minimum 0; maximum 1000000)*
+
+**Minimum steps before early stopping** - `training.early_stop_min_steps`. Wait for this many updates and completed warmup before counting stalled checks. *(default 1000; minimum 0)*
+
+**Minimum epochs before early stopping** - `training.early_stop_min_epochs`. Give the dataset this many passes before counting stalled checks. *(default 2; minimum 0)*
 
 **Base variant** - `training.base_variant`. BF16 is the quality default; INT8 ConvRot reduces frozen base weight memory. *(default "bf16"; choices "bf16", "int8_convrot")*
 

@@ -541,6 +541,8 @@ def analyze_training_run(
             )
 
     validation_by_epoch: dict[int, dict[str, Any]] = {}
+    validation_by_step: dict[int, dict[str, Any]] = {}
+    minimum_by_epoch: dict[int, float] = {}
     if not validation_rows.empty and "epoch" in validation_rows:
         for _, row in validation_rows.iterrows():
             epoch = _integer(row.get("epoch"))
@@ -550,10 +552,13 @@ def analyze_training_run(
                     "loss": val_loss,
                     "accuracy": _finite_float(row.get("val_mel_accuracy")),
                     "step": _integer(row.get("step")),
+                    "epoch": epoch,
                 }
+                validation_by_step[_integer(row.get("step"))] = validation_by_epoch[epoch]
+                minimum_by_epoch[epoch] = min(minimum_by_epoch.get(epoch, val_loss), val_loss)
 
     phases, best_epoch, overfit_start = classify_epoch_phases(
-        {epoch: item["loss"] for epoch, item in validation_by_epoch.items()},
+        minimum_by_epoch,
         tolerance_value,
     )
     summaries: list[EpochSummary] = []
@@ -583,14 +588,15 @@ def analyze_training_run(
     final_epoch = max(epoch_numbers) if epoch_numbers else None
     final_validation = validation_by_epoch.get(final_epoch or -1, {})
     final_val_loss = _finite_float(final_validation.get("loss"))
-    best_validation = validation_by_epoch.get(best_epoch or -1, {})
+    best_validation = min(validation_by_step.values(), key=lambda item: (item["loss"], item["step"]), default={})
+    best_epoch = _integer(best_validation.get("epoch")) or None
     best_val_loss = _finite_float(best_validation.get("loss"))
     best_step = _integer(best_validation.get("step")) or None
     if metrics.empty:
         status = "empty"
     elif not validation_by_epoch:
         status = "no_validation"
-    elif best_epoch == max(validation_by_epoch):
+    elif best_step == _integer(final_validation.get("step")):
         status = "still_improving"
     elif overfit_start is not None:
         status = "best_found"
@@ -606,7 +612,7 @@ def analyze_training_run(
         if item["kind"] in {"final", "interrupted"} and final_epoch is not None and epoch == 0:
             epoch = final_epoch
             item["epoch"] = epoch
-        validation = validation_by_epoch.get(epoch, {})
+        validation = validation_by_step.get(int(item.get("steps") or 0), validation_by_epoch.get(epoch, {}))
         item["val_loss"] = _finite_float(validation.get("loss"))
         item["phase"] = phases.get(epoch, "unknown")
         item.pop("metadata", None)
@@ -626,6 +632,8 @@ def analyze_training_run(
         adapter_dir=adapter_root,
         tolerance=tolerance_value,
     )
+    if best_step is not None:
+        summary += f"\n\nCheckpoint selection uses every validation check; the lowest loss occurred at optimizer step {best_step:,}."
     return TrainingAnalysis(
         adapter_dir=str(adapter_root),
         state_dir=str(state_root),

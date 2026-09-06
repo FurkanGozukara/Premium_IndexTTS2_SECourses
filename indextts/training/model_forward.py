@@ -202,8 +202,35 @@ def gpt_train_step_loss(
         "mel_loss": mel_loss,
         "text_loss": text_loss,
         "mel_accuracy": mel_accuracy,
+        "mel_tokens": masks["mel_loss_mask"].sum(),
+        "text_tokens": masks["text_loss_mask"].sum(),
     }
     return total, metrics
+
+
+class TokenMetrics:
+    """Aggregate each objective over its valid tokens, independent of batching."""
+
+    def __init__(self) -> None:
+        self.mel_sum = self.text_sum = self.correct = 0.0
+        self.mel_tokens = self.text_tokens = 0
+
+    def update(self, metrics: Mapping[str, Any]) -> None:
+        mel_tokens = int(metrics["mel_tokens"])
+        text_tokens = int(metrics["text_tokens"])
+        self.mel_sum += float(metrics["mel_loss"]) * mel_tokens
+        self.text_sum += float(metrics["text_loss"]) * text_tokens
+        self.correct += float(metrics["mel_accuracy"]) * mel_tokens
+        self.mel_tokens += mel_tokens
+        self.text_tokens += text_tokens
+
+    def result(self, mel_weight: float = 1.0, text_weight: float = 0.1) -> dict[str, float | None]:
+        if not self.mel_tokens or not self.text_tokens:
+            return dict.fromkeys(("loss", "mel_loss", "text_loss", "accuracy"))
+        mel = self.mel_sum / self.mel_tokens
+        text = self.text_sum / self.text_tokens
+        return {"loss": mel_weight * mel + text_weight * text, "mel_loss": mel,
+                "text_loss": text, "accuracy": self.correct / self.mel_tokens}
 
 
 __all__ = [
@@ -212,4 +239,5 @@ __all__ = [
     "gpt_train_step_logits",
     "gpt_train_step_loss",
     "masked_cross_entropy",
+    "TokenMetrics",
 ]

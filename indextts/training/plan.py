@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 def _stable_unit_interval(*parts: Any) -> float:
@@ -35,6 +35,50 @@ def validation_split_ids(
         selected.remove(
             max(ids, key=lambda record_id: _stable_unit_interval(seed, record_id, "split"))
         )
+    return selected
+
+
+def validation_record_ids(
+    records: Sequence[Mapping[str, Any]], val_fraction: float, seed: int, mode: str = "record"
+) -> set[str]:
+    """Keep whole recordings together, or honor an explicitly reviewed split.
+
+    Legacy runs retain their record-based split. Source mode falls back to that
+    split for a single recording. Explicit split labels always take precedence,
+    so a curated holdout cannot silently become training data in another tool.
+    """
+    if mode not in {"record", "source"}:
+        raise ValueError("val_split_mode must be record or source")
+    explicit = any("split" in row for row in records)
+    if explicit:
+        if any(row.get("split") not in {"train", "val"} for row in records):
+            raise ValueError("every manifest row must have split=train or split=val when explicit splits are used")
+        if not any(row["split"] == "train" for row in records):
+            raise ValueError("explicit split contains no training records")
+        return {str(row["id"]) for row in records if row["split"] == "val"}
+    ids = [str(row["id"]) for row in records]
+    if mode == "record" or val_fraction <= 0:
+        return validation_split_ids(ids, val_fraction, seed)
+    groups: dict[str, list[str]] = {}
+    for row in records:
+        key = str(row.get("source_media") or row["id"])
+        groups.setdefault(key, []).append(str(row["id"]))
+    if len(groups) < 2:
+        return validation_split_ids(ids, val_fraction, seed)
+    ordered = sorted(groups, key=lambda key: _stable_unit_interval(seed, key, "source_split"))
+    target = max(1, round(len(ids) * min(0.5, float(val_fraction))))
+    selected: set[str] = set()
+    # Greedily approach the requested clip count in seeded group order. At
+    # least one group remains training, even when one recording dominates.
+    for key in ordered:
+        candidates = groups[key]
+        if len(selected) + len(candidates) == len(ids):
+            continue
+        if abs(len(selected) + len(candidates) - target) < abs(len(selected) - target):
+            selected.update(candidates)
+    if not selected:
+        best = min(ordered, key=lambda key: abs(len(groups[key]) - target))
+        selected.update(groups[best])
     return selected
 
 
@@ -169,4 +213,5 @@ __all__ = [
     "training_plan_advisory",
     "training_plan_line",
     "validation_split_ids",
+    "validation_record_ids",
 ]

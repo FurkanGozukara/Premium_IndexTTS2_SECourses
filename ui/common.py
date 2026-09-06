@@ -31,7 +31,7 @@ from indextts.runtime.vram_presets import RuntimeConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_TITLE = "IndexTTS 2.5 Premium SECourses"
-APP_VERSION = "6.0"
+APP_VERSION = "6.1"
 FAVICON_PATH = ROOT / "ui_assets" / "indextts_premium_favicon.svg"
 STATE_ROOT = ROOT / ".ui_state"
 STATE_ROOT.mkdir(parents=True, exist_ok=True)

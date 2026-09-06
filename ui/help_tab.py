@@ -32,6 +32,8 @@ Use one speaker, natural pacing, little echo, and no music. A representative cli
 
 **Validation reference mode:** `self` validates with the target clip, while `other` uses a different same-speaker clip for both speaker and emotion conditioning to measure inference-like generalization.
 
+Validation defaults to complete source recordings and the whole holdout, every 250 updates and at epoch boundaries. Alternative references come only from training clips. The **Automatically stop when progress stalls** checkbox starts checked: after 1,000 updates, completed warmup and two dataset passes, six checks without an improvement greater than 0.005 stop the run and retain its best checkpoint. Uncheck it to train through the configured limit.
+
 ## Speaking Rate
 
 Speaking rate 1.0 is the model's natural pace; values below 1.0 speak more slowly and values above 1.0 speak faster. Training samples calibrate a completed LoRA / DoRA automatically, and **Calibrate speaking rate from this grid** can measure a saved listening grid. Voice Generation auto-applies the saved value so the trained voice matches the words-per-second pace of its recordings.

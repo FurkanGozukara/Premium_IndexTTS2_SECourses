@@ -29,7 +29,7 @@ from .dataset_manifest import atomic_write_json, load_manifest, write_cache_inde
 
 
 CACHE_FORMAT = "indextts2_training_features"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 @dataclass
@@ -225,7 +225,7 @@ class _FeatureModels:
         )
         self.semantic_model = Wav2Vec2BertModel.from_pretrained(
             str(w2v_dir), local_files_only=True
-        ).to(device=self.device, dtype=self.compute_dtype).eval()
+        ).to(device=self.device, dtype=torch.float32).eval()
         stats = torch.load(model_dir / str(cfg.w2v_stat), map_location="cpu", weights_only=True)
         self.semantic_mean = stats["mean"].float().to(self.device)
         self.semantic_std = torch.sqrt(stats["var"].float()).to(self.device)
@@ -265,13 +265,12 @@ class _FeatureModels:
             )
         else:
             attention_mask = attention_mask.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=self.compute_dtype,
-            enabled=self.device.type == "cuda" and self.compute_dtype != torch.float32,
-        ):
+        # The inference encoder and codec run in FP32. BF16 perturbations cross
+        # quantizer boundaries and silently change the supervision code IDs.
+        # Emotion projection below can still use the GPT's compute precision.
+        with torch.autocast(device_type=self.device.type, enabled=False):
             output = self.semantic_model(
-                input_features=input_features.to(dtype=self.compute_dtype),
+                input_features=input_features.float(),
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
@@ -348,7 +347,13 @@ def _load_audio_16k(path: Path) -> tuple[torch.Tensor, float]:
     return waveform, waveform.shape[-1] / 16000.0
 
 
-def _cache_valid(path: Path, semantic_layer: int | None = None) -> bool:
+def _cache_valid(
+    path: Path,
+    semantic_layer: int | None = None,
+    *,
+    source_fingerprint: str | None = None,
+    extraction_fingerprint: str | None = None,
+) -> bool:
     if not path.is_file():
         return False
     try:
@@ -360,7 +365,47 @@ def _cache_valid(path: Path, semantic_layer: int | None = None) -> bool:
         return False
     if semantic_layer is not None and int(value.get("semantic_layer", -1)) != int(semantic_layer):
         return False
-    return value.get("format") in {None, CACHE_FORMAT} and int(value.get("version", CACHE_VERSION)) == CACHE_VERSION
+    if value.get("format") != CACHE_FORMAT or value.get("version") != CACHE_VERSION:
+        return False
+    for key, expected in (("source_fingerprint", source_fingerprint), ("extraction_fingerprint", extraction_fingerprint)):
+        if expected is not None and value.get(key) != expected:
+            return False
+    for key in required:
+        tensor = value[key]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1 or not tensor.numel():
+            return False
+        if not torch.isfinite(tensor).all():
+            return False
+    return bool((value["codes"] >= 0).all() and (value["codes"] < 8192).all())
+
+
+def _source_fingerprint(dataset_dir: Path, row: Mapping[str, Any]) -> str:
+    """Bind cached labels/features to audio bytes and the current transcript."""
+    payload = {
+        "audio_sha256": _sha256(_audio_path(dataset_dir, row)),
+        "text": str(row.get("text", "")),
+        "language": str(row.get("language", "EN")),
+        "speaker": str(row.get("speaker", "")),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _extraction_fingerprint(config: FeatureCacheConfig, model_hashes: Mapping[str, str]) -> str:
+    root = Path(config.model_dir)
+    assets = sorted(set(root.glob("*.tiktoken")) | set(root.glob("*.model")) | set(root.glob("*glossary*.yaml")))
+    w2v = root / "hf_cache" / "w2v-bert-2.0"
+    assets += sorted(w2v.glob("*.json"))
+    source_root = Path(__file__).resolve().parents[1]
+    payload = {
+        "version": CACHE_VERSION, "semantic_dtype": "fp32", "semantic_layer": config.semantic_layer,
+        "model_hashes": dict(model_hashes), "model_config": _sha256(Path(config.model_config)),
+        "text_assets": {str(path.relative_to(root)): _sha256(path) for path in assets},
+        "code": {str(path.relative_to(source_root)): _sha256(path) for path in (
+            Path(__file__), source_root / "utils" / "tokenizer.py", source_root / "utils" / "front.py",
+        )},
+        "torch": torch.__version__, "transformers": _package_version("transformers"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _atomic_torch_save(path: Path, value: Mapping[str, Any]) -> None:
@@ -419,6 +464,7 @@ def _record_from_cache(row: Mapping[str, Any], path: Path) -> dict[str, Any]:
         "n_text_tokens": int(torch.as_tensor(value["text_tokens"]).numel()),
         "duration_s": float(value.get("duration_s", row.get("duration_s", 0.0))),
         "speaker": str(value.get("speaker", row.get("speaker", ""))),
+        "source_fingerprint": str(value.get("source_fingerprint", "")),
     }
 
 
@@ -483,12 +529,21 @@ def cache_dataset_features(
     text_pipeline = TextFeaturePipeline(resolved.model_dir)
     cache_dir = dataset_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    model_hashes = _model_hashes(Path(resolved.model_dir))
+    extraction_fingerprint = _extraction_fingerprint(resolved, model_hashes)
+    source_fingerprints = {
+        str(row["id"]): _source_fingerprint(dataset_dir, row) for row in rows
+    }
 
     existing: dict[str, dict[str, Any]] = {}
     pending: list[Mapping[str, Any]] = []
     for row in rows:
         destination = cache_dir / f"{row['id']}.pt"
-        if resolved.skip_existing and _cache_valid(destination, resolved.semantic_layer):
+        if resolved.skip_existing and _cache_valid(
+            destination, resolved.semantic_layer,
+            source_fingerprint=source_fingerprints[str(row["id"])],
+            extraction_fingerprint=extraction_fingerprint,
+        ):
             existing[str(row["id"])] = _record_from_cache(row, destination)
         else:
             pending.append(row)
@@ -541,6 +596,9 @@ def cache_dataset_features(
                     "language": str(row.get("language", "EN")),
                     "lang_id": int(language_id),
                     "semantic_layer": resolved.semantic_layer,
+                    "semantic_dtype": "fp32",
+                    "source_fingerprint": source_fingerprints[str(row["id"])],
+                    "extraction_fingerprint": extraction_fingerprint,
                 }
                 _atomic_torch_save(destination, payload)
                 existing[str(row["id"])] = _record_from_cache(row, destination)
@@ -585,7 +643,9 @@ def cache_dataset_features(
             "torchaudio": _package_version("torchaudio"),
         },
         "semantic_layer": resolved.semantic_layer,
-        "model_hashes": _model_hashes(Path(resolved.model_dir)),
+        "model_hashes": model_hashes,
+        "semantic_dtype": "fp32",
+        "extraction_fingerprint": extraction_fingerprint,
         "token_statistics": statistics,
         "cancelled": cancelled,
     }

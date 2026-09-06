@@ -54,7 +54,8 @@ from indextts.utils.atomic_json import read_json_retry
 
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .dataset_manifest import atomic_write_json
-from .model_forward import enable_gradient_checkpointing, gpt_train_step_loss
+from .early_stopping import EarlyStopping
+from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
 from .plan import suggested_epochs, training_plan, training_plan_line
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, write_speaking_rate
@@ -332,6 +333,7 @@ class LoraTrainer:
         self.last_checkpoint = ""
         self.resolved_sample_seed: int | None = None
         self._checkpoint_history: list[Path] = []
+        self.early_stopping = EarlyStopping()
 
     def log(self, message: str) -> None:
         line = str(message)
@@ -727,6 +729,7 @@ class LoraTrainer:
             "batch_in_epoch": next_batch,
             "dataset_fingerprint": dataset_fingerprint,
             "best_val_loss": best_val_loss,
+            "early_stopping": self.early_stopping.to_dict(),
             "ema_loss": ema_loss,
             "moving_losses": list(moving_losses),
             "rng": _rng_state(),
@@ -809,12 +812,11 @@ class LoraTrainer:
         model = built.model
         model.eval()
         set_training_mode(model, False)
-        losses: list[float] = []
-        accuracies: list[float] = []
+        aggregate = TokenMetrics()
         amp_dtype = _dtype(self.config.mixed_precision)
         amp_enabled = device.type == "cuda" and amp_dtype != torch.float32
         for index, batch in enumerate(loader):
-            if index >= self.config.val_max_batches:
+            if self.config.val_max_batches and index >= self.config.val_max_batches:
                 break
             batch = _batch_to_device(batch, device)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -825,13 +827,13 @@ class LoraTrainer:
                     text_loss_weight=self.config.text_loss_weight,
                     label_smoothing=self.config.label_smoothing,
                 )
-            losses.append(float(loss))
-            accuracies.append(float(values["mel_accuracy"]))
+            aggregate.update(values)
         model.train()
         set_training_mode(model, True)
-        if not losses:
+        result = aggregate.result(self.config.mel_loss_weight, self.config.text_loss_weight)
+        if result["loss"] is None:
             return math.nan, math.nan
-        return sum(losses) / len(losses), sum(accuracies) / len(accuracies)
+        return float(result["loss"]), float(result["accuracy"])
 
     def _read_resume_state(self, dataset_fingerprint: str) -> dict[str, Any]:
         if not self.config.resume_from:
@@ -856,6 +858,8 @@ class LoraTrainer:
                 "continuing optimizer/scheduler state from the start of the saved epoch"
             )
             state["batch_in_epoch"] = 0
+            state["early_stopping"] = {}
+            state["best_val_loss"] = None
         return state
 
     def _restore_resume_state(
@@ -899,6 +903,10 @@ class LoraTrainer:
             f"validation ref: {config.val_reference_mode}"
         )
         self.log(f">> training samples use seed {self.resolved_sample_seed}")
+        self.log(
+            f">> validation split: {config.val_split_mode}; training-only reference pool; "
+            f"token-weighted metrics; maximum batches: {config.val_max_batches or 'all'}"
+        )
         self.write_status(
             phase="initializing",
             message="loading cached dataset",
@@ -914,11 +922,14 @@ class LoraTrainer:
             max_text_tokens=config.max_text_tokens,
             speaker_ref_mode=config.speaker_ref_mode,
             emo_ref_mode=config.emo_ref_mode,
+            val_split_mode=config.val_split_mode,
         )
         val_speaker_ref_mode = "other" if config.val_reference_mode == "other" else "self"
         val_emo_ref_mode = (
             "follow_speaker" if config.val_reference_mode == "other" else "self"
         )
+        # Invalid holdout/reference data must fail visibly. Only a legitimately
+        # empty validation split should disable validation and early stopping.
         try:
             val_dataset = LoraTrainDataset(
                 self.dataset_dir,
@@ -929,10 +940,12 @@ class LoraTrainer:
                 max_text_tokens=config.max_text_tokens,
                 speaker_ref_mode=val_speaker_ref_mode,
                 emo_ref_mode=val_emo_ref_mode,
+                val_split_mode=config.val_split_mode,
             )
-        except (ValueError, FileNotFoundError):
-            val_dataset = None
-        if val_dataset is not None and len(val_dataset) == 0:
+        except (ValueError, FileNotFoundError) as exc:
+            self.write_status(phase="failed", message=str(exc))
+            raise
+        if len(val_dataset) == 0:
             val_dataset = None
 
         val_count = len(val_dataset) if val_dataset is not None else 0
@@ -968,6 +981,8 @@ class LoraTrainer:
         config.rank = first_adapter.rank
         config.alpha = first_adapter.alpha
         config.adapter_type = "dora" if first_adapter.use_dora else "lora"
+        # CLI runs need the same reproducible evaluation contract as UI jobs.
+        atomic_write_json(self.adapter_dir / "train_config.json", config.to_dict())
         self._prepare_reference()
         self.reporter.set_stage("training")
 
@@ -1026,8 +1041,10 @@ class LoraTrainer:
         resume_next_batch = resume_batch
         best_val_loss = state.get("best_val_loss")
         best_val_loss = float(best_val_loss) if best_val_loss is not None else None
-        early_stop_best = best_val_loss
-        validations_without_improvement = 0
+        self.early_stopping = EarlyStopping.from_state(state.get("early_stopping"))
+        if self.early_stopping.best_loss is None and best_val_loss is not None:
+            self.early_stopping.best_loss = best_val_loss
+            self.early_stopping.meaningful_best = best_val_loss
         ema_loss = state.get("ema_loss")
         ema_loss = float(ema_loss) if ema_loss is not None else None
         moving_losses: deque[float] = deque(
@@ -1060,26 +1077,33 @@ class LoraTrainer:
         )
 
         def update_early_stopping(validation_loss: float) -> bool:
-            nonlocal early_stop_best, validations_without_improvement, early_stop_reason
-            if config.early_stop_patience <= 0 or not math.isfinite(validation_loss):
-                return False
-            if (
-                early_stop_best is None
-                or validation_loss < early_stop_best - config.early_stop_min_delta
-            ):
-                early_stop_best = validation_loss
-                validations_without_improvement = 0
-                return False
-            validations_without_improvement += 1
-            if validations_without_improvement < config.early_stop_patience:
-                return False
-            early_stop_reason = (
-                f"early stopping after {validations_without_improvement} consecutive validation "
-                f"check(s) without an improvement of at least {config.early_stop_min_delta:.4g}; "
-                f"best validation loss {early_stop_best:.4f}"
+            nonlocal early_stop_reason
+            fraction_epoch = epoch_index + (batch_index + 1) / max(1, micro_batches_per_epoch)
+            _, should_stop = self.early_stopping.observe(
+                validation_loss, step=global_step, epoch=fraction_epoch,
+                enabled=config.early_stop_enabled, patience=config.early_stop_patience,
+                min_delta=config.early_stop_min_delta,
+                min_steps=max(config.warmup_steps, config.early_stop_min_steps),
+                min_epochs=config.early_stop_min_epochs,
             )
-            self.log(">> " + early_stop_reason)
-            return True
+            early_stop_reason = self.early_stopping.reason
+            tracking = self.early_stopping.to_dict()
+            self.write_status(early_stopping=tracking, early_stop_patience=config.early_stop_patience,
+                              early_stop_enabled=config.early_stop_enabled,
+                              best_val_loss=self.early_stopping.best_loss,
+                              best_step=self.early_stopping.best_step)
+            atomic_write_json(self.adapter_dir / "analysis" / "checkpoint_selection.json", {
+                **tracking, "checkpoint": str(self.best_path) if config.save_best else "",
+                "metric": "token_weighted_validation_loss", "val_split_mode": config.val_split_mode,
+                "reference_pool": "training_only", "validation_items": val_count,
+                "max_validation_batches": config.val_max_batches,
+            })
+            if config.early_stop_enabled and config.early_stop_patience:
+                self.log(f">> progress check: {self.early_stopping.bad_checks}/{config.early_stop_patience} "
+                         f"without meaningful improvement | best step {self.early_stopping.best_step}")
+            if should_stop:
+                self.log(">> " + early_stop_reason)
+            return should_stop
 
         self.write_status(
             phase="training",
@@ -1127,6 +1151,8 @@ class LoraTrainer:
                             label_smoothing=config.label_smoothing,
                         )
                         scaled_loss = loss / config.grad_accumulation
+                    if not torch.isfinite(loss.detach()):
+                        raise FloatingPointError(f"non-finite training loss before optimizer step {global_step + 1}")
                     scaler.scale(scaled_loss).backward()
                     micro_count += 1
                     group_loss += float(loss.detach())
@@ -1150,9 +1176,26 @@ class LoraTrainer:
                             built.parameters, float("inf")
                         )
                     grad_norm = float(grad_norm_tensor)
+                    if not math.isfinite(grad_norm) and not scaler.is_enabled():
+                        raise FloatingPointError(f"non-finite gradients before optimizer step {global_step + 1}")
+                    previous_scale = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    if scaler.is_enabled() and scaler.get_scale() < previous_scale:
+                        # FP16 overflow is recoverable: GradScaler skips this update
+                        # and lowers its scale. Do not advance the learning schedule
+                        # or include this discarded accumulation group in metrics.
+                        self.log(f">> skipped overflowing FP16 update before step {global_step + 1}; "
+                                 f"gradient scale reduced to {scaler.get_scale():g}")
+                        group_loss, group_accuracy, micro_count = 0.0, 0.0, 0
+                        resume_next_epoch, resume_next_batch = epoch_index, batch_index + 1
+                        if resume_next_batch >= batch_count:
+                            resume_next_epoch, resume_next_batch = epoch_index + 1, 0
+                        if self.stop_path.is_file():
+                            stopped = True
+                            break
+                        continue
                     scheduler.step()
                     global_step += 1
 
@@ -1235,24 +1278,6 @@ class LoraTrainer:
                     if next_batch >= batch_count:
                         next_epoch, next_batch = epoch_index + 1, 0
                     resume_next_epoch, resume_next_batch = next_epoch, next_batch
-                    if config.save_every_steps and global_step % config.save_every_steps == 0:
-                        path = self.adapter_dir / f"{config.name}_step_{global_step:06d}.safetensors"
-                        self.save_checkpoint(
-                            path,
-                            built,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            step=global_step,
-                            epochs_completed=epoch_index + 1,
-                            next_epoch=next_epoch,
-                            next_batch=next_batch,
-                            dataset_fingerprint=train_dataset.fingerprint,
-                            best_val_loss=best_val_loss,
-                            ema_loss=ema_loss,
-                            moving_losses=moving_losses,
-                        )
-
                     if (
                         val_loader is not None
                         and config.val_every_steps
@@ -1260,6 +1285,7 @@ class LoraTrainer:
                     ):
                         last_val_loss, val_accuracy = self.validate(built, val_loader, device)
                         last_validation_step = global_step
+                        should_stop = update_early_stopping(last_val_loss)
                         self.metric(
                             {
                                 "event": "validation",
@@ -1295,9 +1321,29 @@ class LoraTrainer:
                                 keep=True,
                             )
 
-                        if update_early_stopping(last_val_loss):
+                        if should_stop:
                             early_stopped = True
                             break
+
+                    # Save after validation so same-step resumable checkpoints
+                    # include the latest best score and patience counter.
+                    if config.save_every_steps and global_step % config.save_every_steps == 0:
+                        path = self.adapter_dir / f"{config.name}_step_{global_step:06d}.safetensors"
+                        self.save_checkpoint(
+                            path,
+                            built,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            step=global_step,
+                            epochs_completed=epoch_index + 1,
+                            next_epoch=next_epoch,
+                            next_batch=next_batch,
+                            dataset_fingerprint=train_dataset.fingerprint,
+                            best_val_loss=best_val_loss,
+                            ema_loss=ema_loss,
+                            moving_losses=moving_losses,
+                        )
 
                     if self.stop_path.is_file():
                         stopped = True
@@ -1312,6 +1358,7 @@ class LoraTrainer:
                 if val_loader is not None and last_validation_step != global_step:
                     last_val_loss, val_accuracy = self.validate(built, val_loader, device)
                     last_validation_step = global_step
+                    should_stop = update_early_stopping(last_val_loss)
                     self.metric(
                         {
                             "event": "validation",
@@ -1347,7 +1394,7 @@ class LoraTrainer:
                             keep=True,
                         )
 
-                    if update_early_stopping(last_val_loss):
+                    if should_stop:
                         early_stopped = True
 
                 if early_stopped:
