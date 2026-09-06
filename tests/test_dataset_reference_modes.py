@@ -52,6 +52,67 @@ def _index(dataset: LoraTrainDataset, sample_id: str) -> int:
     )
 
 
+def _reference_metadata(root: Path, durations: dict[str, float | None], **updates) -> None:
+    manifest = root / "manifest.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["duration_s"] = durations.get(row["id"])
+        row.update(updates.get(row["id"], {}))
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+@pytest.mark.parametrize("emotion_mode", ["other", "follow_speaker"])
+def test_other_references_target_fifteen_seconds_and_exclude_self(tmp_path, emotion_mode):
+    root = _cached_dataset(tmp_path)
+    _reference_metadata(root, {"a0": 12, "a1": 15, "a2": 20, "b0": 15})
+    dataset = LoraTrainDataset(root, val_fraction=0, speaker_ref_mode="other", emo_ref_mode=emotion_mode)
+    for epoch in (0, 1, 7):
+        dataset.set_epoch(epoch)
+        for target in ("a0", "a2"):
+            item = dataset[_index(dataset, target)]
+            assert item["reference_id"] == item["emo_reference_id"] == "a1"
+        # The only exact 15-second clip cannot condition itself in other mode.
+        item = dataset[_index(dataset, "a1")]
+        assert item["reference_id"] == item["emo_reference_id"] == "a0"
+
+
+def test_nearest_reference_ties_can_vary_deterministically_between_epochs(tmp_path):
+    root = _cached_dataset(tmp_path)
+    _reference_metadata(root, {"a0": 14, "a1": 16, "a2": 20, "b0": 15})
+    dataset = LoraTrainDataset(root, val_fraction=0, seed=19, speaker_ref_mode="other", emo_ref_mode="other")
+    observed = set()
+    index = _index(dataset, "a2")
+    for epoch in range(20):
+        dataset.set_epoch(epoch)
+        first = dataset[index]
+        assert dataset[index]["reference_id"] == first["reference_id"]
+        assert first["reference_id"] in {"a0", "a1"}
+        assert first["emo_reference_id"] in {"a0", "a1"}
+        observed.add(first["reference_id"])
+    assert observed == {"a0", "a1"}
+
+
+def test_nearest_validation_reference_comes_only_from_same_speaker_training_split(tmp_path):
+    root = _cached_dataset(tmp_path)
+    _reference_metadata(root, {"a0": 15, "a1": 12, "a2": 16, "b0": 15},
+                        a0={"split": "val"}, a1={"split": "train"},
+                        a2={"split": "train"}, b0={"split": "train"})
+    dataset = LoraTrainDataset(root, split="val", speaker_ref_mode="other", emo_ref_mode="follow_speaker")
+    item = dataset[_index(dataset, "a0")]
+    assert item["reference_id"] == item["emo_reference_id"] == "a2"
+
+
+def test_reference_duration_selection_preserves_quality_and_known_duration_priority(tmp_path):
+    root = _cached_dataset(tmp_path)
+    _reference_metadata(root, {"a0": 20, "a1": 15, "a2": 14, "b0": 15}, a1={"asr_wer": .1})
+    dataset = LoraTrainDataset(root, val_fraction=0, speaker_ref_mode="other", emo_ref_mode="other")
+    assert dataset[_index(dataset, "a0")]["reference_id"] == "a2"
+    _reference_metadata(root, {"a0": 20, "a1": 15, "a2": None, "b0": 15}, a1={"asr_wer": 0})
+    recreated = LoraTrainDataset(root, val_fraction=0, speaker_ref_mode="other", emo_ref_mode="other")
+    assert recreated[_index(recreated, "a0")]["reference_id"] == "a1"
+    assert recreated.fingerprint != dataset.fingerprint
+
+
 def test_other_emotion_reference_is_different_and_deterministic(tmp_path: Path) -> None:
     root = _cached_dataset(tmp_path)
     dataset = LoraTrainDataset(

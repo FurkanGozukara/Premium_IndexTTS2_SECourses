@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.5 automatic references target 15 seconds:** training speaker/emotion conditioning, validation, checkpoint evaluation, saved adapter references, epoch samples, and new speech comparisons share the same duration preference. Selection prioritizes transcript agreement and matching word boundaries, then takes the nearest eligible clip from the same speaker's training split. Other-reference modes exclude the current target. Restart after updating; existing frozen references, explicit self-reference modes, custom sample references, and training utterance lengths retain their behavior.
+
 **V6.4 automatic selection for each dataset:** fresh runs now freeze their own speech comparison, test several generation seeds, compare current checkpoints with a newly generated Base baseline, and optionally confirm the selected model on separate final-test recordings. Patience checks are spaced by training updates, and a plateau can receive one lower-learning-rate trial within the original budget. Recommendations, failures, and coverage limits are visible in the training dashboard. See the [training and checkpoint-selection guide](docs/TRAINING_SELECTION.md).
 
 Restart after updating. Automatic speech evaluation now runs by default after training and takes additional time. Recommendations include comparison limits and remain separate from human listening ratings. Existing adapters remain compatible.
@@ -344,7 +346,7 @@ The defaults use AdamW, cosine decay, learning rate `4e-5`, 200 warmup steps, a 
 - Fused AdamW can be faster on compatible CUDA builds; ordinary AdamW is the portable choice.
 - Betas `0.9,0.99` and the default epsilon are established stable optimizer values.
 - Mel loss is the main acoustic-token objective; text loss is auxiliary.
-- Speaker reference `other` and emotion reference `follow_speaker` imitate normal inference better than self-conditioning.
+- Speaker reference `other` and emotion reference `follow_speaker` imitate normal inference better than self-conditioning. Automatic training, validation, saved, and epoch-sample references target clean same-speaker clips nearest 15 seconds, excluding the current target where an other reference is requested.
 
 ### Validation and early stopping
 
@@ -598,7 +600,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.4 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.5 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -726,7 +728,7 @@ Reliability improvements cover generation, batching, dataset preparation, featur
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.4-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.5-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -752,7 +754,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.4-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.5-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
@@ -1076,9 +1078,9 @@ The appendix below covers all 267 registered controls, including current default
 
 **Text loss weight** - `training.text_loss_weight`. Auxiliary text modeling loss weight. *(default 0.1; minimum 0; maximum 100)*
 
-**Speaker reference mode** - `training.speaker_ref_mode`. self uses the target clip; other uses a different same-speaker training clip, matching typical generation; mixed alternates between them. *(default "other"; choices "self", "other", "mixed")*
+**Speaker reference mode** - `training.speaker_ref_mode`. self uses the target clip; other selects a different clean same-speaker training clip nearest 15 seconds; mixed alternates between them. *(default "other"; choices "self", "other", "mixed")*
 
-**Emotion reference mode** - `training.emo_ref_mode`. self uses the target emotion; other uses another same-speaker training clip; mixed alternates; follow_speaker reuses the speaker-reference clip. *(default "follow_speaker"; choices "self", "other", "mixed", "follow_speaker")*
+**Emotion reference mode** - `training.emo_ref_mode`. self uses the target emotion; other selects a different clean same-speaker training clip nearest 15 seconds; mixed alternates; follow_speaker reuses the speaker-reference clip. *(default "follow_speaker"; choices "self", "other", "mixed", "follow_speaker")*
 
 **Maximum codes** - `training.max_codes`. Cached samples longer than this semantic-code limit are rejected. *(default 1500; minimum 1; maximum 100000)*
 
@@ -1092,7 +1094,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Maximum validation batches** - `training.val_max_batches`. 0 evaluates the entire holdout. A positive cap uses a fixed shuffled subset; loss is weighted by valid tokens. *(default 0; minimum 0; maximum 1000000)*
 
-**Validation reference** - `training.val_reference_mode`. self validates each target with itself; other uses a different same-speaker training clip for both vectors, matching typical generation. *(default "other"; choices "self", "other")*
+**Validation reference** - `training.val_reference_mode`. self validates each target with itself; other selects a clean same-speaker training clip nearest 15 seconds for both vectors. *(default "other"; choices "self", "other")*
 
 **Automatically stop when progress stalls** - `training.early_stop_enabled`. Stop after validation stalls beyond the initial learning period and retain the best checkpoint. *(default true)*
 
@@ -1186,7 +1188,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Sample text** - `training.sample_text`. Short representative phrase used to compare epochs. *(default "This is a training progress sample for the adapted voice.")*
 
-**Custom sample reference** - `training.sample_reference`. Optional audio path; blank selects a reference from this run's actual training split.
+**Custom sample reference** - `training.sample_reference`. Optional audio path; blank prefers a clean reference near 15 seconds from this run's actual training split. Transcript agreement and matching boundaries take priority over exact duration.
 
 **Sample language** - `training.sample_language`. Mirrors Voice Generation for per-epoch samples; auto uses the prepared dataset language. *(default "auto"; choices "auto", "ZH", "EN", "JA", "AR", "ES")*
 

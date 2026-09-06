@@ -7,6 +7,20 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.5",
+        "2026-09-07",
+        """
+### Consistent 15-second automatic training references
+
+- Automatic references now target 15 seconds across training speaker/emotion conditioning, validation, checkpoint evaluation, saved adapter references, epoch samples, and new speech comparisons.
+- Selection preserves transcript agreement and matching word boundaries, then chooses the nearest eligible duration from the same speaker's training split. Other-reference modes exclude the current target clip; equally suitable alternatives can still vary reproducibly with the seed and epoch.
+- Known durations take priority over missing duration metadata. New speech plans record the target and selected duration, and resume fingerprints include the reference-selection policy and metadata.
+- Training controls and startup logs explain the 15-second target and nearest-reference fallback.
+
+Restart after updating. Existing adapters and frozen comparison references remain compatible. Explicit self-reference modes and custom sample references retain their requested behavior. The 15-second target applies to reference selection; it does not shorten or filter training utterances.
+""".strip(),
+    ),
+    (
         "v6.4",
         "2026-09-07",
         """

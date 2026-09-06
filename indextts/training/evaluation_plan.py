@@ -9,6 +9,7 @@ import shutil
 from typing import Any, Mapping, Sequence
 
 from .dataset_manifest import atomic_write_json, load_manifest
+from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS, training_reference_priority
 
 
 def record_identity(records: Sequence[Mapping[str, Any]]) -> str:
@@ -33,16 +34,11 @@ def audio_digest(path: Path) -> str:
 
 
 def choose_training_reference(records: Sequence[Mapping[str, Any]], dataset: str | Path) -> Mapping[str, Any] | None:
-    """Choose a clear, moderate-length training clip without consulting past runs."""
+    """Prefer clean training speech near 15 seconds without consulting past runs."""
     existing = [row for row in records if row.get("audio") and audio_path(dataset, row).is_file()]
     if not existing:
         return None
-    return min(existing, key=lambda row: (
-        float(row.get("asr_wer", 0) or 0),
-        not bool(row.get("boundary_words_match", True)),
-        abs(float(row.get("duration_s", 12) or 12) - 12),
-        str(row["id"]),
-    ))
+    return min(existing, key=lambda row: (*training_reference_priority(row), str(row["id"])))
 
 
 def representative_records(records: Sequence[Mapping[str, Any]], count: int, seed: int) -> list[Mapping[str, Any]]:
@@ -121,6 +117,7 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
                             "duration_s": None})
         groups.append({"id": f"group_{index:03d}", "speaker": speaker, "language": language,
                        "reference": str(reference.resolve()), "reference_record_id": str(reference_row["id"]),
+                       "reference_duration_s": float(reference_row.get("duration_s", 0) or 0),
                        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(), "prompts": prompts})
     train_sources = {str(row.get("source_media") or row["id"]) for row in train_records}
     val_sources = {str(row.get("source_media") or row["id"]) for row in val_records}
@@ -137,6 +134,7 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
     if all_speakers - evaluated_speakers:
         warnings.append(f"{len(all_speakers - evaluated_speakers)} training speaker(s) have no prompts in this benchmark; the recommendation does not establish their quality.")
     plan = {"version": 1, "dataset_identity": identity, "dataset_dir": str(Path(evaluation_dataset).resolve()),
+            "reference_target_seconds": AUTO_REFERENCE_TARGET_SECONDS,
             "training_items": len(train_records), "validation_items": len(val_records),
             "validation_sources": len(val_sources), "training_sources": len(train_sources),
             "source_overlap": sorted(train_sources & val_sources), "groups": groups,

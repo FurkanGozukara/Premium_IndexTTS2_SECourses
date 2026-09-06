@@ -626,12 +626,12 @@ def build_training_tab(
                 smoothing = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["label_smoothing"], step=0.01, label="Label smoothing", info="0 is recommended; increase only for overconfident large datasets.")
                 mel_weight = gr.Number(value=TRAIN_DEFAULTS["mel_loss_weight"], minimum=0, label="Mel loss weight", info="Primary autoregressive acoustic-token loss weight.")
                 text_weight = gr.Number(value=TRAIN_DEFAULTS["text_loss_weight"], minimum=0, label="Text loss weight", info="Auxiliary text modeling loss weight.")
-                speaker_mode = gr.Dropdown(choices=["self", "other", "mixed"], value=TRAIN_DEFAULTS["speaker_ref_mode"], label="Speaker reference mode", info="self uses the target clip; other uses a different same-speaker training clip, matching typical generation; mixed alternates between them.")
+                speaker_mode = gr.Dropdown(choices=["self", "other", "mixed"], value=TRAIN_DEFAULTS["speaker_ref_mode"], label="Speaker reference mode", info="self uses the target clip; other selects a different clean same-speaker training clip nearest 15 seconds; mixed alternates between them.")
                 emo_ref_mode = gr.Dropdown(
                     choices=["self", "other", "mixed", "follow_speaker"],
                     value=TRAIN_DEFAULTS["emo_ref_mode"],
                     label="Emotion reference mode",
-                    info="self uses the target emotion, other uses another same-speaker training clip, mixed alternates, and follow_speaker uses the same reference for voice and emotion.",
+                    info="self uses the target emotion; other selects a different clean same-speaker training clip nearest 15 seconds; mixed alternates; follow_speaker reuses the speaker reference.",
                 )
             with gr.Row():
                 max_codes = gr.Number(value=TRAIN_DEFAULTS["max_codes"], minimum=1, precision=0, label="Maximum codes", info="Cached samples longer than this semantic-code limit are rejected.")
@@ -644,7 +644,7 @@ def build_training_tab(
                     choices=["self", "other"],
                     value=TRAIN_DEFAULTS["val_reference_mode"],
                     label="Validation reference",
-                    info="self validates each target with itself; other uses a different same-speaker training clip for both vectors, matching typical generation.",
+                    info="self validates each target with itself; other selects a clean same-speaker training clip nearest 15 seconds for both vectors.",
                 )
             with gr.Row():
                 early_enabled = gr.Checkbox(
@@ -844,7 +844,7 @@ def build_training_tab(
                 min_free = gr.Number(value=TRAIN_DEFAULTS["sample_min_free_vram_gb"], minimum=0, label="Minimum free VRAM (GB)", info="Skips sampling rather than risking training OOM below this free-memory threshold.")
                 timeout = gr.Number(value=TRAIN_DEFAULTS["sample_timeout_s"], minimum=1, label="Sample timeout (s)", info="Kills a stuck sampling subprocess after this time.")
             sample_text = gr.Textbox(value=TRAIN_DEFAULTS["sample_text"], label="Sample text", lines=3, info="Short representative phrase used to compare epochs.")
-            sample_reference = gr.Textbox(value=TRAIN_DEFAULTS["sample_reference"], label="Custom sample reference", info="Optional audio path; blank chooses a reference from this run's training split.")
+            sample_reference = gr.Textbox(value=TRAIN_DEFAULTS["sample_reference"], label="Custom sample reference", info="Optional audio path; blank prefers a clean reference near 15 seconds from this run's training split.")
             sample_speaking_rate = gr.Slider(
                 0.5,
                 1.5,

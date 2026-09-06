@@ -18,6 +18,7 @@ from indextts.utils.tokenizer import lang_to_token
 
 from .dataset_manifest import load_manifest
 from .plan import validation_record_ids
+from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS, training_reference_priority
 
 
 def _stable_unit_interval(*parts: Any) -> float:
@@ -143,6 +144,15 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             if record["id"] in val_ids:
                 continue
             self._speaker_records[str(record["speaker"])].append(record)
+        # Rank once rather than scanning every speaker's full pool per item.
+        # Keep equally suitable references together so epoch/seed choices can
+        # still vary without drifting away from the target duration.
+        self._speaker_reference_groups: dict[str, list[list[dict[str, Any]]]] = {}
+        for speaker, records in self._speaker_records.items():
+            ranked: dict[tuple[float, bool, float], list[dict[str, Any]]] = defaultdict(list)
+            for record in records:
+                ranked[training_reference_priority(record)].append(record)
+            self._speaker_reference_groups[speaker] = [ranked[key] for key in sorted(ranked)]
         needs_other_reference = (
             self.speaker_ref_mode in {"other", "mixed"}
             or self.emo_ref_mode in {"other", "mixed"}
@@ -176,11 +186,11 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         index: int,
         tag: str = "reference",
     ) -> Mapping[str, Any] | None:
-        choices = [
-            candidate
-            for candidate in self._speaker_records.get(str(record["speaker"]), [])
-            if candidate["id"] != record["id"]
-        ]
+        choices = []
+        for group in self._speaker_reference_groups.get(str(record["speaker"]), []):
+            choices = [candidate for candidate in group if candidate["id"] != record["id"]]
+            if choices:
+                break
         if not choices:
             return None
         unit = _stable_unit_interval(self.seed, self.epoch, record["id"], index, tag)
@@ -244,7 +254,8 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         value = json.dumps({
             "records": [
                 {key: str(record.get(key, "")) for key in (
-                    "id", "n_codes", "n_text_tokens", "text", "speaker", "source_media", "split"
+                    "id", "n_codes", "n_text_tokens", "text", "speaker", "source_media", "split",
+                    "duration_s", "asr_wer", "boundary_words_match"
                 )} for record in self._all_records
             ],
             "source_fingerprints": {
@@ -255,6 +266,8 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             "split": self.split, "val_split_mode": self.val_split_mode,
             "val_fraction": self.val_fraction, "seed": self.seed,
             "speaker_ref_mode": self.speaker_ref_mode, "emo_ref_mode": self.emo_ref_mode,
+            "reference_selection": "transcript_boundary_nearest_duration",
+            "reference_target_seconds": AUTO_REFERENCE_TARGET_SECONDS,
         }, sort_keys=True)
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

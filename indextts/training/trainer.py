@@ -59,6 +59,7 @@ from .dataset_manifest import atomic_write_json
 from .early_stopping import EarlyStopping
 from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
 from .plan import training_plan, training_plan_line
+from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, write_speaking_rate
 from .train_config import TrainConfig
@@ -995,6 +996,10 @@ class LoraTrainer:
             f">> conditioning | train speaker ref: {config.speaker_ref_mode} | "
             f"train emotion ref: {config.emo_ref_mode} | "
             f"validation ref: {config.val_reference_mode}"
+        )
+        self.log(
+            f">> automatic reference target: {AUTO_REFERENCE_TARGET_SECONDS:g}s; "
+            "transcript quality first, then nearest eligible same-speaker training clip"
         )
         self.log(f">> training samples use seed {self.resolved_sample_seed}")
         self.log(

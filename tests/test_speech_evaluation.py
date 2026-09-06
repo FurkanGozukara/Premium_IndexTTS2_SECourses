@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from indextts.training.early_stopping import EarlyStopping
-from indextts.training.evaluation_plan import build_speech_plan, build_final_test_plan, representative_records
+from indextts.training.evaluation_plan import build_speech_plan, build_final_test_plan, choose_training_reference, representative_records
 from indextts.training.dataset_manifest import write_manifest
 from indextts.training.grid import GridCheckpoint, GridConfig, build_grid_cells
 from indextts.training.run_guard import ensure_run_destination
@@ -45,6 +45,8 @@ def test_plan_is_frozen_source_balanced_and_uses_only_own_training_audio(tmp_pat
     config = _config(tmp_path, speech_eval_prompts=6)
     run = Path(config.output_dir) / config.name
     plan = build_speech_plan(config, train, val, run)
+    assert plan["reference_target_seconds"] == 15.0
+    assert plan["groups"][0]["reference_duration_s"] == 12
     assert plan["groups"][0]["reference_record_id"] in {r["id"] for r in train}
     assert plan["validation_sources"] == 3 and not plan["source_overlap"]
     assert len(plan["groups"][0]["prompts"]) == 7  # six matched plus long-form
@@ -54,6 +56,25 @@ def test_plan_is_frozen_source_balanced_and_uses_only_own_training_audio(tmp_pat
     changed = [{**r, "text": "Changed transcript"} for r in val]
     with pytest.raises(ValueError, match="different dataset"):
         build_speech_plan(config, train, changed, run)
+
+
+def test_automatic_reference_targets_fifteen_seconds_after_transcript_quality(tmp_path):
+    train, _ = _records(tmp_path)
+    for row, duration in zip(train, [12, 15, 20, 15.1]):
+        row.update(duration_s=duration, asr_wer=0, boundary_words_match=True)
+    dataset = tmp_path / "dataset"
+    assert choose_training_reference(train, dataset)["id"] == train[1]["id"]
+    train[1]["boundary_words_match"] = False
+    assert choose_training_reference(train, dataset)["id"] == train[3]["id"]
+    train[3]["asr_wer"] = 0.05
+    assert choose_training_reference(train, dataset)["id"] == train[0]["id"]
+
+
+def test_automatic_reference_prefers_nearest_known_duration_over_missing_metadata(tmp_path):
+    train, _ = _records(tmp_path)
+    for row, duration in zip(train, [None, 14.5, 17, 0]):
+        row.update(duration_s=duration, asr_wer=0, boundary_words_match=True)
+    assert choose_training_reference(train, tmp_path / "dataset")["id"] == train[1]["id"]
 
 
 def test_final_test_rejects_source_overlap_and_ignores_reference_pool_rows(tmp_path):

@@ -23,10 +23,12 @@ Validation audio-token loss and auxiliary text-token loss are recorded separatel
 
 ## How generated speech affects selection
 
+All automatic reference choices share a **15-second target**: the saved adapter reference, epoch sample reference, training speaker/emotion conditioning, and validation/checkpoint evaluation. Selection preserves transcript-quality and boundary priorities, then chooses the nearest available duration within that speaker's training split. Other-reference modes exclude the current target clip; equally suitable alternatives can vary deterministically by seed and epoch. Known durations take precedence over missing duration metadata. Explicit self-reference modes and manually supplied sample references keep their requested behavior; training target utterances are not shortened or filtered to 15 seconds.
+
 Before optimization, the run freezes `analysis/speech_evaluation/plan.json`:
 
 - Up to 12 validation texts balanced across available source recordings, speakers, languages, and clip lengths; a longer concatenated prompt is added for each voice with enough texts.
-- A reference selected from that voice's actual training split and copied into the run. Validation targets never supply their own voice references.
+- A reference selected from that voice's actual training split and copied into the run. Selection prioritizes transcript agreement and matching boundaries, then duration near 15 seconds. The target and selected clip duration are recorded in new plans. Existing frozen plans retain their original references. Validation targets never supply their own voice references.
 - Three deterministic generation seeds per prompt, plus the comparison margins. Audio hashes detect changed reference and target files.
 
 After training releases its model, teacher-forced evaluation measures the saved checkpoints and Base. Speech comparison shortlists up to three distinct training updates: candidates with the lowest measured losses and the latest saved update. It generates Base again using the same prompts, references, seeds, and inference settings. It never loads a preferred adapter from a previous run.
