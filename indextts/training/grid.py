@@ -247,8 +247,20 @@ def build_grid_cells(config: GridConfig | Mapping[str, Any]) -> list[GridCell]:
     cfg = GridConfig.from_dict(config)
     cells: list[GridCell] = []
     index = 0
+    used_file_labels: set[str] = set()
     for checkpoint in cfg.checkpoints:
         file_label, kind = _file_label(checkpoint)
+        if file_label in used_file_labels:
+            # Two checkpoints of the same kind and epoch, such as the "best" files
+            # of two different runs, must not write the same cell files.
+            candidate = (f"{file_label}_{_safe_name(checkpoint.label, 'alt')}" if checkpoint.label
+                         else f"{file_label}_{len(used_file_labels) + 1}")
+            counter = 2
+            while candidate in used_file_labels:
+                candidate = f"{file_label}_{counter}"
+                counter += 1
+            file_label = candidate
+        used_file_labels.add(file_label)
         strengths = [1.0] if not checkpoint.path else cfg.strengths
         for strength in strengths:
             for reference_index, reference in enumerate(cfg.references, start=1):

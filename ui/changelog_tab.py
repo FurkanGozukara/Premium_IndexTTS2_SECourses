@@ -7,6 +7,18 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.8",
+        "2026-09-07",
+        """
+### Unique grid cell files across runs, and a four-adapter comparison report
+
+- Checkpoint Grid cell files were named by checkpoint kind and epoch only, so two checkpoints of the same kind and epoch from different runs (for example the "best" files of two trainings that both stopped in epoch 7) wrote the same files and the later one silently replaced the earlier one's audio and measurements. Cell names now add the checkpoint label when they would collide, so grids that compare adapters from several runs keep every clip.
+- `ADAPTER_COMPARISON_V5_V8_2026-09-07.md` compares the automatically selected checkpoints of four trainings of one voice on a recording none of them trained on, at speaking rate 1.0 and at each adapter's calibrated rate, with objective measurements and a blind five-way listening test. With each adapter at its calibrated speaking rate, as the app runs them, the listener ranked V8 first in 18 of 36 groups and above V6 in 30, V7 second, V5 last of the four; at rate 1.0 V7 led with V8 second. V8 with its saved speaking rate is now the recommended adapter for that voice, V7 when the narrator's own pausing matters most, and V6 stays a fallback.
+
+Restart after updating. Existing grids, adapters, and reports remain readable; only newly generated grids use the new file names.
+""".strip(),
+    ),
+    (
         "v6.7",
         "2026-09-07",
         """

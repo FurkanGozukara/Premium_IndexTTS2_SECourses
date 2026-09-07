@@ -227,6 +227,18 @@ def test_grid_seed_matrix_does_not_collide_or_duplicate_base_strengths(tmp_path)
     assert len([c for c in cells if not c.checkpoint_path]) == 6
 
 
+def test_grid_cells_of_two_runs_with_the_same_kind_and_epoch_do_not_share_files(tmp_path):
+    six = tmp_path / "run_six" / "best" / "run_six.safetensors"
+    eight = tmp_path / "run_eight" / "best" / "run_eight.safetensors"
+    config = GridConfig(adapter_dir=str(tmp_path), checkpoints=[GridCheckpoint("Base", ""), GridCheckpoint("v6_best", str(six)),
+                        GridCheckpoint("v8_best", str(eight))], strengths=[1], references=[str(tmp_path / "ref.wav")], texts=["hello"], seeds=[1, 2])
+    cells = build_grid_cells(config)
+    assert len(cells) == 6 and len({c.filename for c in cells}) == 6
+    by_label = {c.checkpoint_label: c.filename for c in cells}
+    assert by_label["v6_best"].startswith("best__") and by_label["v8_best"].startswith("best_v8_best__")
+    assert {c.checkpoint_path for c in cells if c.checkpoint_label == "v8_best"} == {str(eight.resolve())}
+
+
 def test_speech_pipeline_uses_only_current_run_and_maps_base_cells(tmp_path, monkeypatch):
     import indextts.training.analysis as analysis
     import indextts.training.checkpoint_eval as loss_eval

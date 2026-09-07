@@ -95,6 +95,8 @@ Gemini also blind-transcribed 30 of the 46 clips the second-opinion pass recover
 
 ## Recommendation
 
+**Update, later the same day:** a larger comparison of V5, V6, V7 and V8 on a recording none of them trained on, with each adapter at its calibrated speaking rate, reversed the preference below: the listener ranked V8 first in 18 of 36 groups and above V6 in 30, with V7 second. See `ADAPTER_COMPARISON_V5_V8_2026-09-07.md`; V8 with its saved speaking rate is now the recommended adapter, and the points below stand as the rate-1.0 result on V6's test sentences.
+
 - **Keep V6 (`loras/Furkan_EN_DoRA_r128_v6_fresh`, update 12,000) as the production adapter.** It is the listener's choice against both V7 and V8, and its saved speaking rate of 1.075 sits between the narrator's real pace and the slower delivery the listener rewards. V7 is the adapter to use when matching the narrator's tempo matters more than the smoother delivery; V8 offers nothing over V6.
 - **The v6.6 audit and caption fixes stay.** They keep clean speech (Gemini agreed with the subtitle on 26 of 30 recovered clips and 65 of 65 accepted clips), they matter more for smaller datasets where 15 percent of the audio is the difference between a usable and an unusable set, and the corrected file-name texts teach the right thing for user prompts such as `update.bat`. On this 8-hour dataset one run with 17 percent more audio landed on V6's numbers, which says the speaker's voice was already well covered.
 - **Leave the single-sentence share at 0.** It reproduces the narrator's tempo (V7) but costs the inter-sentence pauses listeners prefer; the pace it fixes is better handled by the saved speaking rate, which the app now calibrates from matched sentences (V6 1.075, V7 1.049, V8 1.105).
