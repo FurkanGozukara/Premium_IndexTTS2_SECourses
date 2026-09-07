@@ -69,7 +69,44 @@ Two knobs were then measured on the same sentences against the same baseline. Gu
 
 At strength 0.6 the path-blind listener leaned toward the adapter: preferred in 7 of 12 pairs and closer in timbre in 7 of 12, naturalness 5.00 against 4.67, voice similarity 4.58 against 4.42, audio quality 4.58 against 4.42, with the same single wrong-word clip on both sides. A score of similarity gain minus four times the word-error increase orders the two strengths the way the listener did (+0.034 at 0.6 against +0.025 at 1.0), so the full-pipeline gate now judges both strengths and records the better-scoring one as the adapter's recommended strength.
 
-FINAL_PLACEHOLDER
+## The shipped V8 decoder adapter
+
+The full-budget run (DoRA rank 128, alpha 128, learning rate 2e-4, random prompts, up to ten epochs) stopped early at update 13,000 after one learning-rate halving, with its best re-rendered identity 0.9477 at update 11,000 (pretrained 0.885; the one-epoch adapter reached 0.935) and a held-out flow loss of 0.5235 (pretrained 0.553). Its automatic full-pipeline test rendered the speech benchmark (13 held-out sentences, three seeds, 39 clips) with the V8 recommended checkpoint at strengths 1.0 and 0.6 and compared each render pairwise with the checkpoint's independent final-test measurement:
+
+| Decoder strength | Speaker similarity to the real recordings | Word error rate | Score | Verdict |
+|---:|---:|---:|---:|---|
+| none (final test) | 0.8035 | 2.34% | | |
+| 1.0 | 0.8654 (+0.0619, 95 percent interval +0.047 to +0.077) | 1.93% (-0.41 points) | +0.0619 | installed, recommended |
+| 0.6 | 0.8643 (+0.0608) | 1.99% (-0.35 points) | +0.0608 | passes |
+
+Unlike the one-epoch adapter, the identity-selected full-budget adapter lowered the word error rate on the benchmark instead of raising it, so strength 1.0 is recommended and Voice Generation applies it with V8. Its style similarity to the real recordings rose from 0.822 to 0.834, and similarity to the reference clip fell from 0.914 to 0.839, the same trade as before: the adapter renders the speaker rather than the low-pitched reference clip.
+
+On the 12 `qwen_2511_tutorial` sentences used throughout this report (one seed, calibrated rate, strength 1.0):
+
+| V8 best with the shipped adapter | Speaker similarity to the real recordings | Style similarity to real | Median pitch | Word error rate | Adapter better (similarity) |
+|---|---:|---:|---:|---:|---:|
+| Calibrated rate 1.094, without / with | 0.7958 / 0.8688 | 0.689 / 0.811 | 141 / 150 Hz | 3.54% / 3.76% | 12 of 12 |
+| In-domain held-out sentences, rate 1.0, without / with | 0.8105 / 0.8750 | 0.702 / 0.807 | 140 / 151 Hz | 5.91% / 5.06% | 12 of 12 |
+
+The path-blind listening test on the calibrated-rate pairs was again a tie: 6 to 6 on preference and on closer timbre, every score equal or within 0.08, artifacts noted in 7 clips without the adapter (muffling, lost high-frequency presence) against 6 with it (grain, sheen). Across all three listening tests the picture is consistent: the measurements say the adapted voice is closer to the speaker by a wide margin, the automated listener hears no overall difference on twelve pairs, and no test since the fixed-prompt build has preferred the pretrained decoder. The adapter is installed for V8 with the full-pipeline verdict above as its justification, and every future training gets the same judgement automatically.
+
+
+## Reference clips near the speaker's median: first benchmark on V8
+
+The automatic reference used to be the cleanest training clip nearest 15 seconds, which for this voice is `qwen_fine_tuning_0357`: 119 Hz and 2.27 words per second for a speaker whose training clips have a median of 144 Hz and 2.64 words per second. The new rule keeps transcript quality first and, among the best candidates, takes the clip nearest the speaker's medians: `qwen_fine_tuning_0185` (143 Hz, 2.67 words per second, 14.98 seconds). Both were run through V8 best on the 12 `qwen_2511_tutorial` sentences, three seeds, the calibrated rate, with and without the shipped decoder adapter:
+
+| Reference | Decoder adapter | Word error rate | Speaker similarity to real | to the reference clip | Style similarity to real | Median pitch | Pace vs real | Pause time vs real |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| nearest 15 s (119 Hz) | none | 3.61% | 0.7858 | 0.9107 | 0.684 | 140 Hz | 1.008 | 1.22 |
+| median-matched (143 Hz) | none | 3.69% | 0.8767 | 0.9501 | 0.798 | 157 Hz | 1.020 | 1.09 |
+| nearest 15 s (119 Hz) | strength 1.0 | 3.54% | 0.8580 | 0.8213 | 0.800 | 150 Hz | 1.008 | 1.06 |
+| median-matched (143 Hz) | strength 1.0 | 4.42% | 0.8892 | 0.9191 | 0.839 | 158 Hz | 1.020 | 1.10 |
+
+Without the decoder adapter the median-matched reference raises similarity to the real recordings by +0.091 in 36 of 36 clips and style similarity by +0.114 in 36 of 36 at the same word error rate; with the adapter the gain shrinks to +0.031 (29 of 36) and the word error rate rises 0.9 points. The path-blind listening test on the two adapter rows preferred the old reference 20 to 16 (timbre 19 to 12 with 5 ties), and the median pitch of the median-matched rows, 157 to 158 Hz, overshoots the speaker's 144 Hz median while the old reference lands on 140 to 150 Hz.
+
+That overshoot has a cause that the benchmark cannot remove: V8's GPT adapter was trained with the old clip as its conditioning reference, so a different reference at inference is out of its training distribution. The measurement that matters is a training that uses the median-matched clip throughout, which the V9 run does; its comparison against V8, each with its own reference, calibrated rate, decoder adapter, and decoding settings, is reported below.
+
+V9_PLACEHOLDER
 
 ## What the trainer now does
 
