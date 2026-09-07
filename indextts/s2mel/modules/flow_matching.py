@@ -74,6 +74,7 @@ class BASECFM(torch.nn.Module, ABC):
                 shape: (batch_size, 192)
         """
         t, _, _ = t_span[0], t_span[-1], t_span[1] - t_span[0]
+        B = x.size(0)  # the guidance-free branch below expands t to the batch
 
         # I am storing this because I can later plot it by putting a debugger here and saving it to a file
         # Or in future might add like a return_all_steps flag
@@ -93,9 +94,24 @@ class BASECFM(torch.nn.Module, ABC):
                 value = self.estimator(*args)
             return value.to(dtype=x.dtype)
 
+        guidance_toggle = getattr(self, "guidance_adapter_toggle", None)
         for step in tqdm(range(1, len(t_span))):
             dt = t_span[step] - t_span[step - 1]
-            if inference_cfg_rate > 0:
+            if inference_cfg_rate > 0 and guidance_toggle is not None:
+                # A voice decoder adapter renders the conditioned branch. The unconditional
+                # branch keeps the pretrained decoder: adapting it to one speaker would make
+                # the guidance term subtract that speaker's identity instead of adding it.
+                guidance_toggle(True)
+                dphi_dt = estimate(x, prompt_x, x_lens, t.expand(B), style, mu)
+                guidance_toggle(False)
+                try:
+                    cfg_dphi_dt = estimate(
+                        x, torch.zeros_like(prompt_x), x_lens, t.expand(B), torch.zeros_like(style), torch.zeros_like(mu),
+                    )
+                finally:
+                    guidance_toggle(True)
+                dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
+            elif inference_cfg_rate > 0:
                 # Stack original and CFG (null) inputs for batched processing
                 stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
                 stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)

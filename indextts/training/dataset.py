@@ -64,6 +64,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
         speaker_ref_mode: str = "mixed",
         emo_ref_mode: str = "self",
         val_split_mode: str = "record",
+        reference_typical: bool = True,
     ) -> None:
         self.dataset_dir = Path(dataset_dir).expanduser().resolve()
         self.split = str(split).lower()
@@ -83,6 +84,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             )
         self.epoch = 0
         self.val_split_mode = str(val_split_mode).lower()
+        self.reference_typical = bool(reference_typical)
 
         manifest_rows = load_manifest(self.dataset_dir)
         if not manifest_rows:
@@ -152,7 +154,17 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
             ranked: dict[tuple[float, bool, float], list[dict[str, Any]]] = defaultdict(list)
             for record in records:
                 ranked[training_reference_priority(record)].append(record)
-            self._speaker_reference_groups[speaker] = [ranked[key] for key in sorted(ranked)]
+            groups = [ranked[key] for key in sorted(ranked)]
+            if self.reference_typical and (self.speaker_ref_mode != "self" or self.emo_ref_mode in {"other", "mixed"}):
+                # The clip nearest the speaker's median pitch and pace leads the pool, so training
+                # conditions on the same reference the adapter later recommends for generation.
+                from .voice_profile import choose_typical_reference
+                choice = choose_typical_reference(self.dataset_dir, records)
+                if choice is not None:
+                    chosen_id = str(choice["record"]["id"])
+                    groups = [[record for record in group if record["id"] != chosen_id] for group in groups]
+                    groups = [[choice["record"]], *[group for group in groups if group]]
+            self._speaker_reference_groups[speaker] = groups
         needs_other_reference = (
             self.speaker_ref_mode in {"other", "mixed"}
             or self.emo_ref_mode in {"other", "mixed"}

@@ -28,8 +28,8 @@ from indextts.training.whisper_asr import _ensure_model
 def summarize(rows: list[dict]) -> dict:
     result = {"clips": len(rows), "corpus_wer": sum(row["word_errors"] for row in rows) / max(1, sum(row["words"] for row in rows)),
               "mean_wer": float(np.mean([row["wer"] for row in rows]))}
-    for key in ("speaker_similarity", "style_similarity_real", "style_similarity_reference", "words_per_s", "rate_ratio_vs_real", "f0_median_hz",
-                "pause_time_fraction"):
+    for key in ("speaker_similarity", "speaker_similarity_real", "style_similarity_real", "style_similarity_reference", "words_per_s",
+                "rate_ratio_vs_real", "f0_median_hz", "pause_time_fraction"):
         values = [row[key] for row in rows if row.get(key) is not None]
         result[key] = float(np.mean(values)) if values else None
     # Total pause time over the matched sentences, generated against real.
@@ -111,6 +111,8 @@ def main() -> None:
         if real_path:
             real = features[str(Path(real_path).resolve())]
             row.update(style_similarity_real=float(torch.dot(feature["style"], real["style"])),
+                       # Similarity to the person's own recording of the sentence; similarity to the reference clip rewards copying that prompt.
+                       speaker_similarity_real=float(torch.dot(feature["speaker"], real["speaker"])),
                        duration_ratio_vs_real=feature["duration_s"] / real["duration_s"],
                        rate_ratio_vs_real=real["duration_s"] / feature["duration_s"],
                        real_pause_s=real["pauses"]["pause_s"],

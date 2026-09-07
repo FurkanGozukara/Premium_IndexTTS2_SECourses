@@ -346,6 +346,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                 "runtime.lora_path",
                 "runtime.lora_strength",
                 "runtime.lora_merge_into_base",
+                "runtime.decoder_adapter",
                 "runtime.use_qwen_emo",
                 "runtime.use_deepspeed",
             }

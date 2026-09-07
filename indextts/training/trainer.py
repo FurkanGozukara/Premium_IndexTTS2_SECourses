@@ -491,8 +491,14 @@ class LoraTrainer:
             return warning
 
     def _reference_candidate(self) -> Path | None:
-        from .evaluation_plan import audio_path, choose_training_reference
-        row = choose_training_reference(self.training_records, self.dataset_dir)
+        from .evaluation_plan import audio_path, choose_training_reference, describe_training_reference
+        typical = bool(getattr(self.config, "reference_typical", True))
+        row = choose_training_reference(self.training_records, self.dataset_dir, typical=typical)
+        if row is not None and typical and not getattr(self, "_reference_choice_logged", False):
+            self._reference_choice_logged = True
+            note = describe_training_reference(self.training_records, self.dataset_dir)
+            if note:
+                self.log(f">> recommended reference near the speaker's median pitch and pace: {note}")
         return audio_path(self.dataset_dir, row) if row is not None else None
 
     def _prepare_reference(self) -> Path | None:
@@ -749,6 +755,240 @@ class LoraTrainer:
             self.log(f">> speech evaluation did not complete: {failure}; saved training weights remain available")
         self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
         return recommended_checkpoint
+
+    def _run_decoder_adaptation(self, *, terminal_phase: str, terminal_message: str,
+                                recommended_checkpoint: str) -> str:
+        """Adapt the semantic-to-mel decoder to this dataset in a bounded child process."""
+        from indextts.lora.decoder import DECODER_ADAPTER_SUFFIX
+        from .decoder_adapter import DecoderAdapterConfig, decoder_report_path, load_decoder_report
+        config = self.config
+        output_path = self.adapter_dir / f"{config.name}{DECODER_ADAPTER_SUFFIX}"
+        if self.stop_path.exists():
+            self.write_status(decoder_adapter_status="skipped", decoder_adapter_message="canceled")
+            self.log(">> voice decoder adaptation skipped: canceled")
+            return ""
+        job_dir = self.adapter_dir / "analysis" / "decoder_adapter_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        decoder_report_path(output_path).unlink(missing_ok=True)  # a stale report must not describe this run
+        decoder_config = DecoderAdapterConfig(
+            dataset_dir=config.dataset_dir, output_path=str(output_path), name=config.name, model_dir=config.model_dir,
+            model_config=config.model_config, device=config.device, adapter_type=config.adapter_type,
+            rank=config.decoder_adapter_rank, alpha=config.decoder_adapter_alpha, epochs=config.decoder_adapter_epochs,
+            learning_rate=config.decoder_adapter_learning_rate, val_fraction=config.val_fraction,
+            val_split_mode=config.val_split_mode, seed=config.seed, max_codes=config.max_codes,
+            max_text_tokens=config.max_text_tokens).validate()
+        config_path = job_dir / "decoder_config.json"
+        atomic_write_json(config_path, decoder_config.to_dict())
+        self.write_status(phase="adapting_decoder", decoder_adapter_status="running",
+                          decoder_adapter_message="Adapting the voice decoder", message="Adapting the voice decoder to this dataset")
+        self.log(f">> starting voice decoder adaptation | {decoder_config.adapter_type.upper()} rank {decoder_config.rank} | "
+                 f"{decoder_config.epochs} epochs | learning rate {decoder_config.learning_rate:g}")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.decoder_worker", "--config", str(config_path),
+                                    "--state-dir", str(job_dir)], cwd=str(Path(__file__).resolve().parents[2]),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                   bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="decoder-adaptation-log")
+        thread.start()
+        started = time.perf_counter()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(phase="adapting_decoder", message=str(child.get("message") or "Adapting the voice decoder"),
+                              decoder_step=int(child.get("step", 0) or 0), decoder_total_steps=int(child.get("total_steps", 0) or 0),
+                              decoder_loss=child.get("avg_loss"), decoder_val_loss=child.get("val_loss"),
+                              decoder_epoch=child.get("epoch"), decoder_eta_s=child.get("eta_s"))
+            if self.stop_path.exists() or time.perf_counter() - started > config.decoder_adapter_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else "decoder adaptation timeout"
+                (job_dir / "stop.flag").touch()
+                if failure == "decoder adaptation timeout":
+                    _kill_evaluation_worker(process)
+                break
+        try:
+            process.wait(timeout=60 if failure == "canceled by user" else 10)
+        except subprocess.TimeoutExpired:
+            _kill_evaluation_worker(process)
+            process.wait()
+        thread.join(timeout=2)
+        report = load_decoder_report(self.adapter_dir)
+        if report and process.returncode == 0 and failure != "decoder adaptation timeout" and (
+                report.get("status") == "rejected" or not output_path.is_file()):
+            reason = str(report.get("message") or "no checkpoint improved on the pretrained decoder")
+            summary = f"Voice decoder adapter {reason}"
+            self.write_status(decoder_adapter_status="rejected", decoder_adapter_message=summary, decoder_adapter_path="")
+            self.log(f">> {summary}")
+        elif report and process.returncode == 0 and failure != "decoder adaptation timeout":
+            best = report.get("best_val_loss")
+            identity = report.get("best_identity")
+            baseline = report.get("initial_identity")
+            summary = f"Voice decoder adapter trained: {int(report.get('steps', 0))} updates"
+            if isinstance(identity, (int, float)) and isinstance(baseline, (int, float)):
+                summary += f", re-rendered clips {float(baseline):.4f} -> {float(identity):.4f} speaker similarity"
+            summary += (f", held-out flow loss {float(best):.4f}" if isinstance(best, (int, float)) else "")
+            summary += f" ({failure})" if failure else ""
+            self.log(f">> {summary}; saved to {output_path}")
+            verdict = self._run_decoder_test(output_path, recommended_checkpoint) if not failure else None
+            if verdict is not None and not verdict["accepted"]:
+                from .decoder_adapter import reject_decoder_adapter
+                parked = reject_decoder_adapter(output_path)
+                reason = "; ".join(verdict["reasons"])
+                summary = f"Voice decoder adapter not installed: {reason}. The pretrained decoder is kept (file parked at {parked.name})"
+                self.write_status(decoder_adapter_status="rejected", decoder_adapter_message=summary, decoder_adapter_path="")
+                self.log(f">> {summary}")
+            else:
+                if verdict is not None:
+                    gain = verdict["speaker_gain"].get("mean")
+                    summary += (f"; full pipeline at strength {float(verdict.get('strength', 1.0)):g}: speaker similarity "
+                                f"{float(gain):+.4f}, word error rate {100 * float(verdict['wer_increase']):+.2f} points"
+                                if gain is not None else "")
+                self.write_status(decoder_adapter_status="complete", decoder_adapter_message=summary,
+                                  decoder_adapter_path=str(output_path.resolve()))
+                self.log(f">> {summary}")
+        else:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            failure = failure or str(child.get("message") or f"worker exited with code {process.returncode}")
+            self.write_status(decoder_adapter_status="failed", decoder_adapter_message=failure)
+            self.log(f">> voice decoder adaptation did not complete: {failure}; the GPT adapter remains usable without it")
+        self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
+        return str(output_path) if output_path.is_file() else ""
+
+    def _run_decoder_test(self, adapter_path: Path, checkpoint: str) -> dict[str, Any] | None:
+        """Judge the decoder adapter through the full pipeline against the speech benchmark.
+
+        Returns the test report, or None when the test cannot run (no benchmark, the base model was
+        recommended, canceled, or the test itself failed); the adapter then stays on the strength of the
+        decoder trainer's own checks.
+        """
+        from .speech_eval import load_decoder_test
+        config = self.config
+        checkpoint_path = Path(checkpoint) if checkpoint else None
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            self.log(">> voice decoder adapter not tested through the full pipeline: the recommended model is the base model")
+            return None
+        if not config.speech_eval_enabled or not self.speech_plan_ready or self.stop_path.exists():
+            self.log(">> voice decoder adapter not tested through the full pipeline: no speech benchmark for this run")
+            return None
+        job_dir = self.adapter_dir / "analysis" / "speech_evaluation" / "decoder_test" / "test_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        (self.adapter_dir / "analysis" / "speech_evaluation" / "decoder_test" / "report.json").unlink(missing_ok=True)
+        config_path = job_dir / "train_config.json"
+        atomic_write_json(config_path, config.to_dict())
+        self.write_status(phase="adapting_decoder", message="Testing the voice decoder adapter through the full pipeline",
+                          decoder_adapter_message="Testing the voice decoder adapter through the full pipeline")
+        self.log(">> testing the voice decoder adapter through the full pipeline on the speech benchmark")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.speech_eval", "--config", str(config_path),
+                                    "--state-dir", str(job_dir), "--decoder-test", str(adapter_path), "--checkpoint", str(checkpoint_path)],
+                                   cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="decoder-test-log")
+        thread.start()
+        started = time.perf_counter()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(phase="adapting_decoder", message=str(child.get("message") or "Testing the voice decoder adapter"))
+            if self.stop_path.exists() or time.perf_counter() - started > config.speech_eval_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else "decoder test timeout"
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
+                break
+            time.sleep(0.5)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_evaluation_worker(process)
+            process.wait()
+        thread.join(timeout=2)
+        report = load_decoder_test(self.adapter_dir) if process.returncode == 0 and not failure else None
+        if report is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.log(">> the full-pipeline decoder test did not complete: "
+                     f"{failure or child.get('message') or f'exit code {process.returncode}'}; the adapter is kept on the trainer's checks")
+        return report
+
+    def _run_decoding_sweep(self, *, terminal_phase: str, terminal_message: str, recommended_checkpoint: str) -> None:
+        """Sweep decoding settings for the recommended checkpoint on the speech benchmark, in a child process."""
+        from .decoding_sweep import load_decoding_settings
+        config = self.config
+        checkpoint_path = Path(recommended_checkpoint) if recommended_checkpoint else None
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            self.write_status(decoding_sweep_status="skipped", decoding_sweep_message="the recommended model is the base model")
+            self.log(">> decoding sweep skipped: the recommended model is the base model")
+            return
+        if not config.speech_eval_enabled or not self.speech_plan_ready:
+            self.write_status(decoding_sweep_status="skipped", decoding_sweep_message="no speech benchmark for this run")
+            self.log(">> decoding sweep skipped: no speech benchmark for this run")
+            return
+        job_dir = self.adapter_dir / "analysis" / "speech_evaluation" / "decoding_sweep" / "sweep_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        (self.adapter_dir / "analysis" / "decoding.json").unlink(missing_ok=True)
+        config_path = job_dir / "train_config.json"
+        atomic_write_json(config_path, config.to_dict())
+        self.write_status(phase="calibrating_decoding", decoding_sweep_status="running",
+                          decoding_sweep_message="Sweeping decoding settings", message="Sweeping decoding settings on the speech benchmark")
+        self.log(">> starting the decoding sweep (temperature, guidance rate, beams) for the recommended checkpoint")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.speech_eval", "--config", str(config_path),
+                                    "--state-dir", str(job_dir), "--decoding-sweep", "--checkpoint", str(checkpoint_path)],
+                                   cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="decoding-sweep-log")
+        thread.start()
+        started = time.perf_counter()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(phase="calibrating_decoding", message=str(child.get("message") or "Sweeping decoding settings"))
+            if self.stop_path.exists() or time.perf_counter() - started > config.decoding_sweep_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else "decoding sweep timeout"
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
+                break
+            time.sleep(0.5)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_evaluation_worker(process)
+            process.wait()
+        thread.join(timeout=2)
+        settings = load_decoding_settings(self.adapter_dir) if process.returncode == 0 and not failure else None
+        report = read_json_retry(self.adapter_dir / "analysis" / "decoding.json", {}) or {}
+        if process.returncode == 0 and not failure and report:
+            if settings is not None:
+                summary = (f"Decoding sweep adopted temperature {settings['temperature']:g}, guidance {settings['inference_cfg_rate']:g}, "
+                           f"beams {settings['num_beams']} (score {settings['score']:+.4f})")
+                self.write_status(decoding_sweep_status="complete", decoding_sweep_message=summary)
+            else:
+                summary = "Decoding sweep kept the default settings: no change beat them on the speech benchmark"
+                self.write_status(decoding_sweep_status="complete", decoding_sweep_message=summary)
+            self.log(f">> {summary}")
+        else:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            reason = failure or str(child.get("message") or f"exit code {process.returncode}")
+            self.write_status(decoding_sweep_status="failed", decoding_sweep_message=reason)
+            self.log(f">> decoding sweep did not complete: {reason}; the default decoding settings remain")
+        self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
 
     def _write_speaking_rate_calibration(self) -> float | None:
         """Measure completed epoch samples without risking the training result."""
@@ -1044,6 +1284,7 @@ class LoraTrainer:
             speaker_ref_mode=config.speaker_ref_mode,
             emo_ref_mode=config.emo_ref_mode,
             val_split_mode=config.val_split_mode,
+            reference_typical=config.reference_typical,
         )
         val_speaker_ref_mode = "other" if config.val_reference_mode == "other" else "self"
         val_emo_ref_mode = (
@@ -1732,6 +1973,39 @@ class LoraTrainer:
                 self.write_status(recommended_checkpoint=recommended_checkpoint)
         elif recommended_checkpoint:
             self.write_status(recommended_checkpoint=recommended_checkpoint)
+        if config.decoder_adapter_enabled:
+            # The decoder adapter trains from the cached dataset in its own process; release the
+            # training model first when the evaluation phases have not already done so.
+            try:
+                del built
+            except UnboundLocalError:
+                pass
+            try:
+                del optimizer, scheduler, scaler
+            except UnboundLocalError:
+                pass
+            try:
+                del train_loader, val_loader
+            except UnboundLocalError:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                self._run_decoder_adaptation(terminal_phase=result_status, terminal_message=terminal_message,
+                                             recommended_checkpoint=recommended_checkpoint)
+            except Exception as exc:
+                self.log(f">> voice decoder adaptation failed but training weights are safe: {exc}")
+                self.write_status(phase=result_status, message=terminal_message, recommended_checkpoint=recommended_checkpoint,
+                                  decoder_adapter_status="failed", decoder_adapter_message=str(exc))
+        if config.decoding_sweep_enabled and not self.stop_path.exists():
+            try:
+                self._run_decoding_sweep(terminal_phase=result_status, terminal_message=terminal_message,
+                                         recommended_checkpoint=recommended_checkpoint)
+            except Exception as exc:
+                self.log(f">> decoding sweep failed but training weights are safe: {exc}")
+                self.write_status(phase=result_status, message=terminal_message, recommended_checkpoint=recommended_checkpoint,
+                                  decoding_sweep_status="failed", decoding_sweep_message=str(exc))
         return TrainingResult(
             status=result_status,
             step=global_step,

@@ -106,6 +106,9 @@ class TrainConfig:
     eval_include_base: bool = True
     eval_timeout_s: float = 900.0
     speech_eval_enabled: bool = True
+    # Automatic references (the saved recommended reference, training conditioning, the speech benchmark)
+    # prefer, among the best-quality clips, the one nearest the speaker's median pitch and pace.
+    reference_typical: bool = True
     speech_eval_prompts: int = 12
     speech_eval_seeds: int = 3
     speech_eval_candidates: int = 3
@@ -113,6 +116,16 @@ class TrainConfig:
     speech_eval_max_wer_increase: float = 0.02
     speech_eval_max_speaker_drop: float = 0.03
     final_test_dataset: str = ""
+    decoder_adapter_enabled: bool = True
+    decoder_adapter_rank: int = 128
+    decoder_adapter_alpha: float = 128.0
+    decoder_adapter_epochs: int = 10
+    decoder_adapter_learning_rate: float = 2e-4
+    decoder_adapter_timeout_s: float = 7200.0
+    # After the decoder adapter is judged, sweep temperature, guidance rate, and beams on the speech
+    # benchmark for the selected checkpoint and save the winner for Voice Generation.
+    decoding_sweep_enabled: bool = True
+    decoding_sweep_timeout_s: float = 5400.0
 
     seed: int = 42
     num_workers: int = 2
@@ -210,6 +223,16 @@ class TrainConfig:
         self.resume_mode = str(self.resume_mode or "weights_only").lower()
         if self.resume_mode not in {"weights_only", "continue"}:
             raise ValueError("resume_mode must be 'weights_only' or 'continue'")
+        self.decoder_adapter_enabled = bool(self.decoder_adapter_enabled)
+        self.decoder_adapter_rank = max(1, int(self.decoder_adapter_rank))
+        self.decoder_adapter_alpha = _finite_float(self.decoder_adapter_alpha, "decoder_adapter_alpha")
+        if self.decoder_adapter_alpha <= 0:
+            raise ValueError("decoder_adapter_alpha must be positive")
+        self.decoder_adapter_epochs = max(1, int(self.decoder_adapter_epochs))
+        self.decoder_adapter_learning_rate = _finite_float(self.decoder_adapter_learning_rate, "decoder_adapter_learning_rate")
+        if self.decoder_adapter_learning_rate <= 0:
+            raise ValueError("decoder_adapter_learning_rate must be positive")
+        self.decoder_adapter_timeout_s = max(60.0, float(self.decoder_adapter_timeout_s))
         self.sample_every_epochs = max(1, int(self.sample_every_epochs))
         self.sample_min_free_vram_gb = max(0.0, float(self.sample_min_free_vram_gb))
         self.sample_timeout_s = max(1.0, float(self.sample_timeout_s))
@@ -278,6 +301,9 @@ class TrainConfig:
         self.eval_include_base = bool(self.eval_include_base)
         self.eval_timeout_s = max(1.0, float(self.eval_timeout_s))
         self.speech_eval_enabled = bool(self.speech_eval_enabled)
+        self.reference_typical = bool(self.reference_typical)
+        self.decoding_sweep_enabled = bool(self.decoding_sweep_enabled)
+        self.decoding_sweep_timeout_s = max(60.0, _finite_float(self.decoding_sweep_timeout_s, "decoding_sweep_timeout_s"))
         self.final_test_dataset = str(self.final_test_dataset or "").strip()
         for key, lower, upper in (("speech_eval_prompts", 1, 100),
                                   ("speech_eval_seeds", 1, 10),

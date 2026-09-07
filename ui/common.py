@@ -999,6 +999,15 @@ def runtime_config_from_values(values: Mapping[str, Any], *, model_dir: str = "m
         "lora_merge_into_base": values.get("runtime.lora_merge_into_base", False),
         "max_section_batch_size_hint": values.get("runtime.max_section_batch_size_hint", 8),
     }
+    # The generation tab's "Voice decoder adapter" choice: "auto" (the selected LoRA / DoRA's own file),
+    # "none" (GPT adapter only), or an explicit decoder adapter file. Older presets saved a boolean.
+    choice = values.get("runtime.decoder_adapter", None)
+    if choice is None:
+        legacy = values.get("runtime.use_decoder_adapter", True)
+        enabled = legacy if isinstance(legacy, bool) else str(legacy).strip().lower() not in {"false", "0", "no", "off"}
+        choice = "auto" if enabled else "none"
+    payload["decoder_adapter"] = choice
+    payload["decoder_adapter_strength"] = values.get("runtime.decoder_adapter_strength", 1.0)
     config = RuntimeConfig.from_dict(payload).to_dict()
     resolved_model_dir = str(Path(model_dir).expanduser().resolve())
     config.update(

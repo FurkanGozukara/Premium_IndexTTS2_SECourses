@@ -210,6 +210,12 @@ class IndexTTS2:
         self._lora_path = ""
         self._lora_strength = 1.0
         self._lora_merged = False
+        self._decoder_handle = None
+        self._decoder_path = ""
+        self._decoder_strength = 1.0
+        # "base": guidance's unconditional branch uses the pretrained decoder (default);
+        # "adapted": both branches use the adapter (for comparison).
+        self.decoder_guidance = os.environ.get("INDEXTTS_DECODER_GUIDANCE", "base").strip().lower() or "base"
         self.runtime_warning = ""
 
         self.cfg = OmegaConf.load(cfg_path)
@@ -562,9 +568,35 @@ class IndexTTS2:
             f"VRAM {stats['allocated_gb']:.2f} GB allocated / {stats['reserved_gb']:.2f} GB reserved"
         )
 
-    def set_lora(self, path, strength=1.0, merge_into_base=None):
-        """Replace the active LoRA / DoRA without reloading base weights."""
+    def set_lora(self, path, strength=1.0, merge_into_base=None, use_decoder_adapter=None, decoder_adapter=None,
+                 decoder_strength=None):
+        """Replace the active LoRA / DoRA without reloading base weights.
+
+        A voice decoder adapter saved next to the GPT adapter (``<name>.s2mel.safetensors``) is applied to the
+        semantic-to-mel decoder at the same time. ``decoder_adapter`` is the choice: ``"auto"`` (that saved
+        file), ``"none"``, or an explicit decoder adapter file, which also works without a GPT adapter;
+        ``use_decoder_adapter`` is the older boolean form. ``decoder_strength`` scales the decoder adapter
+        independently of the GPT adapter's strength.
+        """
+        from indextts.lora.decoder import decoder_adapter_selection, is_decoder_adapter_path
+
         requested = str(path or "")
+        if decoder_strength is not None:
+            self.runtime.decoder_adapter_strength = max(0.0, min(4.0, float(decoder_strength)))
+        if decoder_adapter is not None:
+            choice = str(decoder_adapter or "auto").strip() or "auto"
+            enabled, explicit = decoder_adapter_selection(choice)
+            if explicit and not is_decoder_adapter_path(explicit):
+                raise ValueError(f"{explicit} is not a voice decoder adapter (expected a *.s2mel.safetensors file)")
+            if explicit and not os.path.isfile(explicit):
+                raise FileNotFoundError(f"voice decoder adapter not found: {explicit}")
+            self.runtime.decoder_adapter = explicit if explicit else ("auto" if enabled else "none")
+        elif use_decoder_adapter is not None:
+            self.runtime.decoder_adapter = "auto" if bool(use_decoder_adapter) else "none"
+        if requested and is_decoder_adapter_path(requested):
+            raise ValueError(
+                f"{requested} is a voice decoder adapter; select the LoRA / DoRA file it belongs to and the decoder adapter loads with it"
+            )
         strength = max(0.0, min(4.0, float(strength)))
         merge_requested = (
             bool(self.runtime.lora_merge_into_base)
@@ -596,6 +628,7 @@ class IndexTTS2:
             if merge_requested and self.runtime.model_variant == "bf16":
                 merge_lora_for_inference(self.gpt)
                 self._lora_merged = True
+            self._sync_decoder_adapter(requested, strength)
             return self._lora_handle
         if self._lora_handle is not None or self._lora_path:
             if self._lora_merged:
@@ -604,15 +637,18 @@ class IndexTTS2:
             remove_lora(self.gpt)
             self._lora_handle = None
             self._lora_path = ""
+            self._remove_decoder_adapter()
         if not requested:
             self.runtime.lora_path = ""
             self.runtime.lora_strength = strength
             self.runtime.lora_merge_into_base = merge_requested
+            self._sync_decoder_adapter("", strength)  # an explicit decoder adapter can run with the base GPT
             return None
         if not os.path.isfile(requested):
             raise FileNotFoundError(f"LoRA / DoRA not found: {requested}")
         self._lora_handle = apply_lora(self.gpt, requested, strength)
         move_adapters_to_device(self.gpt, self.device)
+        self._sync_decoder_adapter(requested, strength)
         self._lora_path = resolved
         self._lora_strength = strength
         self.runtime.lora_path = requested
@@ -628,6 +664,66 @@ class IndexTTS2:
             f"merged={'yes' if self._lora_merged else 'no'})"
         )
         return self._lora_handle
+
+    def _decoder_estimator(self):
+        if not hasattr(self, "s2mel"):
+            return None
+        from indextts.lora.decoder import unwrap_estimator
+
+        return unwrap_estimator(self.s2mel.models["cfm"].estimator)
+
+    def _decoder_guidance_toggle(self, enabled):
+        from indextts.lora.apply import set_lora_strength
+
+        if self._decoder_handle is not None:
+            set_lora_strength(self._decoder_handle, self._decoder_strength if enabled else 0.0)
+
+    def _install_decoder_guidance(self):
+        cfm = self.s2mel.models["cfm"] if hasattr(self, "s2mel") else None
+        if cfm is None:
+            return
+        use_base = self._decoder_handle is not None and self.decoder_guidance != "adapted"
+        cfm.guidance_adapter_toggle = self._decoder_guidance_toggle if use_base else None
+
+    def _remove_decoder_adapter(self):
+        estimator = self._decoder_estimator()
+        if estimator is not None and (self._decoder_handle is not None or self._decoder_path):
+            from indextts.lora.apply import remove_lora
+
+            remove_lora(estimator)
+        self._decoder_handle = None
+        self._decoder_path = ""
+        self._install_decoder_guidance()
+
+    def _sync_decoder_adapter(self, gpt_adapter_path, strength):
+        """Apply, update, or remove the voice decoder adapter that belongs to the active GPT adapter."""
+        from indextts.lora.apply import apply_lora, move_adapters_to_device, set_lora_strength
+        from indextts.lora.decoder import decoder_adapter_selection, find_decoder_adapter
+
+        estimator = self._decoder_estimator()
+        if estimator is None:
+            return None
+        strength = float(getattr(self.runtime, "decoder_adapter_strength", 1.0))
+        enabled, explicit = decoder_adapter_selection(getattr(self.runtime, "decoder_adapter", "auto"))
+        wanted = ""
+        if enabled:
+            wanted = explicit if explicit else (find_decoder_adapter(gpt_adapter_path) if gpt_adapter_path else "")
+        resolved = os.path.abspath(wanted) if wanted else ""
+        if resolved and resolved == self._decoder_path and self._decoder_handle is not None:
+            self._decoder_strength = float(strength)
+            set_lora_strength(self._decoder_handle, strength)
+            self._install_decoder_guidance()
+            return self._decoder_handle
+        self._remove_decoder_adapter()
+        if not resolved:
+            return None
+        self._decoder_handle = apply_lora(estimator, wanted, strength)
+        move_adapters_to_device(estimator, next(estimator.parameters()).device)
+        self._decoder_path = resolved
+        self._decoder_strength = float(strength)
+        self._install_decoder_guidance()
+        print(f">> voice decoder adapter active: {wanted} (strength {strength:.3f}, guidance {self.decoder_guidance})")
+        return self._decoder_handle
 
     def unload(self):
         """Move all models to CPU, release CUDA caches, and return freed GiB."""

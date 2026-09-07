@@ -33,12 +33,30 @@ def audio_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def choose_training_reference(records: Sequence[Mapping[str, Any]], dataset: str | Path) -> Mapping[str, Any] | None:
-    """Prefer clean training speech near 15 seconds without consulting past runs."""
+def choose_training_reference(records: Sequence[Mapping[str, Any]], dataset: str | Path,
+                              typical: bool = True) -> Mapping[str, Any] | None:
+    """Prefer clean training speech near 15 seconds without consulting past runs.
+
+    With ``typical`` (the default) the best-quality candidates are measured and the one nearest the
+    speaker's median pitch and pace wins, so the saved reference sounds like the person usually does.
+    """
     existing = [row for row in records if row.get("audio") and audio_path(dataset, row).is_file()]
     if not existing:
         return None
+    if typical:
+        from .voice_profile import choose_typical_reference
+        choice = choose_typical_reference(dataset, existing)
+        if choice is not None:
+            return choice["record"]
     return min(existing, key=lambda row: (*training_reference_priority(row), str(row["id"])))
+
+
+def describe_training_reference(records: Sequence[Mapping[str, Any]], dataset: str | Path) -> str:
+    """One line about the typical-reference choice for logs and plans (empty when unavailable)."""
+    from .voice_profile import choose_typical_reference, describe_reference_choice
+    existing = [row for row in records if row.get("audio") and audio_path(dataset, row).is_file()]
+    choice = choose_typical_reference(dataset, existing) if existing else None
+    return describe_reference_choice(choice) if choice is not None else ""
 
 
 def representative_records(records: Sequence[Mapping[str, Any]], count: int, seed: int) -> list[Mapping[str, Any]]:
@@ -94,8 +112,9 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
         grouped[(str(row.get("speaker", "")), str(row.get("language") or "EN").upper())].append(row)
     groups = []
     for index, ((speaker, language), records) in enumerate(sorted(grouped.items()), 1):
-        reference_row = choose_training_reference(
-            [row for row in train_records if str(row.get("speaker", "")) == speaker], config.dataset_dir)
+        speaker_rows = [row for row in train_records if str(row.get("speaker", "")) == speaker]
+        typical = bool(getattr(config, "reference_typical", True))
+        reference_row = choose_training_reference(speaker_rows, config.dataset_dir, typical=typical)
         if reference_row is None:
             raise ValueError(f"No training-only audio reference is available for speaker {speaker!r}")
         reference = root / "references" / f"speaker_{index:03d}.wav"
@@ -118,6 +137,8 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
         groups.append({"id": f"group_{index:03d}", "speaker": speaker, "language": language,
                        "reference": str(reference.resolve()), "reference_record_id": str(reference_row["id"]),
                        "reference_duration_s": float(reference_row.get("duration_s", 0) or 0),
+                       "reference_selection": "typical" if typical else "nearest_duration",
+                       "reference_note": describe_training_reference(speaker_rows, config.dataset_dir) if typical else "",
                        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(), "prompts": prompts})
     train_sources = {str(row.get("source_media") or row["id"]) for row in train_records}
     val_sources = {str(row.get("source_media") or row["id"]) for row in val_records}
@@ -174,4 +195,4 @@ def build_final_test_plan(config: Any, train_records: Sequence[Mapping[str, Any]
     return build_speech_plan(config, train_records, rows, run_dir, evaluation_dataset=dataset, final_test=True)
 
 
-__all__ = ["audio_path", "build_speech_plan", "build_final_test_plan", "choose_training_reference", "record_identity", "representative_records"]
+__all__ = ["audio_path", "build_speech_plan", "build_final_test_plan", "choose_training_reference", "describe_training_reference", "record_identity", "representative_records"]

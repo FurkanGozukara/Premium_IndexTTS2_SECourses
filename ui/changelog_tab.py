@@ -7,6 +7,24 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.9",
+        "2026-09-08",
+        """
+### Voice decoder adaptation: a second adapter for timbre, trained automatically after every run
+
+- Generation has three stages, and voice adapters so far touched only the first. The GPT LoRA / DoRA decides what is said and when; the semantic-to-mel decoder decides how the voice sounds and knew a voice only through the reference clip of each generation. Training now adapts that decoder too: after checkpoint selection and the speech comparison, a DoRA of rank 128 (alpha 128, learning rate 2e-4 from a five-rate sweep) is trained on the decoder's transformer blocks with its own flow-matching objective, using a randomly drawn other clip of the speaker as the in-context prompt for every target clip and every epoch. A fixed prompt taught an early build a prompt-independent offset toward the dataset's average voice that made every generated sentence thinner and higher; the random prompt removes that failure by construction.
+- Checkpoints are selected by speaker identity, not by loss: every 500 updates and at each epoch boundary, eight held-out clips are re-rendered from their own semantic codes and compared with the real recordings by CAMPPlus similarity, with the held-out flow loss as a guard against drifting from the decoder's objective. Early stopping and a one-time learning-rate halving follow the GPT trainer's rules.
+- An adapter is installed only when it wins twice: its re-rendered identity must beat the pretrained decoder's, and the selected checkpoint must render the speech benchmark closer to the real recordings with the adapter than without it (same sentences, reference, and seeds), without a word-error-rate regression. The test judges strengths 1.0 and 0.6 and records the better-scoring one as the adapter's recommended strength, which Voice Generation applies when the LoRA / DoRA is selected. A rejected file is parked as `analysis/<name>.s2mel.rejected` and the training summary says why; generation keeps the pretrained decoder.
+- The adapter is saved as `<name>.s2mel.safetensors` in the training folder, shared by every checkpoint of that training, and reported in `analysis/decoder_adapter.json` and `analysis/speech_evaluation/decoder_test/report.md`. Voice Generation applies it automatically whenever that LoRA / DoRA is selected; with classifier-free guidance the adapter renders the conditioned branch while the unconditional branch keeps the pretrained decoder. Selecting a LoRA / DoRA sets the new **Voice decoder adapter** dropdown to the adapter saved with it; **None** plays the GPT adapter alone for an A/B listen, any other decoder adapter file can be chosen, and **Voice decoder adapter strength** starts at the recommended strength and scales it independently of the LoRA / DoRA strength. Decoder files are tagged so they can never be applied to the GPT by mistake.
+- Automatic references now prefer, among the cleanest training clips near 15 seconds, the one nearest the speaker's median pitch and pace (**Prefer a reference near the speaker's median pitch and pace**, on by default). The old rule picked a 119 Hz, 2.3 words-per-second clip for a 144 Hz, 2.6 words-per-second speaker, and every generation started from that low, slow baseline. Per-clip pitch is cached in the dataset's `analysis/pitch_cache.json`.
+- **Sweep decoding settings after training** (on by default): the recommended checkpoint renders the speech benchmark at other temperatures, guidance rates, and beam counts; a change is kept only when it beats the defaults on speaker similarity and word error, and the winner is saved as `analysis/decoding.json`. Voice Generation applies it together with the calibrated speaking rate (the auto-apply switch now covers both), and `tools/sweep_decoding.py` runs the sweep for an existing training folder.
+- New training option **Adapt the voice decoder after training** (enabled by default) with rank, alpha, epochs, learning rate, and timeout; the training dashboard shows the new phase and the verdict. `tools/train_decoder_adapter.py` adds a decoder adapter to an existing training folder without retraining the GPT adapter and runs the same full-pipeline test (`--no-test` skips it). A speaking-rate change with `inference_cfg_rate` 0 no longer fails in the flow-matching solver.
+- RESULT_PLACEHOLDER
+
+Restart after updating. Existing adapters keep working without a decoder adapter; add one with the tool or by training again.
+""".strip(),
+    ),
+    (
         "v6.8",
         "2026-09-07",
         """

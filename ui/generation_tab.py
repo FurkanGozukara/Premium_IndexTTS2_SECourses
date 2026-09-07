@@ -24,6 +24,8 @@ import gradio as gr
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
 from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
+from indextts.lora.decoder import decoder_adapter_choices, find_decoder_adapter, recommended_decoder_strength
+from indextts.training.decoding_sweep import load_decoding_settings
 from indextts.training.speaking_rate import (
     load_speaking_rate,
     save_manual_speaking_rate,
@@ -245,6 +247,8 @@ RUNNER_REQUEST_KEYS = frozenset(
         "lora_path",
         "lora_strength",
         "lora_merge_into_base",
+        "decoder_adapter",
+        "decoder_adapter_strength",
         "num_candidates",
         "audio_tuning_preset",
         "audio_tuning_overrides",
@@ -366,9 +370,14 @@ def build_generation_request(
             runtime_value.get("lora_merge_into_base", False),
         )
     )
+    decoder_adapter = str(merged.get("runtime.decoder_adapter", runtime_value.get("decoder_adapter", "auto")) or "auto")
     runtime_value["lora_path"] = lora_path
     runtime_value["lora_strength"] = lora_strength
     runtime_value["lora_merge_into_base"] = lora_merge_into_base
+    runtime_value["decoder_adapter"] = decoder_adapter
+    raw_decoder_strength = merged.get("runtime.decoder_adapter_strength", runtime_value.get("decoder_adapter_strength", 1.0))
+    decoder_adapter_strength = float(1.0 if raw_decoder_strength in (None, "") else raw_decoder_strength)
+    runtime_value["decoder_adapter_strength"] = decoder_adapter_strength
 
     overrides = {}
     for ui_key, backend_key in (
@@ -402,6 +411,8 @@ def build_generation_request(
         "lora_path": lora_path,
         "lora_strength": lora_strength,
         "lora_merge_into_base": lora_merge_into_base,
+        "decoder_adapter": decoder_adapter,
+        "decoder_adapter_strength": decoder_adapter_strength,
         "num_candidates": int(_value(merged, "generation.num_candidates")),
         "audio_tuning_preset": str(_value(merged, "generation.audio_tuning_preset") or "bypass"),
         "audio_tuning_overrides": overrides,
@@ -1242,12 +1253,27 @@ def _lora_info(path: str | None) -> tuple[str, str | None]:
                 f"generated {speaking_rate.generated_words_per_second:.2f} words/s; "
                 f"calibration: {speaking_rate_method_label(speaking_rate.method)})."
             )
+        decoder_path = find_decoder_adapter(path)
+        decoder_line = (
+            f"Voice decoder adapter: **found** (`{Path(decoder_path).name}`, selected automatically; choose **None** under "
+            "Voice decoder adapter to hear the GPT adapter alone)."
+            if decoder_path else
+            "Voice decoder adapter: **none** (train with **Adapt the voice decoder after training** enabled to add one)."
+        )
+        decoding = load_decoding_settings(path)
+        decoding_line = (
+            f"Decoding settings from the sweep: temperature **{decoding['temperature']:g}**, guidance **{decoding['inference_cfg_rate']:g}**, "
+            f"beams **{decoding['num_beams']}** (applied with the calibrated speaking rate)."
+            if decoding else "Decoding settings: **defaults** (no sweep result for this training)."
+        )
         markdown = (
             f"**{str(info['adapter_type']).upper()}** | rank **{info['rank']}** | alpha **{info['alpha']}**  \n"
             f"Steps: **{info.get('steps', 0)}** | Dataset: **{info.get('dataset') or 'not recorded'}** | "
             f"Date: **{info.get('date') or 'not recorded'}**  \n"
             f"Targets: {len(targets)} | Size: **{info.get('size_mb', 0):.2f} MB**  \n"
             f"{rate_line}  \n"
+            f"{decoder_line}  \n"
+            f"{decoding_line}  \n"
             f"Full path: `{Path(path).expanduser().resolve()}`"
         )
         reference = _resolve_lora_reference_path(path, info.get("recommended_reference"))
@@ -1314,6 +1340,19 @@ def lora_selection_updates(
             else "Base model (no LoRA / DoRA) selected."
         )
     return info, reference_update, " ".join(messages), rate_update, source_update
+
+
+def decoding_updates(path: str | None, auto_apply: bool) -> tuple[Any, Any, Any]:
+    """Temperature, guidance rate, and beams for the selected adapter's sweep result, or the defaults."""
+    if not auto_apply:
+        return gr.skip(), gr.skip(), gr.skip()
+    settings = load_decoding_settings(path) if path else None
+    if settings is None:
+        return (gr.update(value=GENERATION_DEFAULTS["generation.temperature"]),
+                gr.update(value=GENERATION_DEFAULTS["generation.inference_cfg_rate"]),
+                gr.update(value=GENERATION_DEFAULTS["generation.num_beams"]))
+    return (gr.update(value=settings["temperature"]), gr.update(value=settings["inference_cfg_rate"]),
+            gr.update(value=settings["num_beams"]))
 
 
 def saved_lora_speaking_rate(path: str | None) -> float | None:
@@ -1994,8 +2033,8 @@ def build_generation_tab(
             )
             auto_rate = gr.Checkbox(
                 value=GENERATION_DEFAULTS["generation.auto_lora_speaking_rate"],
-                label="Auto-apply the LoRA / DoRA calibrated speaking rate",
-                info="Uses the selected voice's measured pace; selecting None resets speaking rate to 1.0.",
+                label="Auto-apply the LoRA / DoRA calibrated speaking rate and decoding settings",
+                info="Uses the selected voice's measured pace and the temperature, guidance, and beams its decoding sweep adopted; selecting None restores the defaults.",
                 scale=2,
             )
             merge_lora = gr.Checkbox(
@@ -2003,6 +2042,19 @@ def build_generation_tab(
                 label="Merge LoRA / DoRA into base weights for speed (BF16 only)",
                 info="Temporarily folds the selected LoRA / DoRA into floating GPT weights and restores them before switching.",
                 scale=3,
+            )
+            use_decoder = gr.Dropdown(
+                choices=decoder_adapter_choices("", ROOT / "loras"),
+                value="auto",
+                label="Voice decoder adapter",
+                info="Selecting a LoRA / DoRA picks the decoder adapter saved with it. Choose None to hear the GPT adapter alone, or any other decoder adapter file.",
+                scale=3,
+            )
+            decoder_strength = gr.Slider(
+                0.0, 2.0, value=1.0, step=0.05,
+                label="Voice decoder adapter strength",
+                info="1.0 is the trained strength of the decoder adapter; it is independent of the LoRA / DoRA strength.",
+                scale=2,
             )
         lora_info = gr.Markdown("No LoRA / DoRA selected.", elem_classes=["section-note"])
         with gr.Row(equal_height=True):
@@ -2016,6 +2068,8 @@ def build_generation_tab(
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
+        registry.register("runtime.decoder_adapter", use_decoder, "auto", kind="str")
+        registry.register("runtime.decoder_adapter_strength", decoder_strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         _register(registry, "generation.auto_lora_reference", auto_ref, kind="bool")
         _register(
             registry,
@@ -2285,6 +2339,8 @@ def build_generation_tab(
     c["runtime.lora_path"] = lora
     c["runtime.lora_strength"] = strength
     c["runtime.lora_merge_into_base"] = merge_lora
+    c["runtime.decoder_adapter"] = use_decoder
+    c["runtime.decoder_adapter_strength"] = decoder_strength
 
     def media_updates(path: Any, value_ranges: str, *, require_ranges: bool = False):
         output, video, message = load_reference_media(
@@ -2591,6 +2647,8 @@ def build_generation_tab(
     )
 
     refresh_lora.click(lambda: gr.update(choices=_lora_choices()), outputs=lora, queue=False)
+    refresh_lora.click(lambda path: gr.update(choices=decoder_adapter_choices(str(path or ""), ROOT / "loras")),
+                       inputs=lora, outputs=use_decoder, queue=False)
 
     lora_selection_inputs = [lora, tab.prompt_audio, auto_ref, auto_rate, tab.reference_source]
 
@@ -2617,6 +2675,11 @@ def build_generation_tab(
             rate_update,
             source_update,
             gr.update(value=saved_lora_speaking_rate(str(items[0] or ""))),
+            # Loading a LoRA / DoRA selects its own decoder adapter again; None stays one click away.
+            gr.update(choices=decoder_adapter_choices(str(items[0] or ""), ROOT / "loras"), value="auto"),
+            # The strength its full-pipeline test chose, or the trained strength when nothing was measured.
+            gr.update(value=recommended_decoder_strength(str(items[0] or "")) or 1.0),
+            *decoding_updates(str(items[0] or ""), bool(items[3])),
         )
 
     lora_selection_outputs = [
@@ -2628,6 +2691,11 @@ def build_generation_tab(
         speaking_rate,
         tab.reference_source,
         lora_saved_rate,
+        use_decoder,
+        decoder_strength,
+        temperature,
+        cfg,
+        beams,
     ]
     save_lora_rate.click(
         save_lora_speaking_rate,

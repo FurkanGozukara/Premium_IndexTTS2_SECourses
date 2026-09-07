@@ -1,3 +1,3 @@
 """Release version shared by the application and saved adapter metadata."""
 
-APP_VERSION = "6.8"
+APP_VERSION = "6.9"

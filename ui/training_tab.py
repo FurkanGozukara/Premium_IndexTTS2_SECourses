@@ -335,6 +335,19 @@ def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.Data
     elif status.get("speech_evaluation_status"):
         summary = (f"**Speech evaluation: {status['speech_evaluation_status']}** — "
                    f"{status.get('speech_evaluation_message', '')}\n\n" + summary)
+    decoder_status = str(status.get("decoder_adapter_status") or "")
+    if decoder_status:
+        from indextts.training.speech_eval import load_decoder_test
+        decoder_test = load_decoder_test(root)
+        decoder_text = (decoder_test["summary_markdown"] if decoder_test is not None and decoder_status in {"complete", "rejected"}
+                        else f"**Voice decoder adapter: {decoder_status}** — {status.get('decoder_adapter_message', '')}")
+        summary = summary + "\n\n" + decoder_text
+    sweep_status = str(status.get("decoding_sweep_status") or "")
+    if sweep_status:
+        sweep_report = read_json(root / "analysis" / "speech_evaluation" / "decoding_sweep" / "report.json", {}) or {}
+        sweep_text = (sweep_report["summary_markdown"] if sweep_report.get("summary_markdown") and sweep_status == "complete"
+                      else f"**Decoding sweep: {sweep_status}** — {status.get('decoding_sweep_message', '')}")
+        summary = summary + "\n\n" + sweep_text
     return "### Generalization summary\n\n" + summary, analysis_epoch_frame(analysis)
 
 
@@ -440,9 +453,25 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
             "fraction": 0.0, "completed": 0, "total": None,
         }
         payload["desc"] = str(payload.get("desc") or status.get("message") or "comparing generated speech")
+    if phase == "calibrating_decoding":
+        payload = read_json(root / "analysis" / "speech_evaluation" / "decoding_sweep" / "sweep_job" / "progress.json", {}) or {
+            "fraction": 0.0, "completed": 0, "total": None,
+        }
+        payload["desc"] = str(payload.get("desc") or status.get("message") or "sweeping decoding settings")
+    if phase == "adapting_decoder":
+        child = read_json(root / "analysis" / "decoder_adapter_job" / "status.json", {}) or {}
+        decoder_step = int(child.get("step", 0) or 0)
+        decoder_total = int(child.get("total_steps", 0) or 0)
+        payload = {
+            "fraction": decoder_step / decoder_total if decoder_total else 0.0, "completed": decoder_step, "total": decoder_total or None,
+            "elapsed_s": child.get("elapsed_s", 0), "eta_s": child.get("eta_s"), "speed": child.get("it_s"), "speed_unit": "it/s",
+            "desc": str(child.get("message") or status.get("message") or "adapting the voice decoder"),
+        }
     titles = {
         "evaluating": "Evaluating checkpoints",
         "evaluating_speech": "Comparing generated speech",
+        "adapting_decoder": "Adapting the voice decoder",
+        "calibrating_decoding": "Sweeping decoding settings",
         "complete": "Training complete",
         "stopped": "Training stopped",
         "cancelled": "Training canceled",
@@ -822,10 +851,13 @@ def build_training_tab(
                     label="Allowed transcript error increase over Base", info="Absolute fraction: 0.02 allows two percentage points. Uses CER for Chinese/Japanese and WER for other supported languages.")
                 speech_speaker = gr.Number(value=TRAIN_DEFAULTS["speech_eval_max_speaker_drop"], minimum=0, maximum=1,
                     label="Allowed speaker-similarity drop from Base")
+            reference_typical = gr.Checkbox(value=TRAIN_DEFAULTS["reference_typical"], label="Prefer a reference near the speaker's median pitch and pace",
+                info="Among the cleanest training clips near 15 seconds, the saved recommended reference, training conditioning, and the speech benchmark use the clip whose pitch and words per second are closest to the dataset's medians.")
             final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
                 info="A prepared dataset with separate source recordings. After selection is frozen, compare only the chosen checkpoint and Base. Blank skips final testing; feature caching is not required for this speech check.")
             for name, component, kind, minimum, maximum in (
                 ("speech_eval_enabled", speech_enabled, "bool", None, None),
+                ("reference_typical", reference_typical, "bool", None, None),
                 ("speech_eval_prompts", speech_prompts, "int", 1, 100),
                 ("speech_eval_seeds", speech_seeds, "int", 1, 10),
                 ("speech_eval_candidates", speech_candidates, "int", 1, 10),
@@ -833,6 +865,34 @@ def build_training_tab(
                 ("speech_eval_max_wer_increase", speech_wer, "float", 0, 1),
                 ("speech_eval_max_speaker_drop", speech_speaker, "float", 0, 1),
                 ("final_test_dataset", final_test, "str", None, None),
+            ):
+                _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
+
+        with gr.Accordion("Voice decoder adaptation", open=False):
+            gr.Markdown("After the checkpoint is selected, adapt the semantic-to-mel decoder to this voice as well. The GPT LoRA / DoRA decides what is said and when; the decoder owns timbre and spectral detail. "
+                        "The decoder adapter trains from the cached dataset in its own process, is saved next to the GPT adapter, and loads automatically whenever that adapter is selected.")
+            with gr.Row():
+                decoder_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoder_adapter_enabled"], label="Adapt the voice decoder after training")
+                decoder_rank = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_rank"], minimum=1, maximum=256, precision=0, label="Decoder rank")
+                decoder_alpha = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_alpha"], minimum=0.1, maximum=512, label="Decoder alpha")
+                decoder_epochs = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_epochs"], minimum=1, maximum=50, precision=0, label="Decoder epochs",
+                    info="Held-out flow-matching loss stops the run early when it stalls; the best file is kept.")
+            with gr.Row():
+                decoder_lr = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_learning_rate"], minimum=1e-6, maximum=1e-2, label="Decoder learning rate")
+                decoder_timeout = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_timeout_s"], minimum=60, label="Decoder adaptation timeout (s)")
+            with gr.Row():
+                decoding_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoding_sweep_enabled"], label="Sweep decoding settings after training",
+                    info="Renders the speech benchmark with the selected checkpoint at other temperatures, guidance rates, and beam counts; a change is kept only when it scores better than the defaults, and Voice Generation applies the winner with the adapter.")
+                decoding_timeout = gr.Number(value=TRAIN_DEFAULTS["decoding_sweep_timeout_s"], minimum=60, label="Decoding sweep timeout (s)")
+            for name, component, kind, minimum, maximum in (
+                ("decoder_adapter_enabled", decoder_enabled, "bool", None, None),
+                ("decoder_adapter_rank", decoder_rank, "int", 1, 256),
+                ("decoder_adapter_alpha", decoder_alpha, "float", 0.1, 512),
+                ("decoder_adapter_epochs", decoder_epochs, "int", 1, 50),
+                ("decoder_adapter_learning_rate", decoder_lr, "float", 1e-6, 1e-2),
+                ("decoder_adapter_timeout_s", decoder_timeout, "float", 60, 1000000),
+                ("decoding_sweep_enabled", decoding_enabled, "bool", None, None),
+                ("decoding_sweep_timeout_s", decoding_timeout, "float", 60, 1000000),
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
 

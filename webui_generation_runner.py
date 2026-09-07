@@ -542,6 +542,9 @@ def run_generation_request(
     lora_merge_into_base = bool(
         request.get("lora_merge_into_base", request_runtime.lora_merge_into_base)
     )
+    decoder_adapter = str(request.get("decoder_adapter", getattr(request_runtime, "decoder_adapter", "auto")) or "auto")
+    raw_decoder_strength = request.get("decoder_adapter_strength", getattr(request_runtime, "decoder_adapter_strength", 1.0))
+    decoder_adapter_strength = float(1.0 if raw_decoder_strength in (None, "") else raw_decoder_strength)
     normalized_lora_path = os.path.abspath(str(lora_path)) if lora_path else ""
     tts.low_vram = bool(low_memory_mode or getattr(tts, "low_vram", False))
 
@@ -550,11 +553,15 @@ def run_generation_request(
             normalized_lora_path != str(getattr(tts, "_lora_path", ""))
             or float(lora_strength) != float(getattr(tts, "_lora_strength", 1.0))
             or lora_merge_into_base != bool(getattr(tts, "_lora_merged", False))
+            or decoder_adapter != str(getattr(getattr(tts, "runtime", None), "decoder_adapter", "auto") or "auto")
+            or decoder_adapter_strength != float(getattr(getattr(tts, "runtime", None), "decoder_adapter_strength", 1.0))
         ):
             tts.set_lora(
                 lora_path,
                 lora_strength,
                 merge_into_base=lora_merge_into_base,
+                decoder_adapter=decoder_adapter,
+                decoder_strength=decoder_adapter_strength,
             )
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
         subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []

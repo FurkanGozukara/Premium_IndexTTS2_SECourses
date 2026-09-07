@@ -243,6 +243,16 @@ def _file_label(checkpoint: GridCheckpoint) -> tuple[str, str]:
         return _safe_name(checkpoint.label or stem, "final"), "final"
 
 
+def _grid_decoder_choice(runtime: Mapping[str, Any]) -> str:
+    """The voice decoder adapter choice of a grid runtime; older grid configs carry a boolean switch."""
+    choice = runtime.get("decoder_adapter")
+    if choice not in (None, ""):
+        return str(choice)
+    if runtime.get("decoder_adapter_path"):
+        return str(runtime["decoder_adapter_path"])
+    return "auto" if bool(runtime.get("use_decoder_adapter", True)) else "none"
+
+
 def build_grid_cells(config: GridConfig | Mapping[str, Any]) -> list[GridCell]:
     cfg = GridConfig.from_dict(config)
     cells: list[GridCell] = []
@@ -429,6 +439,8 @@ def _request_for_cell(
         "lora_path": cell.checkpoint_path,
         "lora_strength": cell.strength,
         "lora_merge_into_base": False,
+        "decoder_adapter": _grid_decoder_choice(runtime.get("runtime") if isinstance(runtime.get("runtime"), Mapping) else runtime),
+        "decoder_adapter_strength": float((runtime.get("runtime") if isinstance(runtime.get("runtime"), Mapping) else runtime).get("decoder_adapter_strength", 1.0) or 1.0),
         "num_candidates": 1,
         "audio_tuning_preset": "bypass",
         "audio_tuning_overrides": {},

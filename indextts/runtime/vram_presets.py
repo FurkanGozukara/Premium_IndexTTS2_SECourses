@@ -42,6 +42,11 @@ class RuntimeConfig:
     lora_path: str = ""
     lora_strength: float = 1.0
     lora_merge_into_base: bool = False
+    # Voice decoder adapter choice: "auto" (the file saved with the selected LoRA / DoRA), "none", or an
+    # explicit decoder adapter file.
+    decoder_adapter: str = "auto"
+    # Strength of the voice decoder adapter, independent of the GPT adapter's strength.
+    decoder_adapter_strength: float = 1.0
     max_section_batch_size_hint: int = 8
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +85,12 @@ class RuntimeConfig:
                 raw["gpt_dtype"] = "bf16"
             elif "use_bf16" in raw:
                 raw["gpt_dtype"] = "fp32"
+        if "decoder_adapter" not in raw:
+            # Earlier builds stored a boolean switch and, briefly, a separate explicit path.
+            if raw.get("decoder_adapter_path"):
+                raw["decoder_adapter"] = str(raw["decoder_adapter_path"])
+            elif "use_decoder_adapter" in raw:
+                raw["decoder_adapter"] = "auto" if _as_bool(raw["use_decoder_adapter"], True) else "none"
 
         allowed = {item.name for item in fields(cls)}
         kwargs = {key: deepcopy(item) for key, item in raw.items() if key in allowed}
@@ -134,6 +145,10 @@ class RuntimeConfig:
         self.lora_path = str(self.lora_path or "")
         self.lora_strength = _clamp_float(self.lora_strength, 0.0, 4.0, 1.0)
         self.lora_merge_into_base = _as_bool(self.lora_merge_into_base, False)
+        choice = str(self.decoder_adapter or "auto").strip()
+        self.decoder_adapter = choice.lower() if choice.lower() in {"auto", "none", ""} else choice
+        self.decoder_adapter = self.decoder_adapter or "auto"
+        self.decoder_adapter_strength = _clamp_float(self.decoder_adapter_strength, 0.0, 4.0, 1.0)
         self.max_section_batch_size_hint = _clamp_int(self.max_section_batch_size_hint, 1, 64, 8)
         return self
 
