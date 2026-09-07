@@ -45,6 +45,8 @@ Validation loss checks sentences the LoRA / DoRA never saw during training, and 
 
 After training, the app analyzes the log and recommends the checkpoint with the lowest end-of-epoch validation loss. Use **Checkpoint Grid** to compare that checkpoint with **Base model (no LoRA / DoRA)**, the final file, other saved epochs, and optional strength values. Keep the text, reference, and seed fixed, then listen down the rows. A measured checkpoint evaluation can add unseen-text and training-text accuracy to the verdict before you generate the grid.
 
+The automatic speech comparison report also lists **Pause time vs real** for each candidate: the generated clips' internal pause time divided by the real recordings' on the same sentences. 1.00 matches the person, above 1 pauses longer, below 1 rushes between sentences. Listeners often prefer slightly longer pauses than a fast narrator takes, so treat it as a description, not a score; it does not change the recommendation.
+
 The **Base model (no LoRA / DoRA)** row is a plain voice clone: only the reference audio shapes the voice. Its verdict is **Reference-only baseline (no LoRA / DoRA)** and it has no strength value.
 
 For **Evaluation references**, **Same as training validation** reuses the run's validation setting, **self** conditions each validation clip on itself, and **other (inference-like: a different clip of the same speaker)** measures the more realistic different-clip workflow.

@@ -21,15 +21,20 @@ from indextts.runtime import ProgressReporter
 from indextts.training.dataset_manifest import atomic_write_json
 from indextts.training.dataset_quality import normalized_words, word_error_counts
 from indextts.training.features import FeatureCacheConfig, _FeatureModels, _load_audio_16k
+from indextts.training.speech_metrics import internal_pause_metrics
 from indextts.training.whisper_asr import _ensure_model
 
 
 def summarize(rows: list[dict]) -> dict:
     result = {"clips": len(rows), "corpus_wer": sum(row["word_errors"] for row in rows) / max(1, sum(row["words"] for row in rows)),
               "mean_wer": float(np.mean([row["wer"] for row in rows]))}
-    for key in ("speaker_similarity", "style_similarity_real", "style_similarity_reference", "words_per_s", "rate_ratio_vs_real", "f0_median_hz"):
+    for key in ("speaker_similarity", "style_similarity_real", "style_similarity_reference", "words_per_s", "rate_ratio_vs_real", "f0_median_hz",
+                "pause_time_fraction"):
         values = [row[key] for row in rows if row.get(key) is not None]
         result[key] = float(np.mean(values)) if values else None
+    # Total pause time over the matched sentences, generated against real.
+    paired = [(row["pause_s"], row["real_pause_s"]) for row in rows if row.get("pause_s") is not None and row.get("real_pause_s")]
+    result["pause_ratio_vs_real"] = (sum(g for g, _ in paired) / sum(r for _, r in paired)) if paired and sum(r for _, r in paired) > 0 else None
     ratios = [row["duration_ratio_vs_real"] for row in rows if row.get("duration_ratio_vs_real") is not None]
     result["paired_duration_ratio_median"] = float(np.median(ratios)) if ratios else None
     return result
@@ -72,7 +77,8 @@ def main() -> None:
         pitch = f0[voiced & np.isfinite(f0)]
         features[path] = {"speaker": torch.nn.functional.normalize(speaker, dim=0),
                           "style": torch.nn.functional.normalize(style, dim=0),
-                          "duration_s": duration, "f0_median_hz": float(np.median(pitch)) if len(pitch) else None}
+                          "duration_s": duration, "f0_median_hz": float(np.median(pitch)) if len(pitch) else None,
+                          "pauses": internal_pause_metrics(wave.numpy(), 16000)}
         print(f"Measured embeddings/pitch {index+1}/{len(paths)}", flush=True)
     del models
     gc.collect()
@@ -99,12 +105,17 @@ def main() -> None:
         row = {"audio": path, "text": text, "asr_text": transcriptions[path], "word_errors": errors, "words": words,
                "wer": errors / max(1, words), "duration_s": feature["duration_s"], "words_per_s": words / feature["duration_s"],
                "speaker_similarity": float(torch.dot(feature["speaker"], ref["speaker"])),
-               "style_similarity_reference": float(torch.dot(feature["style"], ref["style"])), "f0_median_hz": feature["f0_median_hz"]}
+               "style_similarity_reference": float(torch.dot(feature["style"], ref["style"])), "f0_median_hz": feature["f0_median_hz"],
+               "pause_time_fraction": feature["pauses"]["pause_time_fraction"], "pause_count": feature["pauses"]["pause_count"],
+               "longest_pause_ms": feature["pauses"]["longest_pause_ms"], "pause_s": feature["pauses"]["pause_s"]}
         if real_path:
             real = features[str(Path(real_path).resolve())]
             row.update(style_similarity_real=float(torch.dot(feature["style"], real["style"])),
                        duration_ratio_vs_real=feature["duration_s"] / real["duration_s"],
-                       rate_ratio_vs_real=real["duration_s"] / feature["duration_s"])
+                       rate_ratio_vs_real=real["duration_s"] / feature["duration_s"],
+                       real_pause_s=real["pauses"]["pause_s"],
+                       # Above 1.0 the voice pauses longer than the person did on the same sentence; below 1.0 it rushes.
+                       pause_ratio_vs_real=(feature["pauses"]["pause_s"] / real["pauses"]["pause_s"]) if real["pauses"]["pause_s"] else None)
         return row
 
     measured = []

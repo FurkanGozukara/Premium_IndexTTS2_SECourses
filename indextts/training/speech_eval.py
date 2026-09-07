@@ -60,13 +60,15 @@ def report_markdown(report: dict[str, Any]) -> str:
     heading = "Frozen selection on final test" if report.get("final_test") else "Speech recommendation"
     real_metric = report.get("speaker_metric") == "speaker_similarity_real"
     lines = [f"**{heading}: {report['recommended_label']}**", report["scope"], "",
-             "| Candidate | Mean transcript error | Worst clip | Speaker similarity vs real | Speaker similarity vs reference | Flagged clips | Eligible |",
-             "|---|---:|---:|---:|---:|---:|---|"]
+             "| Candidate | Mean transcript error | Worst clip | Speaker similarity vs real | Speaker similarity vs reference | Pause time vs real | Flagged clips | Eligible |",
+             "|---|---:|---:|---:|---:|---:|---:|---|"]
     for row in report["candidates"]:
         speaker = f"{row['speaker_similarity']:.3f}" if row.get("speaker_similarity") is not None else "unavailable"
         speaker_real = f"{row['speaker_similarity_real']:.3f}" if row.get("speaker_similarity_real") is not None else "unavailable"
-        lines.append(f"| {row['label']} | {row['mean_error_rate']:.1%} | {row['worst_error_rate']:.1%} | {speaker_real} | {speaker} | {row['failure_count']}/{row['clips']} | {'yes' if row['eligible'] else 'no'} |")
+        pause = f"{row['pause_ratio_vs_real']:.2f}" if row.get("pause_ratio_vs_real") is not None else "unavailable"
+        lines.append(f"| {row['label']} | {row['mean_error_rate']:.1%} | {row['worst_error_rate']:.1%} | {speaker_real} | {speaker} | {pause} | {row['failure_count']}/{row['clips']} | {'yes' if row['eligible'] else 'no'} |")
     lines.extend(["", report["decision"], "Transcript error uses words for EN/ES/AR and characters for ZH/JA; the dataset's own spellings of names and terms are accepted.",
+                  "Pause time vs real divides the generated clips' internal pause time (silences of at least 120 ms between words and sentences) by the real recordings' on the same sentences: 1.00 matches the person, above 1 pauses longer, below 1 rushes. Shown for information; it does not affect selection.",
                   ("The speaker guard compares each generated sentence with the real recording of that sentence, the speaker's actual identity; "
                    "similarity to the single reference clip rewards copying that prompt and is shown for information.") if real_metric else
                   "Too few matched real recordings for a real-recording speaker comparison; the guard uses similarity to the reference clip."])

@@ -44,6 +44,12 @@ LENIENT_TERM_RATIO = 0.45
 EDGE_SUBSTITUTION_RATIO = 0.6
 # Matched real recordings needed before speaker similarity is judged against them.
 MIN_REAL_SPEAKER_ROWS = 4
+# Internal pauses: quiet stretches at least this long between words or sentences.
+PAUSE_HOP_MS = 10
+MIN_PAUSE_MS = 120
+PAUSE_THRESHOLD_DBFS = -40.0
+PAUSE_RELATIVE_DB = 25.0
+PAUSE_NO_SIGNAL_DBFS = -80.0
 
 
 def _currency(match: re.Match) -> str:
@@ -63,6 +69,42 @@ def _english_spoken_form(text: str) -> str:
     text = _UNIT_RE.sub(lambda m: f"{m.group(1)} {_UNITS[m.group(2)]}", text)
     text = _DECIMAL_RE.sub(r"\1 point \2", text)
     return _CONTRACTION_RE.sub(lambda match: _ENGLISH_CONTRACTIONS.get(match.group(0), match.group(0)), text)
+
+
+def internal_pause_metrics(samples: Any, sample_rate: int) -> dict[str, Any]:
+    """Time spent in pauses inside a clip: total, count, and the longest run.
+
+    Leading and trailing quiet audio is excluded, so the numbers describe the
+    silences between words and sentences. A frame is quiet below
+    ``PAUSE_THRESHOLD_DBFS``; in a recording quieter than that, it must be
+    ``PAUSE_RELATIVE_DB`` under the loudest frame, so a quiet recording is not
+    measured as one long pause. A clip with no signal has no pauses.
+    Compared with the real recording of the same sentence, this shows whether a
+    voice rushes between sentences or lingers longer than the person does.
+    """
+    array = np.asarray(samples, dtype=np.float32).reshape(-1)
+    hop = max(1, int(round(sample_rate * PAUSE_HOP_MS / 1000)))
+    frames = len(array) // hop
+    empty = {"speech_span_s": 0.0, "pause_s": 0.0, "pause_time_fraction": None, "pause_count": 0, "longest_pause_ms": 0}
+    if frames == 0:
+        return empty
+    rms = np.sqrt(np.mean(np.square(array[:frames * hop]).reshape(frames, hop), axis=1) + 1e-12)
+    level = 20.0 * np.log10(rms)
+    loudest = float(level.max())
+    if loudest < PAUSE_NO_SIGNAL_DBFS:
+        return empty
+    quiet = level < min(PAUSE_THRESHOLD_DBFS, loudest - PAUSE_RELATIVE_DB)
+    loud = np.flatnonzero(~quiet)
+    if len(loud) == 0:
+        return empty
+    inner = quiet[loud[0]:loud[-1] + 1]
+    edges = np.diff(np.pad(inner.astype(np.int8), (1, 1)))
+    runs = [(end - start) * PAUSE_HOP_MS for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
+            if (end - start) * PAUSE_HOP_MS >= MIN_PAUSE_MS]
+    span = len(inner) * PAUSE_HOP_MS / 1000.0
+    pause = sum(runs) / 1000.0
+    return {"speech_span_s": span, "pause_s": pause, "pause_time_fraction": pause / span if span else None,
+            "pause_count": len(runs), "longest_pause_ms": int(max(runs)) if runs else 0}
 
 
 def transcript_units(text: str, language: str) -> list[str]:
@@ -201,12 +243,22 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def mean(key: str) -> float | None:
         values = [float(row[key]) for row in rows if row.get(key) is not None]
         return float(np.mean(values)) if values else None
+
+    def pause_ratio() -> float | None:
+        # Total pause time over the matched sentences, generated against real; a
+        # per-clip mean would be dominated by sentences the person spoke without a pause.
+        paired = [(float(row["pause_s"]), float(row["real_pause_s"])) for row in rows
+                  if row.get("pause_s") is not None and row.get("real_pause_s")]
+        if paired and sum(real for _, real in paired) > 0:
+            return sum(generated for generated, _ in paired) / sum(real for _, real in paired)
+        return mean("pause_ratio_vs_real")
     return {"clips": len(rows), "mean_error_rate": mean("error_rate"),
             "corpus_error_rate": sum(row["errors"] for row in rows) / sum(row["units"] for row in rows),
             "worst_error_rate": max(row["error_rate"] for row in rows),
             "speaker_similarity": mean("speaker_similarity"), "speaker_similarity_real": mean("speaker_similarity_real"),
             "style_similarity_real": mean("style_similarity_real"),
             "duration_ratio_vs_real": mean("duration_ratio_vs_real"),
+            "pause_time_fraction": mean("pause_time_fraction"), "pause_ratio_vs_real": pause_ratio(),
             "failure_count": sum(bool(row["invalid_audio"] or row["possible_truncation"] or row["possible_repetition"]) for row in rows),
             "edge_mismatch_count": sum(not row["start_matches"] or not row["end_matches"] for row in rows),
             "invalid_audio_count": sum(bool(row["invalid_audio"]) for row in rows)}
@@ -319,8 +371,9 @@ def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: 
         wave, duration = _load_audio_16k(Path(path))
         array = wave.numpy()
         invalid = not np.isfinite(array).all() or duration < 0.25 or float(np.sqrt(np.mean(np.square(array)))) < 1e-5
-        entry = {"duration_s": duration, "invalid_audio": invalid, "speaker": None, "style": None}
+        entry = {"duration_s": duration, "invalid_audio": invalid, "speaker": None, "style": None, "pauses": None}
         if not invalid:
+            entry["pauses"] = internal_pause_metrics(array, 16000)
             length = min(wave.shape[-1], 20 * 16000)
             starts = sorted(set([0, (wave.shape[-1] - length) // 2, wave.shape[-1] - length]))
             speakers, styles = [], []
@@ -374,10 +427,20 @@ def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: 
         row = {**clip, **transcript_metrics(clip["text"], text, clip["language"], lenient_terms=lenient), "asr_text": text,
                "duration_s": feature["duration_s"], "invalid_audio": feature["invalid_audio"],
                "speaker_similarity": similarity(feature, ref, "speaker"), "speaker_similarity_real": None}
+        pauses = feature.get("pauses") or {}
+        row.update(pause_time_fraction=pauses.get("pause_time_fraction"), pause_count=pauses.get("pause_count"),
+                   longest_pause_ms=pauses.get("longest_pause_ms"), pause_s=pauses.get("pause_s"),
+                   real_pause_s=None, pause_ratio_vs_real=None)
         if clip.get("real_audio"):
             real = features[clip["real_audio"]]
+            real_pauses = real.get("pauses") or {}
             row.update(style_similarity_real=similarity(feature, real, "style"),
                        speaker_similarity_real=similarity(feature, real, "speaker"),
                        duration_ratio_vs_real=feature["duration_s"] / max(0.001, real["duration_s"]))
+            if real_pauses.get("pause_s") is not None:
+                row["real_pause_s"] = float(real_pauses["pause_s"])
+            if real_pauses.get("pause_s"):
+                # Above 1.0 the voice pauses longer than the person did on the same sentence; below 1.0 it rushes.
+                row["pause_ratio_vs_real"] = float(pauses.get("pause_s", 0.0)) / float(real_pauses["pause_s"])
         measured.append(row)
     return measured

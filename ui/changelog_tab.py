@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.7",
+        "2026-09-07",
+        """
+### Pause measurement in speech comparisons, and a measured V8 training pass
+
+- Speech comparison reports and the grid measurement tool now show **Pause time vs real**: the generated clips' internal pause time (silences of at least 120 ms between words and sentences, clip edges excluded) divided by the real recordings' on the same sentences. 1.00 matches the person, above 1 pauses longer, below 1 rushes. It is shown for information and does not change which checkpoint is selected. It was added because a blind listening test preferred the V6 adapter over V7 in 26 of 36 comparisons while every existing proxy favored V7; measured, V7 matched the narrator's pauses (median ratio 0.84) and V6 paused 45 percent longer, and the listener preferred the longer pauses.
+- A V8 adapter was trained with the complete v6.6 preparation and audit (whole file names such as "update.bat", relaxed edge rule, spoken-form normalization, whisper-large-v3 second opinion) and the single-sentence share at 0, so only the data changed against V6. Measured on the same 12 held-out sentences as the V6 and V7 adapters, V8 gained 17 percent more training audio but landed on V6's numbers for identity, pitch, pace and pauses and slightly behind it on strict word error; a blind listener preferred V6 over V8 in 22 of 36 comparisons and V8 over V7 in 20 of 36. V6 remains the recommended adapter for that voice, the audit improvements stay because they keep clean speech, and the single-sentence share stays at 0.
+- The training guide, README, and help text describe the new column. `V8_TRAINING_REPORT_2026-09-07.md` contains the full comparison.
+
+Restart after updating. Existing adapters, datasets, and saved reports remain compatible; older reports simply have no pause column.
+""".strip(),
+    ),
+    (
         "v6.6",
         "2026-09-07",
         """
