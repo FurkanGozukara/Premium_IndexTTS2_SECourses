@@ -106,7 +106,22 @@ Without the decoder adapter the median-matched reference raises similarity to th
 
 That overshoot has a cause that the benchmark cannot remove: V8's GPT adapter was trained with the old clip as its conditioning reference, so a different reference at inference is out of its training distribution. The measurement that matters is a training that uses the median-matched clip throughout, which the V9 run does; its comparison against V8, each with its own reference, calibrated rate, decoder adapter, and decoding settings, is reported below.
 
-V9_PLACEHOLDER
+See the V9 comparison in the real-user section below.
+
+## Real-user run of v6.9 in Chrome: the V9 training
+
+With every new option at its default, a training was started from the browser exactly as a user would: dataset `furkan_v8_curated_20s`, name `Furkan_EN_DoRA_r128_v9`, nothing else touched. The run chose `qwen_fine_tuning_0185` (143 Hz, 2.67 words per second) as its reference for training conditioning, the speech benchmark, and the saved recommended reference; stopped the GPT phase early at update 13,750 (epoch 7, best validation loss 4.8325); recommended the epoch-6 checkpoint on the speech benchmark (mean transcript error 1.5 percent against Base's 1.2 percent, speaker similarity to the real recordings 0.855 against Base's 0.834, the final epoch-7 file rejected for a 3.3 percent error); calibrated the speaking rate to 1.066 from the matched sentences; trained its decoder adapter (re-rendered identity 0.885 to 0.949, early stop at update 13,500, best at 11,000) and installed it after the full-pipeline gate (similarity +0.031 with a 95 percent interval of +0.020 to +0.043, word error +0.6 points, strength 1.0 over 0.6); and swept decoding, adopting guidance rate 1.0 (word error -0.37 points, similarity -0.005, score +0.0097) while keeping temperature 0.8 and 3 beams. Selecting that checkpoint in Voice Generation set the decoder adapter, its strength, the speaking rate, and the swept settings automatically, loaded the run's reference, and a generation with all of them active came back clean: Gemini heard every word, rated pronunciation 5, audio quality 5, naturalness 4, no artifacts.
+
+Two things went wrong on the way and were fixed. The LoRA list offered the decoder adapter file as if it were a GPT adapter (the engine would have refused it); the scanner now skips `*.s2mel.safetensors`. And a generation failed with an import error because a parallel Codex session had integrated its quality fixes into the checkout while the app was running, so the process held an old copy of one module and a new copy of another; restarting the app cleared it, and the combined tree passes 567 tests.
+
+The V9 run itself is the fair test of the median-matched reference, because its GPT adapter was trained, benchmarked, and calibrated with that clip. V9 and V8 were compared as the app deploys each of them (own recommended reference, own calibrated speaking rate, own installed decoder adapter at strength 1.0, V9's adopted guidance rate 1.0) on the 12 `qwen_2511_tutorial` sentences with three seeds:
+
+| As deployed | Word error rate | Speaker similarity to real | to the reference clip | Style similarity to real | Median pitch | Pace vs real | Pause time vs real |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| V8: nearest-15-second reference (119 Hz), rate 1.105, decoder adapter | 4.42% | 0.9008 | 0.8375 | 0.877 | 145 Hz | 1.024 | 1.10 |
+| V9: median-matched reference (143 Hz), rate 1.066, decoder adapter, guidance 1.0 | 3.47% | 0.8932 | 0.8970 | 0.867 | 144 Hz | 1.014 | 1.07 |
+
+The two are within noise of each other on identity (-0.008, V9 better in 14 of 36) and V9 is a point better on word error with pace and pauses slightly closer to the recordings; both sit at the speaker's median pitch. The path-blind listening test preferred V9 in 19 of 36 pairs and V8 in 17, with timbre 17 to 14 for V8 and 5 ties, pronunciation 4.86 against 4.81, audio quality 4.50 against 4.47, and artifacts noted in 18 V9 clips against 22. Read together with the V8 swap test above: the median-matched reference does not overshoot when the GPT adapter is trained with it, it removes the low-pitched baseline that the old rule produced by accident, and the run that used it end to end is at least as good as the best run trained the old way while being fully automatic. The option stays on by default.
 
 ## What the trainer now does
 
