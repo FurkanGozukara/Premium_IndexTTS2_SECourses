@@ -2,50 +2,197 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 import gc
 import math
 from pathlib import Path
+import re
 import unicodedata
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
 
 LANGUAGES = {"EN": "english", "ZH": "chinese", "JA": "japanese", "AR": "arabic", "ES": "spanish"}
 
+# Spoken forms that subtitles and ASR write differently. Both sides receive the
+# same expansion, so these never count as transcript errors.
+_ENGLISH_CONTRACTIONS = {
+    "i'm": "i am", "it's": "it is", "that's": "that is", "there's": "there is", "here's": "here is",
+    "what's": "what is", "let's": "let us", "don't": "do not", "doesn't": "does not", "didn't": "did not",
+    "can't": "cannot", "won't": "will not", "isn't": "is not", "aren't": "are not", "wasn't": "was not",
+    "weren't": "were not", "haven't": "have not", "hasn't": "has not", "hadn't": "had not",
+    "wouldn't": "would not", "couldn't": "could not", "shouldn't": "should not",
+    "you're": "you are", "we're": "we are", "they're": "they are",
+    "i'll": "i will", "you'll": "you will", "we'll": "we will", "it'll": "it will", "they'll": "they will",
+    "i've": "i have", "you've": "you have", "we've": "we have", "they've": "they have",
+    "i'd": "i would", "you'd": "you would", "we'd": "we would", "they'd": "they would",
+    "gonna": "going to", "wanna": "want to", "ok": "okay",
+}
+_APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "`": "'"})
+_CONTRACTION_RE = re.compile(r"\b[a-z]+(?:'[a-z]+)?\b")
+_UNITS = {"gb": "gigabytes", "mb": "megabytes", "kb": "kilobytes", "tb": "terabytes", "ghz": "gigahertz", "mhz": "megahertz",
+          "khz": "kilohertz", "ms": "milliseconds"}
+_UNIT_RE = re.compile(r"(\d)\s*(gb|mb|kb|tb|ghz|mhz|khz|ms)\b")
+_CURRENCY_RE = re.compile(r"\$\s*(\d+)(?:\.(\d{1,2}))?")
+_DECIMAL_RE = re.compile(r"(\d)\.(\d)")
+# A substituted project term still counts as agreement when the recognizer's
+# spelling shares at least this much of the reference spelling.
+LENIENT_TERM_RATIO = 0.45
+# An edge word that is replaced by a similar-looking word or split into pieces
+# is transcript noise; a missing or extra edge word is a real boundary problem.
+EDGE_SUBSTITUTION_RATIO = 0.6
+# Matched real recordings needed before speaker similarity is judged against them.
+MIN_REAL_SPEAKER_ROWS = 4
+
+
+def _currency(match: re.Match) -> str:
+    dollars, cents = int(match.group(1)), match.group(2)
+    cents_value = int(cents.ljust(2, "0")) if cents else 0
+    parts = []
+    if dollars or not cents_value:
+        parts.append(f"{dollars} dollar" + ("" if dollars == 1 else "s"))
+    if cents_value:
+        parts.append(f"{cents_value} cent" + ("" if cents_value == 1 else "s"))
+    return " " + " ".join(parts) + " "
+
+
+def _english_spoken_form(text: str) -> str:
+    text = text.translate(_APOSTROPHES).replace("%", " percent ")
+    text = _CURRENCY_RE.sub(_currency, text)
+    text = _UNIT_RE.sub(lambda m: f"{m.group(1)} {_UNITS[m.group(2)]}", text)
+    text = _DECIMAL_RE.sub(r"\1 point \2", text)
+    return _CONTRACTION_RE.sub(lambda match: _ENGLISH_CONTRACTIONS.get(match.group(0), match.group(0)), text)
+
 
 def transcript_units(text: str, language: str) -> list[str]:
     text = unicodedata.normalize("NFKC", text).casefold()
     if language == "EN":
         from .dataset_quality import normalized_words
-        return normalized_words(text)
+        return normalized_words(_english_spoken_form(text))
     text = "".join(" " if unicodedata.category(c)[0] in {"P", "S"} else c for c in text)
     if language in {"ZH", "JA"}:
         return [c for c in text if not c.isspace()]
     return text.split()
 
 
-def transcript_metrics(reference: str, hypothesis: str, language: str) -> dict[str, Any]:
+def lenient_units(terms: Iterable[str], language: str) -> frozenset[str]:
+    """Normalized units of transcript vocabulary whose ASR spellings may be forgiven."""
+    units: set[str] = set()
+    for term in terms:
+        if str(term).strip().isdigit():
+            continue  # Numbers are ordinary vocabulary, not project spellings.
+        units.update(transcript_units(str(term), language))
+    return frozenset(units)
+
+
+def _alignment_blocks(ref: list[str], hyp: list[str]) -> list[tuple[list[str], list[str], bool, int]]:
+    """Minimal edit alignment grouped into (reference, hypothesis, equal, operations) blocks."""
+    n, m = len(ref), len(hyp)
+    cost = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        cost[i][0] = i
+    for j in range(1, m + 1):
+        cost[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost[i][j] = min(cost[i - 1][j] + 1, cost[i][j - 1] + 1, cost[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]))
+    ops: list[tuple[str, str | None, str | None]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and cost[i][j] == cost[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]):
+            ops.append(("equal" if ref[i - 1] == hyp[j - 1] else "sub", ref[i - 1], hyp[j - 1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and cost[i][j] == cost[i - 1][j] + 1:
+            ops.append(("del", ref[i - 1], None))
+            i -= 1
+        else:
+            ops.append(("ins", None, hyp[j - 1]))
+            j -= 1
+    ops.reverse()
+    blocks: list[tuple[list[str], list[str], bool, int]] = []
+    for tag, r, h in ops:
+        if tag == "equal":
+            blocks.append(([r], [h], True, 0))
+            continue
+        if blocks and not blocks[-1][2]:
+            r_seg, h_seg, _, count = blocks[-1]
+            blocks[-1] = (r_seg + ([r] if r is not None else []), h_seg + ([h] if h is not None else []), False, count + 1)
+        else:
+            blocks.append(([r] if r is not None else [], [h] if h is not None else [], False, 1))
+    return blocks
+
+
+def _block_status(r_seg: list[str], h_seg: list[str], equal: bool, lenient: frozenset[str] | None) -> str:
+    if equal:
+        return "equal"
+    if r_seg and h_seg and "".join(r_seg) == "".join(h_seg):
+        return "equal"  # "Swarm UI" and "SwarmUI" are one spoken word.
+    if lenient and r_seg and h_seg and all(unit in lenient for unit in r_seg):
+        if SequenceMatcher(None, "".join(r_seg), "".join(h_seg)).ratio() >= LENIENT_TERM_RATIO:
+            return "forgiven"
+    return "error"
+
+
+def _edge_substitution(r_seg: list[str], h_seg: list[str]) -> bool:
+    """A recognizer word replaced by a similar word or split into pieces, not a missing or extra word."""
+    if not r_seg or not h_seg:
+        return False
+    if len(r_seg) == len(h_seg):
+        return True
+    return SequenceMatcher(None, "".join(r_seg), "".join(h_seg)).ratio() >= EDGE_SUBSTITUTION_RATIO
+
+
+def _edge_matches(blocks: list[tuple[list[str], list[str], bool, int]], statuses: list[str], edge: int, *, from_end: bool) -> bool:
+    """Both edges must keep every reference word.
+
+    Missing or extra words at an edge fail: they indicate a cut or extra speech
+    the transcript does not contain. A substituted edge word still counts as an
+    error in the error rate, but the acoustic edge check guards against cuts, so
+    it does not by itself reject the clip.
+    """
+    consumed = 0
+    order = range(len(blocks) - 1, -1, -1) if from_end else range(len(blocks))
+    for index in order:
+        r_seg, h_seg, _, _ = blocks[index]
+        if statuses[index] == "error" and not _edge_substitution(r_seg, h_seg):
+            return False
+        consumed += len(r_seg)
+        if consumed >= edge:
+            return True
+    return consumed >= edge
+
+
+def transcript_metrics(reference: str, hypothesis: str, language: str, *,
+                       lenient_terms: Iterable[str] | None = None) -> dict[str, Any]:
+    """Compare a transcript with recognized speech.
+
+    ``lenient_terms`` holds normalized units (see :func:`lenient_units`) of the
+    speaker's own spellings, such as product names. A recognizer that spells one
+    of them differently does not produce an error; missing, extra, or otherwise
+    different words still do.
+    """
     ref, hyp = transcript_units(reference, language), transcript_units(hypothesis, language)
     if not ref:
         raise ValueError("Speech evaluation text contains no scoreable units")
-    distances = list(range(len(hyp) + 1))
-    for i, a in enumerate(ref, 1):
-        previous, distances = distances, [i] + [0] * len(hyp)
-        for j, b in enumerate(hyp, 1):
-            distances[j] = min(previous[j] + 1, distances[j - 1] + 1, previous[j - 1] + (a != b))
+    lenient = frozenset(lenient_terms) if lenient_terms else None
+    blocks = _alignment_blocks(ref, hyp)
+    statuses = [_block_status(r_seg, h_seg, equal, lenient) for r_seg, h_seg, equal, _ in blocks]
+    errors = sum(count for (_, _, _, count), status in zip(blocks, statuses) if status == "error")
+    forgiven = sum(count for (_, _, _, count), status in zip(blocks, statuses) if status == "forgiven")
     edge = min(2, len(ref))
-    end_matches = len(hyp) >= edge and ref[-edge:] == hyp[-edge:]
+    end_matches = _edge_matches(blocks, statuses, edge, from_end=True)
     n = 6 if language in {"ZH", "JA"} else 3
     def grams(units: list[str]) -> Counter:
         return Counter(tuple(units[i:i+n]) for i in range(len(units)-n+1))
     expected, observed = grams(ref), grams(hyp)
     repetition = any(count >= max(3, expected[gram] + 2) for gram, count in observed.items())
-    return {"errors": distances[-1], "units": len(ref), "error_rate": distances[-1] / len(ref),
+    return {"errors": errors, "units": len(ref), "error_rate": errors / len(ref),
             "error_unit": "character" if language in {"ZH", "JA"} else "word",
-            "start_matches": len(hyp) >= edge and ref[:edge] == hyp[:edge], "end_matches": end_matches,
+            "start_matches": _edge_matches(blocks, statuses, edge, from_end=False), "end_matches": end_matches,
             "possible_truncation": len(hyp) < 0.6 * len(ref) and not end_matches,
-            "possible_repetition": repetition}
+            "possible_repetition": repetition, "forgiven_units": forgiven}
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -57,7 +204,8 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"clips": len(rows), "mean_error_rate": mean("error_rate"),
             "corpus_error_rate": sum(row["errors"] for row in rows) / sum(row["units"] for row in rows),
             "worst_error_rate": max(row["error_rate"] for row in rows),
-            "speaker_similarity": mean("speaker_similarity"), "style_similarity_real": mean("style_similarity_real"),
+            "speaker_similarity": mean("speaker_similarity"), "speaker_similarity_real": mean("speaker_similarity_real"),
+            "style_similarity_real": mean("style_similarity_real"),
             "duration_ratio_vs_real": mean("duration_ratio_vs_real"),
             "failure_count": sum(bool(row["invalid_audio"] or row["possible_truncation"] or row["possible_repetition"]) for row in rows),
             "edge_mismatch_count": sum(not row["start_matches"] or not row["end_matches"] for row in rows),
@@ -98,12 +246,20 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
     base = summarize(base_rows)
     if base["invalid_audio_count"] == base["clips"]:
         raise ValueError("Base produced no valid audio; the speech benchmark cannot make a reliable recommendation")
+    # Similarity to the reference clip rewards copying that one prompt; similarity
+    # to the real recording of the same sentence measures the speaker's identity.
+    # Prefer the latter whenever enough matched real recordings exist.
+    speaker_metric = "speaker_similarity"
+    if sum(row.get("speaker_similarity_real") is not None for row in base_rows) >= MIN_REAL_SPEAKER_ROWS and all(
+            sum(row.get("speaker_similarity_real") is not None for row in grouped[c["label"]]) >= MIN_REAL_SPEAKER_ROWS
+            for c in candidates):
+        speaker_metric = "speaker_similarity_real"
     results = []
     for candidate in candidates:
         measured = grouped[candidate["label"]]
         summary = summarize(measured)
         delta = paired_difference(measured, base_rows, "error_rate")
-        speaker = paired_difference(measured, base_rows, "speaker_similarity")
+        speaker = paired_difference(measured, base_rows, speaker_metric)
         reasons = []
         if candidate["path"]:
             if delta["mean"] > float(policy["max_wer_increase"]):
@@ -112,7 +268,7 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
                 reasons.append("speaker similarity falls below the allowed Base margin")
             if summary["failure_count"] > base["failure_count"]:
                 reasons.append("more invalid, possibly truncated, or repetitive clips than Base")
-        results.append({**candidate, **summary, "error_delta_vs_base": delta,
+        results.append({**candidate, **summary, "error_delta_vs_base": delta, "speaker_metric": speaker_metric,
                         "speaker_delta_vs_base": speaker, "eligible": not reasons, "rejection_reasons": reasons})
     eligible = [r for r in results if r["eligible"]]
     lowest = min(eligible, key=lambda r: r["mean_error_rate"])
@@ -124,17 +280,24 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
             comparable.append(item)
     best = min(comparable, key=lambda r: (float(r.get("val_loss") if r.get("val_loss") is not None else float("inf")),
                                           r["mean_error_rate"], r["label"]))
+    speaker_note = ("speaker similarity is measured against the real recording of each sentence"
+                    if speaker_metric == "speaker_similarity_real" else "speaker similarity is measured against the reference clip")
     return {"status": "complete", "recommended_kind": "adapter" if best["path"] else "base",
             "recommended_checkpoint": best["path"], "recommended_label": best["label"],
-            "candidates": results, "listening_status": "not_rated",
-            "decision": "Observed Base regression guards, then paired transcript comparison; validation loss breaks unresolved ties.",
+            "candidates": results, "listening_status": "not_rated", "speaker_metric": speaker_metric,
+            "decision": f"Observed Base regression guards ({speaker_note}), then paired transcript comparison; validation loss breaks unresolved ties.",
             "scope": "Provisional automatic recommendation for this development suite; human listening is still needed to judge naturalness."}
 
 
 def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: str, device: str,
                   output_dir: Path, update: Callable[[str, int, int], None],
-                  cancelled: Callable[[], bool]) -> list[dict[str, Any]]:
-    """Measure entire transcripts and distributed 20-second embedding windows."""
+                  cancelled: Callable[[], bool], lenient_terms: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    """Measure entire transcripts and distributed 20-second embedding windows.
+
+    ``lenient_terms`` are normalized units of the dataset's own spellings (see
+    :func:`lenient_units`); recognizer spellings of those words are not errors.
+    """
+    lenient = frozenset(lenient_terms) if lenient_terms else None
     import torch
     from transformers import pipeline
     from indextts.runtime import ProgressReporter
@@ -208,12 +371,13 @@ def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: 
             if left[key] is None or right[key] is None:
                 return None
             return float(torch.dot(left[key], right[key]))
-        row = {**clip, **transcript_metrics(clip["text"], text, clip["language"]), "asr_text": text,
+        row = {**clip, **transcript_metrics(clip["text"], text, clip["language"], lenient_terms=lenient), "asr_text": text,
                "duration_s": feature["duration_s"], "invalid_audio": feature["invalid_audio"],
-               "speaker_similarity": similarity(feature, ref, "speaker")}
+               "speaker_similarity": similarity(feature, ref, "speaker"), "speaker_similarity_real": None}
         if clip.get("real_audio"):
             real = features[clip["real_audio"]]
             row.update(style_similarity_real=similarity(feature, real, "style"),
+                       speaker_similarity_real=similarity(feature, real, "speaker"),
                        duration_ratio_vs_real=feature["duration_s"] / max(0.001, real["duration_s"]))
         measured.append(row)
     return measured

@@ -209,3 +209,37 @@ def test_lora_selection_auto_applies_and_resets_calibrated_speaking_rate(
     cleared = generation_tab.lora_selection_updates("", None, True, True)
     assert cleared[3] == 1.0
     assert "natural pace" in cleared[2]
+
+
+def test_saving_a_manual_speaking_rate_refreshes_the_adapter_summary(monkeypatch, tmp_path) -> None:
+    checkpoint = tmp_path / "voice.safetensors"
+    checkpoint.write_bytes(b"x")
+    saved: list[tuple[str, float]] = []
+
+    def fake_save(path: str, rate: float) -> SimpleNamespace:
+        if rate > 1.5:
+            raise ValueError("Speaking rate must be between 0.5 and 1.5")
+        saved.append((path, rate))
+        return SimpleNamespace(recommended_speaking_rate=round(rate, 3))
+
+    monkeypatch.setattr(generation_tab, "_lora_info", lambda _path: ("adapter info", None))
+    monkeypatch.setattr(generation_tab, "save_manual_speaking_rate", fake_save)
+
+    info, message, rate_update, field_value = generation_tab.save_lora_speaking_rate(str(checkpoint), 1.07, True)
+    assert info == "adapter info"
+    assert rate_update == 1.07 and field_value == 1.07
+    assert "Saved speaking rate 1.070" in message and "Applied" in message
+    assert saved == [(str(checkpoint), 1.07)]
+
+    _, message, _, _ = generation_tab.save_lora_speaking_rate(str(checkpoint), 1.2, False)
+    assert "Applied" not in message and saved[-1] == (str(checkpoint), 1.2)
+
+    _, message, _, _ = generation_tab.save_lora_speaking_rate(str(checkpoint), 2.0, True)
+    assert "not saved" in message and len(saved) == 2
+
+    _, message, _, _ = generation_tab.save_lora_speaking_rate("", 1.0, True)
+    assert "Select a LoRA / DoRA" in message
+
+    monkeypatch.setattr(generation_tab, "load_speaking_rate", lambda _path: SimpleNamespace(recommended_speaking_rate=0.95))
+    assert generation_tab.saved_lora_speaking_rate(str(checkpoint)) == 0.95
+    assert generation_tab.saved_lora_speaking_rate("") is None

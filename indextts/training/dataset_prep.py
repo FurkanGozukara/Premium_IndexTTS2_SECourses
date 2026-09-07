@@ -31,7 +31,7 @@ from .dataset_manifest import (
     write_manifest,
     write_preview_csv,
 )
-from .audio_boundaries import build_safe_sentence_segments
+from .audio_boundaries import PAUSE_LOOKBACK_MS, build_safe_sentence_segments
 from .media import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_SUBTITLE_EXTENSIONS,
@@ -116,6 +116,7 @@ class DatasetPrepConfig:
     snap_to_silence: bool = True
     snap_window_ms: int = 400
     min_edge_silence_ms: int = 30
+    short_clip_fraction: float = 0.0
     trim_silence: bool = True
     trim_top_db: float = 40.0
     loudness_normalize: bool = True
@@ -165,6 +166,8 @@ class DatasetPrepConfig:
             raise ValueError("min_pause_boundary_ms must be zero or positive")
         if not 0 <= self.min_edge_silence_ms <= 500:
             raise ValueError("min_edge_silence_ms must be between zero and 500")
+        if not 0.0 <= float(self.short_clip_fraction) <= 0.8:
+            raise ValueError("short_clip_fraction must be between zero and 0.8")
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if not 0 < self.min_s <= self.target_s <= self.max_s:
@@ -1592,9 +1595,11 @@ def run_dataset_prep(
         "filter_drop_counts": dict(sorted(filter_drop_counts.items())),
         "filter_keep_counts": dict(sorted(filter_keep_counts.items())),
         "audio_boundaries": {
-            "algorithm": "shared_pause_sentence_repack_v1",
+            "algorithm": "shared_pause_sentence_repack_v2",
             "applies_to": "automatically_cut_segments",
             "minimum_quiet_ms": config.min_edge_silence_ms,
+            "pause_lookback_ms": PAUSE_LOOKBACK_MS,
+            "short_clip_fraction": float(config.short_clip_fraction),
             "threshold_dbfs": config.silence_threshold_dbfs,
             "rejected_segments": len(boundary_rejections),
             "rejections": "boundary_rejections.jsonl",

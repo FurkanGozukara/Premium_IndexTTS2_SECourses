@@ -338,3 +338,72 @@ def test_old_speaking_rate_json_methods_still_load(
     assert report is not None
     assert report.method == method
     assert report.recommended_speaking_rate == 0.9
+
+
+def test_speech_report_calibration_uses_matched_sentences_of_the_recommended_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from indextts.training.speaking_rate import calibrate_from_speech_report
+
+    real = tmp_path / "real.wav"
+    _wav(real, 2.0)
+    checkpoint = tmp_path / "best.safetensors"
+    cells = []
+    for index in range(4):
+        generated = tmp_path / f"generated_{index}.wav"
+        _wav(generated, 2.2)
+        base = tmp_path / f"base_{index}.wav"
+        _wav(base, 3.0)
+        for label, audio in (("best", generated), ("Base", base)):
+            cells.append({"checkpoint": label, "kind": "matched", "audio": str(audio), "real_audio": str(real),
+                          "text": "one two three four five", "invalid_audio": False})
+    cells.append({"checkpoint": "best", "kind": "long_form", "audio": str(tmp_path / "generated_0.wav"),
+                  "real_audio": None, "text": "one two three four five", "invalid_audio": False})
+    report = {
+        "recommended_label": "best",
+        "recommended_checkpoint": str(checkpoint),
+        "candidates": [{"label": "Base", "path": ""}, {"label": "best", "path": str(checkpoint)}],
+        "cells": cells,
+    }
+
+    result = calibrate_from_speech_report(report, checkpoint)
+    assert result is not None
+    assert result.method == "speech_matched"
+    assert result.clips_used == 4
+    assert result.recommended_speaking_rate == pytest.approx(1.1, abs=0.01)
+    assert result.dataset_words_per_second == pytest.approx(2.5, abs=0.05)
+
+    # Base cannot receive an adapter pace, and too few matched sentences abstain.
+    assert calibrate_from_speech_report({**report, "recommended_label": "Base"}) is None
+    assert calibrate_from_speech_report({**report, "cells": cells[:2]}, checkpoint) is None
+
+
+def test_manual_speaking_rate_round_trips_and_keeps_measurements(tmp_path: Path) -> None:
+    from indextts.training.speaking_rate import save_manual_speaking_rate
+
+    adapter = tmp_path / "voice"
+    (adapter / "best").mkdir(parents=True)
+    checkpoint = adapter / "best" / "voice.safetensors"
+    checkpoint.write_bytes(b"x")
+    write_speaking_rate(
+        adapter,
+        SpeakingRateReport(1.241, 2.66, 2.14, 7, "training_samples", "2026-09-06T00:00:00+00:00", "automatic"),
+    )
+
+    saved = save_manual_speaking_rate(checkpoint, 1.07)
+    loaded = load_speaking_rate(checkpoint)
+    assert saved == loaded
+    assert loaded.method == "manual"
+    assert loaded.recommended_speaking_rate == 1.07
+    assert loaded.dataset_words_per_second == 2.66 and loaded.clips_used == 7
+    assert "1.241" in loaded.summary and "training samples" in loaded.summary
+
+    with pytest.raises(ValueError):
+        save_manual_speaking_rate(checkpoint, 2.0)
+    assert load_speaking_rate(checkpoint).recommended_speaking_rate == 1.07
+
+    fresh = tmp_path / "other" / "other.safetensors"
+    fresh.parent.mkdir()
+    fresh.write_bytes(b"x")
+    assert save_manual_speaking_rate(fresh, 0.9).clips_used == 1
+    assert load_speaking_rate(fresh).recommended_speaking_rate == 0.9

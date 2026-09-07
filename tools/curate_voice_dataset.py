@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import hashlib
 import json
 import os
@@ -16,11 +16,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 import soundfile as sf
 from indextts.training.dataset_manifest import atomic_write_json, load_manifest, summarize_manifest, write_manifest, write_preview_csv
-from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript
-from indextts.training.speech_metrics import transcript_metrics
+from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript, transcript_vocabulary
+from indextts.training.speech_metrics import lenient_units, transcript_metrics
 from indextts.training.media import measure_edge_silence
 from indextts.training.features import _load_audio_16k, _read_audio
 from indextts.training.whisper_asr import _ensure_model
+
+# Whisper accepts a short prompt of expected spellings, derived here from the
+# speaker's own subtitles. Optional: on a 17-recording narration dataset it
+# recovered about 9 more rejected clips per 100 but made 2-5 of 60 previously
+# accepted clips fail, so the comparison rules below do the work by default.
+PROMPT_TERMS = 40
+
+
+def transcript_prompt(topic_texts: list[str], vocabulary: list[str]) -> str:
+    """Comma-separated spellings for one recording, topped up from the whole dataset."""
+    terms = [term for term in transcript_vocabulary(topic_texts) if not term.isdigit()]
+    if len(terms) < 10:
+        terms += [term for term in vocabulary if term not in terms and not term.isdigit()]
+    return ", ".join(terms[:PROMPT_TERMS])
+
+
+TRANSCRIPT_REASONS = frozenset({"transcript_disagreement", "transcript_boundary_mismatch"})
+# The fast turbo model spells technical vocabulary poorly. Measured on one
+# narration dataset, the full model recovered a third of the clips turbo had
+# rejected on transcript grounds while agreeing with an independent listener
+# more often, so rejected clips get a second opinion from it.
+DEFAULT_SECOND_OPINION_WHISPER = "openai/whisper-large-v3"
+
+
+def transcribe_clip(pipe, waveform, language: str, beams: int, prompt_ids=None) -> str:
+    """Transcribe one 16 kHz clip with a transformers ASR pipeline."""
+    generate_kwargs = {"language": str(language or "EN").lower(), "task": "transcribe", "do_sample": False}
+    if beams > 1:
+        generate_kwargs["num_beams"] = beams
+    if prompt_ids is not None:
+        generate_kwargs["prompt_ids"] = prompt_ids
+    result = pipe({"array": waveform.squeeze().numpy(), "sampling_rate": 16000}, return_timestamps=True,
+                  generate_kwargs=generate_kwargs)
+    return str(result["text"]).strip()
+
+
+def whisper_prompt_ids(pipe, prompt: str):
+    """Prompt ids for the pipeline's tokenizer, or None when unsupported or empty."""
+    get_prompt_ids = getattr(getattr(pipe, "tokenizer", None), "get_prompt_ids", None)
+    if not prompt.strip() or get_prompt_ids is None:
+        return None
+    prompt_ids = get_prompt_ids(prompt, return_tensors="pt")
+    device = getattr(getattr(pipe, "model", None), "device", None)
+    return prompt_ids.to(device) if device is not None else prompt_ids
 
 
 def link_or_copy(source: Path, destination: Path) -> None:
@@ -48,8 +92,13 @@ def main() -> None:
     parser.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     parser.add_argument("--no-asr-recheck", action="store_true", help="Disable fresh clip transcription when source-chunk ASR disagrees")
     parser.add_argument("--transcribe-all", action="store_true", help="Transcribe every voice-matched extracted clip")
-    parser.add_argument("--check-boundary-words", action="store_true", help="Require the first and last two normalized transcript words to match fresh clip ASR")
+    parser.add_argument("--check-boundary-words", action="store_true", help="Reject clips whose first or last two transcript words are missing, extra, or different in fresh clip ASR; the subtitles' own spellings of names and terms are accepted")
     parser.add_argument("--min-edge-silence-ms", type=int, default=0)
+    parser.add_argument("--asr-beams", type=int, default=3, help="Beam search width for fresh clip transcription; 1 is greedy decoding")
+    parser.add_argument("--term-prompt", action="store_true",
+                        help="Prompt Whisper with the spellings used in the dataset transcripts. Measured: a few more rejected clips pass, but some clean clips start failing, so it is off by default")
+    parser.add_argument("--second-opinion-whisper", default=DEFAULT_SECOND_OPINION_WHISPER,
+                        help="Re-transcribe clips that failed only transcript checks with this model and keep them when it agrees with the transcript; pass an empty string to disable")
     parser.add_argument("--state-dir", type=Path, help="Optional UI status and graceful-stop directory")
     args = parser.parse_args()
     try:
@@ -117,6 +166,19 @@ def run_curation(args: argparse.Namespace) -> None:
     asr_pipe = None
     asr_rechecked, asr_recovered = 0, 0
     rejected = Counter()
+    # The user's transcripts are the authority on how names and terms are
+    # written. Recognizer spellings of those words are not transcript errors.
+    vocabulary = transcript_vocabulary(row["text"] for row in rows)
+    texts_by_topic: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        texts_by_topic[Path(row["source_media"]).stem].append(row["text"])
+    lenient_by_language: dict[str, frozenset[str]] = {}
+    prompt_ids_by_topic: dict[str, object] = {}
+    asr_beams = max(1, int(getattr(args, "asr_beams", 1) or 1))
+    use_term_prompt = bool(getattr(args, "term_prompt", False))
+    second_opinion_model = str(getattr(args, "second_opinion_whisper", "") or "").strip()
+    second_pipe = None
+    second_opinions, second_recovered = 0, 0
     with (output / "quality_audit.jsonl").open("w", encoding="utf-8") as audit_file:
         for index, row in enumerate(rows):
             if args.state_dir and (args.state_dir / "stop.flag").exists():
@@ -127,8 +189,11 @@ def run_curation(args: argparse.Namespace) -> None:
             reasons = []
             hypothesis = transcript.between(float(row["source_start_s"]) - .04, float(row["source_end_s"]) + .04) if transcript else ""
             language = str(row.get("language") or "EN").upper()
+            if language not in lenient_by_language:
+                lenient_by_language[language] = lenient_units(vocabulary, language)
+            lenient = lenient_by_language[language]
             try:
-                agreement = transcript_metrics(row["text"], hypothesis, language)
+                agreement = transcript_metrics(row["text"], hypothesis, language, lenient_terms=lenient)
             except ValueError:
                 reasons.append("empty_normalized_transcript")
                 agreement = {"error_rate": 1.0, "start_matches": False, "end_matches": False, "error_unit": "unknown"}
@@ -148,6 +213,7 @@ def run_curation(args: argparse.Namespace) -> None:
                 edge_quality = measure_edge_silence(samples, sr)
                 if min(edge_quality.values()) < args.min_edge_silence_ms:
                     reasons.append("unsafe_audio_boundary")
+            waveform = None
             if not reasons and (args.transcribe_all or args.check_boundary_words or (wer > args.max_wer and not args.no_asr_recheck)):
                 # Source chunk stitching can duplicate words at overlaps. Audit
                 # the actual extracted clip before discarding clean narration.
@@ -156,10 +222,13 @@ def run_curation(args: argparse.Namespace) -> None:
                     asr_pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(args.whisper)),
                                         device=args.device, dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32)
                 waveform, _ = _load_audio_16k(audio)
-                result = asr_pipe({"array": waveform.squeeze().numpy(), "sampling_rate": 16000}, return_timestamps=True,
-                                  generate_kwargs={"language": str(row.get("language", "EN")).lower(), "task": "transcribe", "do_sample": False})
-                hypothesis = str(result["text"]).strip()
-                agreement = transcript_metrics(row["text"], hypothesis, language)
+                prompt_ids = None
+                if use_term_prompt:
+                    if topic not in prompt_ids_by_topic:
+                        prompt_ids_by_topic[topic] = whisper_prompt_ids(asr_pipe, transcript_prompt(texts_by_topic[topic], vocabulary))
+                    prompt_ids = prompt_ids_by_topic[topic]
+                hypothesis = transcribe_clip(asr_pipe, waveform, str(row.get("language", "EN")), asr_beams, prompt_ids)
+                agreement = transcript_metrics(row["text"], hypothesis, language, lenient_terms=lenient)
                 wer = agreement["error_rate"]
                 rechecked = True
                 asr_rechecked += 1
@@ -169,9 +238,32 @@ def run_curation(args: argparse.Namespace) -> None:
             edge_match = agreement["start_matches"] and agreement["end_matches"]
             if args.check_boundary_words and not edge_match:
                 reasons.append("transcript_boundary_mismatch")
+            second_text, second_wer, second_used = None, None, False
+            if second_opinion_model and reasons and set(reasons) <= TRANSCRIPT_REASONS:
+                # Only transcript checks failed: a stronger recognizer decides
+                # whether the recording says what the transcript says.
+                if second_pipe is None:
+                    from transformers import pipeline
+                    second_pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(second_opinion_model)),
+                                           device=args.device, dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32)
+                if waveform is None:
+                    waveform, _ = _load_audio_16k(audio)
+                second_text = transcribe_clip(second_pipe, waveform, str(row.get("language", "EN")), asr_beams)
+                second = transcript_metrics(row["text"], second_text, language, lenient_terms=lenient)
+                second_wer = second["error_rate"]
+                second_opinions += 1
+                second_edge = second["start_matches"] and second["end_matches"]
+                if second_wer <= args.max_wer and (second_edge or not args.check_boundary_words):
+                    reasons = [reason for reason in reasons if reason not in TRANSCRIPT_REASONS]
+                    hypothesis, agreement, wer, edge_match = second_text, second, second_wer, second_edge
+                    second_used = True
+                    second_recovered += 1
             item = {"id": row["id"], "source": topic, "text": row["text"], "asr_text": hypothesis,
                     "asr_wer": wer, "asr_error_unit": agreement["error_unit"], "source_asr_wer": source_wer, "source_asr_text": source_hypothesis,
                     "asr_rechecked": rechecked, "boundary_words_match": edge_match,
+                    "forgiven_units": int(agreement.get("forgiven_units", 0) or 0),
+                    "asr_model": "second_opinion" if second_used else "primary",
+                    "second_opinion_text": second_text, "second_opinion_wer": second_wer,
                     **edge_quality, **scores, "reasons": reasons, "audio": str(audio)}
             audit.append(item)
             audit_file.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -229,6 +321,8 @@ def run_curation(args: argparse.Namespace) -> None:
                 "min_window_similarity": args.min_window_similarity,
                 "fresh_asr_all": args.transcribe_all, "check_boundary_words": args.check_boundary_words,
                 "min_edge_silence_ms": args.min_edge_silence_ms,
+                "transcript_vocabulary_terms": len(vocabulary), "asr_beams": asr_beams,
+                "asr_term_prompt": use_term_prompt, "second_opinion_whisper": second_opinion_model,
             }, "split_counts": dict(Counter(row["split"] for row in selected)),
             "reference_audio": args.reference,
             "reference_candidates": reference_candidates,
@@ -240,6 +334,10 @@ def run_curation(args: argparse.Namespace) -> None:
         "validation": summarize_manifest([row for row in kept if row["split"] == "val"]),
         "test": summarize_manifest(test), "validation_sources": args.validation_source, "test_sources": args.test_source,
         "clip_asr_rechecks": asr_rechecked, "clips_recovered_by_fresh_asr": asr_recovered,
+        "transcript_vocabulary_terms": len(vocabulary), "transcript_vocabulary_sample": vocabulary[:PROMPT_TERMS],
+        "asr_beams": asr_beams, "asr_term_prompt": use_term_prompt,
+        "second_opinion_whisper": second_opinion_model, "second_opinion_checks": second_opinions,
+        "clips_recovered_by_second_opinion": second_recovered,
     }
     atomic_write_json(output / "quality_summary.json", summary)
     report(len(rows), "complete", "Voice and transcript audit complete", kept=len(kept), test=len(test),

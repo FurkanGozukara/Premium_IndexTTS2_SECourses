@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Sequence, TYPE_CHECKING
+import hashlib
 import math
 
 import numpy as np
@@ -12,6 +13,16 @@ from .media import measure_loudness_lufs
 
 if TYPE_CHECKING:
     from .dataset_prep import DatasetPrepConfig
+
+# Whisper word end times frequently run into the following pause. When the
+# strict window finds nothing, the search may start this far before the aligned
+# end of the previous word, but never before that word's midpoint.
+PAUSE_LOOKBACK_MS = 200
+# A quiet run found inside the previous word must be longer than a stop
+# consonant closure, so that closure cannot be mistaken for a pause.
+CLOSURE_SAFE_QUIET_MS = 100
+# Target used for the share of groups that should stay one short sentence.
+SHORT_CLIP_TARGET_S = 6.0
 
 
 def _get(word: Any, key: str, default: Any = None) -> Any:
@@ -113,6 +124,11 @@ def build_safe_sentence_segments(
                    _ms(following, "end_s") - 1)
         pause = _pause(energy, previous_end, high, preferred,
                        2 * edge_ms, threshold)
+        previous_start = _ms(previous, "start_s")
+        low = max((previous_start + previous_end) // 2, previous_end - PAUSE_LOOKBACK_MS)
+        if pause is None and low < previous_end:
+            pause = _pause(energy, low, high, preferred,
+                           max(CLOSURE_SAFE_QUIET_MS, 2 * edge_ms), threshold)
         if pause:
             quiet_start, quiet_end = pause
             middle = (quiet_start + quiet_end) // 2
@@ -171,11 +187,24 @@ def build_safe_sentence_segments(
     # and duplicate a release in both neighbors even though both ends are quiet.
     boundaries = [boundary(index, gain) if math.isfinite(gain) else (None, None)
                   for index, gain in enumerate(boundary_gains)]
+
+    short_fraction = min(1.0, max(0.0, float(getattr(config, "short_clip_fraction", 0.0) or 0.0)))
+    short_target_s = max(float(config.min_s), min(SHORT_CLIP_TARGET_S, float(config.target_s)))
+
+    def target_for(first_index: int) -> float:
+        # A reproducible share of groups aims for one short sentence, so the
+        # dataset also contains the sentence lengths generation typically uses.
+        if short_fraction <= 0.0:
+            return float(config.target_s)
+        digest = hashlib.sha256(f"{config.seed}:{n}:{first_index}".encode("utf-8")).digest()
+        return short_target_s if int.from_bytes(digest[:8], "big") / 2 ** 64 < short_fraction else float(config.target_s)
+
     scores: list[tuple[int, float]] = [(0, 0.0)] * (n + 1)
     choices: list[int | None] = [None] * n
     chosen_times: list[tuple[int, int] | None] = [None] * n
     for first_index in range(n - 1, -1, -1):
         scores[first_index] = scores[first_index + 1]
+        target_s = target_for(first_index)
         for last_index, word_count in groups[first_index]:
             start = boundaries[first_index][1]
             end = boundaries[last_index + 1][0]
@@ -185,7 +214,7 @@ def build_safe_sentence_segments(
             if not (config.min_s <= duration <= config.max_s):
                 continue
             future = scores[last_index + 1]
-            score = (future[0] + word_count, future[1] - abs(duration - config.target_s))
+            score = (future[0] + word_count, future[1] - abs(duration - target_s))
             if score > scores[first_index]:
                 scores[first_index] = score
                 choices[first_index] = last_index

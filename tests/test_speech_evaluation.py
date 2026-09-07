@@ -278,3 +278,25 @@ def test_speech_pipeline_uses_only_current_run_and_maps_base_cells(tmp_path, mon
     frozen = json.loads((run / "analysis" / "speech_evaluation" / "final_test" / "selection_frozen.json").read_text())
     assert frozen["recommended_checkpoint"] == str(checkpoint.resolve())
     assert load_speech_evaluation(run)["recommended_checkpoint"] == str(checkpoint.resolve())
+
+
+def _measured_with_real(label, speaker=0.8, speaker_real=None):
+    rows = _measured(label, speaker=speaker)
+    for row in rows:
+        row["speaker_similarity_real"] = speaker_real
+    return rows
+
+
+def test_speaker_guard_prefers_similarity_to_the_real_recording_when_available():
+    candidates = [{"label": "Base", "path": "", "val_loss": 6}, {"label": "voice", "path": "voice.safetensors", "val_loss": 4}]
+    # Base copies the reference clip closely but sounds less like the speaker's real recordings.
+    rows = _measured_with_real("Base", speaker=.95, speaker_real=.78) + _measured_with_real("voice", speaker=.90, speaker_real=.82)
+    report = select_recommendation(candidates, rows, {"max_wer_increase": .02, "max_speaker_drop": .03})
+    assert report["speaker_metric"] == "speaker_similarity_real"
+    assert report["candidates"][1]["eligible"] and report["recommended_label"] == "voice"
+    assert report["candidates"][1]["speaker_delta_vs_base"]["mean"] == pytest.approx(.04)
+    assert "real recording" in report["decision"]
+    # Without matched real recordings the reference-clip similarity still guards, and the same drop rejects.
+    plain = select_recommendation(candidates, _measured("Base", speaker=.95) + _measured("voice", speaker=.90),
+                                  {"max_wer_increase": .02, "max_speaker_drop": .03})
+    assert plain["speaker_metric"] == "speaker_similarity" and not plain["candidates"][1]["eligible"]

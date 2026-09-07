@@ -16,8 +16,9 @@ CURATION_DEFAULTS = {
     "name": "voice_curated", "references": "", "validation_sources": "", "test_sources": "",
     "max_wer": .15, "min_speaker_similarity": .70, "min_window_similarity": .60,
     "transcribe_all": True, "check_boundary_words": True, "min_edge_silence_ms": 30,
-    "device": "cuda:0",
+    "second_opinion": True, "device": "cuda:0",
 }
+SECOND_OPINION_WHISPER = "openai/whisper-large-v3"
 
 
 def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "models") -> tuple[list[str], Path]:
@@ -68,6 +69,7 @@ def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "
     for field, flag in (("transcribe_all", "--transcribe-all"), ("check_boundary_words", "--check-boundary-words")):
         if values[field]:
             command.append(flag)
+    command.extend(["--second-opinion-whisper", SECOND_OPINION_WHISPER if values.get("second_opinion", True) else ""])
     return command, output
 
 
@@ -99,8 +101,11 @@ def build_curation_controls(registry: Any, existing: Any, dataset_path: Any, *, 
             register("transcribe_all", gr.Checkbox(value=True, label="Transcribe every voice-matched clip",
                      info="Checks the extracted audio itself; takes longer than reusing source transcriptions."), "bool")
             register("check_boundary_words", gr.Checkbox(value=True, label="Verify first and last words",
-                     info="Requires both transcript edges to match fresh clip transcription, even when overall word error is low."), "bool")
+                     info="Rejects clips whose first or last two words are missing or extra in the fresh clip transcription, even when overall word error is low. Your transcript's own spellings and similar-sounding replacements pass."), "bool")
             register("min_edge_silence_ms", gr.Slider(0, 500, value=30, step=10, label="Audit minimum quiet edge (ms)"), "int", minimum=0, maximum=500)
+        with gr.Row():
+            register("second_opinion", gr.Checkbox(value=True, label="Second opinion for transcript rejections",
+                     info="Re-transcribes clips that failed only the transcript checks with the full whisper-large-v3 model and keeps them when it agrees with your transcript. Measured to recover about a third of such rejections; adds a few minutes and a 3 GB model download."), "bool")
             register("device", gr.Textbox(value="cuda:0", label="Audit device"), "str")
         with gr.Row():
             start = gr.Button("🧪  Audit and create training dataset", variant="primary", elem_classes=btn("teal"))

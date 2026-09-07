@@ -58,13 +58,18 @@ def shortlist_checkpoints(run_dir: str | Path, limit: int) -> list[dict[str, Any
 
 def report_markdown(report: dict[str, Any]) -> str:
     heading = "Frozen selection on final test" if report.get("final_test") else "Speech recommendation"
+    real_metric = report.get("speaker_metric") == "speaker_similarity_real"
     lines = [f"**{heading}: {report['recommended_label']}**", report["scope"], "",
-             "| Candidate | Mean transcript error | Worst clip | Speaker similarity | Flagged clips | Eligible |",
-             "|---|---:|---:|---:|---:|---|"]
+             "| Candidate | Mean transcript error | Worst clip | Speaker similarity vs real | Speaker similarity vs reference | Flagged clips | Eligible |",
+             "|---|---:|---:|---:|---:|---:|---|"]
     for row in report["candidates"]:
         speaker = f"{row['speaker_similarity']:.3f}" if row.get("speaker_similarity") is not None else "unavailable"
-        lines.append(f"| {row['label']} | {row['mean_error_rate']:.1%} | {row['worst_error_rate']:.1%} | {speaker} | {row['failure_count']}/{row['clips']} | {'yes' if row['eligible'] else 'no'} |")
-    lines.extend(["", report["decision"], "Transcript error uses words for EN/ES/AR and characters for ZH/JA."])
+        speaker_real = f"{row['speaker_similarity_real']:.3f}" if row.get("speaker_similarity_real") is not None else "unavailable"
+        lines.append(f"| {row['label']} | {row['mean_error_rate']:.1%} | {row['worst_error_rate']:.1%} | {speaker_real} | {speaker} | {row['failure_count']}/{row['clips']} | {'yes' if row['eligible'] else 'no'} |")
+    lines.extend(["", report["decision"], "Transcript error uses words for EN/ES/AR and characters for ZH/JA; the dataset's own spellings of names and terms are accepted.",
+                  ("The speaker guard compares each generated sentence with the real recording of that sentence, the speaker's actual identity; "
+                   "similarity to the single reference clip rewards copying that prompt and is shown for information.") if real_metric else
+                  "Too few matched real recordings for a real-recording speaker comparison; the guard uses similarity to the reference clip."])
     for row in report["candidates"]:
         if row["path"]:
             delta = row["error_delta_vs_base"]
@@ -159,8 +164,21 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    # The dataset's own spellings of names and terms are not transcript errors,
+    # for Base and adapters alike; this mirrors the voice and transcript audit.
+    from .dataset_manifest import load_manifest
+    from .dataset_quality import transcript_vocabulary
+    from .speech_metrics import lenient_units
+    try:
+        vocabulary = transcript_vocabulary(row.get("text", "") for row in load_manifest(Path(config.dataset_dir)))
+    except Exception:
+        vocabulary = []
+    lenient = set()
+    for language in {group["language"] for group in plan["groups"]}:
+        lenient |= set(lenient_units(vocabulary, language))
     measured = measure_clips([*clips, *real_clips], model_dir=config.model_dir, model_config=config.model_config,
-                             device=config.device, output_dir=root, update=update, cancelled=cancelled)
+                             device=config.device, output_dir=root, update=update, cancelled=cancelled,
+                             lenient_terms=lenient)
     generated = [row for row in measured if row["kind"] != "real"]
     real = [row for row in measured if row["kind"] == "real"]
     report = select_recommendation(candidates, generated, plan["policy"])

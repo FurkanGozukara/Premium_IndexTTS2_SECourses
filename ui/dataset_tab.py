@@ -474,6 +474,11 @@ def build_dataset_tab(
                 min_s = gr.Slider(0.5, 15, value=DATASET_DEFAULTS["min_s"], step=0.25, label="Minimum seconds", info="4 seconds keeps enough voice context while retaining the measured quality range.")
                 max_s = gr.Slider(2, 40, value=DATASET_DEFAULTS["max_s"], step=0.25, label="Maximum seconds", info="20 seconds covers 12-15-second inference segments and retains more source audio; 30 seconds measured worse.")
                 max_gap = gr.Slider(0, 3000, value=700, step=25, label="Maximum cue gap (ms)", info="Cues closer than this can merge into one sentence segment.")
+                short_share = gr.Slider(
+                    0, 0.8, value=DATASET_DEFAULTS["short_clip_fraction"], step=0.05,
+                    label="Share of single-sentence clips",
+                    info="Sentence-aligned preparation aims this share of clips at one short sentence (about 6 seconds) instead of the target length. 0 keeps every clip near the target. Experimental: in one blind listening comparison a 0.3 share made the adapter rush between sentences and lowered naturalness ratings, while identity and pace measurements improved.",
+                )
             with gr.Row():
                 pad = gr.Slider(0, 500, value=60, step=10, label="Edge padding (ms)", info="Small context padding avoids clipped consonants.")
                 snap = gr.Checkbox(value=True, label="Snap to silence", info="Moves segment boundaries toward nearby low-energy points.")
@@ -483,6 +488,7 @@ def build_dataset_tab(
             for field_name, component, kind, minimum, maximum in (
                 ("target_s", target_s, "float", 1, 30), ("min_s", min_s, "float", 0.5, 15),
                 ("max_s", max_s, "float", 2, 40), ("max_gap_ms", max_gap, "int", 0, 3000),
+                ("short_clip_fraction", short_share, "float", 0, 0.8),
                 ("pad_ms", pad, "int", 0, 500), ("snap_to_silence", snap, "bool", None, None),
                 ("snap_window_ms", snap_window, "int", 0, 1000), ("min_words", min_words, "int", 0, 30),
                 ("max_words", max_words, "int", 10, 200),

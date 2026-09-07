@@ -61,7 +61,7 @@ from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_trai
 from .plan import training_plan, training_plan_line
 from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS
 from .sampling import generate_training_sample
-from .speaking_rate import calibrate_from_samples, write_speaking_rate
+from .speaking_rate import calibrate_from_samples, calibrate_from_speech_report, write_speaking_rate
 from .train_config import TrainConfig
 
 
@@ -741,6 +741,7 @@ class LoraTrainer:
             self.write_status(recommended_kind=report["recommended_kind"], speech_evaluation_status="complete",
                               speech_evaluation_message=report["scope"], speech_recommended_checkpoint=recommended_checkpoint)
             self.log(f">> speech recommendation: {report['recommended_label']}. {report['scope']}")
+            self._write_speech_matched_speaking_rate(report, recommended_checkpoint)
         else:
             child = read_json_retry(job_dir / "status.json", {}) or {}
             failure = failure or str(child.get("message") or f"worker exited with code {process.returncode}")
@@ -777,6 +778,27 @@ class LoraTrainer:
                 f">> speaking-rate calibration failed but training is safe: {exc}"
             )
             return None
+
+    def _write_speech_matched_speaking_rate(self, report: Mapping[str, Any], checkpoint: str) -> None:
+        """Replace the short-sample pace estimate with matched held-out sentences."""
+
+        try:
+            if not checkpoint:
+                self.log(">> speaking rate keeps the training-sample estimate: Base was recommended")
+                return
+            calibrated = calibrate_from_speech_report(report, checkpoint)
+            if calibrated is None:
+                self.log(">> speaking rate keeps the training-sample estimate: too few matched held-out sentences")
+                return
+            existing = self.adapter_dir / "analysis" / "speaking_rate.json"
+            if existing.is_file():
+                # Keep the earlier estimate for comparison; the app reads only speaking_rate.json.
+                shutil.copy2(existing, existing.with_name("speaking_rate_training_samples.json"))
+            write_speaking_rate(self.adapter_dir, calibrated)
+            self.log(">> " + calibrated.summary)
+            self.write_status(recommended_speaking_rate=calibrated.recommended_speaking_rate)
+        except Exception as exc:
+            self.log(f">> matched-sentence speaking-rate calibration failed but training is safe: {exc}")
 
     def _metadata(self, step: int, epochs: int, targets: list[str]) -> LoraMetadata:
         return LoraMetadata(

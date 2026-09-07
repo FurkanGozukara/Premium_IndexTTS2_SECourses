@@ -79,7 +79,10 @@ class CaptionTranscript:
 def _fix_punctuation_spacing(text: str) -> str:
     text = re.sub(r"\s+([,.;:!?。！？])", r"\1", text)
     text = re.sub(r"([,;:!?])(?=[^\s\d\"')\]])", r"\1 ", text)
-    text = re.sub(r"([.!?。！？])(?=[A-Za-z])", r"\1 ", text)
+    text = re.sub(r"([!?。！？])(?=[A-Za-z])", r"\1 ", text)
+    # Separate run-on sentences such as "done.Next", but keep file names and
+    # dotted acronyms ("update.bat", "main.py", "U.S.") as one spoken token.
+    text = re.sub(r"(?<=[a-z]{2})\.(?=[A-Z])", ". ", text)
     text = re.sub(r"([\[(])\s+", r"\1", text)
     text = re.sub(r"\s+([\])])", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()

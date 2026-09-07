@@ -26,6 +26,7 @@ from indextts.runtime.progress import read_progress_file
 from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
 from indextts.training.speaking_rate import (
     load_speaking_rate,
+    save_manual_speaking_rate,
     speaking_rate_method_label,
 )
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
@@ -1315,6 +1316,43 @@ def lora_selection_updates(
     return info, reference_update, " ".join(messages), rate_update, source_update
 
 
+def saved_lora_speaking_rate(path: str | None) -> float | None:
+    """Return the adapter's stored speaking rate for the editable field, or None."""
+
+    if not path:
+        return None
+    report = load_speaking_rate(path)
+    return float(report.recommended_speaking_rate) if report is not None else None
+
+
+def save_lora_speaking_rate(
+    path: str | None,
+    value: float | None,
+    auto_speaking_rate: bool,
+) -> tuple[str, str, Any, Any]:
+    """Store a manual speaking rate for the selected adapter and refresh its summary."""
+
+    if not path or not Path(path).expanduser().is_file():
+        return (
+            _lora_info(path)[0],
+            "Select a LoRA / DoRA file before saving a speaking rate.",
+            gr.skip(),
+            gr.skip(),
+        )
+    try:
+        if value is None:
+            raise ValueError("enter a speaking rate between 0.5 and 1.5")
+        report = save_manual_speaking_rate(path, float(value))
+    except (TypeError, ValueError, OSError) as exc:
+        return _lora_info(path)[0], f"Speaking rate was not saved: {exc}", gr.skip(), gr.skip()
+    message = f"Saved speaking rate {report.recommended_speaking_rate:.3f} for {Path(path).name}."
+    rate_update: Any = gr.skip()
+    if auto_speaking_rate:
+        rate_update = report.recommended_speaking_rate
+        message += " Applied it to the Speaking rate slider."
+    return _lora_info(path)[0], message, rate_update, report.recommended_speaking_rate
+
+
 def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int = 10) -> list[list[Any]]:
     rows: list[tuple[float, list[Any]]] = []
     root_path = Path(root).expanduser().resolve()
@@ -1967,6 +2005,14 @@ def build_generation_tab(
                 scale=3,
             )
         lora_info = gr.Markdown("No LoRA / DoRA selected.", elem_classes=["section-note"])
+        with gr.Row(equal_height=True):
+            lora_saved_rate = gr.Number(
+                value=None, step=0.01, precision=3,
+                label="Saved speaking rate for this LoRA / DoRA",
+                info="The pace multiplier stored with the selected adapter (0.5 to 1.5). Edit it and press Save to override the automatic estimate; auto-apply then uses your value.",
+                scale=4,
+            )
+            save_lora_rate = gr.Button("⏱️  Save speaking rate", elem_classes=btn("purple"), scale=1)
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
@@ -2570,6 +2616,7 @@ def build_generation_tab(
             message,
             rate_update,
             source_update,
+            gr.update(value=saved_lora_speaking_rate(str(items[0] or ""))),
         )
 
     lora_selection_outputs = [
@@ -2580,7 +2627,14 @@ def build_generation_tab(
         reference_status,
         speaking_rate,
         tab.reference_source,
+        lora_saved_rate,
     ]
+    save_lora_rate.click(
+        save_lora_speaking_rate,
+        [lora, lora_saved_rate, auto_rate],
+        [lora_info, reference_status, speaking_rate, lora_saved_rate],
+        queue=False,
+    )
     lora.change(
         on_lora_selection,
         lora_selection_inputs,
@@ -2888,6 +2942,8 @@ __all__ = [
     "reference_selection_updates",
     "resolve_reference_selection",
     "request_from_registry_defaults",
+    "save_lora_speaking_rate",
+    "saved_lora_speaking_rate",
     "stream_generation_request",
     "validate_request_coverage",
 ]

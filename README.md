@@ -307,7 +307,11 @@ Sort through the prepared-segments table, inspect durations and warnings, and cl
 
 For single-speaker narration that includes demonstrations or music, open **Voice and transcript audit** in the dataset tab before caching. Select the prepared dataset, enter a new audited dataset name and a verified speaker reference path, and reserve source filename stems for validation and optional final testing. **Audit and create training dataset** checks speaker similarity over whole clips and overlapping six-second windows. Its defaults transcribe each voice-matched clip and check both transcript edges separately, so an incorrect ending cannot hide inside a low overall error score. Transcript errors use words for English, Spanish and Arabic, and characters for Chinese and Japanese. Completion selects the audited dataset for caching and training. Every rejection is recorded and the source clips are preserved.
 
-The command-line audit remains available. Add `--transcribe-all --check-boundary-words --min-edge-silence-ms 30` for the same additional checks:
+The audit trusts the transcripts you supplied for how names and terms are written. It collects mixed-case words, acronyms, version numbers, and mid-sentence capitalized names from your own subtitles, decodes fresh clip transcriptions with a small beam search, and does not count a recognizer spelling of one of those terms (for example "Swarm UI" or "Rumpod") as a transcript error. Contractions, joined compounds, and okay/OK are normalized on both sides. Missing words, extra words, and different ordinary words still count, so cut endings and music bleed are still rejected.
+
+Clips that fail only the transcript checks get a second opinion from the full `openai/whisper-large-v3` model, which spells technical vocabulary better than the fast turbo model; a clip is kept when the stronger model agrees with your transcript. Numbers, currency, and storage or frequency units are compared in their spoken forms, so "$0.61" matches "61 cents" and "6 GB" matches "6 gigabytes".
+
+The command-line audit remains available. Add `--transcribe-all --check-boundary-words --min-edge-silence-ms 30` for the same additional checks, and `--second-opinion-whisper ""` to disable the second opinion. `--asr-beams 1` restores greedy decoding, and `--term-prompt` additionally prompts Whisper with each recording's own terms; in measurements that recovered a few more rejected clips but made some clean clips fail, so it is off by default:
 
 ```text
 python tools/curate_voice_dataset.py datasets/raw datasets/clean --reference reference.wav --validation-source held_out_tutorial --test-source final_test_tutorial
@@ -506,6 +510,8 @@ Press **Calibrate speaking rate from this grid** after generating representative
 ![Annotated 4K speaking-rate calibration result](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/yXNqQKNzturKNPbl-y8hM.png)
 
 *Figure 42. Voice Generation can automatically apply the stored value when that adapter is selected. The production calibration measured about 0.944, while a separate smoke calibration proved the full write-and-reload path.*
+
+Training saves a first estimate from the short epoch sample. Because that compares one ten-word sentence with long multi-sentence recordings, it tends to overstate how slow the voice is. When the automatic speech comparison completes, the trainer replaces it with a calibration from matched held-out sentences, the same text spoken by the person and by the adapter, and keeps the earlier estimate beside it as `speaking_rate_training_samples.json`. In Voice Generation, the **Saved speaking rate for this LoRA / DoRA** field under the adapter summary shows the stored value; edit it and press **Save speaking rate** to override any estimate for that adapter. Auto-apply then uses your value.
 
 ## 10. Fit Runtime to the GPU
 
@@ -914,7 +920,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Continue after item errors** - `batch.continue_errors`. Records a failed row and proceeds to the next item instead of ending the batch. *(default true)*
 
-### Dataset Preparation - 46 settings
+### Dataset Preparation - 47 settings
 
 **Input files or folders** - `dataset.inputs`. Accepts media files, folders, metadata.csv, or pre-segmented WAV+TXT folders.
 
@@ -960,7 +966,9 @@ The appendix below covers all 267 registered controls, including current default
 
 **Silence snap window (ms)** - `dataset.snap_window_ms`. Search radius around a proposed boundary; 400 ms allows for late word releases. *(default 400; minimum 0; maximum 1000)*
 
-**Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
+**Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. When no pause follows the aligned end of a word, the search may look up to 200 ms back into that word, but only a quiet stretch longer than a stop-consonant closure counts. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
+
+**Share of single-sentence clips** - `dataset.short_clip_fraction`. Sentence-aligned preparation aims this reproducible share of clips at one short sentence of about 6 seconds instead of the target length, so the dataset also contains the sentence lengths generation typically uses. 0 keeps every clip near the target. *(default 0; minimum 0; maximum 0.8)*
 
 **Minimum words** - `dataset.min_words`. Drops fragments with too little transcript context. *(default 2; minimum 0; maximum 30)*
 
@@ -1008,7 +1016,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Preparation seed** - `dataset.seed`. Controls deterministic candidate ranking and randomized operations. *(default 0; minimum 0; maximum 4294967295)*
 
-### Voice and Transcript Audit - 11 settings
+### Voice and Transcript Audit - 12 settings
 
 | Setting | Preset key | Default and behavior |
 | --- | --- | --- |
@@ -1020,8 +1028,9 @@ The appendix below covers all 267 registered controls, including current default
 | Minimum voice similarity | `curation.min_speaker_similarity` | 0.70; range 0–1. |
 | Minimum voice-window similarity | `curation.min_window_similarity` | 0.60; range 0–1. |
 | Transcribe every voice-matched clip | `curation.transcribe_all` | Enabled; transcribes the actual exported audio. |
-| Verify first and last words | `curation.check_boundary_words` | Enabled; compares both normalized transcript edges against fresh clip transcription. |
+| Verify first and last words | `curation.check_boundary_words` | Enabled; rejects clips whose first or last two words are missing or extra in the fresh clip transcription. The subtitles' own spellings and similar-sounding replacements pass; the quiet-edge measurement guards against cut audio. |
 | Audit minimum quiet edge (ms) | `curation.min_edge_silence_ms` | 30; range 0–500. Measures both waveform edges at −40 dBFS; 0 disables this check. |
+| Second opinion for transcript rejections | `curation.second_opinion` | Enabled; re-transcribes clips that failed only the transcript checks with the full `openai/whisper-large-v3` model and keeps them when it agrees with the transcript. Measured to recover about a third of such rejections; adds a few minutes and a 3 GB model download. |
 | Audit device | `curation.device` | `cuda:0`. |
 
 ### LoRA / DoRA Training

@@ -59,7 +59,8 @@ def test_curation_checks_real_clip_edges_and_keeps_source_holdouts(tmp_path, mon
             return {"speaker_similarity": .95, "speaker_window_min": .9, "speaker_window_mean": .93,
                     "speaker_windows": [.9, .96], "duration_s": 2}
 
-    native = iter([texts[0], texts[1].replace("ending.", "and."), texts[2], texts[3]])
+    # The recognizer misses the final word of clip 1: a missing edge word is a boundary problem.
+    native = iter([texts[0], texts[1].replace(" complete ending.", " complete."), texts[2], texts[3]])
     monkeypatch.setattr(curate, "SpeakerVerifier", Verifier)
     monkeypatch.setattr(curate, "_ensure_model", lambda model: tmp_path)
     monkeypatch.setattr(curate, "_load_audio_16k", lambda path: (torch.zeros(1, 32000), 2.0))
@@ -68,7 +69,7 @@ def test_curation_checks_real_clip_edges_and_keeps_source_holdouts(tmp_path, mon
                      validation_source=["validation"], test_source=["test"], max_wer=.15,
                      min_speaker_similarity=.7, min_window_similarity=.6, device="cpu", model_dir=tmp_path,
                      whisper="fixture", no_asr_recheck=False, transcribe_all=True, check_boundary_words=True,
-                     min_edge_silence_ms=30, state_dir=tmp_path / "state")
+                     min_edge_silence_ms=30, state_dir=tmp_path / "state", second_opinion_whisper="")
     curate.run_curation(args)
     train_val = load_manifest(args.output)
     assert [(row["id"], row["split"]) for row in train_val] == [("0", "train"), ("2", "val")]
@@ -102,3 +103,62 @@ def test_ui_audit_rejects_invalid_holdout_before_starting_worker(tmp_path):
     assert command[command.index("--min-edge-silence-ms") + 1] == "30"
     assert "--check-boundary-words" in command and "--transcribe-all" in command
     assert output == tmp_path / "voice_curated"
+
+
+def test_second_opinion_recognizer_rescues_transcript_rejections_only(tmp_path, monkeypatch):
+    from tools import curate_voice_dataset as curate
+    import transformers
+    source = tmp_path / "prepared"
+    source.mkdir()
+    sr = 24000
+    waveform = np.sin(2 * np.pi * 220 * np.arange(sr * 2) / sr).astype(np.float32) * .1
+    waveform[:sr // 10] = waveform[-sr // 10:] = 0
+    reference = tmp_path / "reference.wav"
+    sf.write(reference, waveform, sr)
+    texts = ["Install SwarmUI on RunPod with the update file today.",
+             "This separate validation sentence has a complete ending.",
+             "The narrator says these exact words in this clip."]
+    topics = ["train", "validation", "train"]
+    rows = []
+    for index, (text, topic) in enumerate(zip(texts, topics)):
+        filename = f"clip_{index}.wav"
+        sf.write(source / filename, waveform, sr)
+        rows.append({"id": str(index), "audio": filename, "text": text, "duration_s": 2.0, "source_media": topic + ".flac",
+                     "source_start_s": 0, "source_end_s": 2, "speaker": "Speaker", "language": "EN"})
+    write_manifest(source / "manifest.jsonl", rows)
+
+    class Verifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def score(self, path):
+            return {"speaker_similarity": .95, "speaker_window_min": .9, "speaker_window_mean": .93, "speaker_windows": [.9, .96], "duration_s": 2}
+
+    # The fast model garbles the first clip's ending and misses the last clip's final word;
+    # the second-opinion model hears the first clip correctly but confirms the missing word.
+    primary = iter(["install swarm ui on rumpod with the update file to they", texts[1], "the narrator says these exact words in this"])
+    second = iter(["Install SwarmUI on RunPod with the update file today.", "the narrator says these exact words in this"])
+    loaded = []
+
+    def fake_pipeline(*args, **kwargs):
+        loaded.append(kwargs["model"])
+        return (lambda *a, **k: {"text": next(second)}) if "second" in kwargs["model"] else (lambda *a, **k: {"text": next(primary)})
+
+    monkeypatch.setattr(curate, "SpeakerVerifier", Verifier)
+    monkeypatch.setattr(curate, "_ensure_model", lambda model: model)
+    monkeypatch.setattr(curate, "_load_audio_16k", lambda path: (torch.zeros(1, 32000), 2.0))
+    monkeypatch.setattr(transformers, "pipeline", fake_pipeline)
+    args = Namespace(dataset=source, output=tmp_path / "curated", reference=[str(reference)], validation_source=["validation"],
+                     test_source=[], max_wer=.15, min_speaker_similarity=.7, min_window_similarity=.6, device="cpu",
+                     model_dir=tmp_path, whisper="primary-model", no_asr_recheck=False, transcribe_all=True,
+                     check_boundary_words=True, min_edge_silence_ms=30, state_dir=tmp_path / "state", second_opinion_whisper="second-model")
+    curate.run_curation(args)
+    kept = load_manifest(args.output)
+    assert [row["id"] for row in kept] == ["0", "1"]
+    audit = load_manifest(args.output / "quality_audit.jsonl")
+    assert audit[0]["asr_model"] == "second_opinion" and audit[0]["reasons"] == [] and audit[0]["second_opinion_wer"] == 0
+    assert audit[1]["asr_model"] == "primary" and audit[1]["second_opinion_text"] is None
+    assert audit[2]["reasons"] == ["transcript_boundary_mismatch"] and audit[2]["asr_model"] == "primary"
+    assert loaded == ["primary-model", "second-model"]  # the stronger model loads only when a clip needs it
+    summary = json.loads((args.output / "quality_summary.json").read_text())
+    assert summary["second_opinion_checks"] == 2 and summary["clips_recovered_by_second_opinion"] == 1

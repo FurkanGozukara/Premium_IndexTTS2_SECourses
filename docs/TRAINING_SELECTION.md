@@ -39,6 +39,10 @@ The default selection policy rejects a candidate with an observed mean transcrip
 
 The margins are configurable screening choices. These intervals describe the sampled prompts and do not establish performance on other speakers or recording sessions. Few validation sources, overlapping training/validation recordings, and unevaluated speakers are reported. Style, pace, edge checks, ASR, and embedding similarities are proxies; naturalness still requires listening. The result is a provisional automatic recommendation, not a guarantee of the universally best checkpoint.
 
+## Speaking rate
+
+Training first saves a pace estimate from the epoch samples. That compares one short sample sentence with the whole dataset's words per second, and long multi-sentence recordings speak faster per word than a single sentence, so the estimate tends to overstate how slow the adapter is. When the speech comparison completes with an adapter recommendation, the trainer recalibrates from the matched held-out sentences: the same texts spoken by the person and by the selected checkpoint, edge-trimmed, at least four clips. The earlier estimate stays beside it as `analysis/speaking_rate_training_samples.json`. Voice Generation shows the stored value in **Saved speaking rate for this LoRA / DoRA**; edit it and press **Save speaking rate** to override any estimate for that adapter. The stored method label tells you whether a value came from training samples, matched sentences, a grid, or a manual edit.
+
 ## Independent final test
 
 An optional final-test dataset must use separate source recordings. The app rejects overlapping source names, shared audio paths, and byte-identical copies of training/validation files. Curated test datasets may include training-reference rows; only their `split=val` rows become test targets.

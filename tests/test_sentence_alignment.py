@@ -221,3 +221,8 @@ def test_first_three_minutes_are_sentence_aligned(tmp_path: Path) -> None:
     # budget keeps that documented fallback from hiding cue-boundary regressions.
     assert len(exceptions) / len(rows) <= 0.05
     assert summary.alignment["files"][0]["coverage"] >= 0.60
+
+
+def test_caption_cleanup_keeps_file_names_and_acronyms_but_splits_run_on_sentences() -> None:
+    cleaned = clean_cues([SubtitleCue(1, 0, 6000, "Double-click Windows install or update.bat file.Then edit main.py and config.yaml in the U.S. build.Next step!Done")])
+    assert cleaned[0].text == "Double-click Windows install or update.bat file. Then edit main.py and config.yaml in the U.S. build. Next step! Done"

@@ -152,3 +152,62 @@ def test_full_preparation_recovers_source_release_and_preserves_transcript(tmp_p
 def test_invalid_minimum_context_is_rejected(value):
     with pytest.raises(ValueError, match="min_edge_silence_ms"):
         config(min_edge_silence_ms=value).validate()
+
+
+def test_lookback_recovers_a_pause_hidden_by_an_overshooting_word_end():
+    caption, _, aligned, energy = fixture()
+    # Whisper reports "continues" ending at 4.2 s, but the real pause is
+    # 3.95-4.15 s; nothing after the aligned end is quiet.
+    energy[440:460] = .2
+    energy[395:415] = 0
+    segments, rejected = build_safe_sentence_segments(caption, aligned.words, energy, config())
+    assert not rejected
+    assert [s.text for s in segments] == ["Alpha ends. Bravo continues.", "Charlie finishes."]
+    assert 3950 <= segments[0].end_ms <= segments[1].start_ms <= 4150
+    assert " ".join(s.text for s in segments) == caption.text
+
+
+def test_lookback_does_not_accept_a_stop_closure_as_a_pause():
+    caption, _, aligned, energy = fixture()
+    energy[440:460] = .2
+    energy[410:417] = 0  # 70 ms of quiet inside the word: shorter than a real pause
+    segments, rejected = build_safe_sentence_segments(caption, aligned.words, energy, config())
+    assert segments == []
+    assert len(rejected) == 3
+
+
+def _long_sentence_fixture():
+    text = "Alpha ends. Bravo continues. Charlie finishes."
+    caption = build_caption_transcript(clean_cues([SubtitleCue(1, 0, 19500, text)]))
+    words = [Word(w, a, b) for w, a, b in [
+        ("Alpha", .3, 3.0), ("ends", 3.0, 6.0),
+        ("Bravo", 6.4, 9.4), ("continues", 9.4, 12.4),
+        ("Charlie", 12.8, 15.8), ("finishes", 15.8, 18.8),
+    ]]
+    aligned = align_caption_words(caption.words, words)
+    energy = np.ones(1950, dtype=np.float32) * .2
+    energy[:30] = energy[600:640] = energy[1240:1280] = energy[1890:] = 0
+    return caption, aligned, energy
+
+
+def _long_config(**kwargs):
+    return DatasetPrepConfig(name="safe", inputs=["source"], min_s=4, target_s=14, max_s=20,
+                             min_words_per_second=.1, export_reference_candidates=0, **kwargs)
+
+
+def test_single_sentence_share_prefers_short_clips_reproducibly():
+    caption, aligned, energy = _long_sentence_fixture()
+    packed, rejected = build_safe_sentence_segments(
+        caption, aligned.words, energy, _long_config(short_clip_fraction=0.0))
+    assert not rejected
+    assert [s.text for s in packed] == [caption.text]
+    short, rejected = build_safe_sentence_segments(
+        caption, aligned.words, energy, _long_config(short_clip_fraction=1.0))
+    assert not rejected
+    assert [s.text for s in short] == ["Alpha ends.", "Bravo continues.", "Charlie finishes."]
+    assert all(4000 <= s.duration_ms <= 7000 for s in short)
+    again, _ = build_safe_sentence_segments(
+        caption, aligned.words, energy, _long_config(short_clip_fraction=1.0))
+    assert [(s.start_ms, s.end_ms) for s in again] == [(s.start_ms, s.end_ms) for s in short]
+    with pytest.raises(ValueError, match="short_clip_fraction"):
+        _long_config(short_clip_fraction=0.9).validate()

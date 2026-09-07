@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+import re
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -13,8 +15,40 @@ from .features import _load_audio_16k
 from .whisper_asr import normalize_alignment_token
 
 
+_TERM_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\-\.]*[A-Za-z0-9]|[A-Za-z0-9]")
+_MIXED_CASE_RE = re.compile(r"[a-z][A-Z]|[A-Z][a-z]+[A-Z]")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
 def normalized_words(text: str) -> list[str]:
     return [token for word in text.split() for token in normalize_alignment_token(word)]
+
+
+def transcript_vocabulary(texts: Iterable[str], *, minimum_count: int = 2) -> list[str]:
+    """Spellings the transcripts themselves use for names, acronyms, versions, and products.
+
+    Mixed-case tokens, acronyms, tokens containing digits, and words that stay
+    capitalized in the middle of sentences are returned most frequent first.
+    These are the words a speech recognizer most often spells differently, and
+    the user's subtitles are the authority on how they are written.
+    """
+    counts: Counter[str] = Counter()
+    mid_sentence: Counter[str] = Counter()
+    for text in texts:
+        for sentence in _SENTENCE_SPLIT_RE.split(str(text or "")):
+            for index, token in enumerate(_TERM_TOKEN_RE.findall(sentence)):
+                counts[token] += 1
+                if index:
+                    mid_sentence[token] += 1
+
+    def is_term(token: str) -> bool:
+        if len(token) < 2 or token == "I" or token.startswith("I'"):
+            return False
+        if any(ch.isdigit() for ch in token) or token.isupper() or _MIXED_CASE_RE.search(token):
+            return True
+        return token[0].isupper() and mid_sentence[token] >= 3 and mid_sentence[token] >= 0.6 * counts[token]
+
+    return [token for token, count in counts.most_common() if count >= minimum_count and is_term(token)]
 
 
 def word_error_counts(reference: str, hypothesis: str) -> tuple[int, int]:

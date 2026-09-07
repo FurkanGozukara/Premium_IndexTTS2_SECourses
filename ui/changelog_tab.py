@@ -7,6 +7,26 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.6",
+        "2026-09-07",
+        """
+### Transcript audits that trust your subtitles, and a corrected speaking-rate calibration
+
+- The voice and transcript audit now treats the transcripts you supplied as the authority on how names and terms are written. It collects mixed-case words, acronyms, version numbers, and mid-sentence capitalized names from your subtitles, decodes fresh clip transcriptions with a small beam search, and no longer counts a recognizer spelling of one of those terms as a transcript error. Contractions, joined compounds such as "Swarm UI", and okay/OK are normalized on both sides.
+- The first/last-word check now fails only for missing, extra, or different ordinary words at a clip edge, so cut endings and music bleed are still rejected while spelling variants of your terms pass. On a 17-recording English narration dataset these rules accepted about 60 percent of the clips the previous audit had rejected on transcript grounds, without changing any clip it had accepted. Prompting Whisper with the dataset's terms is available as a command-line option; it recovered a few more clips but made some clean clips fail, so it stays off.
+- Pause search for sentence-aligned clips may look up to 200 ms back into the previous word when Whisper's word end runs into the pause, but only a quiet stretch longer than a stop-consonant closure counts. Measured recovery is modest; the 30 ms quiet-edge check on exported audio is unchanged.
+- New experimental dataset option **Share of single-sentence clips** aims a reproducible share of clips at one short sentence of about 6 seconds. It defaults to 0 and leaves existing presets unchanged. In one blind listening comparison a 0.3 share made the adapter rush between sentences and lowered naturalness ratings even though identity and pace measurements improved, so leave it at 0 unless you are experimenting.
+- The saved speaking rate is now calibrated from matched held-out sentences once the automatic speech comparison completes. The earlier estimate from the short epoch sample compared a ten-word sentence with long multi-sentence recordings and overstated how slow a voice is; it is kept beside the new value for reference. Voice Generation shows the stored value in an editable **Saved speaking rate for this LoRA / DoRA** field with a **Save speaking rate** button, so you can override any estimate per adapter.
+- Speech comparison reports use the same normalized transcript comparison, so split compounds and contractions no longer count as errors there either, and the dataset's own spellings of names and terms are accepted for Base and adapters alike.
+- The speaker guard in automatic checkpoint selection now compares each generated sentence with the real recording of that sentence whenever at least four matched recordings exist. Similarity to the single reference clip rewards copying that prompt, which favored the unadapted model even when independent listening rated the adapted voice far closer to the speaker; both values are reported.
+- Spoken forms of currency, storage and frequency units, and decimals are normalized on both sides of every transcript comparison ("$0.61" and "61 cents", "6 GB" and "6 gigabytes", "1.5" and "one point five"). An edge word that the recognizer merely replaces with a similar word or splits into pieces no longer fails the first/last-word check; missing or extra edge words still do, and the quiet-edge measurement continues to guard against cut audio.
+- The audit gives clips that failed only the transcript checks a second opinion from the full whisper-large-v3 model and keeps them when it agrees with your transcript. Measured on the same narration dataset, the full model recovered a third of the clips the fast turbo model had rejected and agreed with an independent listener more often; it is 2.5 times slower, so it runs only on those clips. A new audit checkbox controls it.
+- Caption cleanup no longer inserts a space inside file names and dotted acronyms such as "update.bat", "main.py", or "U.S."; run-on sentences like "done.Next" are still separated. Previously prepared clips containing such names spelled them as "update. bat", which taught models to pause before the extension.
+
+Restart after updating. Existing adapters and datasets remain compatible; re-run the audit to benefit from the transcript changes. Generated speech and audit decisions still depend on automatic recognition, which remains imperfect on technical vocabulary.
+""".strip(),
+    ),
+    (
         "v6.5",
         "2026-09-07",
         """
