@@ -110,7 +110,7 @@ class TextFeaturePipeline:
             lambda match: self.normalizer.char_rep_map[match.group()], str(text)
         )
         if lang in {"zh", "zhen", "en"}:
-            processed = self.normalizer.normalize(processed)
+            processed = self.normalizer.normalize(processed, lang=lang)
         elif lang in {"ja", "es"}:
             processed = nemo_text_normalize(processed, lang)
         if lang in {"ja", "zh", "zhen", "en"}:

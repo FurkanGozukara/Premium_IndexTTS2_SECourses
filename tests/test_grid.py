@@ -408,6 +408,9 @@ def test_frontend_grid_config_carries_full_generation_request(tmp_path: Path) ->
             "generation.target_duration_mode": "trim",
             "generation.latent_multiplier": 2.05,
             "generation.speaking_rate": 0.75,
+            "generation.auto_retry_incomplete_speech": False,
+            "generation.max_speech_retries": 0,
+            "generation.max_speech_split_depth": 5,
         }
     )
 
@@ -449,3 +452,6 @@ def test_frontend_grid_config_carries_full_generation_request(tmp_path: Path) ->
     assert request["infer_kwargs"]["interval_silence"] == 777
     assert request["infer_kwargs"]["num_beams"] == 5
     assert request["infer_kwargs"]["latent_multiplier"] == pytest.approx(2.5625)
+    assert request["infer_kwargs"]["auto_retry_incomplete_speech"] is False
+    assert request["infer_kwargs"]["max_speech_retries"] == 0
+    assert request["infer_kwargs"]["max_speech_split_depth"] == 5

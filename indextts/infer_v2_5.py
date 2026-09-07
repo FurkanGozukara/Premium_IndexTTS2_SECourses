@@ -30,9 +30,11 @@ from indextts.utils.nemo_tn import normalize_text as nemo_text_normalize
 from indextts.utils.pause_tags import PauseChunk, TextChunk, split_text_with_pauses
 from indextts.utils.text_segmentation import (
     DEFAULT_NON_CJK_BUDGET_SCALE,
+    SpeechRecoveryConfig,
     default_segment_tokens,
     split_atomic_pieces,
     split_text_by_tokens as shared_split_text_by_tokens,
+    split_text_for_recovery,
 )
 from indextts.runtime.block_swap import (
     BlockSwapConfig,
@@ -170,8 +172,12 @@ class IndexTTS2:
             self.runtime.use_accel = bool(legacy_kwargs.pop("use_accel"))
         if "use_torch_compile" in legacy_kwargs:
             self.runtime.torch_compile_s2mel = bool(legacy_kwargs.pop("use_torch_compile"))
-        use_deepspeed = bool(legacy_kwargs.pop("use_deepspeed", False))
-        load_qwen_emo = bool(legacy_kwargs.pop("use_qwen_emo", runtime_was_supplied))
+        use_deepspeed = bool(legacy_kwargs.pop("use_deepspeed", self.runtime.use_deepspeed))
+        load_qwen_emo = bool(legacy_kwargs.pop(
+            "use_qwen_emo", self.runtime.use_qwen_emo if runtime_was_supplied else False,
+        ))
+        self.runtime.use_deepspeed = use_deepspeed
+        self.runtime.use_qwen_emo = load_qwen_emo
         if legacy_kwargs:
             print(">> Ignoring unsupported legacy runtime options:", ", ".join(sorted(legacy_kwargs)))
         self.runtime.validate()
@@ -372,6 +378,7 @@ class IndexTTS2:
             half=self.gpt_torch_dtype == torch.float16,
             dtype=self.gpt_torch_dtype,
         )
+        self.runtime.use_deepspeed = use_deepspeed
         self._log_model("gpt", self.gpt, load_started)
 
         if self.use_cuda_kernel:
@@ -1013,7 +1020,7 @@ class IndexTTS2:
         )
         if text_normalization:
             if language in {"zh", "zhen", "en"}:
-                value = self.text_process.normalize(value)
+                value = self.text_process.normalize(value, lang=language)
             elif language in {"ja", "es"}:
                 value = nemo_text_normalize(value, language)
         if language in {"ja", "zh", "zhen", "en"}:
@@ -1055,7 +1062,10 @@ class IndexTTS2:
                 lang_prefix,
                 segment_budget_scale_non_cjk,
             )
-            chunk_segments = [item for item in chunk_segments if item]
+            # The splitter preserves every character, including a whitespace
+            # fragment between two words which each fill their token budget.
+            # Whitespace is a text boundary, not a separate synthesis request.
+            chunk_segments = [item for item in chunk_segments if item.strip()]
             for index, segment in enumerate(chunk_segments):
                 segment_index = len(segments)
                 segments.append(segment)
@@ -1256,6 +1266,93 @@ class IndexTTS2:
             minimum_silence_ms=trim_silence_ms_threshold,
         )
         return wav, s2mel_elapsed, vocoder_elapsed
+
+    def _completed_code_length(self, code):
+        """Return the speech length before a real EOS, or None if generation was cut off."""
+        positions = (code == self.stop_mel_token).nonzero(as_tuple=False)
+        return int(positions[0, 0].item()) if positions.numel() else None
+
+    def _complete_speech_codes(self, text, codes, generate_codes, *, max_mel_tokens, recovery):
+        """Recover one original segment, returning only complete, nonempty code parts.
+
+        The caller retains its original audio plan. Recovered parts occupy that
+        segment's one slot, so explicit pauses, subtitle units and already
+        streamed segments cannot move or be replayed. No incomplete code is
+        decoded, even if a later child exhausts the recovery budget.
+        """
+        attempts = 0
+
+        def failure(piece, code):
+            reason = (
+                "generated no speech before its end token"
+                if self._completed_code_length(code[0]) == 0
+                else f"reached max_mel_tokens={max_mel_tokens} without an end-of-speech token"
+            )
+            excerpt = " ".join(piece.split())[:100]
+            recovery_status = (
+                f"Recovery stopped after {attempts} retries"
+                if recovery.enabled else "Automatic incomplete-speech recovery is disabled"
+            )
+            return RuntimeError(
+                f"Incomplete speech: the model {reason}. {recovery_status} "
+                f"for segment {excerpt!r}; no incomplete audio was accepted. "
+                "Increase Max mel tokens or use shorter text."
+            )
+
+        def generate(piece):
+            nonlocal attempts
+            attempts += 1
+            message = f"Recovering incomplete speech: retry {attempts}/{recovery.max_attempts}"
+            self._progress_log(f">> {message}")
+            if self.progress_reporter is not None:
+                self.progress_reporter.update(
+                    getattr(self.progress_reporter, "completed", 0), desc=message,
+                )
+            return generate_codes(piece)
+
+        def recover(piece, code, depth):
+            if code.ndim != 2 or code.shape[0] != 1:
+                raise RuntimeError("Speech recovery expected one generated sequence")
+            length = self._completed_code_length(code[0])
+            if length is not None and length > 0:
+                return [code[:, :length]]
+            if not recovery.enabled or attempts >= recovery.max_attempts:
+                raise failure(piece, code)
+            children = (
+                split_text_for_recovery(piece, self._token_len)
+                if depth < recovery.max_split_depth else []
+            )
+            if not children:
+                # At the selected split depth (including zero), or for one
+                # unsplittable word, use only the user's remaining retry budget.
+                while attempts < recovery.max_attempts:
+                    retried = generate(piece)
+                    length = self._completed_code_length(retried[0])
+                    if length is not None and length > 0:
+                        return [retried[:, :length]]
+                raise failure(piece, retried)
+            complete = []
+            for child in children:
+                if attempts >= recovery.max_attempts:
+                    raise failure(child, code)
+                complete.extend(recover(child, generate(child), depth + 1))
+            return complete
+
+        return recover(text, codes, 0)
+
+    def _render_code_parts(self, code_parts, prompt_condition, ref_mel, style, **kwargs):
+        """Join recovery pieces within their original segment, adding no new explicit pauses."""
+        wavs = []
+        s2mel_time = 0.0
+        vocoder_time = 0.0
+        for codes in code_parts:
+            wav, acoustic_elapsed, vocoder_elapsed = self._render_codes_segment(
+                codes, prompt_condition, ref_mel, style, **kwargs,
+            )
+            wavs.append(wav)
+            s2mel_time += acoustic_elapsed
+            vocoder_time += vocoder_elapsed
+        return torch.cat(wavs, dim=-1), s2mel_time, vocoder_time
     
     def normalize_emo_vec(self, emo_vector, apply_bias=True):
         # apply biased emotion factors for better user experience,
@@ -1301,6 +1398,9 @@ class IndexTTS2:
               cfm_temperature=1.0, seed=None, reuse_spk_cond_for_emo=False,
               enable_pause_tags=True, trim_silence_ms_threshold=0,
               target_duration_s=None, target_duration_mode="off",
+              auto_retry_incomplete_speech=SpeechRecoveryConfig.enabled,
+              max_speech_retries=SpeechRecoveryConfig.max_attempts,
+              max_speech_split_depth=SpeechRecoveryConfig.max_split_depth,
               **generation_kwargs):
         if cfm_cache_length is None:
             cfm_cache_length = self.runtime.cfm_cache_length
@@ -1329,6 +1429,9 @@ class IndexTTS2:
                 trim_silence_ms_threshold=trim_silence_ms_threshold,
                 target_duration_s=target_duration_s,
                 target_duration_mode=target_duration_mode,
+                auto_retry_incomplete_speech=auto_retry_incomplete_speech,
+                max_speech_retries=max_speech_retries,
+                max_speech_split_depth=max_speech_split_depth,
                 **generation_kwargs
             )
         else:
@@ -1356,6 +1459,9 @@ class IndexTTS2:
                 trim_silence_ms_threshold=trim_silence_ms_threshold,
                 target_duration_s=target_duration_s,
                 target_duration_mode=target_duration_mode,
+                auto_retry_incomplete_speech=auto_retry_incomplete_speech,
+                max_speech_retries=max_speech_retries,
+                max_speech_split_depth=max_speech_split_depth,
                 **generation_kwargs
             ))
             return results[0] if results else None
@@ -1607,6 +1713,7 @@ class IndexTTS2:
         lang_code = str(lang or "EN").upper()
         lang_prefix = f'<|{lang_code.lower()}|> '
         jobs = []
+        job_texts = {}
         expected_segments = []
         text_plans = []
         for text_index, unit_text in enumerate(texts):
@@ -1626,6 +1733,7 @@ class IndexTTS2:
                 token_tensor = torch.tensor(token_ids, dtype=torch.long, device=self.device)
                 token_tensor = F.pad(token_tensor, (0, 1), value=self.stop_text_token)
                 jobs.append((text_index, segment_index, token_tensor))
+                job_texts[text_index, segment_index] = segment_text
 
         if len(jobs) < 2:
             kwargs.update({
@@ -1663,6 +1771,11 @@ class IndexTTS2:
         num_beams = int(kwargs.pop("num_beams", 3))
         repetition_penalty = kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = int(kwargs.pop("max_mel_tokens", 1500))
+        recovery = SpeechRecoveryConfig(
+            enabled=bool(kwargs.pop("auto_retry_incomplete_speech", SpeechRecoveryConfig.enabled)),
+            max_attempts=kwargs.pop("max_speech_retries", SpeechRecoveryConfig.max_attempts),
+            max_split_depth=kwargs.pop("max_speech_split_depth", SpeechRecoveryConfig.max_split_depth),
+        )
 
         generated_parts = [[] for _ in texts]
         results = [None for _ in texts]
@@ -1779,54 +1892,96 @@ class IndexTTS2:
                         self._reset_generation_cache()
                 gpt_time += time.perf_counter() - gpt_started
 
-                code_lens = []
-                for code in codes:
-                    stop_positions = (code == self.stop_mel_token).nonzero(as_tuple=False)
-                    code_lens.append(
-                        stop_positions[0, 0].item() if stop_positions.numel() else code.numel()
-                    )
-                code_lens = torch.tensor(code_lens, dtype=torch.long, device=self.device)
-                generated_code_tokens += int(code_lens.sum().item())
-                if max_consecutive_silence > 0:
-                    codes, code_lens = self.remove_long_silence(
-                        codes,
-                        silent_token=52,
-                        max_consecutive=max_consecutive_silence,
-                    )
+                lengths = [self._completed_code_length(code) for code in codes]
+                complete_rows = [row for row, length in enumerate(lengths) if length is not None and length > 0]
+                recovered_parts = {}
 
-                s2mel_started = time.perf_counter()
-                with torch.amp.autocast(
-                    text_tokens.device.type,
-                    enabled=False,
-                    dtype=None,
-                ):
-                    cond, target_lengths = self._prepare_batched_conditioning(
-                        codes, code_lens, duration_factor=duration_factor,
-                    )
-                    with self._use_s2mel():
-                        batch_prompt = prompt_condition.expand(batch_count, -1, -1)
-                        batch_ref_mel = ref_mel.expand(batch_count, -1, -1)
-                        batch_style = style.expand(batch_count, -1)
-                        cat_condition = torch.cat([batch_prompt, cond], dim=1)
-                        cfm_lengths = target_lengths + batch_prompt.size(1)
-                        required_cache_length = max(cfm_cache_length, cat_condition.size(1))
-                        cfm_batch_size = batch_count * (2 if inference_cfg_rate > 0 else 1)
-                        self._setup_s2mel_caches(cfm_batch_size, required_cache_length)
-                        vc_target = self.s2mel.models['cfm'].inference(
-                            cat_condition,
-                            cfm_lengths,
-                            batch_ref_mel,
-                            batch_style,
-                            None,
-                            diffusion_steps,
-                            temperature=cfm_temperature,
-                            inference_cfg_rate=inference_cfg_rate,
+                def generate_recovery_codes(piece):
+                    nonlocal gpt_time
+                    token_ids = self.tokenizer.encode(lang_prefix + piece, allowed_special='all')
+                    tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+                    tokens = F.pad(tokens, (0, 1), value=self.stop_text_token)
+                    started = time.perf_counter()
+                    with torch.amp.autocast(
+                        tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype,
+                    ):
+                        recovered, _ = self.gpt.inference_speech(
+                            spk_cond_emb, tokens, langs[:1], emo_cond_emb,
+                            cond_lengths=cond_lengths, emo_cond_lengths=emo_cond_lengths,
+                            emo_vec=emovec, campplus_embedding=style, wav=spk_audio_prompt,
+                            num_return_sequences=1, max_generate_length=max_mel_tokens,
+                            **generation_options,
                         )
-                        vc_target = vc_target[:, :, ref_mel.size(-1):]
-                    s2mel_time += time.perf_counter() - s2mel_started
-                    vocoder_started = time.perf_counter()
-                    wav_batch = self._vocode_batched_mels(vc_target, target_lengths)
-                    vocoder_time += time.perf_counter() - vocoder_started
+                        if reset_beam_cache_per_segment:
+                            self._reset_generation_cache()
+                    gpt_time += time.perf_counter() - started
+                    return recovered
+
+                for row, length in enumerate(lengths):
+                    if length is None or length <= 0:
+                        text_index, segment_index, _ = batch_jobs[row]
+                        parts = self._complete_speech_codes(
+                            job_texts[text_index, segment_index], codes[row:row + 1],
+                            generate_recovery_codes, max_mel_tokens=max_mel_tokens, recovery=recovery,
+                        )
+                        generated_code_tokens += sum(part.shape[-1] for part in parts)
+                        if max_consecutive_silence > 0:
+                            parts = [
+                                self.remove_long_silence(
+                                    part, silent_token=52, max_consecutive=max_consecutive_silence,
+                                )[0]
+                                for part in parts
+                            ]
+                        recovered_parts[row] = parts
+
+                wav_batch = [None] * batch_count
+                if complete_rows:
+                    complete_codes = codes[complete_rows]
+                    code_lens = torch.tensor([lengths[row] for row in complete_rows], dtype=torch.long, device=self.device)
+                    generated_code_tokens += int(code_lens.sum().item())
+                    if max_consecutive_silence > 0:
+                        complete_codes, code_lens = self.remove_long_silence(
+                            complete_codes, silent_token=52, max_consecutive=max_consecutive_silence,
+                        )
+                    s2mel_started = time.perf_counter()
+                    with torch.amp.autocast(text_tokens.device.type, enabled=False, dtype=None):
+                        cond, target_lengths = self._prepare_batched_conditioning(
+                            complete_codes, code_lens, duration_factor=duration_factor,
+                        )
+                        with self._use_s2mel():
+                            complete_count = len(complete_rows)
+                            batch_prompt = prompt_condition.expand(complete_count, -1, -1)
+                            batch_ref_mel = ref_mel.expand(complete_count, -1, -1)
+                            batch_style = style.expand(complete_count, -1)
+                            cat_condition = torch.cat([batch_prompt, cond], dim=1)
+                            cfm_lengths = target_lengths + batch_prompt.size(1)
+                            required_cache_length = max(cfm_cache_length, cat_condition.size(1))
+                            cfm_batch_size = complete_count * (2 if inference_cfg_rate > 0 else 1)
+                            self._setup_s2mel_caches(cfm_batch_size, required_cache_length)
+                            vc_target = self.s2mel.models['cfm'].inference(
+                                cat_condition, cfm_lengths, batch_ref_mel, batch_style,
+                                None, diffusion_steps, temperature=cfm_temperature,
+                                inference_cfg_rate=inference_cfg_rate,
+                            )
+                            vc_target = vc_target[:, :, ref_mel.size(-1):]
+                        s2mel_time += time.perf_counter() - s2mel_started
+                        vocoder_started = time.perf_counter()
+                        complete_wavs = self._vocode_batched_mels(vc_target, target_lengths)
+                        vocoder_time += time.perf_counter() - vocoder_started
+                    for row, wav in zip(complete_rows, complete_wavs):
+                        wav_batch[row] = wav
+
+                for row, parts in recovered_parts.items():
+                    wav, acoustic_elapsed, vocoder_elapsed = self._render_code_parts(
+                        parts, prompt_condition, ref_mel, style,
+                        duration_factor=duration_factor, cfm_cache_length=cfm_cache_length,
+                        diffusion_steps=diffusion_steps, inference_cfg_rate=inference_cfg_rate,
+                        cfm_temperature=cfm_temperature,
+                        trim_silence_ms_threshold=trim_silence_ms_threshold,
+                    )
+                    wav_batch[row] = wav
+                    s2mel_time += acoustic_elapsed
+                    vocoder_time += vocoder_elapsed
 
             completed_texts = set()
             for row_index, (text_index, segment_index, _) in enumerate(batch_jobs):
@@ -1885,7 +2040,14 @@ class IndexTTS2:
               cfm_temperature=1.0, seed=None, reuse_spk_cond_for_emo=False,
               enable_pause_tags=True, trim_silence_ms_threshold=0,
               target_duration_s=None, target_duration_mode="off",
+              auto_retry_incomplete_speech=SpeechRecoveryConfig.enabled,
+              max_speech_retries=SpeechRecoveryConfig.max_attempts,
+              max_speech_split_depth=SpeechRecoveryConfig.max_split_depth,
               **generation_kwargs):
+        recovery = SpeechRecoveryConfig(
+            enabled=bool(auto_retry_incomplete_speech), max_attempts=max_speech_retries,
+            max_split_depth=max_speech_split_depth,
+        )
         if cfm_cache_length is None:
             cfm_cache_length = self.runtime.cfm_cache_length
         actual_seed = _seed_everything(seed)
@@ -2106,7 +2268,6 @@ class IndexTTS2:
         gpt_gen_time = 0
         s2mel_time = 0
         bigvgan_time = 0
-        has_warned = False
         generated_code_tokens = 0
         stream_plan_cursor = 0
         cond_lengths = torch.tensor([spk_cond_emb.shape[-1]], device=self.device)
@@ -2126,9 +2287,18 @@ class IndexTTS2:
                 print(text_tokens)
                 print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
 
-            m_start_time = time.perf_counter()
-            with torch.no_grad():
-                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+            def generate_codes(piece):
+                nonlocal gpt_gen_time
+                if piece == segments[seg_idx]:
+                    piece_tokens = text_tokens
+                else:
+                    token_ids = self.tokenizer.encode(lang_prefix + piece, allowed_special='all')
+                    piece_tokens = torch.tensor(token_ids, dtype=text_tokens.dtype, device=self.device).unsqueeze(0)
+                    piece_tokens = F.pad(piece_tokens, (0, 1), value=self.stop_text_token)
+                m_start_time = time.perf_counter()
+                with torch.no_grad(), torch.amp.autocast(
+                    piece_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype,
+                ):
                     emovec = default_emovec
                     if emovec is None:
                         emovec = self.gpt.merge_emovec(
@@ -2145,7 +2315,7 @@ class IndexTTS2:
 
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
-                        text_tokens,
+                        piece_tokens,
                         lang,
                         emo_cond_emb,
                         cond_lengths=cond_lengths,
@@ -2161,49 +2331,24 @@ class IndexTTS2:
                         self._reset_generation_cache()
 
                 gpt_gen_time += time.perf_counter() - m_start_time
-                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_segment`({max_text_tokens_per_segment}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
-                    )
-                    has_warned = True
+                return codes
 
-                code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
-                #                 if verbose:
-                #                     print(codes, type(codes))
-                #                     print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
-                #                     print(f"code len: {code_lens}")
-
-                code_lens = []
-                max_code_len = 0
-                for code in codes:
-                    if self.stop_mel_token not in code:
-                        code_len = len(code)
-                    else:
-                        len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0]
-                        code_len = len_[0].item() if len_.numel() > 0 else len(code)
-                    code_lens.append(code_len)
-                    max_code_len = max(max_code_len, code_len)
-                codes = codes[:, :max_code_len]
-                code_lens = torch.LongTensor(code_lens)
-                generated_code_tokens += int(code_lens.sum().item())
-                code_lens = code_lens.to(self.device)
+            with torch.no_grad():
+                code_parts = self._complete_speech_codes(
+                    segments[seg_idx], generate_codes(segments[seg_idx]), generate_codes,
+                    max_mel_tokens=max_mel_tokens, recovery=recovery,
+                )
+                generated_code_tokens += sum(part.shape[-1] for part in code_parts)
                 if max_consecutive_silence > 0:
-                    codes, code_lens = self.remove_long_silence(
-                        codes,
-                        silent_token=52,
-                        max_consecutive=int(max_consecutive_silence),
-                    )
-                if verbose:
-                    print(codes, type(codes))
-                    print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                    print(f"code len: {code_lens}")
-
-                rendered_codes.append(codes.detach().cpu())
-                wav, segment_s2mel_time, segment_vocoder_time = self._render_codes_segment(
-                    codes,
+                    code_parts = [
+                        self.remove_long_silence(
+                            part, silent_token=52, max_consecutive=int(max_consecutive_silence),
+                        )[0]
+                        for part in code_parts
+                    ]
+                rendered_codes.append([part.detach().cpu() for part in code_parts])
+                wav, segment_s2mel_time, segment_vocoder_time = self._render_code_parts(
+                    code_parts,
                     prompt_condition,
                     ref_mel,
                     style,
@@ -2249,9 +2394,9 @@ class IndexTTS2:
                 f"{desired_speech_samples / sampling_rate:.3f}s, duration_factor={adjusted_factor:.4f}"
             )
             adjusted_wavs = []
-            for codes in rendered_codes:
-                adjusted_wav, segment_s2mel_time, segment_vocoder_time = self._render_codes_segment(
-                    codes,
+            for code_parts in rendered_codes:
+                adjusted_wav, segment_s2mel_time, segment_vocoder_time = self._render_code_parts(
+                    code_parts,
                     prompt_condition,
                     ref_mel,
                     style,

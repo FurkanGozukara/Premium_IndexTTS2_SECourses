@@ -172,6 +172,15 @@ def build_training_model(
         if changes:
             emit(">> resume metadata overrides config: " + ", ".join(changes))
         targets = list(resume_file.module_paths)
+        requested_targets = list_target_modules(
+            model, attention=cfg.target_attention, mlp=cfg.target_mlp
+        )
+        if set(targets) != set(requested_targets):
+            emit(
+                ">> resume checkpoint fixes the adapter target layout: "
+                f"using its {len(targets)} modules instead of the "
+                f"{len(requested_targets)} selected attention/MLP modules"
+            )
     else:
         targets = list_target_modules(
             model, attention=cfg.target_attention, mlp=cfg.target_mlp
@@ -187,10 +196,6 @@ def build_training_model(
         use_dora=cfg.adapter_type == "dora",
         target_modules=targets,
     )
-    if cfg.resume_from:
-        apply_lora(model, cfg.resume_from, strength=1.0)
-        adapters = _adapter_mapping(model)
-
     full_modules: dict[str, torch.nn.Module] = {}
     if cfg.train_spk_proj:
         full_modules["spk_emb_proj"] = model.spk_emb_proj
@@ -200,6 +205,19 @@ def build_training_model(
     if cfg.train_mel_embed_head:
         full_modules["mel_embedding"] = model.mel_embedding
         full_modules["mel_head"] = model.mel_head
+    if cfg.train_full_modules_fp32:
+        # Keep small updates and AdamW moments in FP32, as for the adapters.
+        # Promote before restoring weights so an FP32 checkpoint never passes
+        # through BF16 storage and loses its accumulated updates on resume.
+        for module in full_modules.values():
+            module.float()
+    if full_modules:
+        precision = "FP32" if cfg.train_full_modules_fp32 else str(base_dtype).removeprefix("torch.")
+        emit(f">> fully trained modules: {', '.join(full_modules)} | parameter/optimizer precision {precision}")
+    if cfg.resume_from:
+        apply_lora(model, cfg.resume_from, strength=1.0)
+        adapters = _adapter_mapping(model)
+
     parameters = trainable_parameters(model, adapters, full_modules)
     if not parameters:
         raise ValueError("the training configuration produced no trainable parameters")
@@ -274,7 +292,7 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
 
 def _optimizer(config: TrainConfig, parameters: list[torch.nn.Parameter]) -> torch.optim.Optimizer:
     kwargs = {
-        "lr": 1.0 if config.optimizer == "prodigy" else config.learning_rate,
+        "lr": config.learning_rate,
         "betas": config.betas,
         "eps": config.eps,
         "weight_decay": config.weight_decay,
@@ -301,7 +319,7 @@ def _scheduler(
     return get_scheduler(
         config.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=min(config.warmup_steps, total_steps),
+        num_warmup_steps=config.warmup_steps,
         num_training_steps=max(1, total_steps),
     )
 

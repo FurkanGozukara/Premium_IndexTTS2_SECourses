@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 from typing import Iterable, Sequence
 
@@ -263,7 +264,7 @@ def find_media_files(inputs: list[str], recursive: bool = True) -> list[str]:
     return sorted(found.values(), key=lambda value: value.casefold())
 
 
-def find_sidecar_subtitles(media_path: str | Path) -> list[str]:
+def find_sidecar_subtitles(media_path: str | Path, language: str | None = None) -> list[str]:
     media = Path(media_path)
     if not media.parent.is_dir():
         return []
@@ -276,9 +277,26 @@ def find_sidecar_subtitles(media_path: str | Path) -> list[str]:
         if candidate_stem == stem or candidate_stem.startswith(stem + "."):
             matches.append(candidate)
 
+    aliases = {
+        "en": {"en", "eng", "english"}, "es": {"es", "spa", "spanish"},
+        "ja": {"ja", "jpn", "japanese"}, "zh": {"zh", "zho", "chi", "cmn", "chinese"},
+        "ar": {"ar", "ara", "arabic"},
+    }
+    requested = str(language or "").casefold().split("-")[0]
+    requested = next((key for key, names in aliases.items() if requested in names), requested)
+
+    def language_priority(path: Path) -> int:
+        if not requested or requested == "auto":
+            return 0
+        suffix = path.stem.casefold()[len(stem):].lstrip(".")
+        tag = re.split(r"[._-]", suffix)[0]
+        detected = next((key for key, names in aliases.items() if tag in names), None)
+        return 0 if detected == requested else 1 if detected is None else 2
+
     extension_order = {".srt": 0, ".vtt": 1, ".sbv": 2}
     matches.sort(
         key=lambda p: (
+            language_priority(p),
             0 if p.stem.casefold() == stem else 1,
             extension_order.get(p.suffix.casefold(), 99),
             p.name.casefold(),

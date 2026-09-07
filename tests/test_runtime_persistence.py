@@ -30,6 +30,8 @@ def test_applied_runtime_round_trips_and_only_overlays_system_presets(tmp_path):
         blocks_to_swap=7,
         lora_strength=0.65,
         lora_merge_into_base=True,
+        use_qwen_emo=False,
+        use_deepspeed=True,
     )
     persist_runtime_config(expected, path)
     restored = load_persisted_runtime(path)
@@ -46,6 +48,8 @@ def test_applied_runtime_round_trips_and_only_overlays_system_presets(tmp_path):
     )
     assert system_values["runtime.blocks_to_swap"] == 7
     assert system_values["runtime.lora_merge_into_base"] is True
+    assert system_values["runtime.use_qwen_emo"] is False
+    assert system_values["runtime.use_deepspeed"] is True
     assert user_values == preset
     assert runtime_registry_values(restored)["runtime.gpt_dtype"] == "fp32"
 

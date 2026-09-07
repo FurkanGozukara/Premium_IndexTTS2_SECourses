@@ -24,6 +24,7 @@ class TrainConfig:
     train_spk_proj: bool = True
     train_emo_layers: bool = False
     train_mel_embed_head: bool = False
+    train_full_modules_fp32: bool = True
 
     base_variant: str = "bf16"
     base_dtype: str = "bf16"
@@ -152,6 +153,7 @@ class TrainConfig:
             raise ValueError("dropout must be in [0, 1)")
         if not (self.target_attention or self.target_mlp):
             raise ValueError("at least one LoRA / DoRA target group must be enabled")
+        self.train_full_modules_fp32 = bool(self.train_full_modules_fp32)
 
         self.base_variant = str(self.base_variant).lower()
         if self.base_variant not in {"bf16", "int8_convrot"}:

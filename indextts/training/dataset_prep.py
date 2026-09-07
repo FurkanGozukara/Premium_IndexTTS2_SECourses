@@ -59,6 +59,7 @@ from .segmenter import (
 )
 from .subtitles import (
     Segment,
+    SubtitleCue,
     build_caption_transcript,
     clean_cues,
     merge_cues_into_sentences,
@@ -126,6 +127,10 @@ class DatasetPrepConfig:
     max_words: int = 80
     min_file_alignment_coverage: float = 0.60
     min_segment_alignment_coverage: float = 0.70
+    cue_fallback_enabled: bool = True
+    cue_fallback_max_error: float = 0.15
+    cue_fallback_check_boundary_words: bool = True
+    cue_fallback_margin_ms: int = 40
     min_words_per_second: float = 1.0
     max_words_per_second: float = 5.5
     min_peak_dbfs: float = -35.0
@@ -176,10 +181,15 @@ class DatasetPrepConfig:
             raise ValueError("Word limits are invalid")
         if self.max_segments < 0:
             raise ValueError("max_segments must be zero or positive")
-        for name in ("min_file_alignment_coverage", "min_segment_alignment_coverage"):
+        for name in ("min_file_alignment_coverage", "min_segment_alignment_coverage", "cue_fallback_max_error"):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between zero and one")
+        for name in ("cue_fallback_enabled", "cue_fallback_check_boundary_words"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be true or false")
+        if not 0 <= self.cue_fallback_margin_ms <= 1000:
+            raise ValueError("cue_fallback_margin_ms must be between zero and 1000")
         if not 0.0 <= self.max_clipping_ratio <= 1.0:
             raise ValueError("max_clipping_ratio must be between zero and one")
         if not 0.0 < self.clipping_threshold <= 1.0:
@@ -192,10 +202,10 @@ class DatasetPrepConfig:
             raise ValueError("silence_frame_ms must be positive")
 
     def resolved_segmentation_mode(self) -> str:
+        if self.subtitle_policy == "whisper_only" or self.segmentation_mode == "whisper_only":
+            return "whisper_only"
         if self.align_with_whisper:
             return "sentence_aligned"
-        if self.subtitle_policy == "whisper_only":
-            return "whisper_only"
         if self.segmentation_mode == "auto":
             return _default_segmentation_mode()
         return self.segmentation_mode
@@ -373,6 +383,7 @@ def _parse_metadata_csv(path: Path, warnings: list[str]) -> list[_ImportItem]:
 def _discover_import_items(config: DatasetPrepConfig, warnings: list[str]) -> list[_ImportItem]:
     metadata_files: dict[str, Path] = {}
     pair_candidates: dict[str, Path] = {}
+    clip_extensions = {".wav", ".flac", ".aiff", ".aif", ".ogg"}
     for raw in config.inputs:
         path = Path(raw).expanduser()
         if path.is_file() and path.name.casefold() == "metadata.csv":
@@ -382,18 +393,12 @@ def _discover_import_items(config: DatasetPrepConfig, warnings: list[str]) -> li
             iterator = path.rglob("metadata.csv") if config.recursive else path.glob("metadata.csv")
             for metadata in iterator:
                 metadata_files[str(metadata.resolve()).casefold()] = metadata.resolve()
-        if path.is_file() and path.suffix.casefold() in SUPPORTED_MEDIA_EXTENSIONS:
+        if path.is_file() and path.suffix.casefold() in clip_extensions:
             pair_candidates[str(path.resolve()).casefold()] = path.resolve()
         elif path.is_dir():
             iterator = path.rglob("*") if config.recursive else path.glob("*")
             for candidate in iterator:
-                if candidate.is_file() and candidate.suffix.casefold() in {
-                    ".wav",
-                    ".flac",
-                    ".aiff",
-                    ".aif",
-                    ".ogg",
-                }:
+                if candidate.is_file() and candidate.suffix.casefold() in clip_extensions:
                     pair_candidates[str(candidate.resolve()).casefold()] = candidate.resolve()
 
     items: list[_ImportItem] = []
@@ -415,6 +420,13 @@ def _discover_import_items(config: DatasetPrepConfig, warnings: list[str]) -> li
         if transcript is None:
             continue
         if find_sidecar_subtitles(audio):
+            continue
+        # A transcript next to a long recording is not an already-cut clip.
+        # Leave it in media discovery so its text is aligned and segmented.
+        try:
+            if sf.info(audio).duration > config.max_s:
+                continue
+        except (OSError, RuntimeError):
             continue
         text = _read_text(transcript, warnings.append).strip()
         if text:
@@ -615,35 +627,109 @@ def _snap_segments(
     return snapped
 
 
-def _segments_from_plain_transcript(
-    text: str,
-    timed_segments: Sequence[Segment],
-) -> list[Segment]:
-    transcript_matches = list(_WORD_RE.finditer(text))
-    if not transcript_matches or not timed_segments:
-        return []
-    weights = [max(1, len(_WORD_RE.findall(segment.text))) for segment in timed_segments]
-    total_weight = sum(weights)
-    result: list[Segment] = []
-    cursor = 0
-    cumulative = 0
-    for index, (segment, weight) in enumerate(zip(timed_segments, weights)):
-        cumulative += weight
-        next_cursor = (
-            len(transcript_matches)
-            if index == len(timed_segments) - 1
-            else max(cursor + 1, round(cumulative * len(transcript_matches) / total_weight))
+def _align_plain_transcript(text: str, words: Sequence[Any], duration_ms: int) -> tuple[Any, Any]:
+    """Keep supplied text while anchoring its words to actual recognized speech."""
+    from .whisper_asr import align_caption_words
+
+    caption = build_caption_transcript([SubtitleCue(1, 0, duration_ms, text)])
+    return caption, align_caption_words(caption.words, words)
+
+
+def _source_transcript(words: Sequence[Any]) -> Any:
+    from .dataset_quality import TimedTranscript
+    from .whisper_asr import _word_text, _word_times
+
+    return TimedTranscript([
+        {"text": _word_text(word), "start_s": _word_times(word)[0], "end_s": _word_times(word)[1]}
+        for word in words
+    ])
+
+
+def _verified_cue_text(
+    text: str, start_s: float, end_s: float, transcript: Any, config: DatasetPrepConfig,
+) -> bool:
+    """Use curation's spoken-form and edge-word checks before trusting cue timing."""
+    from .speech_metrics import transcript_metrics
+
+    try:
+        margin = config.cue_fallback_margin_ms / 1000.0
+        agreement = transcript_metrics(
+            text, transcript.between(start_s - margin, end_s + margin), config.language)
+    except ValueError:
+        return False
+    edges_match = agreement["start_matches"] and agreement["end_matches"]
+    return (agreement["error_rate"] <= config.cue_fallback_max_error
+            and (not config.cue_fallback_check_boundary_words or edges_match))
+
+
+@dataclass
+class _AlignedSidecar:
+    path: Path
+    cues: Sequence[Any]
+    caption: Any
+    alignment: Any
+    verified_segments: list[Segment] | None = None
+
+
+def _choose_aligned_sidecar(
+    candidates: Sequence[tuple[Path, Sequence[Any]]], words: Sequence[Any], config: DatasetPrepConfig,
+) -> tuple[_AlignedSidecar | None, list[dict[str, Any]]]:
+    """Try preferred subtitles first; cue fallback retains only verified pairs."""
+    from .whisper_asr import align_caption_words
+
+    attempted: list[dict[str, Any]] = []
+    low_coverage: list[_AlignedSidecar] = []
+    for path, cues in candidates:
+        cleaned = clean_cues(cues, remove_bracket_annotations=config.remove_bracket_annotations,
+                             dedupe_rolling_captions=config.dedupe_rolling_captions)
+        caption = build_caption_transcript(cleaned)
+        alignment = align_caption_words(caption.words, words)
+        attempted.append({"subtitle": _source_name(path), "coverage": round(alignment.coverage, 6)})
+        choice = _AlignedSidecar(path, cues, caption, alignment)
+        if alignment.coverage >= config.min_file_alignment_coverage:
+            return choice, attempted
+        low_coverage.append(choice)
+
+    if not config.cue_fallback_enabled:
+        return None, attempted
+    transcript = _source_transcript(words)
+    selected = None
+    best_duration = 0
+    for choice, attempt in zip(low_coverage, attempted):
+        cleaned = clean_cues(choice.cues, remove_bracket_annotations=config.remove_bracket_annotations,
+                             dedupe_rolling_captions=config.dedupe_rolling_captions)
+        segments = merge_cues_into_sentences(
+            choice.cues, max_gap_ms=config.max_gap_ms,
+            target_s=min(config.target_s, _reserve_segmentation_max(config)),
+            max_s=_reserve_segmentation_max(config), min_s=config.min_s,
+            remove_bracket_annotations=config.remove_bracket_annotations,
+            dedupe_rolling_captions=config.dedupe_rolling_captions,
         )
-        next_cursor = min(len(transcript_matches), next_cursor)
-        if cursor >= len(transcript_matches):
-            break
-        char_start = transcript_matches[cursor].start()
-        char_end = transcript_matches[next_cursor - 1].end()
-        while char_end < len(text) and text[char_end] in ",.;:!?。！？\"') ]":
-            char_end += 1
-        result.append(replace(segment, text=text[char_start:char_end].strip()))
-        cursor = next_cursor
-    return result
+        segments = _split_overlong(segments, cleaned, _reserve_segmentation_max(config))
+        verified = [segment for segment in segments if _verified_cue_text(
+            segment.text, segment.start_ms / 1000, segment.end_ms / 1000, transcript, config)]
+        attempt.update(verified_cue_segments=len(verified), rejected_cue_segments=len(segments) - len(verified))
+        duration = sum(segment.duration_ms for segment in verified)
+        if duration > best_duration:
+            choice.verified_segments = verified
+            selected, best_duration = choice, duration
+    return selected, attempted
+
+
+def _build_aligned_segments(
+    caption: Any, words: Sequence[Any], energy: np.ndarray, config: DatasetPrepConfig,
+    *, audio: np.ndarray, progress_cb: Callable[[str], None] | None = None,
+) -> tuple[list[Segment], bool, list[dict[str, Any]]]:
+    if config.min_edge_silence_ms and config.snap_to_silence and config.boundary_mode == "sentence":
+        segments, rejected = build_safe_sentence_segments(
+            caption, words, energy, config, audio=audio, progress_cb=progress_cb)
+        return segments, True, rejected
+    maximum = _reserve_segmentation_max(config)
+    return build_sentence_aligned_segments(
+        caption, words, target_s=min(config.target_s, maximum), max_s=maximum,
+        min_s=config.min_s, max_gap_ms=config.max_gap_ms, boundary_mode=config.boundary_mode,
+        min_pause_boundary_ms=config.min_pause_boundary_ms,
+    ), False, []
 
 
 def _word_count(text: str) -> int:
@@ -945,6 +1031,7 @@ def run_dataset_prep(
             "non_finite_loudness",
             "duplicate_sentence",
             "unsafe_audio_boundary",
+            "transcript_disagreement",
         )
     }
     filter_keep_counts: dict[str, int] = {"pause_boundary": 0}
@@ -969,10 +1056,18 @@ def run_dataset_prep(
     )
     _log(reporter, "Discovering media, subtitle sidecars, and pre-segmented inputs ...")
     import_items = _discover_import_items(config, warnings)
+    imported_speakers = {str(item.audio_path.resolve()).casefold(): item.speaker for item in import_items}
+    discovery_inputs = list(config.inputs)
+    if segmentation_mode == "whisper_only":
+        # Metadata may be the only listing of the audio files. Keep that list,
+        # but do not import its text when the user explicitly requested ASR text.
+        discovery_inputs.extend(str(item.audio_path) for item in import_items)
+        import_items = []
+        _log(reporter, "Whisper-only selected: supplied subtitle, TXT, and metadata text will be ignored.")
     import_paths = {str(item.audio_path.resolve()).casefold() for item in import_items}
     media_files = [
         path
-        for path in find_media_files(config.inputs, config.recursive)
+        for path in find_media_files(discovery_inputs, config.recursive)
         if str(Path(path).resolve()).casefold() not in import_paths
     ]
     warnings.extend(_orphan_subtitle_warnings(config, media_files))
@@ -1112,10 +1207,14 @@ def run_dataset_prep(
                     segments: list[Segment] = []
                     acoustic_repacked = False
                     transcript_source = ""
-                    sidecars = find_sidecar_subtitles(media_path)
+                    sidecars = find_sidecar_subtitles(media_path, language=config.language)
                     transcript_path = find_sidecar_transcript(media_path)
                     selected_sidecar: Path | None = None
                     raw_cues: Sequence[Any] = []
+                    aligned_sidecar: _AlignedSidecar | None = None
+                    verified_source = None
+                    sidecar_attempts: list[dict[str, Any]] = []
+                    parsed_sidecars: list[tuple[Path, Sequence[Any]]] = []
                     if segmentation_mode != "whisper_only" and config.subtitle_policy != "whisper_only":
                         for candidate_raw in sidecars:
                             candidate = Path(candidate_raw)
@@ -1125,13 +1224,38 @@ def run_dataset_prep(
                                     warning_callback=record_runtime_warning,
                                 )
                                 if parsed:
-                                    selected_sidecar = candidate
-                                    raw_cues = parsed
-                                    break
+                                    parsed_sidecars.append((candidate, parsed))
+                                    if segmentation_mode != "sentence_aligned":
+                                        break
                             except Exception as exc:
                                 warning = f"Could not parse subtitle {candidate}: {exc}"
                                 warnings.append(warning)
                                 _log(reporter, f"Warning: {warning}")
+
+                    if parsed_sidecars:
+                        if segmentation_mode == "sentence_aligned":
+                            _stage(reporter, "whisper_alignment")
+                            transcript, cache_reused = _transcribe_cached(
+                                audio=audio, media_path=media_path,
+                                cache_path=output_dir / "whisper" / f"{key}.words.json",
+                                config=config, reporter=reporter,
+                            )
+                            aligned_sidecar, sidecar_attempts = _choose_aligned_sidecar(
+                                parsed_sidecars, transcript.words, config)
+                            for attempt in sidecar_attempts:
+                                _log(reporter, f"Subtitle {Path(attempt['subtitle']).name}: "
+                                     f"{attempt['coverage']:.1%} word alignment")
+                            if aligned_sidecar is None:
+                                detail = ("No cue passed the configured transcript verification checks. "
+                                          if config.cue_fallback_enabled else "Verified cue fallback is disabled. ")
+                                raise ValueError(
+                                    "No subtitle matched the recognized speech. " + detail +
+                                    "Check the recording language/subtitle files "
+                                    "or use Whisper-only transcription. Original subtitles were preserved."
+                                )
+                            selected_sidecar, raw_cues = aligned_sidecar.path, aligned_sidecar.cues
+                        else:
+                            selected_sidecar, raw_cues = parsed_sidecars[0]
 
                     if selected_sidecar is not None:
                         _stage(reporter, "subtitles")
@@ -1157,18 +1281,8 @@ def run_dataset_prep(
                         )
                         sidecar_source = f"sidecar_{selected_sidecar.suffix.lstrip('.').lower()}"
                         if segmentation_mode == "sentence_aligned":
-                            _stage(reporter, "whisper_alignment")
-                            from .whisper_asr import align_caption_words
-
-                            transcript, cache_reused = _transcribe_cached(
-                                audio=audio,
-                                media_path=media_path,
-                                cache_path=output_dir / "whisper" / f"{key}.words.json",
-                                config=config,
-                                reporter=reporter,
-                            )
-                            caption = build_caption_transcript(cleaned)
-                            alignment = align_caption_words(caption.words, transcript.words)
+                            assert aligned_sidecar is not None
+                            caption, alignment = aligned_sidecar.caption, aligned_sidecar.alignment
                             source_alignment_coverage = alignment.coverage
                             alignment_entry = {
                                 "source_media": _source_name(media_path),
@@ -1178,48 +1292,48 @@ def run_dataset_prep(
                                 "coverage": round(alignment.coverage, 6),
                                 "cache_reused": cache_reused,
                                 "fallback_to_cue_boundaries": False,
+                                "subtitle_candidates": sidecar_attempts,
                             }
                             alignment_files.append(alignment_entry)
-                            if alignment.coverage < config.min_file_alignment_coverage:
-                                source_effective_mode = "cue_boundaries"
+                            if aligned_sidecar.verified_segments is not None:
+                                source_effective_mode = "verified_cue_boundaries"
                                 alignment_entry["fallback_to_cue_boundaries"] = True
+                                alignment_entry["cue_transcripts_verified"] = True
+                                alignment_entry["cue_verification"] = {
+                                    "max_error": config.cue_fallback_max_error,
+                                    "check_boundary_words": config.cue_fallback_check_boundary_words,
+                                    "margin_ms": config.cue_fallback_margin_ms,
+                                }
+                                verified_source = _source_transcript(transcript.words)
+                                segments = aligned_sidecar.verified_segments
+                                rejected_count = len(cue_segments) - len(segments)
+                                source_filter_counts["transcript_disagreement"] = rejected_count
+                                filter_drop_counts["transcript_disagreement"] += rejected_count
                                 warning = (
                                     f"Caption/Whisper alignment for {media_path.name} covered "
-                                    f"{alignment.coverage:.1%} of caption words (< "
-                                    f"{config.min_file_alignment_coverage:.0%}); using cue boundaries."
+                                    f"{alignment.coverage:.1%} of caption words; retained {len(segments)} "
+                                    f"of {len(cue_segments)} cue segments after the configured transcript "
+                                    "checks. Unverified pairs were skipped; original subtitles were preserved."
                                 )
                                 warnings.append(warning)
                                 _log(reporter, f"Warning: {warning}")
-                                segments = cue_segments
-                                transcript_source = sidecar_source
+                                transcript_source = sidecar_source + "+whisper_verified_cues"
                             else:
-                                if config.min_edge_silence_ms and config.snap_to_silence and config.boundary_mode == "sentence":
-                                    _stage(reporter, "audio_boundaries")
-                                    segments, rejected_sentences = build_safe_sentence_segments(
-                                        caption, alignment.words, energy, config, audio=audio,
-                                        progress_cb=lambda message: _update(
-                                            reporter, processed_sources - 1, total_sources, message,
-                                            {"file_i": processed_sources, "file_n": total_sources},
-                                        ),
-                                    )
-                                    acoustic_repacked = True
-                                    sentence_rejections.extend(
-                                        {"source_media": _source_name(media_path), **item}
-                                        for item in rejected_sentences
-                                    )
+                                _stage(reporter, "audio_boundaries")
+                                segments, acoustic_repacked, rejected_sentences = _build_aligned_segments(
+                                    caption, alignment.words, energy, config, audio=audio,
+                                    progress_cb=lambda message: _update(
+                                        reporter, processed_sources - 1, total_sources, message,
+                                        {"file_i": processed_sources, "file_n": total_sources},
+                                    ),
+                                )
+                                sentence_rejections.extend(
+                                    {"source_media": _source_name(media_path), **item}
+                                    for item in rejected_sentences
+                                )
+                                if acoustic_repacked:
                                     _log(reporter, f"Repacked complete sentences at verified pauses: {len(segments)} clips; "
                                          f"{len(rejected_sentences)} sentences could not form a safe group within the limits.")
-                                else:
-                                    segments = build_sentence_aligned_segments(
-                                        caption,
-                                        alignment.words,
-                                        target_s=min(config.target_s, segmentation_max_s),
-                                        max_s=segmentation_max_s,
-                                        min_s=config.min_s,
-                                        max_gap_ms=config.max_gap_ms,
-                                        boundary_mode=config.boundary_mode,
-                                        min_pause_boundary_ms=config.min_pause_boundary_ms,
-                                    )
                                 transcript_source = sidecar_source + "+whisper_sentence_aligned"
                             _log(
                                 reporter,
@@ -1243,6 +1357,13 @@ def run_dataset_prep(
                         _log(reporter, f"Warning: {warning}")
                         continue
                     else:
+                        if (segmentation_mode == "cue_boundaries" and requested_segmentation_mode != "auto"
+                                and transcript_path is not None):
+                            raise ValueError(
+                                "Cue-boundary segmentation requires timed subtitles for a long recording. "
+                                "Choose sentence_aligned or auto to align its TXT transcript, or whisper_only "
+                                "to use recognized text. The selected cue-boundary mode was preserved."
+                            )
                         _stage(reporter, "whisper")
                         source_effective_mode = "whisper_only"
                         transcript, _ = _transcribe_cached(
@@ -1252,21 +1373,50 @@ def run_dataset_prep(
                             config=config,
                             reporter=reporter,
                         )
-                        segments = build_segments_from_words(
-                            transcript.words,
-                            target_s=min(config.target_s, segmentation_max_s),
-                            max_s=segmentation_max_s,
-                            min_s=config.min_s,
-                            max_gap_ms=config.max_gap_ms,
-                        )
-                        if transcript_path is not None and config.subtitle_policy != "whisper_only":
+                        if transcript_path is not None and segmentation_mode != "whisper_only":
                             provided_text = _read_text(
                                 Path(transcript_path),
                                 record_runtime_warning,
                             ).strip()
-                            segments = _segments_from_plain_transcript(provided_text, segments)
-                            transcript_source = "sidecar_txt+whisper_aligned"
+                            _log(reporter, f"Aligning supplied TXT words from {Path(transcript_path).name} "
+                                 "to recognized speech before sentence segmentation.")
+                            caption, alignment = _align_plain_transcript(
+                                provided_text, transcript.words, media_duration_ms)
+                            if alignment.coverage < config.min_file_alignment_coverage:
+                                raise ValueError(
+                                    f"TXT/Whisper word alignment covered only {alignment.coverage:.1%} "
+                                    f"of {Path(transcript_path).name}; no proportional text assignment was used. "
+                                    "Check that the transcript matches this recording and language, or use "
+                                    "Whisper-only transcription. Original text was preserved."
+                                )
+                            source_effective_mode = "sentence_aligned"
+                            source_alignment_coverage = alignment.coverage
+                            alignment_files.append({
+                                "source_media": _source_name(media_path),
+                                "caption_words": alignment.total_words,
+                                "whisper_words": len(transcript.words),
+                                "matched_caption_words": alignment.matched_words,
+                                "coverage": round(alignment.coverage, 6),
+                                "fallback_to_cue_boundaries": False,
+                                "transcript": _source_name(Path(transcript_path)),
+                            })
+                            segments, acoustic_repacked, rejected_sentences = _build_aligned_segments(
+                                caption, alignment.words, energy, config, audio=audio,
+                                progress_cb=lambda message: _update(
+                                    reporter, processed_sources - 1, total_sources, message,
+                                    {"file_i": processed_sources, "file_n": total_sources},
+                                ),
+                            )
+                            sentence_rejections.extend(
+                                {"source_media": _source_name(media_path), **item}
+                                for item in rejected_sentences
+                            )
+                            transcript_source = "sidecar_txt+whisper_sentence_aligned"
                         else:
+                            segments = build_segments_from_words(
+                                transcript.words, target_s=min(config.target_s, segmentation_max_s),
+                                max_s=segmentation_max_s, min_s=config.min_s, max_gap_ms=config.max_gap_ms,
+                            )
                             transcript_source = "whisper"
                         _log(
                             reporter,
@@ -1362,6 +1512,14 @@ def run_dataset_prep(
                             continue
                         source_start_s = actual_start_s + trim_start / float(config.sample_rate)
                         source_end_s = actual_start_s + trim_end / float(config.sample_rate)
+                        if verified_source is not None and not _verified_cue_text(
+                            segment.text, source_start_s, source_end_s, verified_source, config
+                        ):
+                            _increment_reason(source_filter_counts, "transcript_disagreement")
+                            _increment_reason(filter_drop_counts, "transcript_disagreement")
+                            _log(reporter, f"Skipped {media_path.name} cue after trimming: "
+                                 "transcript or boundary words no longer match the extracted range.")
+                            continue
                         duration_s = piece.size / float(config.sample_rate)
                         if not config.min_s <= duration_s <= config.max_s + 1.0 / config.sample_rate:
                             _increment_reason(source_filter_counts, "duration_after_trim")
@@ -1414,7 +1572,8 @@ def run_dataset_prep(
                             source_start_s=source_start_s,
                             source_end_s=source_end_s,
                             config=config,
-                            speaker=_speaker_for(config, media_path),
+                            speaker=_speaker_for(
+                                config, media_path, imported_speakers.get(str(media_path.resolve()).casefold(), "")),
                             transcript_source=transcript_source,
                             lufs=lufs,
                             alignment_coverage=segment.alignment_coverage,

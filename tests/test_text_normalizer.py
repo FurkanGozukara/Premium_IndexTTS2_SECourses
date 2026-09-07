@@ -26,6 +26,40 @@ def test_wetext_normalizes_chinese(normalizer):
     assert "苹果" in normalized
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [("123", "one hundred and twenty three"), ("42", "forty two"), ("3.14", "three point one four")],
+)
+def test_explicit_english_numeric_text_stays_english(normalizer, source, expected):
+    assert normalizer.normalize(source, lang="EN").lower() == expected
+
+
+def test_explicit_chinese_and_legacy_detection_still_normalize_numbers(normalizer):
+    assert normalizer.normalize("123", lang="zh") == "一百二十三"
+    assert normalizer.normalize("123") == "一百二十三"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "She's been waiting for you.",
+        "It's already been completed.",
+        "That's been my experience too.",
+        "She's happy.",
+        "John's car is red.",
+        "Where's my coat?",
+    ],
+)
+def test_english_contractions_keep_their_meaning(normalizer, source):
+    assert normalizer.normalize(source, lang="en").lower() == source.lower()
+
+
+def test_explicit_language_keeps_pronunciation_annotations(normalizer):
+    result = normalizer.normalize("Read <API|ay pee eye> 42.", lang="en")
+    assert "<API|ay pee eye>" in result
+    assert "forty two" in result.lower()
+
+
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_normalizer_preserves_text_when_wetext_rejects_fragment(
     normalizer, monkeypatch, capsys, language

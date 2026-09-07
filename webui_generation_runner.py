@@ -24,6 +24,7 @@ from indextts.utils.subtitle_utils import (
     write_pcm16_wav,
 )
 from indextts.utils.task_output_utils import build_segment_output_path, write_metadata_file
+from indextts.utils.text_segmentation import SpeechRecoveryConfig
 
 try:
     from pydub import AudioSegment
@@ -474,6 +475,18 @@ def run_generation_request(
     mp3_bitrate = request["mp3_bitrate"]
     image_path = request.get("image_path")
     infer_kwargs = dict(request["infer_kwargs"])
+    # Normal generation, batch items and subtitle units share these exact
+    # Gradio request values, including disabled recovery and zero budgets.
+    recovery = SpeechRecoveryConfig(
+        enabled=bool(infer_kwargs.get("auto_retry_incomplete_speech", SpeechRecoveryConfig.enabled)),
+        max_attempts=infer_kwargs.get("max_speech_retries", SpeechRecoveryConfig.max_attempts),
+        max_split_depth=infer_kwargs.get("max_speech_split_depth", SpeechRecoveryConfig.max_split_depth),
+    )
+    infer_kwargs.update(
+        auto_retry_incomplete_speech=recovery.enabled,
+        max_speech_retries=recovery.max_attempts,
+        max_speech_split_depth=recovery.max_split_depth,
+    )
     inference_extra_defaults = {
         "segment_budget_scale_non_cjk": 0.72,
         "cfm_temperature": 1.0,

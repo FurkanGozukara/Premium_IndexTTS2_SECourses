@@ -45,7 +45,7 @@ from indextts.utils.task_output_utils import (
     normalize_file_extension,
     write_metadata_file,
 )
-from indextts.utils.text_segmentation import default_segment_tokens, split_text_by_tokens
+from indextts.utils.text_segmentation import SpeechRecoveryConfig, default_segment_tokens, split_text_by_tokens
 from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
 
 from .common import (
@@ -165,6 +165,9 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.target_duration_mode": "off",
     "generation.enable_pause_tags": True,
     "generation.text_normalization": True,
+    "generation.auto_retry_incomplete_speech": SpeechRecoveryConfig.enabled,
+    "generation.max_speech_retries": SpeechRecoveryConfig.max_attempts,
+    "generation.max_speech_split_depth": SpeechRecoveryConfig.max_split_depth,
     "generation.max_speaker_audio_length": 15.0,
     "generation.max_emotion_audio_length": 15.0,
     "generation.semantic_layer": 17,
@@ -223,6 +226,9 @@ INFER_KWARG_KEYS = frozenset(
         "cfm_cache_length",
         "reset_beam_cache_per_segment",
         "text_normalization",
+        "auto_retry_incomplete_speech",
+        "max_speech_retries",
+        "max_speech_split_depth",
     }
 )
 
@@ -355,6 +361,9 @@ def build_generation_request(
         "cfm_cache_length": int(_value(merged, "generation.cfm_cache_length")),
         "reset_beam_cache_per_segment": bool(_value(merged, "generation.prevent_vram_accumulation")),
         "text_normalization": bool(_value(merged, "generation.text_normalization")),
+        "auto_retry_incomplete_speech": bool(_value(merged, "generation.auto_retry_incomplete_speech")),
+        "max_speech_retries": int(_value(merged, "generation.max_speech_retries")),
+        "max_speech_split_depth": int(_value(merged, "generation.max_speech_split_depth")),
     }
     runtime_value = dict(runtime or runtime_config_from_values(merged, model_dir=model_dir))
     lora_path = str(merged.get("runtime.lora_path", runtime_value.get("lora_path", "")) or "")
@@ -2192,6 +2201,22 @@ def build_generation_tab(
                 target_mode = gr.Dropdown(choices=["off", "natural", "pad", "trim"], value="off", label="Target duration mode", info="Natural regenerates timing; pad/trim only adjust the assembled result.")
                 pause_tags = gr.Checkbox(value=True, label="Enable pause tags", info="Parses inline pause tags before tokenization.")
                 normalization = gr.Checkbox(value=True, label="Text normalization", info="Recommended: expands and normalizes text before phonetic processing.")
+            with gr.Row():
+                speech_recovery = gr.Checkbox(
+                    value=GENERATION_DEFAULTS["generation.auto_retry_incomplete_speech"],
+                    label="Automatically retry incomplete speech",
+                    info="Retries unfinished sections before saving audio. When off, incomplete speech fails immediately.",
+                )
+                speech_retries = gr.Slider(
+                    0, 64, value=GENERATION_DEFAULTS["generation.max_speech_retries"], step=1,
+                    label="Maximum speech retries",
+                    info="Total additional attempts per original section. 0 disables retries; the selected limit is used exactly.",
+                )
+                speech_split_depth = gr.Slider(
+                    0, 8, value=GENERATION_DEFAULTS["generation.max_speech_split_depth"], step=1,
+                    label="Maximum recovery split depth",
+                    info="How many times an unfinished section may be split at word or clause boundaries. 0 retries without splitting.",
+                )
             _register(registry, "generation.segment_budget_scale_non_cjk", budget_scale, kind="float", minimum=0.3, maximum=1)
             _register(registry, "generation.interval_silence", interval, kind="int", minimum=0, maximum=2000)
             _register(registry, "generation.max_consecutive_silence", max_silence, kind="int", minimum=0, maximum=200)
@@ -2208,6 +2233,9 @@ def build_generation_tab(
             _register(registry, "generation.target_duration_mode", target_mode, kind="choice", choices=["off", "natural", "pad", "trim"])
             _register(registry, "generation.enable_pause_tags", pause_tags, kind="bool")
             _register(registry, "generation.text_normalization", normalization, kind="bool")
+            _register(registry, "generation.auto_retry_incomplete_speech", speech_recovery, kind="bool")
+            _register(registry, "generation.max_speech_retries", speech_retries, kind="int", minimum=0, maximum=64)
+            _register(registry, "generation.max_speech_split_depth", speech_split_depth, kind="int", minimum=0, maximum=8)
 
         with gr.Accordion("Reference Processing", open=False):
             with gr.Row():

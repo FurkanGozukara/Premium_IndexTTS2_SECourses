@@ -320,6 +320,19 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         options = runtime_config_from_values(values, model_dir=model_dir)
         return options, RuntimeConfig.from_dict(options)
 
+    # Share the exact output order with the callback. Hardware tiers must not
+    # replace the chosen voice/decoder or change either adapter's strength.
+    tier_output_specs = [
+        spec
+        for spec in runtime_specs
+        if spec.key not in {
+            "runtime.device", "runtime.vram_tier", "runtime.lora_path",
+            "runtime.lora_strength", "runtime.lora_merge_into_base",
+            "runtime.decoder_adapter", "runtime.decoder_adapter_strength",
+            "runtime.use_qwen_emo", "runtime.use_deepspeed",
+        }
+    ]
+
     def apply_tier(tier_value: str, device_value: str):
         if tier_value == "custom":
             return (*[gr.skip()] * len(tier_output_specs), "Custom runtime settings.", gr.skip())
@@ -334,43 +347,11 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             **{f"runtime.aux_residency.{key}": value for key, value in values["aux_residency"].items()},
             "runtime.vram_tier": tier_value,
         }
-        updates = []
-        # Tier and device are inputs and are intentionally not outputs here.
-        output_specs = [
-            spec
-            for spec in runtime_specs
-            if spec.key
-            not in {
-                "runtime.device",
-                "runtime.vram_tier",
-                "runtime.lora_path",
-                "runtime.lora_strength",
-                "runtime.lora_merge_into_base",
-                "runtime.decoder_adapter",
-                "runtime.use_qwen_emo",
-                "runtime.use_deepspeed",
-            }
-        ]
-        for spec in output_specs:
-            updates.append(flat.get(spec.key, gr.skip()))
+        updates = [flat.get(spec.key, gr.skip()) for spec in tier_output_specs]
         notes = preset_notes(requested)
         estimate = _estimate_html(cfg, total or float(requested))
         return (*updates, notes, estimate)
 
-    tier_output_specs = [
-        spec
-        for spec in runtime_specs
-        if spec.key
-        not in {
-            "runtime.device",
-            "runtime.vram_tier",
-            "runtime.lora_path",
-            "runtime.lora_strength",
-            "runtime.lora_merge_into_base",
-            "runtime.use_qwen_emo",
-            "runtime.use_deepspeed",
-        }
-    ]
     tab.tier.change(
         apply_tier,
         [tab.tier, tab.device],

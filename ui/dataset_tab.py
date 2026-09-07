@@ -435,12 +435,32 @@ def build_dataset_tab(
 
         with gr.Accordion("Transcripts", open=False):
             with gr.Row():
-                subtitle_policy = gr.Dropdown(choices=["prefer_sidecar", "whisper_only", "sidecar_only"], value="prefer_sidecar", label="Transcript policy", info="Prefer sidecars is recommended; Whisper fills missing timing/text.")
+                subtitle_policy = gr.Dropdown(choices=["prefer_sidecar", "whisper_only", "sidecar_only"], value="prefer_sidecar", label="Transcript policy", info="Prefer sidecars, require supplied text, or ignore it. A Whisper-only selection here or in Segmentation mode uses ASR text.")
                 whisper_model = gr.Textbox(value="openai/whisper-large-v3-turbo", label="Whisper model", info="Hugging Face model id or local path used when transcription/alignment is needed.")
                 whisper_device = gr.Textbox(value=device_default, label="Whisper device", info="CUDA device recommended for sentence alignment; CPU works but is much slower.")
             with gr.Row():
-                segmentation_mode = gr.Dropdown(choices=["auto", "sentence_aligned", "cue_boundaries", "whisper_only"], value=DATASET_DEFAULTS["segmentation_mode"], label="Segmentation mode", info="Sentence aligned uses Whisper word times with caption sentences and is recommended on CUDA.")
-                align = gr.Checkbox(value=False, label="Force Whisper alignment", info="Compatibility alias that forces sentence_aligned mode.")
+                segmentation_mode = gr.Dropdown(choices=["auto", "sentence_aligned", "cue_boundaries", "whisper_only"], value=DATASET_DEFAULTS["segmentation_mode"], label="Segmentation mode", info="Sentence aligned uses supplied text with Whisper word times. Cue boundaries requires timed subtitles for long recordings; Whisper only ignores supplied text.")
+                align = gr.Checkbox(value=False, label="Force Whisper alignment", info="Uses sentence-aligned timing for supplied transcripts. Whisper-only selections still use ASR text.")
+            with gr.Row():
+                cue_fallback = gr.Checkbox(
+                    value=DATASET_DEFAULTS["cue_fallback_enabled"], label="Recover weakly aligned subtitle cues",
+                    info="After trying alternative subtitles, keep only cue-timed clips passing the checks below. Off rejects sources below the minimum file alignment coverage.",
+                )
+                cue_error = gr.Slider(
+                    0, 1, value=DATASET_DEFAULTS["cue_fallback_max_error"], step=.01,
+                    label="Maximum cue fallback transcript error",
+                    info="Allowed transcript error against source ASR. Uses word errors for EN/ES/AR and character errors for Chinese/Japanese.",
+                )
+            with gr.Row():
+                cue_boundaries = gr.Checkbox(
+                    value=DATASET_DEFAULTS["cue_fallback_check_boundary_words"], label="Check cue fallback boundary words",
+                    info="Require both transcript edges to match, including after audio trimming.",
+                )
+                cue_margin = gr.Slider(
+                    0, 1000, value=DATASET_DEFAULTS["cue_fallback_margin_ms"], step=10,
+                    label="ASR timing margin for cue fallback (ms)",
+                    info="Expand the source-ASR lookup around cue/output edges by this amount; 0 uses the exact range.",
+                )
             with gr.Row():
                 remove_annotations = gr.Checkbox(value=True, label="Remove bracket annotations", info="Removes caption notes such as [music] and [applause].")
                 dedupe = gr.Checkbox(value=True, label="Deduplicate rolling captions", info="Removes repeated text from live/rolling subtitle cues.")
@@ -450,6 +470,10 @@ def build_dataset_tab(
             _reg(registry, controls, "whisper_device", whisper_device, kind="str")
             _reg(registry, controls, "segmentation_mode", segmentation_mode, kind="choice", choices=["auto", "sentence_aligned", "cue_boundaries", "whisper_only"])
             _reg(registry, controls, "align_with_whisper", align, kind="bool")
+            _reg(registry, controls, "cue_fallback_enabled", cue_fallback, kind="bool")
+            _reg(registry, controls, "cue_fallback_max_error", cue_error, kind="float", minimum=0, maximum=1)
+            _reg(registry, controls, "cue_fallback_check_boundary_words", cue_boundaries, kind="bool")
+            _reg(registry, controls, "cue_fallback_margin_ms", cue_margin, kind="int", minimum=0, maximum=1000)
             _reg(registry, controls, "remove_bracket_annotations", remove_annotations, kind="bool")
             _reg(registry, controls, "dedupe_rolling_captions", dedupe, kind="bool")
             _reg(registry, controls, "drop_duplicate_sentences", drop_duplicates, kind="bool")
@@ -520,7 +544,7 @@ def build_dataset_tab(
                 lufs = gr.Slider(-30, -10, value=-20, step=0.5, label="Target LUFS", info="-20 LUFS leaves headroom and matches voice training defaults.")
                 sample_rate = gr.Dropdown(choices=[16000, 22050, 24000, 44100, 48000], value=24000, label="Sample rate", info="24000 Hz is required by the IndexTTS training pipeline.")
             with gr.Row():
-                file_cov = gr.Slider(0, 1, value=0.6, step=0.01, label="Minimum file alignment coverage", info="Below 0.60, sentence alignment falls back or rejects unreliable timing.")
+                file_cov = gr.Slider(0, 1, value=0.6, step=0.01, label="Minimum file alignment coverage", info="Below this threshold, use the configured cue recovery checks or reject unmatched subtitles.")
                 segment_cov = gr.Slider(0, 1, value=0.7, step=0.01, label="Minimum segment alignment coverage", info="Drops individual caption segments with weak word alignment.")
                 min_wps = gr.Slider(0.1, 5, value=1.0, step=0.1, label="Minimum words / second", info="Drops unusually sparse transcript/audio matches.")
                 max_wps = gr.Slider(1, 12, value=5.5, step=0.1, label="Maximum words / second", info="Drops implausibly dense or misaligned speech.")

@@ -15,6 +15,7 @@ import wave
 
 from indextts.runtime.progress import ProgressReporter
 from indextts.utils.atomic_json import write_json_atomic
+from indextts.utils.text_segmentation import SpeechRecoveryConfig
 from webui_generation_runner import create_tts, run_generation_request
 
 from .analysis import (
@@ -40,6 +41,7 @@ _INFER_KEYS = {
     "section_batch_size", "max_emotion_sum", "latent_multiplier",
     "max_consecutive_silence", "semantic_layer", "cfm_cache_length",
     "reset_beam_cache_per_segment", "text_normalization",
+    "auto_retry_incomplete_speech", "max_speech_retries", "max_speech_split_depth",
 }
 _RUNNER_EXTRA_KEYS = {
     "segment_budget_scale_non_cjk", "cfm_temperature", "seed",
@@ -372,6 +374,9 @@ def _default_infer_kwargs(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "cfm_cache_length": int(runtime_payload.get("cfm_cache_length", 8192)),
         "reset_beam_cache_per_segment": True,
         "text_normalization": True,
+        "auto_retry_incomplete_speech": SpeechRecoveryConfig.enabled,
+        "max_speech_retries": SpeechRecoveryConfig.max_attempts,
+        "max_speech_split_depth": SpeechRecoveryConfig.max_split_depth,
     }
 
 

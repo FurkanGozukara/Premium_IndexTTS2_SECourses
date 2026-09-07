@@ -44,7 +44,7 @@ from .common import (
 )
 from .dataset_tab import scan_datasets
 from .generation_tab import GenerationTab
-from .models_tab import ModelsTab
+from .models_tab import ModelsTab, _gpu_total
 from .presets_store import PresetRegistry
 
 
@@ -533,6 +533,7 @@ class TrainingTab:
     controls: dict[str, Any]
     apply_tier_button: Any
     base_variant: Any
+    base_dtype: Any
     mixed_precision: Any
     blocks_to_swap: Any
     swap_ring_size: Any
@@ -611,6 +612,11 @@ def build_training_tab(
                 train_spk = gr.Checkbox(value=TRAIN_DEFAULTS["train_spk_proj"], label="Train speaker projection", info="Fully trains the small speaker projection module.")
                 train_emo = gr.Checkbox(value=TRAIN_DEFAULTS["train_emo_layers"], label="Train emotion layers", info="Advanced: trains small emotion modules in addition to LoRA / DoRA layers.")
                 train_mel = gr.Checkbox(value=TRAIN_DEFAULTS["train_mel_embed_head"], label="Train mel embedding head", info="Advanced: trains the mel token embedding/head modules.")
+            full_modules_fp32 = gr.Checkbox(
+                value=TRAIN_DEFAULTS["train_full_modules_fp32"],
+                label="Train speaker/extra modules in FP32",
+                info="Keeps small learning updates in the selected speaker, emotion, and mel modules. Turn off to use base precision and reduce memory use; CPU training still uses FP32. LoRA / DoRA weights stay in FP32 either way.",
+            )
             for field_name, component, kind, choices, minimum, maximum in (
                 ("name", name, "str", None, None, None),
                 ("adapter_type", adapter_type, "choice", ["lora", "dora"], None, None),
@@ -621,15 +627,16 @@ def build_training_tab(
                 ("train_spk_proj", train_spk, "bool", None, None, None),
                 ("train_emo_layers", train_emo, "bool", None, None, None),
                 ("train_mel_embed_head", train_mel, "bool", None, None, None),
+                ("train_full_modules_fp32", full_modules_fp32, "bool", None, None, None),
             ):
                 _reg(registry, controls, field_name, component, kind=kind, choices=choices, minimum=minimum, maximum=maximum)
 
         with gr.Accordion("Optimization", open=False):
             with gr.Row():
-                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="Starting update size. The optional plateau trial lowers it once when this dataset stops improving.")
-                optimizer = gr.Dropdown(choices=["adamw", "adamw_fused", "prodigy"], value=TRAIN_DEFAULTS["optimizer"], label="Optimizer", info="AdamW is portable; fused AdamW is faster on supported CUDA builds.")
-                scheduler = gr.Dropdown(choices=["cosine", "linear", "constant", "constant_with_warmup"], value=TRAIN_DEFAULTS["lr_scheduler"], label="Scheduler", info="Cosine decay is recommended for multi-epoch voice adaptation.")
-                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="Gradually increases the learning rate at the start. Early stopping waits until warmup finishes.")
+                learning_rate = gr.Number(value=TRAIN_DEFAULTS["learning_rate"], minimum=1e-8, maximum=1, label="Learning rate", info="Used as entered by every optimizer. Prodigy usually uses 1.0 as its learning-rate multiplier; choose it here when wanted. The optional plateau trial lowers the rate once.")
+                optimizer = gr.Dropdown(choices=["adamw", "adamw_fused", "prodigy"], value=TRAIN_DEFAULTS["optimizer"], label="Optimizer", info="AdamW is portable; fused AdamW is faster on supported CUDA builds. Changing optimizer keeps your learning rate.")
+                scheduler = gr.Dropdown(choices=["cosine", "linear", "constant", "constant_with_warmup"], value=TRAIN_DEFAULTS["lr_scheduler"], label="Scheduler", info="Cosine decay is recommended for multi-epoch voice adaptation. Constant has no warmup; the other schedules use Warmup steps.")
+                warmup = gr.Number(value=TRAIN_DEFAULTS["warmup_steps"], minimum=0, precision=0, label="Warmup steps", info="Used as entered, even beyond the update budget, so a short run can stay in warmup throughout. Early stopping waits until warmup finishes.")
                 weight_decay = gr.Number(value=TRAIN_DEFAULTS["weight_decay"], minimum=0, maximum=1, label="Weight decay", info="Regularizes trainable weights; its useful strength depends on the data and update budget.")
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
@@ -752,6 +759,7 @@ def build_training_tab(
                 ring = gr.Slider(1, 4, value=TRAIN_DEFAULTS["swap_ring_size"], step=1, label="Swap ring size", info="2 balances overlap and VRAM; 1 uses the least memory.")
                 pinned = gr.Checkbox(value=TRAIN_DEFAULTS["pin_swap_memory"], label="Pinned swap memory", info="Recommended for faster CPU-to-GPU transfers.")
                 apply_tier = gr.Button("🎚️  Apply VRAM tier defaults", elem_classes=btn("orange"))
+            gr.Markdown("Applies the Models tab's selected tier and device to base precision, mixed precision, and block swapping. Auto and Custom detect that device's VRAM; the training device selection stays separate.")
             _reg(registry, controls, "base_variant", base_variant, kind="choice", choices=["bf16", "int8_convrot"])
             _reg(registry, controls, "base_dtype", base_dtype, kind="choice", choices=["bf16", "fp16", "fp32"])
             _reg(registry, controls, "mixed_precision", precision, kind="choice", choices=["bf16", "fp16", "fp32"])
@@ -775,12 +783,12 @@ def build_training_tab(
                     label="Save train state with every epoch checkpoint",
                     info="Only needed to Continue run from a specific epoch; costs ~4x disk per checkpoint.",
                 )
-                resume = gr.Dropdown(choices=_resume_choices(), value=TRAIN_DEFAULTS["resume_from"], label="Resume from", info="Select a LoRA / DoRA checkpoint; rank, alpha, and type are inspected before launch.")
+                resume = gr.Dropdown(choices=_resume_choices(), value=TRAIN_DEFAULTS["resume_from"], label="Resume from", info="Resume preserves the checkpoint's rank, alpha, type, and adapter target layout. These must match its saved weights; differences from your selections are reported.")
                 resume_mode = gr.Radio(
                     choices=[("Weights only", "weights_only"), ("Continue run", "continue")],
                     value=TRAIN_DEFAULTS["resume_mode"],
                     label="Resume mode",
-                    info="Weights only starts a fresh schedule at step 0; Continue run restores train state when available.",
+                    info="Weights only uses your optimizer settings with a fresh schedule at step 0. Continue run restores saved optimizer settings, schedule position, and RNG when train state is available.",
                 )
                 refresh_resume = gr.Button("🔄  Refresh resume list", elem_classes=btn("sky"))
             with gr.Row():
@@ -1396,6 +1404,7 @@ def build_training_tab(
         controls=controls,
         apply_tier_button=apply_tier,
         base_variant=base_variant,
+        base_dtype=base_dtype,
         mixed_precision=precision,
         blocks_to_swap=blocks,
         swap_ring_size=ring,
@@ -1416,24 +1425,19 @@ def bind_training_events(
     generation: GenerationTab,
     main_tabs: Any,
 ) -> None:
-    def apply_tier(tier_value: str):
-        total = 32.0
+    def apply_tier(tier_value: str, device_value: str):
+        total = _gpu_total(device_value)
+        if device_value == "cpu" or (device_value == "auto" and not total):
+            return "bf16", "fp32", "fp32", 0, 2, False
         if tier_value in {"auto", "custom"}:
-            try:
-                from indextts.runtime.gpu import list_gpus
-
-                gpus = list_gpus()
-                total = gpus[0].total_gb if gpus else 6.0
-            except Exception:
-                total = 6.0
-            tier_value = str(auto_tier(total))
-        cfg = resolve_preset(tier_value, total)
-        return cfg.model_variant, cfg.gpt_dtype, max(0, cfg.blocks_to_swap), cfg.swap_ring_size, cfg.pin_swap_memory
+            tier_value = str(auto_tier(total or 6.0))
+        cfg = resolve_preset(tier_value, total or 6.0)
+        return cfg.model_variant, cfg.gpt_dtype, cfg.gpt_dtype, max(0, cfg.blocks_to_swap), cfg.swap_ring_size, cfg.pin_swap_memory
 
     tab.apply_tier_button.click(
         apply_tier,
-        models.tier,
-        [tab.base_variant, tab.mixed_precision, tab.blocks_to_swap, tab.swap_ring_size, tab.pin_swap_memory],
+        [models.tier, models.device],
+        [tab.base_variant, tab.base_dtype, tab.mixed_precision, tab.blocks_to_swap, tab.swap_ring_size, tab.pin_swap_memory],
         queue=False,
     )
 

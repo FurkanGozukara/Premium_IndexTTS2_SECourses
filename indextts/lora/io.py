@@ -448,6 +448,8 @@ def scan_lora_files(root_dirs: list[str]) -> list[LoraEntry]:
         for candidate in root.rglob("*"):
             if not candidate.is_file() or candidate.suffix.lower() != ".safetensors":
                 continue
+            if candidate.name.lower().endswith(".s2mel.safetensors"):
+                continue  # voice decoder adapters load with their GPT adapter, never as one
             canonical = os.path.normcase(str(candidate.resolve()))
             if canonical in seen:
                 continue

@@ -98,10 +98,6 @@ class TextNormalizer:
     用于保护连字符结构，防止中文normalizer将连字符解析为减号（如"负五减"）
     """
 
-    # 匹配常见英语缩写 's，仅用于替换为 is，不匹配所有 's
-    ENGLISH_CONTRACTION_PATTERN = r"(what|where|who|which|how|t?here|it|s?he|that|this)'s"
-
-
     def use_chinese(self, s):
         has_chinese = bool(re.search(r"[\u4e00-\u9fff]", s))
         has_alpha = bool(re.search(r"[a-zA-Z]", s))
@@ -154,14 +150,21 @@ class TextNormalizer:
             text = text.replace(key, val)
         return text
 
-    def normalize(self, text: str) -> str:
+    def normalize(self, text: str, lang: str | None = None) -> str:
+        """Normalize written forms without changing the requested language or grammar.
+
+        Explicit EN/ZH choices also apply to number-only text. Legacy callers and
+        mixed ZHEN text retain automatic detection. Ambiguous English contractions
+        stay intact: ``she's`` can mean ``she is`` or ``she has``.
+        """
         if not self.zh_normalizer or not self.en_normalizer:
             print("Error, text normalizer is not initialized !!!")
             return ""
         # 保护 G2P 发音标注 <word|pronunciation>，防止被 normalizer 破坏
         text, _pron_placeholders = self._protect_pronunciation_annotations(text)
-        if self.use_chinese(text):
-            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
+        language = str(lang or "auto").strip().lower().replace("_", "-").split("-")[0]
+        chinese = language == "zh" if language in {"en", "zh"} else self.use_chinese(text)
+        if chinese:
             # 应用术语词汇表（优先级最高，在所有保护之前）
             if self.enable_glossary:
                 text = self.apply_glossary_terms(text, lang="zh")
@@ -190,7 +193,6 @@ class TextNormalizer:
             result = pattern.sub(lambda x: self.zh_char_rep_map[x.group()], result)
         else:
             try:
-                text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
                 # 应用术语词汇表（优先级最高，在所有保护之前）
                 if self.enable_glossary:
                     text = self.apply_glossary_terms(text, lang="en")

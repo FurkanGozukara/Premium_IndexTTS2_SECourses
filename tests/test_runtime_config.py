@@ -27,6 +27,8 @@ def test_runtime_config_legacy_and_validation():
         "blocks_to_swap": -99,
         "attention_backend": "unknown",
         "lora_strength": 999,
+        "use_qwen_emo": "false",
+        "use_deepspeed": "yes",
     })
     assert config.gpt_dtype == "bf16"
     assert config.use_cuda_kernel_bigvgan is True
@@ -34,6 +36,8 @@ def test_runtime_config_legacy_and_validation():
     assert config.blocks_to_swap == -1
     assert config.attention_backend == "sdpa"
     assert config.lora_strength == 4.0
+    assert config.use_qwen_emo is False
+    assert config.use_deepspeed is True
 
 
 def test_binding_preset_table():

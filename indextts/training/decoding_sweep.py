@@ -31,8 +31,10 @@ DECODING_KEYS = ("temperature", "inference_cfg_rate", "num_beams")
 
 
 def _adapter_dir(path: str | Path) -> Path:
+    """The training folder for a checkpoint file, a ``best/`` file, or the folder itself."""
     from indextts.lora.decoder import adapter_root
-    return adapter_root(path)
+    candidate = Path(path).expanduser()
+    return candidate.resolve() if candidate.is_dir() else adapter_root(candidate)
 
 
 def decoding_settings_path(adapter_or_checkpoint_path: str | Path) -> Path:

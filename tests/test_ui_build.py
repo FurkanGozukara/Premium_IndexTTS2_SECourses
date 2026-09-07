@@ -11,6 +11,7 @@ from ui.batch_tab import _batch_items, _batch_timer, _item_generation_values
 from ui.common import APP_CSS
 from ui.generation_tab import GENERATION_DEFAULTS
 from ui.models_tab import _estimate_html, _gpu_total
+from ui.presets_store import PresetStore
 from ui.training_tab import TRAIN_DEFAULTS, _refresh_dataset_updates
 
 
@@ -23,7 +24,7 @@ def test_cpu_runtime_does_not_report_a_gpu_vram_fit() -> None:
     assert "Fits selected GPU" not in estimate
 
 
-def test_build_app_constructs_all_tabs_without_loading_models():
+def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
     args = SimpleNamespace(
         model_dir="models",
         device="cpu",
@@ -85,6 +86,19 @@ def test_build_app_constructs_all_tabs_without_loading_models():
     assert reference_audio["props"]["visible"] is False
     assert reference_audio["props"]["interactive"] is False
     assert reference_video["props"]["visible"] is False
+    full_precision = components[("checkbox", "Train speaker/extra modules in FP32")]
+    assert full_precision["props"]["value"] is True
+    assert full_precision["props"]["visible"] is True
+    assert demo.preset_registry.coerce({"training.train_full_modules_fp32": False})["training.train_full_modules_fp32"] is False
+    precision_store = PresetStore(demo.preset_registry, tmp_path / "precision-presets")
+    precision_store.save("base precision", {"training.train_full_modules_fp32": False})
+    restored_precision = precision_store.load("base precision")
+    assert restored_precision["training.train_full_modules_fp32"] is False
+    restored_training = TrainConfig.from_dict({
+        **TRAIN_DEFAULTS,
+        "train_full_modules_fp32": restored_precision["training.train_full_modules_fp32"],
+    })
+    assert restored_training.train_full_modules_fp32 is False
     dependencies = {item.get("api_name"): item for item in demo.config["dependencies"]}
     assert dependencies["generate_voice"]["trigger_only_on_success"] is True
     assert dependencies["generate_voice"]["trigger_after"] is not None
@@ -143,6 +157,7 @@ def test_build_app_constructs_all_tabs_without_loading_models():
         "keep_last_n",
         "epoch_train_state",
         "sample_speaking_rate",
+        "train_full_modules_fp32",
     )
     config_defaults = TrainConfig(
         dataset_dir="datasets/secourses_demo", name="voice_adapter"

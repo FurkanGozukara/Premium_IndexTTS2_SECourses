@@ -99,7 +99,12 @@ def build_gpt_training_inputs(
     text_emb = text_emb + gpt.lang_embedding(lang_ids).unsqueeze(1)
     mel_emb = gpt.mel_embedding(mel_inputs) + gpt.mel_pos_embedding(mel_inputs)
 
-    inputs_embeds = torch.cat((cond, text_emb, mel_emb), dim=1)
+    # Fully trained conditioning/embedding modules may keep FP32 parameters.
+    # Match the frozen text/transformer storage at this boundary, including
+    # when mixed precision is disabled; the cast preserves their gradients.
+    inputs_embeds = torch.cat(
+        (cond.to(dtype=text_emb.dtype), text_emb, mel_emb.to(dtype=text_emb.dtype)), dim=1
+    )
     text_key_mask = text_positions.unsqueeze(0) <= (text_lengths.unsqueeze(1) + 1)
     mel_positions = torch.arange(mel_inputs.shape[1], device=device)
     mel_key_mask = mel_positions.unsqueeze(0) <= (code_lengths.unsqueeze(1) + 1)
@@ -149,8 +154,8 @@ def gpt_train_step_logits(
     )
     hidden = gpt.final_norm(output.last_hidden_state[:, 3:])
     text_width = values["text_inputs"].shape[1]
-    text_logits = gpt.text_head(hidden[:, :text_width])
-    mel_logits = gpt.mel_head(hidden[:, text_width:])
+    text_logits = gpt.text_head(hidden[:, :text_width].to(dtype=gpt.text_head.weight.dtype))
+    mel_logits = gpt.mel_head(hidden[:, text_width:].to(dtype=gpt.mel_head.weight.dtype))
     return text_logits, mel_logits, values
 
 

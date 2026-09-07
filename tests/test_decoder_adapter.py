@@ -273,3 +273,20 @@ def test_decoder_test_markdown_lists_strength_variants():
     text = decoder_test_markdown(report)
     assert "| 0.6 (recommended) | +0.0433 | +0.32 points | +0.0305 | yes |" in text
     assert "| 1 | +0.0777 | +1.33 points | +0.0245 | yes |" in text and "minus 4 times" in text
+
+
+def test_lora_scanner_skips_decoder_adapter_files(tmp_path):
+    from indextts.lora.io import scan_lora_files
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4)
+
+    adapters = inject_adapters(Toy(), rank=2, alpha=2.0, dropout=0.0, use_dora=False, target_modules=["proj"])
+    run = tmp_path / "loras" / "voice"
+    save_lora(run / "voice.safetensors", adapters, {}, LoraMetadata(adapter_type="lora", rank=2, alpha=2.0, target_modules=["proj"]), dtype=torch.float32)
+    save_lora(run / f"voice{DECODER_ADAPTER_SUFFIX}", adapters, {}, LoraMetadata(adapter_type="lora", rank=2, alpha=2.0, target_modules=["proj"],
+                                                                                   train_config={"component": "s2mel"}), dtype=torch.float32)
+    names = [Path(entry.path).name for entry in scan_lora_files([str(tmp_path / "loras")])]
+    assert names == ["voice.safetensors"]

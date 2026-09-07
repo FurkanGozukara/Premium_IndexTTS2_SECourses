@@ -33,6 +33,8 @@ class RuntimeConfig:
     aux_residency: dict = field(default_factory=_default_aux_residency)
     attention_backend: str = "sdpa"
     use_accel: bool = False
+    use_qwen_emo: bool = True
+    use_deepspeed: bool = False
     torch_compile_s2mel: bool = False
     use_cuda_kernel_bigvgan: bool = False
     s2mel_estimator_autocast: bool = False
@@ -133,6 +135,8 @@ class RuntimeConfig:
         backend = str(self.attention_backend or "sdpa").strip().lower()
         self.attention_backend = backend if backend in {"sdpa", "flash_attention_2", "eager"} else "sdpa"
         self.use_accel = _as_bool(self.use_accel, False)
+        self.use_qwen_emo = _as_bool(self.use_qwen_emo, True)
+        self.use_deepspeed = _as_bool(self.use_deepspeed, False)
         self.torch_compile_s2mel = _as_bool(self.torch_compile_s2mel, False)
         self.use_cuda_kernel_bigvgan = _as_bool(self.use_cuda_kernel_bigvgan, False)
         self.s2mel_estimator_autocast = _as_bool(self.s2mel_estimator_autocast, False)

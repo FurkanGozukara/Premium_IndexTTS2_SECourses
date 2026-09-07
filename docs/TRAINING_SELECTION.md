@@ -13,6 +13,8 @@ Each fresh run uses the installed base model, the selected dataset, and checkpoi
 
 ## How training stops
 
+**Train speaker/extra modules in FP32** is enabled by default. It keeps the selected fully trained speaker projection, emotion layers, and mel embedding/head parameters and optimizer moments in FP32 so small learning updates are not rounded away. The frozen base keeps its configured precision and forward computation still uses the selected mixed precision. Turn the option off to store those modules in base precision and reduce memory use; CPU training still uses FP32. LoRA / DoRA parameters already use FP32 independently of this option. The choice is saved with presets and training runs, and applies before restoring weights and optimizer state when resuming.
+
 The epoch/update budget is a maximum, not a target quality score. By default, validation runs every 250 optimizer updates and at epoch boundaries. Every absolute improvement may replace the separately saved best checkpoint.
 
 Patience requires six checks without a loss improvement greater than 0.005. It begins after warmup, 1,000 updates, and two dataset passes. **Minimum updates between patience checks** defaults to the validation interval: nearby epoch-end checks can save a better checkpoint without consuming extra patience.

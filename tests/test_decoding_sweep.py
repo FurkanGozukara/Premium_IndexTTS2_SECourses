@@ -58,6 +58,7 @@ def test_saved_settings_and_markdown(tmp_path):
         "accepted": True, "settings": {"temperature": 1.0, "inference_cfg_rate": 0.7, "num_beams": 1}, "score": 0.031}), encoding="utf-8")
     settings = load_decoding_settings(run / "best" / "voice.safetensors")
     assert settings["temperature"] == 1.0 and settings["num_beams"] == 1 and settings["score"] == 0.031
+    assert load_decoding_settings(run)["num_beams"] == 1  # the training folder itself works too
     (run / "analysis" / "decoding.json").write_text(json.dumps({"accepted": False, "settings": {"temperature": 1.0}}), encoding="utf-8")
     assert load_decoding_settings(gpt) is None
     report = {"accepted": True, "base_settings": {"temperature": 0.8, "inference_cfg_rate": 0.7, "num_beams": 3},

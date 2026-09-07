@@ -15,6 +15,7 @@ def test_reference_sampling_and_evaluation_defaults() -> None:
     assert config.warmup_steps == 200
     assert config.batch_size == 1
     assert config.grad_accumulation == 1
+    assert config.train_full_modules_fp32 is True
     assert config.speaker_ref_mode == "other"
     assert config.emo_ref_mode == "follow_speaker"
     assert config.val_reference_mode == "other"
@@ -63,11 +64,13 @@ def test_new_fields_round_trip_and_old_configs_receive_defaults() -> None:
         eval_train_subset=9,
         eval_strengths="0.5, 1.5",
         eval_include_base=False,
+        train_full_modules_fp32=False,
     ).validate()
 
     loaded = TrainConfig.from_dict(config.to_dict())
     assert loaded.to_dict() == config.to_dict()
     assert loaded.sample_language == "JA"
+    assert loaded.train_full_modules_fp32 is False
 
     old = TrainConfig.from_dict({"dataset_dir": "dataset", "name": "old-adapter"})
     assert old.emo_ref_mode == "follow_speaker"
@@ -76,6 +79,7 @@ def test_new_fields_round_trip_and_old_configs_receive_defaults() -> None:
     assert old.sample_num_beams == 3
     assert old.sample_speaking_rate == 1.0
     assert old.eval_strengths == "1.0"
+    assert old.train_full_modules_fp32 is True
 
 
 @pytest.mark.parametrize(
