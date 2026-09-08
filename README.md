@@ -7,11 +7,15 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6.9 voice decoder adaptation, median-matched references, and a decoding sweep:** training now adapts the semantic-to-mel decoder to the voice as a second, automatic phase (a DoRA trained with a random prompt per clip, selected by re-rendered speaker identity, and installed only after a full-pipeline test on the speech benchmark), picks automatic references near the speaker's median pitch and pace instead of the nearest-15-second clip, and sweeps temperature, guidance rate, and beams for the selected checkpoint. On the V8 voice the installed decoder adapter raised speaker similarity to the real recordings from 0.80 to 0.87 on the benchmark while lowering the word error rate from 2.3 to 1.9 percent; a first build with one fixed training prompt had made every sentence thinner and higher, which is why the trainer now judges adapters end to end. Voice Generation gained a **Voice decoder adapter** dropdown (automatic, none, or any file) and strength slider, and applies each adapter's recommended strength and decoding settings with its calibrated speaking rate. See `VOICE_DECODER_ADAPTER_2026-09-08.md`.
+**V6.10 reliability and training safeguards:** fixes cold-start/AUTO decoder loading, checkpoint recommendations, stale speaking-rate settings, cancellation and reconnect races, batch error handling and input forwarding, high-bitrate MP3 and MP4 duration, audio-filter warnings, concurrent logging, and VRAM benchmark accounting. Automatic checkpoint, decoder-strength, and decoding choices now use validation only; an optional independent final test runs after a hash-verified deployment freeze and never retunes that deployment. Unverified decoder gates retain evidence outside automatic loading. The Gradio Changelog contains the full public, product-focused release notes.
 
-**V6.8 unique grid cell files and a four-adapter comparison:** Checkpoint Grid cell files are now unique across runs (two "best, epoch 7" checkpoints from different trainings used to overwrite each other's clips). `ADAPTER_COMPARISON_V5_V8_2026-09-07.md` compares the selected checkpoints of four trainings of one voice on a recording none of them trained on, at rate 1.0 and at each adapter's calibrated rate, with a blind five-way listening test: as deployed, V8 ranks first and V7 second, V6 is a fallback and V5 is superseded.
+**V6.9 voice decoder adaptation, median-matched references, and a decoding sweep:** training can adapt the semantic-to-mel decoder as an automatic second phase, choose clean reference clips near the speaker's median pitch and pace, and evaluate alternative temperatures, guidance rates, and beam counts. Voice Generation offers automatic, disabled, or explicit decoder selection with an independent strength slider, and can apply the saved speaking rate and accepted decoding settings.
 
-**V6.7 pause measurement and a measured V8 pass:** speech comparison reports and the grid measurement tool now show **Pause time vs real**, the generated clips' internal pause time relative to the person's recordings of the same sentences, after a blind listening test preferred an adapter that paused longer than the narrator over one that matched the narrator's pauses. A V8 adapter trained with the complete v6.6 audit (17 percent more audio, corrected file-name texts) landed on V6's measurements and was not preferred by the listener; see `V8_TRAINING_REPORT_2026-09-07.md`. V6.6 made the voice and transcript audit trust your subtitles' spellings, added a whisper-large-v3 second opinion for transcript rejections, kept file names such as `update.bat` whole, and recalibrated the saved speaking rate from matched held-out sentences with an editable per-adapter override.
+**V6.8 unique grid cell files:** Checkpoint Grid uses unique filenames when similarly labeled checkpoints from different training runs would otherwise overwrite one another's audio or measurements.
+
+**V6.7 pause measurement:** speech comparison reports and the grid measurement tool show **Pause time vs real**, the generated clips' internal pause time relative to matched real recordings. The column is informational and does not change checkpoint selection.
+
+**V6.6 transcript audits and speaking-rate calibration:** the voice and transcript audit trusts your subtitles' spellings, offers a whisper-large-v3 second opinion for transcript rejections, preserves file names such as `update.bat`, and calibrates speaking rate from matched held-out sentences with an editable per-adapter override.
 
 **V6.5 automatic references target 15 seconds:** training speaker/emotion conditioning, validation, checkpoint evaluation, saved adapter references, epoch samples, and new speech comparisons share the same duration preference. Selection prioritizes transcript agreement and matching word boundaries, then takes the nearest eligible clip from the same speaker's training split. Other-reference modes exclude the current target. Restart after updating; existing frozen references, explicit self-reference modes, custom sample references, and training utterance lengths retain their behavior.
 
@@ -620,7 +624,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.5 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.10 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -748,7 +752,7 @@ Reliability improvements cover generation, batching, dataset preparation, featur
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.5-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.10-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -774,7 +778,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.5-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.10-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
