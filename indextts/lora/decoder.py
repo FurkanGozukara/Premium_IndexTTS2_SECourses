@@ -1,8 +1,9 @@
 """Voice decoder (s2mel) adapters: file discovery, component tags, and LoRA / DoRA target modules.
 
 A voice decoder adapter is a LoRA / DoRA on the semantic-to-mel flow-matching DiT. It is saved next to
-the GPT adapter of the same training as ``<name>.s2mel.safetensors`` and is loaded automatically whenever
-that GPT adapter is selected. The safetensors metadata marks it with ``train_config.component = "s2mel"``
+the GPT adapter of the same training as ``<name>.s2mel.safetensors``. AUTO loads it only when the recorded
+decoder lifecycle permits it; explicit selection remains available for validation and advanced use.
+The safetensors metadata marks it with ``train_config.component = "s2mel"``
 so the two kinds of file are never applied to the wrong model.
 """
 from __future__ import annotations
@@ -45,24 +46,103 @@ def decoder_adapter_candidates(gpt_adapter_path: str | os.PathLike[str]) -> list
     return unique
 
 
-def find_decoder_adapter(gpt_adapter_path: str | os.PathLike[str] | None) -> str:
+def _decoder_metadata(path: Path) -> dict[str, Any] | None:
+    """Absent historical metadata is different from unreadable or invalid metadata."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid decoder lifecycle metadata: {path}")
+    return value
+
+
+def _decoder_auto_policy(root: Path) -> tuple[bool, Path | None]:
+    """Fail closed for a recorded lifecycle; retain metadata-free legacy adapters.
+
+    Training saves provisional weights at the same path as an accepted decoder.
+    Neither that file's existence nor a teacher-forced decoder check is approval.
+    No tensors are read here, and old accepted reports need no newer hash fields.
+    """
+    try:
+        status = _decoder_metadata(root / "status.json") or {}
+        if status.get("phase") in {"adapting_decoder", "testing_decoder"}:
+            return False, None
+        managed = any(key.startswith("decoder_") for key in status)
+        for key in ("decoder_adapter_status", "decoder_test_status"):
+            if key in status and status[key] != "complete":
+                return False, None
+
+        adaptation_job = root / "analysis" / "decoder_adapter_job"
+        gate_dir = root / "analysis" / "speech_evaluation" / "decoder_test"
+        gate_job = gate_dir / "test_job"
+        managed = managed or adaptation_job.exists() or gate_dir.exists()
+        for job in (adaptation_job, gate_job):
+            child = _decoder_metadata(job / "status.json")
+            if child is not None:
+                managed = True
+                if child.get("phase") != "complete" or child.get("error"):
+                    return False, None
+                if "accepted" in child and child["accepted"] is not True:
+                    return False, None
+
+        adaptation = _decoder_metadata(root / "analysis" / "decoder_adapter.json")
+        if adaptation is not None:
+            managed = True
+            if (not ({"status", "accepted"} & adaptation.keys()) or adaptation.get("error")
+                    or ("status" in adaptation and adaptation["status"] != "complete")
+                    or ("accepted" in adaptation and adaptation["accepted"] is not True)):
+                return False, None
+
+        gate = _decoder_metadata(gate_dir / "report.json")
+        if gate is None:
+            return not managed, None
+        if (gate.get("accepted") is not True or gate.get("error")
+                or ("status" in gate and gate["status"] != "complete")):
+            return False, None
+
+        # Older reports may omit paths as well as status/hash fields. If paths
+        # are recorded, do not apply their approval to a different candidate.
+        approved: Path | None = None
+        for record, key in ((status, "decoder_adapter_path"), (gate, "adapter")):
+            if key not in record:
+                continue
+            value = record[key]
+            if not isinstance(value, str) or not value.strip():
+                return False, None
+            path = Path(value).expanduser().resolve()
+            if approved is not None and approved != path:
+                return False, None
+            approved = path
+        return True, approved
+    except (OSError, ValueError, TypeError, UnicodeError):
+        # A corrupt/in-progress metadata read must never silently enable AUTO.
+        return False, None
+
+
+def find_decoder_adapter(gpt_adapter_path: str | os.PathLike[str] | None, *, allow_unverified: bool = False) -> str:
     """Return the decoder adapter file that belongs to a GPT adapter file, or an empty string.
 
     Every checkpoint of one training (epoch files, the final file, and ``best/``) shares the decoder
     adapter saved in the training folder, because the decoder is trained from the dataset rather than from
-    a particular GPT checkpoint.
+    a particular GPT checkpoint. AUTO excludes active, failed or unverified
+    decoder lifecycles. ``allow_unverified`` is only for checking an explicitly
+    supplied adapter's association before its validation gate, not AUTO loading.
     """
     if not gpt_adapter_path or is_decoder_adapter_path(gpt_adapter_path):
         return ""
     source = Path(gpt_adapter_path).expanduser()
     if not source.is_file():
         return ""
-    for candidate in decoder_adapter_candidates(source):
-        if candidate.is_file():
-            return str(candidate)
     root = adapter_root(source)
+    allowed, approved = (True, None) if allow_unverified else _decoder_auto_policy(root)
+    if not allowed:
+        return ""
+    for candidate in decoder_adapter_candidates(source):
+        if candidate.is_file() and (approved is None or candidate.resolve() == approved):
+            return str(candidate)
     singles = sorted(path for path in root.glob("*" + DECODER_ADAPTER_SUFFIX) if path.is_file())
-    if len(singles) == 1:
+    if len(singles) == 1 and (approved is None or singles[0].resolve() == approved):
         return str(singles[0])
     return ""
 
@@ -142,7 +222,7 @@ DECODER_CHOICE_NONE = "none"
 def decoder_adapter_selection(choice: object) -> tuple[bool, str]:
     """Map the generation tab's "Voice decoder adapter" choice to (use_decoder_adapter, explicit path).
 
-    ``auto`` (or empty) applies the file saved with the selected LoRA / DoRA, ``none`` applies no decoder
+    ``auto`` (or empty) requests an eligible file saved with the selected LoRA / DoRA, ``none`` applies no decoder
     adapter, and anything else is an explicit decoder adapter file.
     """
     value = str(choice or "").strip()
@@ -159,7 +239,7 @@ def decoder_adapter_choices(lora_path: str | os.PathLike[str] | None, loras_root
     if found:
         auto_label = f"Automatic: {Path(found).name} (saved with this LoRA / DoRA)"
     elif lora_path:
-        auto_label = "Automatic: none saved with this LoRA / DoRA"
+        auto_label = "Automatic: no eligible decoder (none saved, pending, or not accepted)"
     else:
         auto_label = "Automatic: the selected LoRA / DoRA's own adapter"
     choices: list[tuple[str, str]] = [(auto_label, DECODER_CHOICE_AUTO), ("None (GPT adapter only)", DECODER_CHOICE_NONE)]

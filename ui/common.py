@@ -537,12 +537,14 @@ def _terminate_process_tree(process: subprocess.Popen[Any] | None) -> bool:
         return False
     try:
         if os.name == "nt":
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            if completed.returncode != 0:
+                return process.poll() is not None
         else:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except ProcessLookupError:
@@ -645,10 +647,10 @@ class ProcessManager:
                 returncode = job.process.poll()
             print(f">> {job.kind} finished with code {returncode} in {elapsed:.2f}s", flush=True)
 
-    def terminate(self, kind: str) -> bool:
+    def terminate(self, kind: str, *, expected_job: ChildJob | None = None) -> bool:
         with self._lock:
             job = self._jobs.get(kind)
-            if job is None:
+            if job is None or (expected_job is not None and job is not expected_job):
                 return False
             job.canceled = True
             return _terminate_process_tree(job.process)
@@ -673,6 +675,10 @@ class LazyEngine:
         self._instance: Any = None
         self._fingerprint = ""
         self._lock = threading.RLock()
+        self._cancel_requested = threading.Event()
+        self._cancel_lock = threading.Lock()
+        self._active_task = ""
+        self._canceled_reporters: list[tuple[Any, Any, Any, Any]] = []
 
     def get(
         self,
@@ -683,6 +689,7 @@ class LazyEngine:
     ) -> Any:
         from webui_generation_runner import create_tts
 
+        self.raise_if_canceled()
         fingerprint_options = dict(runtime_options)
         for key in ("lora_path", "lora_strength", "lora_merge_into_base"):
             fingerprint_options.pop(key, None)
@@ -694,6 +701,7 @@ class LazyEngine:
             fingerprint_options["runtime"] = nested_runtime
         fingerprint = json.dumps(fingerprint_options, sort_keys=True, default=str)
         with self._lock:
+            self.raise_if_canceled()
             if self._instance is not None and fingerprint != self._fingerprint:
                 self.unload()
             if self._instance is None:
@@ -706,24 +714,50 @@ class LazyEngine:
                 )
                 self._fingerprint = fingerprint
                 print(f">> Lazy model load finished in {time.perf_counter() - started:.2f}s", flush=True)
+            # A stop request must survive a cold load, even though no engine or
+            # progress reporter existed when the request arrived.
+            self.raise_if_canceled()
             return self._instance
 
     def peek(self) -> Any:
         with self._lock:
             return self._instance
 
-    def request_cancel(self) -> bool:
-        instance = self.peek()
-        reporter = getattr(instance, "progress_reporter", None) if instance is not None else None
-        if reporter is None:
-            return False
+    def request_cancel(self, *, expected_task: str | None = None) -> bool:
+        # Do not acquire the model-load lock here: loading may take minutes.
+        # The event is authoritative; mutating an existing reporter also keeps
+        # legacy inference callers cooperatively cancellable.
+        with self._cancel_lock:
+            if expected_task is not None and expected_task != self._active_task:
+                return False
+            self._cancel_requested.set()
+            instance = self._instance
+            reporter = getattr(instance, "progress_reporter", None) if instance is not None else None
+            if reporter is not None and not any(item[0] is reporter for item in self._canceled_reporters):
+                def abort(*_args: Any, **_kwargs: Any) -> Any:
+                    self.raise_if_canceled()
 
-        def abort(*_args: Any, **_kwargs: Any) -> Any:
-            raise RuntimeError("Generation canceled by user")
-
-        reporter.update = abort
-        reporter.finish = abort
+                self._canceled_reporters.append((reporter, reporter.update, reporter.finish, abort))
+                reporter.update = abort
+                reporter.finish = abort
         return True
+
+    def reset_cancel(self, *, task_id: str | None = None) -> None:
+        """Start a new serialized request without retaining an earlier stop."""
+
+        with self._cancel_lock:
+            self._cancel_requested.clear()
+            self._active_task = str(task_id or "")
+            for reporter, update, finish, abort in self._canceled_reporters:
+                if reporter.update is abort:
+                    reporter.update = update
+                if reporter.finish is abort:
+                    reporter.finish = finish
+            self._canceled_reporters.clear()
+
+    def raise_if_canceled(self) -> None:
+        if self._cancel_requested.is_set():
+            raise RuntimeError("Generation canceled by user")
 
     def unload(self) -> bool:
         with self._lock:

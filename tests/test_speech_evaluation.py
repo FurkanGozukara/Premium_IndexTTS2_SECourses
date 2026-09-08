@@ -244,7 +244,7 @@ def test_speech_pipeline_uses_only_current_run_and_maps_base_cells(tmp_path, mon
     import indextts.training.checkpoint_eval as loss_eval
     import indextts.training.grid as grid
     import indextts.training.speech_metrics as metrics
-    from indextts.training.speech_eval import load_speech_evaluation, run_speech_evaluation
+    from indextts.training.speech_eval import load_speech_evaluation, run_final_test, run_speech_evaluation
     train, val = _records(tmp_path)
     config = _config(tmp_path, speech_eval_prompts=3, speech_eval_seeds=2)
     run = Path(config.output_dir) / config.name
@@ -282,11 +282,17 @@ def test_speech_pipeline_uses_only_current_run_and_maps_base_cells(tmp_path, mon
                 for clip in clips]
     monkeypatch.setattr(metrics, "measure_clips", measure)
     report = run_speech_evaluation(config, run / "analysis" / "speech_evaluation" / "eval_job")
-    assert len(generated) == 32  # development and final test, each 4 prompts x 2 seeds x 2 models
+    assert len(generated) == 16  # development only: 4 prompts x 2 seeds x 2 models
+    assert report["final_test_status"] == "pending deployment freeze"
+    assert not (run / "analysis" / "speech_evaluation" / "final_test" / "selection_frozen.json").exists()
+    final = run_final_test(config, run / "analysis" / "speech_evaluation" / "final_test" / "eval_job",
+                          checkpoint_path=str(checkpoint))
+    assert len(generated) == 32
     assert {r["lora_path"] for r in generated} == {"", str(checkpoint.resolve())}
     assert report["recommended_label"] == "fresh"
     assert len(report["real_cells"]) == 3
-    assert report["final_test_status"] == "regression detected"
+    assert final["final_test_status"] == "regression detected"
+    assert final["deployment_frozen"]["selection_partition"] == "validation"
     frozen = json.loads((run / "analysis" / "speech_evaluation" / "final_test" / "selection_frozen.json").read_text())
     assert frozen["recommended_checkpoint"] == str(checkpoint.resolve())
     assert load_speech_evaluation(run)["recommended_checkpoint"] == str(checkpoint.resolve())

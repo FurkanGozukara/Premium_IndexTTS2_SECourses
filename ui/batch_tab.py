@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import json
 import os
@@ -12,6 +13,7 @@ import threading
 import time
 import traceback
 from typing import Any
+import uuid
 
 import gradio as gr
 
@@ -27,7 +29,6 @@ from .common import (
     adopt_output_task,
     btn,
     open_folder,
-    output_task_is_active,
     progress_panel_html,
     read_json,
     tail_text,
@@ -35,6 +36,7 @@ from .common import (
 )
 from .generation_tab import (
     GenerationTab,
+    _Tee,
     prepare_generation_request,
     prepare_reference_for_generation,
 )
@@ -42,6 +44,10 @@ from .presets_store import PresetRegistry
 
 
 _BATCH_CANCEL = threading.Event()
+_BATCH_ACTIVE = threading.Event()
+_BATCH_CURRENT_TASK = ""
+_BATCH_RUN_ID = ""
+_BATCH_RUN_LOCK = threading.RLock()
 _LAST_BATCH_FOLDER = ROOT / "outputs"
 
 
@@ -59,6 +65,10 @@ class BatchTab:
     controls: dict[str, Any]
     task_state: Any = None
     task_timer: Any = None
+    cancel_confirmation: Any = None
+    cancel_confirm_button: Any = None
+    cancel_dismiss_button: Any = None
+    cancel_target_state: Any = None
 
 
 def _safe_subfolder(value: str) -> str:
@@ -68,6 +78,8 @@ def _safe_subfolder(value: str) -> str:
 
 
 def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[dict[str, Any]]:
+    """Collect ordered work without parsing a file ahead of its item boundary."""
+
     paths: list[Path] = []
     for value in files or []:
         path = Path(str(value))
@@ -77,21 +89,22 @@ def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[
     folder_path = Path(folder_text).expanduser() if folder_text else None
     if folder_path is not None and folder_path.is_dir():
         paths.extend(
-            path.resolve()
-            for path in folder_path.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".txt", ".srt", ".vtt", ".sbv"}
+            sorted(
+                (
+                    path.resolve()
+                    for path in folder_path.rglob("*")
+                    if path.is_file() and path.suffix.lower() in {".txt", ".srt", ".vtt", ".sbv"}
+                ),
+                key=lambda path: str(path).lower(),
+            )
         )
-    unique = sorted(dict.fromkeys(paths), key=lambda path: str(path).lower())
+    # Upload cache directories are hashes, not a user-visible sort order. Keep
+    # the displayed upload order, then append the deterministically sorted scan.
+    unique = dict.fromkeys(paths)
     items: list[dict[str, Any]] = []
     for path in unique:
-        if path.suffix.lower() in {".srt", ".vtt", ".sbv"}:
-            cues = parse_subtitle_file(str(path))
-            text = subtitle_cues_to_text(cues)
-            subtitle = str(path)
-        else:
-            text = path.read_text(encoding="utf-8-sig", errors="replace").strip()
-            subtitle = None
-        items.append({"name": path.stem, "path": str(path), "text": text, "subtitle": subtitle})
+        subtitle = str(path) if path.suffix.lower() in {".srt", ".vtt", ".sbv"} else None
+        items.append({"name": path.stem, "path": str(path), "text": None, "subtitle": subtitle})
     for index, paragraph in enumerate(re.split(r"\n\s*\n", str(paragraphs or "")), start=1):
         text = paragraph.strip()
         if text:
@@ -99,13 +112,31 @@ def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[
     return items
 
 
+def _load_batch_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Read one item inside the loop's continue-after-error handling."""
+
+    loaded = dict(item)
+    if loaded.get("path"):
+        if loaded.get("subtitle"):
+            loaded["text"] = subtitle_cues_to_text(parse_subtitle_file(loaded["subtitle"]))
+        else:
+            loaded["text"] = Path(loaded["path"]).read_text(
+                encoding="utf-8-sig", errors="replace"
+            ).strip()
+    if not str(loaded.get("text") or "").strip():
+        raise ValueError(f"No readable text found in {loaded['name']}")
+    return loaded
+
+
 def _item_generation_values(
-    generation_values: dict[str, Any], item: dict[str, Any]
+    generation_values: dict[str, Any], item: dict[str, Any], *, subprocess_mode: bool | None = None
 ) -> dict[str, Any]:
     """Adjust shared settings for one item in a mixed TXT/caption batch."""
     values = dict(generation_values)
     if not item.get("subtitle"):
         values["generation.use_caption_timing"] = False
+    if subprocess_mode is not None:
+        values["generation.use_subprocess"] = subprocess_mode
     return values
 
 
@@ -212,63 +243,129 @@ def batch_task_updates(
         log_value,
         gr.Timer(5.0, active=True),
     )
+class _BatchCanceled(RuntimeError):
+    pass
+
+
+def _record_batch_item_error(request: dict[str, Any], error: Exception, *, canceled: bool) -> None:
+    """Persist failures only after the worker has exited (including load errors)."""
+
+    task_folder = Path(request["task_layout"]["task_folder"])
+    message = "Batch generation canceled by user" if canceled else str(error)
+    metadata = read_json(request["metadata_path"], {}) or {}
+    if canceled and str(metadata.get("status") or "").lower() in {"complete", "completed"}:
+        # A late click can stop the next item without invalidating audio that
+        # the just-finished worker already saved successfully.
+        return
+    metadata.update(
+        status="canceled" if canceled else "failed",
+        updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        error=message,
+    )
+    metadata.setdefault("processing", {})["ended_at"] = metadata["updated_at"]
+    write_metadata_file(request["metadata_path"], metadata)
+    result = read_json(task_folder / "result.json", {}) or {}
+    result.update(status="canceled" if canceled else "error", error=message)
+    write_json_atomic(task_folder / "result.json", result)
+    progress = read_progress_file(request["progress_file"]) or {}
+    progress.update(desc="Canceled" if canceled else f"Failed: {message}", eta_s=0)
+    write_json_atomic(request["progress_file"], progress)
+
+
 def _poll_batch_item(request: dict[str, Any], subprocess_mode: bool, reuse_model: bool):
     task_folder = Path(request["task_layout"]["task_folder"])
     result_path = task_folder / "result.json"
     log_path = task_folder / "generation.log"
-    if subprocess_mode:
-        job = PROCESS_MANAGER.start(
-            "batch_generation",
-            [
-                sys.executable,
-                str(ROOT / "webui_subprocess_worker.py"),
-                "--request-file",
-                str(task_folder / "request.json"),
-                "--result-file",
-                str(result_path),
-            ],
-            state_dir=task_folder,
-            log_path=log_path,
-            cwd=ROOT,
-            metadata={"metadata_path": request["metadata_path"]},
-        )
-        while job.running:
-            yield read_progress_file(request["progress_file"]) or {}, tail_text(log_path, 40)
-            if _BATCH_CANCEL.is_set():
-                PROCESS_MANAGER.terminate("batch_generation")
-                raise RuntimeError("Batch canceled by user")
-            time.sleep(0.5)
-        payload = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
-        if job.process.returncode != 0 or payload.get("status") != "ok":
-            raise RuntimeError(payload.get("error") or f"Generation worker exited with code {job.process.returncode}")
-        return payload
-
-    box: dict[str, Any] = {}
-
-    def worker() -> None:
-        try:
-            engine = LAZY_ENGINE.get(request["runtime"])
-            box["result"] = run_generation_request(request, engine)
-        except BaseException as exc:
-            box["error"] = exc
-            traceback.print_exc()
-        finally:
-            box["done"] = True
-
-    thread = threading.Thread(target=worker, daemon=True, name="batch-inprocess-item")
-    thread.start()
-    while not box.get("done"):
-        yield read_progress_file(request["progress_file"]) or {}, tail_text(log_path, 40)
+    try:
         if _BATCH_CANCEL.is_set():
-            LAZY_ENGINE.request_cancel()
-            raise RuntimeError("Batch canceled by user")
-        time.sleep(0.5)
-    thread.join()
-    if not reuse_model:
-        LAZY_ENGINE.unload()
-    if "error" in box:
-        raise RuntimeError(str(box["error"])) from box["error"]
-    return box["result"]
+            raise _BatchCanceled("Batch canceled by user")
+        if subprocess_mode:
+            job = PROCESS_MANAGER.start(
+                "batch_generation",
+                [
+                    sys.executable,
+                    str(ROOT / "webui_subprocess_worker.py"),
+                    "--request-file",
+                    str(task_folder / "request.json"),
+                    "--result-file",
+                    str(result_path),
+                ],
+                state_dir=task_folder,
+                log_path=log_path,
+                cwd=ROOT,
+                metadata={"metadata_path": request["metadata_path"]},
+            )
+            cancel_sent = False
+            while job.running:
+                if _BATCH_CANCEL.is_set() and not cancel_sent:
+                    cancel_sent = PROCESS_MANAGER.terminate("batch_generation", expected_job=job)
+                payload = read_progress_file(request["progress_file"]) or {}
+                if _BATCH_CANCEL.is_set():
+                    payload.update(desc="Cancel requested; waiting for the worker to stop", eta_s=None)
+                yield payload, tail_text(log_path, 40)
+                time.sleep(0.5)
+            payload = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+            metadata = read_json(request["metadata_path"], {}) or {}
+            if payload.get("status") == "ok" and (
+                job.process.returncode == 0
+                or str(metadata.get("status") or "").lower() in {"complete", "completed"}
+            ):
+                return payload
+            if _BATCH_CANCEL.is_set() or job.canceled:
+                raise _BatchCanceled("Batch canceled by user")
+            if job.process.returncode != 0 or payload.get("status") != "ok":
+                raise RuntimeError(payload.get("error") or f"Generation worker exited with code {job.process.returncode}")
+            return payload
+
+        box: dict[str, Any] = {}
+
+        def worker() -> None:
+            tee = _Tee(sys.stdout, log_path)
+            try:
+                with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+                    # "Reload per item" also means reload before the first item,
+                    # not just unload the model after it happened to be reused.
+                    if not reuse_model:
+                        LAZY_ENGINE.unload()
+                    LAZY_ENGINE.raise_if_canceled()
+                    engine = LAZY_ENGINE.get(request["runtime"], progress_file=request["progress_file"])
+                    box["result"] = run_generation_request(
+                        request, engine, cancellation_check=LAZY_ENGINE.raise_if_canceled
+                    )
+                    write_json_atomic(result_path, {"status": "ok", **box["result"]})
+            except BaseException as exc:
+                box["error"] = exc
+                traceback.print_exc(file=tee)
+            finally:
+                tee.close()
+
+        thread = threading.Thread(target=worker, daemon=True, name="batch-inprocess-item")
+        thread.start()
+        try:
+            while thread.is_alive():
+                payload = read_progress_file(request["progress_file"]) or {}
+                if _BATCH_CANCEL.is_set():
+                    LAZY_ENGINE.request_cancel(expected_task=(request.get("batch") or {}).get("run_id"))
+                    payload.update(desc="Cancel requested; waiting for the worker to stop", eta_s=None)
+                yield payload, tail_text(log_path, 40)
+                time.sleep(0.5)
+        finally:
+            # Never release the generation queue or unload its engine while a
+            # canceled (or disconnected) in-process item is still using it.
+            thread.join()
+            if not reuse_model:
+                LAZY_ENGINE.unload()
+        metadata = read_json(request["metadata_path"], {}) or {}
+        if "result" in box and str(metadata.get("status") or "").lower() in {"complete", "completed"}:
+            return box["result"]
+        if _BATCH_CANCEL.is_set():
+            raise _BatchCanceled("Batch canceled by user")
+        if "error" in box:
+            raise RuntimeError(str(box["error"])) from box["error"]
+        return box["result"]
+    except Exception as exc:
+        _record_batch_item_error(request, exc, canceled=isinstance(exc, _BatchCanceled) or _BATCH_CANCEL.is_set())
+        raise
 
 
 def build_batch_tab(
@@ -339,6 +436,11 @@ def build_batch_tab(
             start = gr.Button("🎬  Generate batch", variant="primary", elem_classes=btn("emerald"))
             cancel = gr.Button("⛔  Cancel batch", variant="stop", elem_classes=btn("red"))
             open_button = gr.Button("📁  Open batch folder", elem_classes=btn("indigo"))
+        with gr.Column(visible=False) as cancel_confirmation:
+            gr.Markdown("Cancel the batch and stop its active item? In-process work may need time to reach a safe stopping point.")
+            with gr.Row():
+                cancel_confirm = gr.Button("🛑  Yes, cancel batch", variant="stop", elem_classes=btn("crimson"))
+                cancel_dismiss = gr.Button("▶️  Keep batch running", elem_classes=btn("pink"))
         progress = gr.HTML(progress_panel_html({}, title="Ready"))
         status = gr.Markdown("")
         results = gr.Dataframe(
@@ -349,6 +451,7 @@ def build_batch_tab(
         )
         log = gr.Textbox(label="Current item log", lines=10, max_lines=16, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
         task_state = gr.State("")
+        cancel_target_state = gr.State("")
         task_timer = gr.Timer(5.0, active=True)
 
         open_button.click(lambda: open_folder(_LAST_BATCH_FOLDER), outputs=status, queue=False)
@@ -383,6 +486,10 @@ def build_batch_tab(
         controls,
         task_state,
         task_timer,
+        cancel_confirmation,
+        cancel_confirm,
+        cancel_dismiss,
+        cancel_target_state,
     )
 
 
@@ -398,10 +505,17 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         paragraphs: str,
         folder: str,
         common_reference: str | None,
+        image_path: str | None,
+        emotion_audio: str | None,
         *values: Any,
     ):
-        global _LAST_BATCH_FOLDER
-        _BATCH_CANCEL.clear()
+        global _LAST_BATCH_FOLDER, _BATCH_CURRENT_TASK, _BATCH_RUN_ID
+        run_id = uuid.uuid4().hex
+        with _BATCH_RUN_LOCK:
+            _BATCH_CANCEL.clear()
+            _BATCH_ACTIVE.set()
+            _BATCH_CURRENT_TASK = ""
+            _BATCH_RUN_ID = run_id
         batch_values = dict(zip(batch_keys, values[:len(batch_keys)]))
         generation_values = dict(zip(generation_keys, values[len(batch_keys):]))
         items: list[dict[str, Any]] = []
@@ -410,6 +524,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         output_root = ROOT / "outputs"
         last_item_progress: dict[str, Any] = {}
         current_task = ""
+        poller = None
 
         def emit(panel: Any, message: str, result_rows: list[list[Any]], log_value: str, *, running: bool) -> tuple[Any, ...]:
             return (
@@ -431,6 +546,8 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             execution = batch_values["batch.execution"]
             subprocess_mode = execution == "Subprocess per item"
             reuse_model = execution == "Reuse loaded model between items"
+            if not subprocess_mode:
+                LAZY_ENGINE.reset_cancel(task_id=run_id)
             print(f">> Batch started | {len(items)} items | {execution}", flush=True)
             yield emit(
                 progress_panel_html({"fraction": 0, "completed": 0, "total": len(items), "desc": "Starting"}, title="Batch generation"),
@@ -444,30 +561,38 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 if _BATCH_CANCEL.is_set():
                     break
                 item_started = time.perf_counter()
-                reference = common_reference
-                if batch_values["batch.reference_mode"] == "Per-file reference":
-                    reference = _per_file_reference(item)
-                    if not reference:
-                        rows.append([item["name"], "Missing same-stem reference", 0.0, "", round(time.perf_counter() - item_started, 2)])
-                        if not batch_values["batch.continue_errors"]:
-                            break
-                        continue
                 try:
+                    item = _load_batch_item(item)
+                    reference = common_reference
+                    if batch_values["batch.reference_mode"] == "Per-file reference":
+                        reference = _per_file_reference(item)
+                        if not reference:
+                            raise ValueError("Missing same-stem reference")
                     pattern = str(batch_values["batch.naming_pattern"] or "{index:03d}_{name}")
                     filename = pattern.format(index=index, name=item["name"], stem=item["name"])
-                    item_values = _item_generation_values(generation_values, item)
+                    item_values = _item_generation_values(generation_values, item, subprocess_mode=subprocess_mode)
                     item_values["generation.output_filename"] = filename
                     request = prepare_generation_request(
                         item_values,
                         prompt=str(reference or ""),
                         text=item["text"],
                         subtitle_file=item["subtitle"],
-                        image_path=None,
-                        emotion_audio=None,
+                        image_path=image_path,
+                        emotion_audio=emotion_audio,
                         model_dir=model_dir,
                         output_root=output_root,
                     )
                     current_task = str(request["task_layout"]["task_folder"])
+                    request["batch"] = {
+                        "run_id": run_id, "item_index": index, "item_count": len(items),
+                        "execution": execution, "source": item.get("path") or None,
+                    }
+                    metadata = read_json(request["metadata_path"], {}) or {}
+                    metadata["batch"] = dict(request["batch"])
+                    write_metadata_file(request["metadata_path"], metadata)
+                    write_json_atomic(Path(current_task) / "request.json", request)
+                    with _BATCH_RUN_LOCK:
+                        _BATCH_CURRENT_TASK = current_task
                     poller = _poll_batch_item(request, subprocess_mode, reuse_model)
                     while True:
                         try:
@@ -485,7 +610,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                             "total": len(items),
                             "elapsed_s": elapsed,
                             "eta_s": eta,
-                            "desc": f"{item['name']} ({index}/{len(items)})",
+                            "desc": "Cancel requested; waiting for the worker to stop" if _BATCH_CANCEL.is_set() else f"{item['name']} ({index}/{len(items)})",
                             "speed": item_progress.get("speed"),
                             "speed_unit": item_progress.get("speed_unit", "x RT"),
                             "vram_used_gb": item_progress.get("vram_used_gb", 0),
@@ -493,7 +618,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                         }
                         yield emit(
                             progress_panel_html(payload, title="Batch generation"),
-                            f"Generating {item['name']} ({index}/{len(items)})",
+                            "Batch cancellation requested; waiting for the active item to stop." if _BATCH_CANCEL.is_set() else f"Generating {item['name']} ({index}/{len(items)})",
                             rows,
                             item_log,
                             running=True,
@@ -504,9 +629,11 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                         last_item_progress = dict(final_item_progress)
                     rows.append([item["name"], "Complete", round(duration, 3), result.get("output_path", ""), round(time.perf_counter() - item_started, 2)])
                 except Exception as exc:
-                    traceback.print_exc()
-                    rows.append([item["name"], f"Failed: {exc}", 0.0, "", round(time.perf_counter() - item_started, 2)])
-                    if not batch_values["batch.continue_errors"]:
+                    canceled = _BATCH_CANCEL.is_set() or isinstance(exc, _BatchCanceled)
+                    if not canceled:
+                        traceback.print_exc()
+                    rows.append([item["name"], "Canceled" if canceled else f"Failed: {exc}", 0.0, "", round(time.perf_counter() - item_started, 2)])
+                    if canceled or not batch_values["batch.continue_errors"]:
                         break
                 completed_count = len(rows)
                 elapsed = time.perf_counter() - started
@@ -577,6 +704,13 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                     title="Failed",
                 )
             yield emit(panel, f"Batch failed: {exc}", rows, "", running=False)
+        finally:
+            if poller is not None:
+                poller.close()
+            with _BATCH_RUN_LOCK:
+                if _BATCH_RUN_ID == run_id:
+                    _BATCH_CURRENT_TASK = ""
+                    _BATCH_ACTIVE.clear()
 
     def prepare_common_reference(
         reference_mode: str,
@@ -644,6 +778,8 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             tab.text,
             tab.folder,
             generation.prompt_audio,
+            generation.image,
+            generation.emotion_audio,
             *batch_components,
             *generation_components,
         ],
@@ -654,41 +790,59 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         show_progress="hidden",
         stream_every=0.5,
     )
-    confirmation = gr.Checkbox(value=False, visible=False, label="Batch cancel confirmation")
+    def show_batch_cancel(state_value: str):
+        metadata = read_json(Path(state_value) / "metadata.json", {}) if state_value else {}
+        captured_run = ((metadata or {}).get("batch") or {}).get("run_id")
+        with _BATCH_RUN_LOCK:
+            if not captured_run or not _BATCH_ACTIVE.is_set() or captured_run != _BATCH_RUN_ID:
+                return gr.update(visible=False), "", "No active batch run is attached to the displayed item."
+            return gr.update(visible=True), captured_run, "Confirm cancellation below."
 
-    def cancel_batch(confirmed: bool, state_value: str):
-        if not confirmed:
-            return gr.skip(), "Batch cancellation dismissed."
-        if not state_value or not output_task_is_active(state_value):
-            return gr.skip(), "No active run."
-        displayed = Path(state_value).resolve()
-        _BATCH_CANCEL.set()
-        job = PROCESS_MANAGER.get("batch_generation")
-        if job is not None and job.running and job.state_dir.resolve() == displayed:
-            PROCESS_MANAGER.terminate("batch_generation")
-        else:
-            LAZY_ENGINE.request_cancel()
-        metadata = read_json(displayed / "metadata.json", {}) or {}
-        metadata.update(
-            status="canceled",
-            updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            error="Batch generation canceled by user",
-        )
-        write_metadata_file(str(displayed / "metadata.json"), metadata)
-        payload = read_progress_file(displayed / "progress.json") or {}
-        payload.update({"desc": "Canceled", "eta_s": 0})
-        write_json_atomic(displayed / "progress.json", payload)
+    def cancel_batch(captured_run: str):
+        # Bind confirmation to the batch that was displayed when the panel was
+        # opened, not whichever run happens to be active on the later Yes click.
+        # One ID spans all items, so advancing to the next item remains safe.
+        with _BATCH_RUN_LOCK:
+            if not captured_run or captured_run != _BATCH_RUN_ID or not _BATCH_ACTIVE.is_set():
+                return gr.skip(), "The selected batch is no longer active; no other run was stopped.", gr.update(visible=False), ""
+            displayed = Path(_BATCH_CURRENT_TASK).resolve() if _BATCH_CURRENT_TASK else None
+            _BATCH_CANCEL.set()
+            job = PROCESS_MANAGER.get("batch_generation")
+            if job is not None and job.running and job.state_dir.resolve() == displayed:
+                PROCESS_MANAGER.terminate("batch_generation", expected_job=job)
+            else:
+                LAZY_ENGINE.request_cancel(expected_task=captured_run)
+        # The active poller handles cancellation and terminal metadata only
+        # after its worker exits. The button must not claim an early stop.
+        payload = read_progress_file(displayed / "progress.json") if displayed else {}
+        payload = payload or {}
+        payload.update(desc="Cancel requested; waiting for the worker to stop", eta_s=None)
         return (
-            progress_panel_html(payload, title="Batch canceled"),
-            "Batch cancellation requested; the active item was stopped.",
+            progress_panel_html(payload, title="Cancel requested"),
+            "Batch cancellation requested; waiting for the active item to stop.",
+            gr.update(visible=False),
+            "",
         )
 
     tab.cancel_button.click(
-        cancel_batch,
-        [confirmation, tab.task_state],
-        [tab.progress, tab.status],
-        js="(value, state) => [window.confirm('Cancel the batch and stop the active item?'), state]",
+        show_batch_cancel,
+        inputs=[tab.task_state],
+        outputs=[tab.cancel_confirmation, tab.cancel_target_state, tab.status],
         queue=False,
+        api_name=False,
+    )
+    tab.cancel_confirm_button.click(
+        cancel_batch,
+        [tab.cancel_target_state],
+        [tab.progress, tab.status, tab.cancel_confirmation, tab.cancel_target_state],
+        api_name="confirm_cancel_batch",
+        queue=False,
+    )
+    tab.cancel_dismiss_button.click(
+        lambda: (gr.update(visible=False), "Batch cancellation dismissed.", ""),
+        outputs=[tab.cancel_confirmation, tab.status, tab.cancel_target_state],
+        queue=False,
+        api_name=False,
     )
 
 

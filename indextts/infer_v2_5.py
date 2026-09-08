@@ -274,6 +274,9 @@ class IndexTTS2:
                 self.low_vram = True
                 reason = f"{total_vram_gb:.1f} GB GPU" if total_vram_gb < 10.0 else "aggressive block swap"
                 print(f">> Low-VRAM mode enabled ({reason}); long text will be split into chunks")
+        # Keep the hardware/runtime policy separate from the per-request override.
+        # Reusing an engine must not make a previous request's checkbox sticky.
+        self._runtime_low_vram = self.low_vram
 
         load_started = time.perf_counter()
         self.gpt = UnifiedVoice(
@@ -460,6 +463,10 @@ class IndexTTS2:
         self.s2mel.models["cfm"].estimator_autocast_dtype = (
             torch.bfloat16 if self.runtime.s2mel_estimator_autocast else None
         )
+        # GPT adapters are installed before s2mel exists. Apply the decoder now,
+        # including an explicit decoder selected with the base GPT, before any
+        # residency moves, cache setup, or compilation capture the estimator.
+        self._sync_decoder_adapter(self.runtime.lora_path, self.runtime.lora_strength)
         self.residency.register("s2mel", self.s2mel, self.runtime.aux_residency["s2mel"])
         if self.runtime.aux_residency["s2mel"] == "gpu" or resolved_device.type == "cpu":
             self.s2mel.models['cfm'].estimator.setup_caches(

@@ -33,6 +33,7 @@ from indextts.training.checkpoint_eval import (
     CheckpointEvalConfig,
     load_checkpoint_eval,
 )
+from indextts.training.selection import recommended_generation_value
 from indextts.training.grid import (
     GridCheckpoint,
     GridConfig,
@@ -238,6 +239,13 @@ def _analysis_payload(adapter_dir: str | Path | None) -> dict[str, Any]:
             "Run **Analyze training log** or train with validation enabled.\n\n"
             + GENERALIZATION_LEGEND
         )
+    try:
+        recommended = recommended_generation_value(root)
+        recommendation_label = Path(recommended).name if recommended else BASE_CHECKPOINT_LABEL
+        summary += f"\n\n**Generation recommendation:** {recommendation_label}. Completed speech evaluation takes precedence over token loss."
+    except ValueError as exc:
+        recommended = ""
+        summary += f"\n\n**Generation recommendation unavailable:** {exc}"
     chart = analysis_epoch_frame(analysis)
     mapping: dict[str, dict[str, str]] = {
         "base": {"label": BASE_CHECKPOINT_LABEL, "path": ""}
@@ -777,6 +785,10 @@ class GridTab:
     eval_timer: Any = None
     generate_button: Any = None
     cancel_button: Any = None
+    cancel_panel: Any = None
+    cancel_yes: Any = None
+    cancel_no: Any = None
+    cancel_target: Any = None
     open_button: Any = None
     calibrate_button: Any = None
     calibration_result: Any = None
@@ -1060,6 +1072,12 @@ def build_grid_tab(
             )
             tab.cancel_button = gr.Button("⛔  Cancel", variant="stop", elem_classes=btn("red"))
             tab.open_button = gr.Button("📁  Open grid folder", elem_classes=btn("indigo"))
+        with gr.Group(visible=False) as tab.cancel_panel:
+            tab.cancel_target = gr.State("")
+            gr.Markdown("Cancel after the current grid cell finishes? Completed clips are kept.")
+            with gr.Row():
+                tab.cancel_yes = gr.Button("🛑  Yes, cancel grid", variant="stop", elem_classes=btn("crimson"))
+                tab.cancel_no = gr.Button("▶️  Keep rendering grid", elem_classes=btn("pink"))
         tab.calibrate_button = gr.Button(
             "🐢  Calibrate speaking rate from this grid",
             elem_classes=btn("teal"),
@@ -1593,38 +1611,42 @@ def bind_grid_events(
         concurrency_id="grid_generation",
         api_name="generate_checkpoint_grid",
     )
-    with gr.Group(visible=False):
-        cancel_confirm = gr.Checkbox(value=False, visible=False, label="Grid cancellation confirmation")
-
-    def cancel_grid(confirmed: bool, state_value: str):
-        if not confirmed:
-            return "Cancellation dismissed."
+    def cancel_grid(confirmation_target: str, state_value: str):
+        if not confirmation_target or not _same_folder(confirmation_target, state_value):
+            return "The displayed grid changed; click Cancel again to review the current grid."
         if not state_value or not _grid_running(state_value):
             return "No active grid is displayed."
         (Path(state_value) / "stop.flag").touch()
         return "Cancellation requested. The current cell will finish, then the grid will stop."
 
     tab.cancel_button.click(
-        cancel_grid,
-        [cancel_confirm, tab.state],
-        tab.status,
-        js="(confirmed, state) => [window.confirm('Cancel after the current grid cell finishes?'), state]",
-        queue=False,
+        lambda state: (gr.update(visible=True), state), inputs=tab.state,
+        outputs=[tab.cancel_panel, tab.cancel_target], queue=False,
     )
+    tab.cancel_no.click(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target], queue=False)
+    tab.cancel_yes.click(
+        cancel_grid,
+        [tab.cancel_target, tab.state],
+        tab.status,
+        api_name="confirm_cancel_grid",
+        queue=False,
+    ).then(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target], queue=False)
 
     lora_component = generation.controls.get("runtime.lora_path")
     if lora_component is not None:
-        def use_recommended(path: str):
-            if not path or not Path(path).is_file():
-                raise gr.Error("No recommended checkpoint is available")
+        def use_recommended(adapter_dir: str):
+            try:
+                path = recommended_generation_value(adapter_dir)
+            except ValueError as exc:
+                raise gr.Error(str(exc)) from exc
             return (
-                gr.update(choices=_lora_choices(), value=str(Path(path).resolve())),
+                gr.update(choices=_lora_choices(), value=path),
                 gr.Tabs(selected="voice-generation"),
             )
 
         tab.use_generation.click(
             use_recommended,
-            tab.recommended,
+            tab.adapter,
             [lora_component, main_tabs],
             queue=False,
         )

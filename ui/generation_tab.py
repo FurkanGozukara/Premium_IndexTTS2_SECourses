@@ -68,6 +68,7 @@ from .presets_store import PresetRegistry
 
 
 LANGUAGES = ("ZH", "EN", "JA", "AR", "ES")
+_ACTIVE_INPROCESS_TASK = ""
 EMOTION_MODES = (
     "Same as speaker voice",
     "Emotion reference audio",
@@ -488,6 +489,9 @@ def prepare_generation_request(
         raise ValueError("Enter text or load a caption file")
     if image_source and not Path(image_source).is_file():
         raise ValueError(f"Image file not found: {image_source}")
+    # Validate captions before allocating an output task.
+    cues = parse_subtitle_file(subtitle_path) if subtitle_mode else []
+    units = build_subtitle_render_units(cues) if cues else []
 
     extension = Path(image_source).suffix if image_source else None
     layout = create_task_output_layout(
@@ -519,8 +523,6 @@ def prepare_generation_request(
         model_dir=model_dir,
     )
 
-    cues = parse_subtitle_file(subtitle_path) if subtitle_mode else []
-    units = build_subtitle_render_units(cues) if cues else []
     started = _now()
     metadata = {
         "status": "in_progress",
@@ -603,6 +605,10 @@ def prepare_generation_request(
         }
     write_metadata_file(metadata_path, metadata)
     write_json_atomic(task_folder / "request.json", request)
+    write_json_atomic(progress_file, {
+        "stage": "initializing", "desc": "Loading model / preparing generation",
+        "completed": 0, "total": 0, "fraction": 0.0, "updated_at": time.time(),
+    })
     return request
 
 
@@ -1238,7 +1244,7 @@ def _lora_choices() -> list[tuple[str, str]]:
             f"  ·  {int(info.get('steps', 0) or 0)} steps"
         )
         if source.parent.name.lower() == "best":
-            label += "  [best]"
+            label += "  [lowest validation loss]"
         choices.append((label, str(source)))
     return choices
 
@@ -1273,7 +1279,7 @@ def _lora_info(path: str | None) -> tuple[str, str | None]:
         decoding_line = (
             f"Decoding settings from the sweep: temperature **{decoding['temperature']:g}**, guidance **{decoding['inference_cfg_rate']:g}**, "
             f"beams **{decoding['num_beams']}** (applied with the calibrated speaking rate)."
-            if decoding else "Decoding settings: **defaults** (no sweep result for this training)."
+            if decoding else "Decoding settings: **defaults** (no accepted sweep override for this training)."
         )
         markdown = (
             f"**{str(info['adapter_type']).upper()}** | rank **{info['rank']}** | alpha **{info['alpha']}**  \n"
@@ -1341,6 +1347,9 @@ def lora_selection_updates(
                 messages.append(
                     f"Applied calibrated speaking rate {report.recommended_speaking_rate:.3f}."
                 )
+            else:
+                rate_update = 1.0
+                messages.append("No calibration for this adapter; reset speaking rate to the model's natural pace (1.0).")
 
     if not messages:
         messages.append(
@@ -1518,11 +1527,11 @@ def _terminal_generation_updates(
         progress_panel_html(payload, title=title),
         message,
         log_value,
-        gr.skip(),
-        gr.skip(),
-        gr.skip(),
-        gr.skip(),
-        gr.skip(),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        [],
+        gr.update(value="", visible=False),
+        "",
         recent_outputs(),
     )
 
@@ -1544,14 +1553,45 @@ def _generation_result_from_disk(task_folder: Path, metadata: Mapping[str, Any])
     }
 
 
+_GENERATION_CARD_OWNERS: set[str] = set()
+_GENERATION_CARD_LOCK = threading.Lock()
+
+
+def _claim_generation_card(gr_request: gr.Request | None) -> None:
+    """The connected click/stream owns this page until its next reload."""
+
+    session = str(getattr(gr_request, "session_hash", "") or "")
+    if session:
+        with _GENERATION_CARD_LOCK:
+            _GENERATION_CARD_OWNERS.add(session)
+
+
+def _generation_card_is_owned(gr_request: gr.Request | None) -> bool:
+    session = str(getattr(gr_request, "session_hash", "") or "")
+    with _GENERATION_CARD_LOCK:
+        return bool(session and session in _GENERATION_CARD_OWNERS)
+
+
+def _guard_generation_poll(gr_request: gr.Request | None, updates: tuple[Any, ...]) -> tuple[Any, ...]:
+    # A timer may have started before a Generate click and finished its disk
+    # reads after validation failed. Check ownership again at the return boundary
+    # rather than trusting that the timer's captured task state is still current.
+    if _generation_card_is_owned(gr_request):
+        return (*[gr.skip()] * 10, gr.Timer(5.0, active=False))
+    return updates
+
+
 def generation_task_updates(
     state_value: str,
+    gr_request: gr.Request = None,
     *,
     output_root: str | os.PathLike[str] = ROOT / "outputs",
     page_load: bool = False,
 ) -> tuple[Any, ...]:
     """Discover and render the per-session generation task card."""
 
+    if _generation_card_is_owned(gr_request):
+        return _guard_generation_poll(gr_request, ())
     task_value, running = adopt_output_task(
         state_value,
         root=output_root,
@@ -1559,7 +1599,7 @@ def generation_task_updates(
         page_load=page_load,
     )
     if not task_value:
-        return (
+        return _guard_generation_poll(gr_request, (
             "",
             progress_panel_html({}, title="Ready"),
             "",
@@ -1570,8 +1610,8 @@ def generation_task_updates(
             gr.skip(),
             gr.skip(),
             recent_outputs(output_root) if page_load else [],
-            gr.Timer(5.0, active=True),
-        )
+            gr.Timer(5.0, active=False),
+        ))
 
     task_folder = Path(task_value)
     metadata = read_json(task_folder / "metadata.json", {}) or {}
@@ -1584,7 +1624,7 @@ def generation_task_updates(
     log_value = tail_text(task_folder / "generation.log", 60)
     if running:
         description = str(payload.get("desc") or payload.get("stage") or "Model is working...")
-        return (
+        return _guard_generation_poll(gr_request, (
             task_value,
             progress_panel_html(payload, title="Generating voice"),
             f"Attached to running run {task_name} | {description}",
@@ -1592,7 +1632,7 @@ def generation_task_updates(
             gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
             recent_outputs(output_root),
             gr.Timer(1.0, active=True),
-        )
+        ))
 
     metadata_status = str(metadata.get("status") or "").strip().lower()
     if metadata_status in {"complete", "completed"}:
@@ -1605,30 +1645,44 @@ def generation_task_updates(
         card[1] = f"Last task {task_name} | {card[1]}"
     card[2] = log_value
     card[8] = recent_outputs(output_root)
-    return task_value, *card, gr.Timer(5.0, active=True)
+    return _guard_generation_poll(gr_request, (task_value, *card, gr.Timer(5.0, active=False)))
 
 
 class _Tee:
+    """Forward all console writes, but capture only the creating worker's log.
+
+    stdout/stderr redirection is process-wide. Foreign threads (for example,
+    child-process log pumps) must still reach the console without being copied
+    into this task's file. A retained tee stays a console-only forwarder after
+    close, including while a late foreign write races worker shutdown.
+    """
+
     def __init__(self, stream: Any, path: Path) -> None:
         self.stream = stream
         self.handle = path.open("a", encoding="utf-8", newline="\n")
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        # Thread objects cannot be confused when the OS reuses a thread ID.
+        self.owner_thread = threading.current_thread()
 
     def write(self, value: str) -> int:
         with self.lock:
             self.stream.write(value)
             self.stream.flush()
-            self.handle.write(value)
-            self.handle.flush()
+            if threading.current_thread() is self.owner_thread and not self.handle.closed:
+                self.handle.write(value)
+                self.handle.flush()
         return len(value)
 
     def flush(self) -> None:
         with self.lock:
             self.stream.flush()
-            self.handle.flush()
+            if threading.current_thread() is self.owner_thread and not self.handle.closed:
+                self.handle.flush()
 
     def close(self) -> None:
-        self.handle.close()
+        with self.lock:
+            if not self.handle.closed:
+                self.handle.close()
 
 
 def stream_generation_request(
@@ -1640,6 +1694,10 @@ def stream_generation_request(
 ):
     """Execute one prepared request and yield a shared nine-output dashboard tuple."""
 
+    global _ACTIVE_INPROCESS_TASK
+    task_identity = str(Path(str(request["task_layout"]["task_folder"])).resolve())
+    if not use_subprocess:
+        _ACTIVE_INPROCESS_TASK = task_identity
     started = time.perf_counter()
     try:
         yield from _stream_generation_request(
@@ -1657,6 +1715,15 @@ def stream_generation_request(
         except OSError as metadata_error:
             print(f">> Could not save generation failure: {metadata_error}", file=sys.stderr, flush=True)
         raise
+    except GeneratorExit:
+        # An in-process worker is joined by the inner generator before closing.
+        # If it never started or failed during loading, do not leave stale live metadata.
+        if not use_subprocess:
+            _record_generation_failure(request, "Generation canceled after its stream closed.", time.perf_counter() - started)
+        raise
+    finally:
+        if not use_subprocess and _ACTIVE_INPROCESS_TASK == task_identity:
+            _ACTIVE_INPROCESS_TASK = ""
 
 
 def _record_generation_failure(request: Mapping[str, Any], error: str, elapsed: float) -> None:
@@ -1667,7 +1734,7 @@ def _record_generation_failure(request: Mapping[str, Any], error: str, elapsed: 
     if not metadata or metadata.get("status") in {"completed", "complete", "failed", "error", "canceled", "cancelled"}:
         return
     ended_at = current_timestamp()
-    metadata.update(status="failed", error=error, updated_at=ended_at)
+    metadata.update(status="canceled" if "cancel" in error.lower() else "failed", error=error, updated_at=ended_at)
     metadata.setdefault("processing", {}).update(
         ended_at=ended_at,
         elapsed_ms=round(elapsed * 1000),
@@ -1684,7 +1751,10 @@ def _stream_generation_request(
     gr_progress: Any = None,
     process_kind: str = "generation",
 ):
+    started = time.perf_counter()
     task_folder = Path(str(request["task_layout"]["task_folder"]))
+    if not use_subprocess:
+        LAZY_ENGINE.reset_cancel(task_id=str(task_folder.resolve()))
     log_path = task_folder / "generation.log"
     progress_file = request.get("progress_file")
     initial = (
@@ -1732,6 +1802,7 @@ def _stream_generation_request(
             time.sleep(0.5)
         payload = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
         if job.canceled:
+            _record_generation_failure(request, "Generation canceled by user.", time.monotonic() - job.started_at)
             yield _terminal_generation_updates(
                 request,
                 title="Canceled",
@@ -1757,7 +1828,10 @@ def _stream_generation_request(
                     progress_file=progress_file,
                     progress_callback=gr_progress,
                 )
-                result_box["result"] = run_generation_request(dict(request), engine, progress_callback=gr_progress)
+                result_box["result"] = run_generation_request(
+                    dict(request), engine, progress_callback=gr_progress,
+                    cancellation_check=LAZY_ENGINE.raise_if_canceled,
+                )
         except BaseException as exc:
             result_box["error"] = exc
             result_box["traceback"] = traceback.format_exc()
@@ -1768,16 +1842,22 @@ def _stream_generation_request(
 
     thread = threading.Thread(target=run_in_process, daemon=True, name="indextts-inprocess-generation")
     thread.start()
-    while not result_box.get("done"):
-        payload = read_progress_file(progress_file) or {}
-        yield (
-            progress_panel_html(payload, title="Generating voice in process"),
-            str(payload.get("desc") or payload.get("stage") or "Model is working..."),
-            tail_text(log_path, 60),
-            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
-        )
-        time.sleep(0.5)
-    thread.join()
+    try:
+        while not result_box.get("done"):
+            payload = read_progress_file(progress_file) or {}
+            yield (
+                progress_panel_html(payload, title="Generating voice in process"),
+                str(payload.get("desc") or payload.get("stage") or "Model is working..."),
+                tail_text(log_path, 60),
+                gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            )
+            time.sleep(0.5)
+    finally:
+        # Keep the shared generation queue occupied if the stream disconnects;
+        # reloading the browser must not race a second request against this one.
+        thread.join()
+        if "error" in result_box:
+            _record_generation_failure(request, str(result_box["error"]), time.perf_counter() - started)
     if "error" in result_box:
         raise RuntimeError(str(result_box["error"]))
     yield _result_updates(result_box["result"], request)
@@ -1823,6 +1903,10 @@ class GenerationTab:
     emotion_audio: Any = None
     generate_button: Any = None
     cancel_button: Any = None
+    cancel_panel: Any = None
+    cancel_yes: Any = None
+    cancel_no: Any = None
+    cancel_target: Any = None
     progress_html: Any = None
     status: Any = None
     log_tail: Any = None
@@ -2000,6 +2084,12 @@ def build_generation_tab(
                     tab.cancel_button = gr.Button(
                         "⛔  Cancel", variant="stop", elem_classes=btn("red"), scale=1,
                     )
+                with gr.Group(visible=False) as tab.cancel_panel:
+                    tab.cancel_target = gr.State("")
+                    gr.Markdown("Cancel the running generation? Completed files are kept.")
+                    with gr.Row():
+                        tab.cancel_yes = gr.Button("🛑  Yes, cancel generation", variant="stop", elem_classes=btn("crimson"))
+                        tab.cancel_no = gr.Button("▶️  Keep generating", elem_classes=btn("pink"))
                 open_outputs = gr.Button("📁  Open outputs folder", elem_classes=btn("indigo"))
                 tab.output_audio = gr.Audio(
                     label="Generated audio",
@@ -2803,8 +2893,11 @@ def build_generation_tab(
         show_progress="hidden",
     )
     if load_hook is not None:
+        def attach_generation(state: str, gr_request: gr.Request = None):
+            return generation_task_updates(state, gr_request, page_load=True)
+
         load_hook(
-            lambda state: generation_task_updates(state, page_load=True),
+            attach_generation,
             tab.task_state,
             task_outputs,
             queue=False,
@@ -2834,9 +2927,11 @@ def bind_generation_events(
         subtitle_file: str | None,
         image_path: str | None,
         emotion_audio: str | None,
+        gr_request: gr.Request = None,
         *component_values: Any,
         progress=gr.Progress(track_tqdm=False),
     ):
+        _claim_generation_card(gr_request)
         values = dict(zip(tab.request_keys, component_values))
         started = time.perf_counter()
         request: dict[str, Any] | None = None
@@ -2861,7 +2956,7 @@ def bind_generation_events(
                 yield (
                     task_folder,
                     *updates,
-                    gr.Timer(1.0 if running else 5.0, active=True),
+                    gr.Timer(1.0 if running else 5.0, active=False),
                 )
             print(f">> Generation finished in {time.perf_counter() - started:.2f}s", flush=True)
         except Exception as exc:
@@ -2876,9 +2971,11 @@ def bind_generation_events(
             task_folder = (
                 str((request.get("task_layout") or {}).get("task_folder") or "")
                 if request
-                else gr.skip()
+                else ""
             )
-            yield task_folder, *terminal, gr.Timer(5.0, active=True)
+            # Keep validation failures visible instead of reattaching an old
+            # completed task on the next timer tick.
+            yield task_folder, *terminal, gr.Timer(5.0, active=False)
 
     generation_outputs = [
         tab.task_state,
@@ -2902,7 +2999,9 @@ def bind_generation_events(
         time_ranges: str,
         lora_path: str,
         auto_lora_reference: bool,
+        gr_request: gr.Request = None,
     ):
+        _claim_generation_card(gr_request)
         try:
             prepared = prepare_reference_for_generation(
                 prompt,
@@ -2967,14 +3066,9 @@ def bind_generation_events(
         stream_every=0.5,
     )
 
-    # State inputs are resolved server-side and cannot be replaced by an
-    # event's JavaScript return value.  A hidden non-stateful component lets
-    # confirm() pass its boolean to the handler exactly once.
-    confirm_state = gr.Checkbox(value=False, visible=False, label="Generation cancel confirmation")
-
-    def cancel(confirmed: bool, state_value: str, subprocess_mode: bool):
-        if not confirmed:
-            return gr.skip(), "Cancellation dismissed."
+    def cancel(confirmation_target: str, state_value: str, subprocess_mode: bool):
+        if not confirmation_target or _path_key(confirmation_target) != _path_key(state_value):
+            return gr.skip(), "The displayed run changed; click Cancel again to review the current run."
         if not state_value or not output_task_is_active(state_value):
             return gr.skip(), "No active run."
         displayed = Path(state_value).resolve()
@@ -2984,32 +3078,38 @@ def bind_generation_events(
             job = PROCESS_MANAGER.get("generation")
             if job is None or not job.running or job.state_dir.resolve() != displayed:
                 return gr.skip(), "The active displayed run is not managed by this app process."
-            PROCESS_MANAGER.terminate("generation")
-            metadata.update(status="canceled", updated_at=_now(), error="Generation canceled by user")
-            write_metadata_file(str(displayed / "metadata.json"), metadata)
+            if not PROCESS_MANAGER.terminate("generation", expected_job=job):
+                return gr.skip(), "The displayed worker has already ended or could not be stopped; check its live log."
             payload = read_progress_file(displayed / "progress.json") or {}
-            payload.update({"eta_s": 0, "desc": "Canceled"})
+            payload.update({"eta_s": 0, "desc": "Waiting for the canceled subprocess to exit"})
             write_json_atomic(displayed / "progress.json", payload)
             return (
-                progress_panel_html(payload, title="Canceled"),
-                "Generation canceled and its subprocess tree was stopped.",
+                progress_panel_html(payload, title="Cancel requested"),
+                "Cancellation requested; waiting for the generation subprocess tree to stop.",
             )
-        if LAZY_ENGINE.request_cancel():
+        if _path_key(_ACTIVE_INPROCESS_TASK) != _path_key(displayed):
+            return gr.skip(), "The displayed in-process run is not active in this app process."
+        if LAZY_ENGINE.request_cancel(expected_task=str(displayed)):
             return (
-                progress_panel_html({"desc": "Canceled"}, title="Canceled"),
+                progress_panel_html({"desc": "Stopping at the next safe boundary"}, title="Cancel requested"),
                 "In-process cancellation requested; synthesis will stop at the next progress boundary.",
             )
         return gr.skip(), "No in-process generation is running."
 
     use_subprocess_component = tab.controls["generation.use_subprocess"]
     tab.cancel_button.click(
+        lambda state: (gr.update(visible=True), state), inputs=tab.task_state,
+        outputs=[tab.cancel_panel, tab.cancel_target], queue=False,
+    )
+    tab.cancel_no.click(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target], queue=False)
+    tab.cancel_yes.click(
         cancel,
-        inputs=[confirm_state, tab.task_state, use_subprocess_component],
+        inputs=[tab.cancel_target, tab.task_state, use_subprocess_component],
         outputs=[tab.progress_html, tab.status],
-        js="(confirmed, state, mode) => [window.confirm('Cancel the running generation?'), state, mode]",
+        api_name="confirm_cancel_generation",
         queue=False,
         show_progress="hidden",
-    )
+    ).then(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target], queue=False)
 
 
 __all__ = [

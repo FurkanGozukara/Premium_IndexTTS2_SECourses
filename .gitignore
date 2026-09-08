@@ -48,3 +48,11 @@ Trellis_2_3D_Generator/
 /presets/user/*
 !/presets/user/.gitkeep
 /.ui_state/
+
+# Local, dataset-specific QA evidence and its one-off listening harness.
+# Public release notes belong in ui/changelog_tab.py, not personal run reports.
+/docs/BROWSER_V10_VALIDATION_*.md
+/docs/qa_v10_*.md
+/tools/qa_v10_native_bundle.py
+/tests/test_qa_v10_native_bundle*.py
+/tests/fixtures/browser_v10/

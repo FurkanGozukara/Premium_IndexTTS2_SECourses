@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import time
 import traceback
 from typing import Any, Mapping, Sequence
@@ -20,6 +21,214 @@ def load_speech_evaluation(run_dir: str | Path) -> dict[str, Any] | None:
         return report if report.get("status") == "complete" else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def development_fingerprint(run_dir: str | Path) -> str:
+    """Identify measured development data, excluding later final-test summary updates."""
+    root = Path(run_dir) / "analysis" / "speech_evaluation"
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
+    payload = {"plan": plan, **{key: report.get(key) for key in
+               ("dataset_identity", "candidates", "cells", "real_cells", "inference", "evaluation_partition")}}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _validate_development_report(report: Mapping[str, Any]) -> None:
+    if (report.get("status") != "complete" or report.get("final_test")
+            or report.get("evaluation_partition") != "validation"):
+        raise ValueError("Selection requires a completed validation-only speech report")
+    inference = report.get("inference") or {}
+    runtime = inference.get("runtime", {})
+    runtime = runtime.get("runtime", runtime) if isinstance(runtime, dict) else {}
+    if runtime.get("decoder_adapter") != "none":
+        raise ValueError("The development baseline must have the voice decoder adapter explicitly disabled")
+
+
+def development_baseline(run_dir: str | Path, checkpoint: str) -> tuple[dict[str, Any], list[dict[str, Any]], str, Path, dict[str, Any]]:
+    """Only validation may select a decoder strength or decoding settings."""
+    root = Path(run_dir) / "analysis" / "speech_evaluation"
+    report_path = root / "report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("A completed development speech benchmark is required; final-test measurements cannot be used for tuning") from exc
+    if not isinstance(report, dict):
+        raise ValueError("A completed validation-only speech report is required")
+    _validate_development_report(report)
+    candidate = next((row for row in report.get("candidates", [])
+                      if row.get("path") and str(Path(row["path"]).resolve()) == checkpoint), None)
+    if not candidate or not Path(checkpoint).is_file() or candidate.get("sha256") != _file_sha256(checkpoint):
+        raise ValueError("The selected checkpoint no longer matches its development measurement")
+    label = str(candidate["label"])
+    rows = [row for row in report.get("cells", []) if label and row.get("checkpoint") == label]
+    if not rows:
+        raise ValueError("The development speech benchmark has no measurement of the selected checkpoint")
+    inference = report.get("inference") if isinstance(report.get("inference"), dict) else {}
+    return plan, rows, label, report_path, inference
+
+
+def freeze_deployment_selection(config: Any, checkpoint_path: str) -> dict[str, Any]:
+    """Freeze development-selected weights and effective deployment settings before final testing."""
+    from indextts.lora.decoder import find_decoder_adapter
+    from .decoding_sweep import DECODING_KEYS, load_decoding_settings
+    from .sampling import SAMPLE_FIXED_INFER_KWARGS
+    from .speaking_rate import load_speaking_rate
+
+    run_dir = Path(config.output_dir).resolve() / config.name
+    root = run_dir / "analysis" / "speech_evaluation"
+    report = load_speech_evaluation(run_dir)
+    if report is None:
+        raise ValueError("Freeze requires a completed development speech recommendation")
+    _validate_development_report(report)
+    checkpoint = str(Path(checkpoint_path).resolve()) if checkpoint_path else ""
+    recommended = str(Path(report["recommended_checkpoint"]).resolve()) if report.get("recommended_checkpoint") else ""
+    if checkpoint != recommended:
+        raise ValueError("Final testing cannot change the development-selected checkpoint")
+    if checkpoint and not Path(checkpoint).is_relative_to(run_dir):
+        raise ValueError("The frozen checkpoint must belong to this training run")
+    base = next((dict(row) for row in report["candidates"] if not row.get("path")), None)
+    selected = next((dict(row) for row in report["candidates"]
+                     if (str(Path(row["path"]).resolve()) if row.get("path") else "") == checkpoint), None)
+    if base is None or selected is None:
+        raise ValueError("The development report lacks Base or the selected checkpoint")
+    runtime = _benchmark_runtime(config).to_dict()
+    runtime.update(lora_path="", decoder_adapter="none", decoder_adapter_strength=1.0)
+    infer = _benchmark_infer_kwargs(config)
+    base.update(path="", runtime=dict(runtime), infer_kwargs=dict(infer), speaking_rate=float(config.sample_speaking_rate))
+    candidates = [base]
+    artifacts = {str(root / "report.json"): _file_sha256(root / "report.json"),
+                 str(root / "plan.json"): _file_sha256(root / "plan.json"),
+                 str(root / "final_test" / "plan.json"): _file_sha256(root / "final_test" / "plan.json")}
+    if checkpoint:
+        selected.update(path=checkpoint, runtime=dict(runtime), infer_kwargs=dict(infer),
+                        speaking_rate=float(config.sample_speaking_rate))
+        artifacts[checkpoint] = _file_sha256(checkpoint)
+        if selected.get("sha256") != artifacts[checkpoint]:
+            raise ValueError("The selected checkpoint changed after development evaluation")
+        measured_development = development_fingerprint(run_dir)
+        decoder_path = find_decoder_adapter(checkpoint)
+        if decoder_path:
+            decoder = load_decoder_test(run_dir)
+            expected_baseline = root / "report.json"
+            if (not decoder or not decoder.get("accepted") or decoder.get("evaluation_partition") != "validation"
+                    or str(Path(str(decoder.get("checkpoint", ""))).resolve()) != checkpoint
+                    or str(Path(str(decoder.get("adapter", ""))).resolve()) != str(Path(decoder_path).resolve())
+                    or str(Path(str(decoder.get("baseline_report", ""))).resolve()) != str(expected_baseline.resolve())
+                    or decoder.get("checkpoint_sha256") != artifacts[checkpoint]
+                    or decoder.get("development_fingerprint") != measured_development
+                    or decoder.get("adapter_sha256") != _file_sha256(decoder_path)):
+                raise ValueError("An installed decoder lacks a matching completed validation gate; final testing is blocked")
+            selected["runtime"].update(decoder_adapter=str(Path(decoder_path).resolve()),
+                                       decoder_adapter_strength=float(decoder.get("strength", 1.0)))
+            artifacts[str(Path(decoder_path).resolve())] = decoder["adapter_sha256"]
+            gate_path = root / "decoder_test" / "report.json"
+            artifacts[str(gate_path)] = _file_sha256(gate_path)
+        rate = load_speaking_rate(checkpoint)
+        if rate is not None:
+            selected["speaking_rate"] = float(rate.recommended_speaking_rate)
+            selected["infer_kwargs"]["latent_multiplier"] = round(
+                float(SAMPLE_FIXED_INFER_KWARGS["latent_multiplier"]) / selected["speaking_rate"], 4)
+            rate_path = run_dir / "analysis" / "speaking_rate.json"
+            artifacts[str(rate_path)] = _file_sha256(rate_path)
+        settings_path = run_dir / "analysis" / "decoding.json"
+        if settings_path.is_file():
+            settings_report = json.loads(settings_path.read_text(encoding="utf-8"))
+            artifacts[str(settings_path)] = _file_sha256(settings_path)
+            if settings_report.get("accepted"):
+                current_decoder = selected["runtime"]["decoder_adapter"]
+                if (settings_report.get("evaluation_partition") != "validation"
+                        or str(Path(str(settings_report.get("checkpoint", ""))).resolve()) != checkpoint
+                        or str(settings_report.get("decoder_adapter", "none")) != current_decoder
+                        or float(settings_report.get("decoder_adapter_strength", 1.0)) != selected["runtime"]["decoder_adapter_strength"]):
+                    raise ValueError("Adopted decoding settings do not match the validation-selected checkpoint and decoder")
+                decoder_digest = artifacts.get(current_decoder, "")
+                sweep_path = root / "decoding_sweep" / "report.json"
+                if (settings_report.get("checkpoint_sha256") != artifacts[checkpoint]
+                        or settings_report.get("decoder_adapter_sha256", "") != decoder_digest
+                        or settings_report.get("development_fingerprint") != measured_development
+                        or not sweep_path.is_file() or settings_report.get("report_sha256") != _file_sha256(sweep_path)):
+                    raise ValueError("Adopted decoding settings lack matching validation provenance")
+                sweep = json.loads(sweep_path.read_text(encoding="utf-8"))
+                if (sweep.get("status") != "complete" or not sweep.get("accepted")
+                        or sweep.get("evaluation_partition") != "validation"
+                        or sweep.get("settings") != settings_report.get("settings")
+                        or sweep.get("checkpoint_sha256") != artifacts[checkpoint]
+                        or sweep.get("decoder_adapter_sha256", "") != decoder_digest
+                        or sweep.get("development_fingerprint") != measured_development):
+                    raise ValueError("The complete decoding validation report does not match the frozen deployment")
+                artifacts[str(sweep_path)] = settings_report["report_sha256"]
+                settings = load_decoding_settings(checkpoint)
+                if settings is None:
+                    raise ValueError("The adopted decoding settings cannot be loaded")
+                selected["infer_kwargs"].update({key: settings[key] for key in DECODING_KEYS})
+        candidates.append(selected)
+    for candidate in candidates:
+        candidate["sha256"] = artifacts.get(candidate["path"], "")
+    return {"version": 2, "evaluation_partition": "final_test", "selection_partition": "validation",
+            "recommended_checkpoint": checkpoint, "candidates": candidates, "artifacts": artifacts,
+            "frozen_at": datetime.now(timezone.utc).isoformat(),
+            "scope": "Checkpoint, decoder and strength, calibrated speaking rate, and decoding settings frozen before final testing"}
+
+
+def _validate_frozen_deployment(frozen: Mapping[str, Any]) -> None:
+    for path, expected in frozen.get("artifacts", {}).items():
+        if not Path(path).is_file() or _file_sha256(path) != expected:
+            raise ValueError(f"A frozen deployment artifact changed: {path}")
+
+
+def run_final_test(config: Any, state_dir: str | Path, *, checkpoint_path: str) -> dict[str, Any]:
+    """Assess the already frozen deployment, without feeding final results back into tuning."""
+    run_dir = Path(config.output_dir).resolve() / config.name
+    root = run_dir / "analysis" / "speech_evaluation"
+    final_root = root / "final_test"
+    frozen = freeze_deployment_selection(config, checkpoint_path)
+    # An explicit rerun preserves earlier evidence instead of silently replacing it.
+    prior = [final_root / name for name in ("report.json", "report.md", "selection_frozen.json", "listening_review.html")
+             if (final_root / name).is_file()]
+    if prior:
+        history = final_root / "history" / str(time.time_ns())
+        history.mkdir(parents=True)
+        for path in prior:
+            shutil.copy2(path, history / path.name)
+    # The development summary receives the final result later. Keep its exact
+    # selection-time contents as immutable evidence for the frozen deployment.
+    source_report = root / "report.json"
+    evidence = final_root / "frozen_inputs" / str(time.time_ns()) / "development_report.json"
+    evidence.parent.mkdir(parents=True)
+    shutil.copy2(source_report, evidence)
+    expected = frozen["artifacts"].pop(str(source_report))
+    if _file_sha256(evidence) != expected:
+        raise ValueError("The development recommendation changed while freezing deployment")
+    frozen["artifacts"][str(evidence)] = expected
+    frozen["development_report"] = str(evidence)
+    atomic_write_json(final_root / "selection_frozen.json", frozen)
+    try:
+        report = run_speech_evaluation(config, state_dir, frozen_selection=frozen["candidates"], frozen_deployment=frozen)
+    except Exception as exc:
+        development = load_speech_evaluation(run_dir)
+        if development:
+            development.update(final_test_status="failed", final_test_message=str(exc))
+            development["summary_markdown"] = report_markdown(development)
+            atomic_write_json(root / "report.json", development)
+            (root / "report.md").write_text(development["summary_markdown"], encoding="utf-8")
+        raise
+    development = load_speech_evaluation(run_dir)
+    if development:
+        development.update(final_test_status=report["final_test_status"], final_test_message=report["final_test_message"],
+                           final_test_report=str(final_root / "report.json"), final_test_deployment_frozen=True)
+        development["summary_markdown"] = report_markdown(development)
+        atomic_write_json(root / "report.json", development)
+        (root / "report.md").write_text(development["summary_markdown"], encoding="utf-8")
+    return report
 
 
 def shortlist_checkpoints(run_dir: str | Path, limit: int) -> list[dict[str, Any]]:
@@ -92,7 +301,8 @@ def report_markdown(report: dict[str, Any]) -> str:
 
 
 def run_speech_evaluation(config: Any, state_dir: str | Path, *,
-                          frozen_selection: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                          frozen_selection: list[dict[str, Any]] | None = None,
+                          frozen_deployment: Mapping[str, Any] | None = None) -> dict[str, Any]:
     import torch
     from indextts.runtime import ProgressReporter, gpu_free_gb, gpu_total_gb, resolve_preset
     from .grid import GridCheckpoint, GridConfig, run_grid
@@ -103,6 +313,10 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     final_test = frozen_selection is not None
     if final_test:
         root = root / "final_test"
+        if frozen_deployment is None:
+            raise ValueError("Final testing requires an explicit frozen deployment")
+    if frozen_deployment is not None:
+        _validate_frozen_deployment(frozen_deployment)
     plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
     if not plan["groups"]:
         raise ValueError("The speech benchmark contains no held-out prompts")
@@ -112,7 +326,8 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     def cancelled() -> bool:
         return (state / "stop.flag").exists() or (run_dir / "stop.flag").exists()
     def update(message: str, completed: int, total: int) -> None:
-        value = {"phase": "evaluating_speech", "message": message, "desc": message, "completed": completed,
+        value = {"phase": "evaluating_final_test" if final_test else "evaluating_speech",
+                 "message": message, "desc": message, "completed": completed,
                  "total": total, "fraction": completed / total if total else 0, "elapsed_s": time.perf_counter()-started,
                  "updated_at": time.time()}
         atomic_write_json(state / "status.json", value)
@@ -121,11 +336,15 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     candidates = [dict(row) for row in frozen_selection] if final_test else shortlist_checkpoints(run_dir, plan["candidate_limit"])
     for candidate in candidates:
         if candidate["path"]:
-            candidate["sha256"] = hashlib.sha256(Path(candidate["path"]).read_bytes()).hexdigest()
+            candidate["sha256"] = _file_sha256(candidate["path"])
     runtime = _benchmark_runtime(config)
+    # A continued run can still have an older decoder installed. Development
+    # compares GPT checkpoints without it; deployment is assessed separately.
+    runtime.decoder_adapter = "none"
     infer = _benchmark_infer_kwargs(config)
     attempt = root / "grids" / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     clips, real_clips, grids = [], [], []
+    candidate_inference = {}
     for group in plan["groups"]:
         update(f"Generating speech for {group['speaker']} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]) * len(candidates))
         if hashlib.sha256(Path(group["reference"]).read_bytes()).hexdigest() != group["reference_sha256"]:
@@ -133,22 +352,36 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
         for prompt in group["prompts"]:
             if prompt.get("audio_sha256") and hashlib.sha256(Path(prompt["audio"]).read_bytes()).hexdigest() != prompt["audio_sha256"]:
                 raise ValueError("A frozen evaluation recording has changed")
-        grid_config = GridConfig(adapter_dir=str(run_dir),
-            checkpoints=[GridCheckpoint(row["label"], row["path"]) for row in candidates],
-            references=[group["reference"]], texts=[p["text"] for p in group["prompts"]], language=group["language"],
-            seeds=plan["seeds"], seed=plan["seeds"][0], output_root=str(attempt), grid_name=group["id"],
-            runtime={"runtime": runtime.to_dict(), "model_dir": config.model_dir, "cfg_path": config.model_config, "use_qwen_emo": False},
-            infer_kwargs=infer, include_verdicts=False)
-        result = run_grid(grid_config, reporter=ProgressReporter("speech clips", progress_file=state / "progress.json"), cancel_callback=cancelled)
-        if result.status != "complete":
-            raise InterruptedError(f"Speech generation {result.status}")
-        grids.append(result.grid_dir)
-        for cell in result.cells:
-            prompt = group["prompts"][cell.text_index - 1]
-            clips.append({"audio": cell.audio_path, "reference": group["reference"], "real_audio": prompt["audio"],
-                          "text": prompt["text"], "language": group["language"], "kind": prompt["kind"],
-                          "prompt_id": f"{group['id']}:{prompt['id']}", "source": prompt["source"],
-                          "seed": cell.seed, "checkpoint": cell.checkpoint_label if cell.checkpoint_path else "Base"})
+        # Final deployment needs per-candidate settings: Base must never inherit
+        # the selected adapter's decoder, speaking rate, or tuned decoding knobs.
+        batches = [[row] for row in candidates] if final_test else [candidates]
+        for index, batch in enumerate(batches):
+            if frozen_deployment is not None:
+                _validate_frozen_deployment(frozen_deployment)
+            candidate = batch[0]
+            selected_runtime = dict(candidate.get("runtime") or runtime.to_dict()) if final_test else runtime.to_dict()
+            selected_infer = dict(candidate.get("infer_kwargs") or infer) if final_test else dict(infer)
+            if not candidate["path"]:
+                selected_runtime["decoder_adapter"] = "none"
+            grid_config = GridConfig(adapter_dir=str(run_dir),
+                checkpoints=[GridCheckpoint(row["label"], row["path"]) for row in batch],
+                references=[group["reference"]], texts=[p["text"] for p in group["prompts"]], language=group["language"],
+                seeds=plan["seeds"], seed=plan["seeds"][0], output_root=str(attempt),
+                grid_name=f"{group['id']}_candidate_{index}" if final_test else group["id"],
+                runtime={"runtime": selected_runtime, "model_dir": config.model_dir, "cfg_path": config.model_config, "use_qwen_emo": False},
+                infer_kwargs=selected_infer, include_verdicts=False)
+            result = run_grid(grid_config, reporter=ProgressReporter("speech clips", progress_file=state / "progress.json"), cancel_callback=cancelled)
+            if result.status != "complete":
+                raise InterruptedError(f"Speech generation {result.status}")
+            grids.append(result.grid_dir)
+            for row in batch:
+                candidate_inference[row["label"]] = grid_config.to_dict()
+            for cell in result.cells:
+                prompt = group["prompts"][cell.text_index - 1]
+                clips.append({"audio": cell.audio_path, "reference": group["reference"], "real_audio": prompt["audio"],
+                              "text": prompt["text"], "language": group["language"], "kind": prompt["kind"],
+                              "prompt_id": f"{group['id']}:{prompt['id']}", "source": prompt["source"],
+                              "seed": cell.seed, "checkpoint": cell.checkpoint_label if cell.checkpoint_path else "Base"})
         for prompt in group["prompts"]:
             if prompt["audio"]:
                 real_clips.append({"audio": prompt["audio"], "reference": group["reference"], "real_audio": "",
@@ -163,6 +396,8 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                              lenient_terms=_lenient_terms(config, plan))
     generated = [row for row in measured if row["kind"] != "real"]
     real = [row for row in measured if row["kind"] == "real"]
+    if frozen_deployment is not None:
+        _validate_frozen_deployment(frozen_deployment)
     report = select_recommendation(candidates, generated, plan["policy"])
     if final_test:
         chosen = candidates[-1]
@@ -171,32 +406,19 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                       recommended_kind="adapter" if chosen["path"] else "base",
                       final_test_status="passed observed regression guards" if measured_chosen["eligible"] else "regression detected",
                       final_test_message="; ".join(measured_chosen["rejection_reasons"]),
-                      scope="Independent final-test measurements for the already selected checkpoint. These results do not reselect a checkpoint.",
-                      decision="The development recommendation was frozen before any final-test audio was generated.")
+                      scope="Independent final-test measurements for the frozen deployed pipeline. These results do not reselect a checkpoint, decoder, or decoding settings.",
+                      decision="The checkpoint, decoder, speaking rate, and decoding settings were frozen on development data before final-test generation.",
+                      deployment_frozen=dict(frozen_deployment) if frozen_deployment else None)
     report.update(dataset_identity=plan["dataset_identity"], plan=str(root / "plan.json"), grids=grids,
                   cells=generated, real_cells=real, real_recordings=summarize(real) if real else None,
                   warnings=plan["warnings"], seeds=plan["seeds"], inference=grid_config.to_dict(),
+                  candidate_inference=candidate_inference, evaluation_partition="final_test" if final_test else "validation",
                   generated_at=datetime.now(timezone.utc).isoformat(), elapsed_s=time.perf_counter()-started)
     if not final_test:
-        # Write the development decision before touching independent final-test audio.
-        report["summary_markdown"] = report_markdown(report)
-        atomic_write_json(root / "report.json", report)
-        report["final_test_status"] = "not configured"
-        if (root / "final_test" / "plan.json").is_file():
-            base = candidates[0]
-            selected = next(row for row in candidates if row["path"] == report["recommended_checkpoint"])
-            frozen = [base] if selected is base else [base, selected]
-            atomic_write_json(root / "final_test" / "selection_frozen.json", {
-                "recommended_checkpoint": selected["path"], "candidates": frozen,
-                "frozen_at": datetime.now(timezone.utc).isoformat()})
-            try:
-                final_report = run_speech_evaluation(config, state_dir, frozen_selection=frozen)
-                report.update(final_test_status=final_report["final_test_status"],
-                              final_test_message=final_report["final_test_message"],
-                              final_test_report=str(root / "final_test" / "report.json"))
-            except Exception as exc:
-                report.update(final_test_status="failed", final_test_message=str(exc))
-                print(f">> independent final test did not complete: {exc}", flush=True)
+        # Decoder and decoding selection still follow. Independent testing runs
+        # in a separate final phase only after the whole deployment is frozen.
+        report["final_test_status"] = ("pending deployment freeze" if (root / "final_test" / "plan.json").is_file()
+                                      else "not configured")
         report["elapsed_s"] = time.perf_counter()-started
     report["summary_markdown"] = report_markdown(report)
     from .listening_review import write_listening_review
@@ -369,32 +591,18 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
     out = root / "decoder_test"
     checkpoint = str(Path(checkpoint_path).expanduser().resolve())
     adapter = str(Path(adapter_path).expanduser().resolve())
-    found = find_decoder_adapter(checkpoint)
+    found = find_decoder_adapter(checkpoint, allow_unverified=True)  # explicit gate association, not AUTO loading
     if not found or str(Path(found).resolve()) != adapter:
-        raise ValueError(f"generation with {Path(checkpoint).name} would use {found or 'no decoder adapter'}, not {adapter}")
+        raise ValueError(f"decoder associated with {Path(checkpoint).name} is {found or 'none'}, not {adapter}")
     plan: dict[str, Any] | None = None
     baseline_rows: list[dict[str, Any]] = []
     label = ""
     baseline_report = ""
     inference: dict[str, Any] = {}
-    # The independent final test measured the selected checkpoint last; fall back to the development report.
-    for base_root in (root / "final_test", root):
-        try:
-            report = json.loads((base_root / "report.json").read_text(encoding="utf-8"))
-            candidate_plan = json.loads((base_root / "plan.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        if not isinstance(report, dict) or report.get("status") != "complete":
-            continue
-        label = next((str(c["label"]) for c in report.get("candidates", [])
-                      if c.get("path") and str(Path(c["path"]).resolve()) == checkpoint), "")
-        rows = [row for row in report.get("cells", []) if label and row.get("checkpoint") == label]
-        if rows:
-            plan, baseline_rows, baseline_report = candidate_plan, rows, str(base_root / "report.json")
-            inference = report.get("inference") if isinstance(report.get("inference"), dict) else {}
-            break
-    if plan is None:
-        raise ValueError("the speech benchmark has no measurement of the selected checkpoint to compare the decoder adapter with")
+    plan, baseline_rows, label, report_path, inference = development_baseline(run_dir, checkpoint)
+    baseline_report = str(report_path)
+    checkpoint_sha256, adapter_sha256 = _file_sha256(checkpoint), _file_sha256(adapter)
+    measured_development = development_fingerprint(run_dir)
     state = Path(state_dir)
     state.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
@@ -451,11 +659,18 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
     chosen["selected"] = True
     accepted = bool(passing)
     reasons = list(chosen["reasons"]) if not accepted else []
-    report = {"status": "complete", "accepted": accepted, "reasons": reasons, "metric": chosen["metric"],
+    if (_file_sha256(checkpoint) != checkpoint_sha256 or _file_sha256(adapter) != adapter_sha256
+            or development_fingerprint(run_dir) != measured_development):
+        raise ValueError("The checkpoint or decoder adapter changed during its validation gate")
+    report = {"status": "complete", "evaluation_partition": "validation",
+              "accepted": accepted, "reasons": reasons, "metric": chosen["metric"],
               "speaker_gain": chosen["speaker_gain"], "without": without_summary, "with": chosen["with"],
               "wer_increase": chosen["wer_increase"], "max_wer_increase": max_wer_increase, "min_speaker_gain": min_speaker_gain,
               "strength": chosen["strength"], "wer_weight": wer_weight, "variants": variants, "clips": len(chosen["cells"]),
-              "checkpoint": checkpoint, "checkpoint_label": label, "adapter": adapter, "baseline_report": baseline_report,
+              "checkpoint": checkpoint, "checkpoint_sha256": checkpoint_sha256,
+              "checkpoint_label": label, "adapter": adapter, "adapter_sha256": adapter_sha256,
+              "development_fingerprint": measured_development,
+              "baseline_report": baseline_report,
               "cells": chosen["cells"], "baseline_cells": baseline, "grids": [grid for item in variants for grid in item["grids"]],
               "seeds": plan["seeds"], "generated_at": datetime.now(timezone.utc).isoformat(), "elapsed_s": time.perf_counter() - started}
     report["summary_markdown"] = decoder_test_markdown(report)
@@ -474,10 +689,13 @@ def main() -> int:
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--decoder-test", default="", help="Voice decoder adapter file to judge through the full pipeline")
     parser.add_argument("--decoding-sweep", action="store_true", help="Sweep decoding settings for --checkpoint on the benchmark")
+    parser.add_argument("--final-test", action="store_true", help="Assess the frozen deployment only after all development tuning")
     parser.add_argument("--checkpoint", default="", help="GPT checkpoint the decoder test or decoding sweep generates with")
     args = parser.parse_args()
     try:
-        if args.decoder_test:
+        if args.final_test:
+            report = run_final_test(TrainConfig.from_json(args.config), args.state_dir, checkpoint_path=args.checkpoint)
+        elif args.decoder_test:
             report = run_decoder_test(TrainConfig.from_json(args.config), args.state_dir,
                                       checkpoint_path=args.checkpoint, adapter_path=args.decoder_test)
         elif args.decoding_sweep:

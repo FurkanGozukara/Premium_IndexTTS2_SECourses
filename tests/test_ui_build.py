@@ -267,8 +267,10 @@ def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():
         if "window.confirm(" in (dependency.get("js") or "")
     ]
 
-    assert len(confirmations) == 8
+    assert len(confirmations) == 5
     for dependency in confirmations:
         confirmation_input = components[dependency["inputs"][0]]
         assert confirmation_input["type"] == "checkbox"
         assert confirmation_input["props"]["visible"] is False
+    button_labels = {item["props"].get("value") for item in demo.config["components"] if item["type"] == "button"}
+    assert {"🛑  Yes, cancel generation", "▶️  Keep generating", "🛑  Yes, cancel grid", "▶️  Keep rendering grid"}.issubset(button_labels)

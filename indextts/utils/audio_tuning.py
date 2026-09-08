@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, Callable
 
 import soundfile as sf
 
@@ -64,9 +64,11 @@ def apply_audio_tuning(
     in_wav: str | Path,
     out_wav: str | Path,
     preset: str = "bypass",
+    *,
+    warning_callback: Callable[[str], Any] | None = None,
     **overrides: Any,
 ) -> str:
-    """Apply a named voice preset and explicit overrides to a WAV file."""
+    """Apply a voice preset, reporting sample-rate corrections to the console and callback."""
 
     source = Path(in_wav)
     destination = Path(out_wav)
@@ -103,13 +105,44 @@ def apply_audio_tuning(
     if sample_rate <= 0:
         raise ValueError(f"Audio tuning input has an invalid sample rate: {source}")
 
+    nyquist = sample_rate / 2.0
+
+    def warn(message: str) -> None:
+        message = f"Audio tuning warning: {message}"
+        print(f">> {message}", flush=True)
+        if warning_callback is not None:
+            warning_callback(message)
+
+    def valid_cutoff(name: str, frequency: float | None) -> float | None:
+        if frequency is None or frequency < nyquist:
+            return frequency
+        # Leave a small margin below Nyquist; FFmpeg otherwise logs an invalid
+        # filter but exits successfully, silently leaving the audio unfiltered.
+        effective = round(nyquist * 0.99, 2)
+        warn(
+            f"{name}={frequency:g} Hz is at or above the {nyquist:g} Hz Nyquist limit "
+            f"for {sample_rate} Hz audio; using {effective:.2f} Hz."
+        )
+        return effective
+
+    low_cut = valid_cutoff("low_cut_hz", low_cut)
+    high_cut = valid_cutoff("high_cut_hz", high_cut)
+    if low_cut is not None and high_cut is not None and low_cut >= high_cut:
+        raise ValueError(f"low_cut_hz must be lower than high_cut_hz at the input's {sample_rate} Hz sample rate")
+
     filters: list[str] = []
     if low_cut is not None and low_cut > 20.5:
         filters.append(f"highpass=f={low_cut:.2f}:p=2")
     for frequency, eq_gain, width in parameters.get("eq", ()):
-        filters.append(f"equalizer=f={frequency}:t=q:w={width}:g={eq_gain}")
+        if frequency < nyquist:
+            filters.append(f"equalizer=f={frequency}:t=q:w={width}:g={eq_gain}")
+        else:
+            warn(f"skipping the {frequency:g} Hz equalizer band at the input's {sample_rate} Hz sample rate.")
     if deess is not None and deess >= 0.05:
-        filters.append(f"equalizer=f=6500:t=q:w=1.2:g={-abs(deess):.2f}")
+        if 6500 < nyquist:
+            filters.append(f"equalizer=f=6500:t=q:w=1.2:g={-abs(deess):.2f}")
+        else:
+            warn(f"skipping the 6500 Hz de-esser at the input's {sample_rate} Hz sample rate.")
     if high_cut is not None:
         filters.append(f"lowpass=f={high_cut:.2f}:p=2")
     if gain is not None and abs(gain) >= 0.05:

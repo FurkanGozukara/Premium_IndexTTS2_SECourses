@@ -26,6 +26,7 @@ ANALYSIS_SERIES = (
     "validation (regression)",
 )
 BASE_CHECKPOINT_LABEL = "Base model (no LoRA / DoRA)"
+DECODER_CHECKPOINT_LABEL = "Voice decoder adapter (s2mel)"
 BASE_CHECKPOINT_CHOICE_LABEL = (
     BASE_CHECKPOINT_LABEL
     + " - plain voice clone from the reference audio only"
@@ -202,6 +203,12 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
 
     source = Path(path).expanduser().resolve()
     info = inspect_lora(source)
+    if source.name.lower().endswith(".s2mel.safetensors") or (info.get("train_config") or {}).get("component") == "s2mel":
+        return {
+            "path": str(source), "label": DECODER_CHECKPOINT_LABEL,
+            "file_label": "decoder", "kind": "decoder", "epoch": _integer(info.get("epochs")) or None,
+            "steps": _integer(info.get("steps")), "metadata": info,
+        }
     stem = source.stem
     epoch_match = _EPOCH_RE.search(stem)
     step_match = _STEP_RE.search(stem)
@@ -284,8 +291,8 @@ def checkpoint_display_label(
     )
     suffix = strength_match.group("suffix") if strength_match else ""
     core = value[: strength_match.start()].rstrip() if strength_match else value
-    if core.endswith("Checkpoint)"):
-        return value
+    if str(kind or "").strip().lower() == "decoder" or str(path).lower().endswith(".s2mel.safetensors"):
+        return DECODER_CHECKPOINT_LABEL + suffix
 
     source = Path(path).expanduser()
     if not source.is_file():
@@ -299,6 +306,10 @@ def checkpoint_display_label(
             return value
         if cache is not None:
             cache[cache_key] = derived
+    # Cached reports can contain a decoder mislabeled as a GPT final/best file.
+    # Metadata wins for decoders; retain already-modern labels for real GPTs.
+    if core.endswith("Checkpoint)") and derived != DECODER_CHECKPOINT_LABEL:
+        return value
     return derived + suffix
 
 
@@ -349,7 +360,9 @@ def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, 
         if path.name.startswith("."):
             continue
         try:
-            descriptors.append(checkpoint_descriptor(path))
+            descriptor = checkpoint_descriptor(path)
+            if descriptor["kind"] != "decoder":
+                descriptors.append(descriptor)
         except Exception:
             continue
     order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4}

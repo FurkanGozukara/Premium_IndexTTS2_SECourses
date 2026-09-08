@@ -457,6 +457,8 @@ def scan_lora_files(root_dirs: list[str]) -> list[LoraEntry]:
                 info = inspect_lora(candidate)
             except Exception:
                 continue
+            if (info.get("train_config") or {}).get("component") == "s2mel":
+                continue
             seen.add(canonical)
             relative = candidate.relative_to(root).as_posix()
             label = f"{root.name}/{relative}" if root.name else relative

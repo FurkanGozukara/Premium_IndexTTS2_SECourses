@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -25,9 +27,11 @@ from indextts.runtime.vram_presets import (
 from indextts.utils.model_downloads import ensure_base_models, ensure_int8_gpt
 
 from .common import (
+    ChildJob,
     LAZY_ENGINE,
     PROCESS_MANAGER,
     ROOT,
+    _terminate_process_tree,
     btn,
     open_folder,
     runtime_config_from_values,
@@ -42,6 +46,85 @@ RUNTIME_DEFAULTS = RuntimeConfig(device="auto").to_dict()
 RUNTIME_DEFAULTS.update({"use_qwen_emo": True, "use_deepspeed": False})
 APPLIED_RUNTIME: dict[str, Any] = {}
 LAST_RUNTIME_PATH = ROOT / "presets" / "user" / ".last_runtime.json"
+BENCHMARK_IDLE_WAIT_S = 120
+BENCHMARK_MAX_IDLE_WAIT_S = 1800
+
+
+def _benchmark_environment(device: str) -> dict[str, str] | None:
+    selected = str(device or "auto").strip().lower()
+    if selected == "cpu":
+        raise ValueError("The VRAM benchmark requires a CUDA GPU; select Auto or a CUDA device.")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and (not visible.strip() or visible.strip() == "-1"):
+        raise ValueError("CUDA_VISIBLE_DEVICES disables CUDA; the VRAM benchmark cannot run.")
+    if selected == "auto":
+        return None
+    match = re.fullmatch(r"cuda:(\d+)", selected)
+    if match is None:
+        raise ValueError(f"Unsupported benchmark device: {device}")
+    index = int(match.group(1))
+    if visible is None:
+        target = str(index)
+    else:
+        devices = [item.strip() for item in visible.split(",") if item.strip()]
+        if index >= len(devices):
+            raise ValueError(f"{device} is outside the CUDA-visible device list.")
+        target = devices[index]
+    return {"CUDA_VISIBLE_DEVICES": target}
+
+
+def _benchmark_updates(job: ChildJob, notice: str = "") -> tuple[Any, ...]:
+    running = job.running
+    returncode = job.process.returncode
+    if job.canceled:
+        status = "cancelling" if running else "cancelled"
+        message = (
+            "Benchmark cancellation requested; waiting for its process tree to exit."
+            if running else "Benchmark canceled."
+        )
+    elif running:
+        status = "running"
+        limit = job.metadata.get("idle_timeout_s", BENCHMARK_IDLE_WAIT_S)
+        message = f"Benchmark running. Maximum GPU idle wait: {limit:g}s."
+    elif returncode == 0:
+        status, message = "complete", "Benchmark completed."
+    else:
+        status, message = "failed", f"Benchmark failed with exit code {returncode}."
+    # Persist the terminal status separately from the worker's result, since a
+    # cancelled process cannot be relied on to write a final JSON record.
+    if job.metadata.get("ui_status") != status:
+        write_json_atomic(job.state_dir / "status.json", {
+            "status": status, "pid": job.process.pid, "returncode": returncode,
+            "log_path": str(job.log_path), "idle_timeout_s": job.metadata.get("idle_timeout_s"),
+        })
+        job.metadata["ui_status"] = status
+    output = "\n".join(part for part in (
+        notice, message, f"Log: {job.log_path}", "", tail_text(job.log_path, 120),
+    ) if part)
+    return output, str(job.state_dir), gr.update(interactive=not running), gr.update(interactive=running)
+
+
+def _refresh_benchmark() -> tuple[Any, ...]:
+    job = PROCESS_MANAGER.get("vram_benchmark")
+    if job is None:
+        return "No benchmark has been started.", "", gr.update(interactive=True), gr.update(interactive=False)
+    return _benchmark_updates(job)
+
+
+def _cancel_benchmark(state_dir: str) -> tuple[Any, ...]:
+    job = PROCESS_MANAGER.get("vram_benchmark")
+    if job is None:
+        return _refresh_benchmark()
+    if not state_dir or Path(state_dir).resolve() != job.state_dir.resolve():
+        return _benchmark_updates(job, "The displayed benchmark changed. Review this job before canceling it.")
+    if job.running:
+        # Capture this managed child, not a later job that might replace the
+        # manager entry between the UI click and termination.
+        job.canceled = True
+        stopped = _terminate_process_tree(job.process)
+        if not stopped and job.running:
+            return _benchmark_updates(job, "Cancellation could not be confirmed. You can retry Cancel benchmark.")
+    return _benchmark_updates(job)
 
 
 def load_persisted_runtime(
@@ -146,6 +229,16 @@ def _model_status_rows(model_dir: str | Path) -> list[list[Any]]:
     return rows
 
 
+def _tier_notes(tier_value: str, device_value: str) -> str:
+    """Describe a restored tier/device without applying any runtime settings."""
+
+    if tier_value == "custom":
+        return "Custom runtime settings."
+    total = _gpu_total(device_value)
+    requested = tier_value if tier_value != "auto" else str(auto_tier(total) if total else 6)
+    return preset_notes(requested)
+
+
 def _estimate_html(config: RuntimeConfig, total_gb: float) -> str:
     if str(config.device).strip().lower() == "cpu":
         return (
@@ -219,7 +312,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                     value=_gpu_rows(), type="array", interactive=False, label="GPU inventory",
                     datatype=["str", "str", "number", "number", "str"], buttons=["fullscreen"],
                 )
-                tab.notes = gr.Markdown(preset_notes("32" if not list_gpus() else str(auto_tier(list_gpus()[0].total_gb))))
+                tab.notes = gr.Markdown(_tier_notes("auto", initial_device))
             with gr.Column(scale=1):
                 tab.estimate = gr.HTML(_estimate_html(RuntimeConfig(device=initial_device), _gpu_total(initial_device)))
                 with gr.Row():
@@ -303,12 +396,21 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             )
 
         with gr.Accordion("VRAM Benchmark", open=False):
-            gr.Markdown("Runs the repository benchmark in an isolated process on CUDA-visible GPU 0. Keep calibration runs short while the GPU is shared.")
+            gr.Markdown("Runs a short benchmark on the selected CUDA GPU in an isolated process. The log shows GPU use and the remaining idle wait; Cancel benchmark stops only this benchmark.")
             with gr.Row():
                 emulate = gr.Checkbox(value=False, label="Emulate tier cap", info="Caps the PyTorch allocator to tier minus reserve for a stricter fit test.")
                 subtitle_bench = gr.Checkbox(value=False, label="Exercise batch/subtitle path", info="Also runs the multi-text path used by caption generation.")
+                idle_wait = gr.Number(
+                    value=BENCHMARK_IDLE_WAIT_S, minimum=0, maximum=BENCHMARK_MAX_IDLE_WAIT_S,
+                    precision=0, label="Maximum GPU idle wait (seconds)",
+                    info="Stops if the GPU stays busy. 0 checks once without waiting.",
+                )
+            with gr.Row():
                 benchmark_button = gr.Button("⏱️  Run VRAM benchmark", variant="primary", elem_classes=btn("purple"))
-            benchmark_output = gr.Textbox(label="Benchmark log / result", lines=12, max_lines=20, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
+                cancel_benchmark_button = gr.Button("⏹️  Cancel benchmark", variant="stop", interactive=False, elem_classes=btn("crimson"))
+            benchmark_output = gr.Textbox(value="No benchmark has been started.", label="Benchmark log / result", lines=12, max_lines=20, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
+            benchmark_state = gr.State("")
+            benchmark_timer = gr.Timer(2.0)
 
     runtime_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("runtime.")]
     runtime_keys = [spec.key for spec in runtime_specs]
@@ -352,12 +454,26 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         estimate = _estimate_html(cfg, total or float(requested))
         return (*updates, notes, estimate)
 
-    tab.tier.change(
+    # Programmatic preset restoration must not overwrite explicit residency
+    # choices (notably Quality's on-demand emotion model).
+    tab.tier.input(
         apply_tier,
         [tab.tier, tab.device],
         [*[spec.component for spec in tier_output_specs], tab.notes, tab.estimate],
         queue=False,
     )
+    # Restoring a preset changes the selected tier programmatically. Refresh
+    # its description without reapplying hardware defaults over preset values.
+    for component in (tab.tier, tab.device):
+        component.change(
+            _tier_notes,
+            [tab.tier, tab.device],
+            tab.notes,
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+            api_name=False,
+        )
 
     def estimate_runtime(*items: Any):
         try:
@@ -455,12 +571,22 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
     int8_download.click(download_int8, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
     base_download.click(download_base, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
 
-    def benchmark(tier_value: str, device_value: str, emulate_value: bool, subtitle_value: bool):
+    def benchmark(tier_value: str, device_value: str, emulate_value: bool, subtitle_value: bool, idle_wait_value: float):
+        try:
+            wait_s = float(idle_wait_value)
+            if not math.isfinite(wait_s) or not 0 <= wait_s <= BENCHMARK_MAX_IDLE_WAIT_S:
+                raise ValueError(f"Maximum GPU idle wait must be between 0 and {BENCHMARK_MAX_IDLE_WAIT_S} seconds.")
+            selected_env = _benchmark_environment(device_value)
+        except (TypeError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
+        existing = PROCESS_MANAGER.get("vram_benchmark")
+        if existing is not None and existing.running:
+            return _benchmark_updates(existing, "A benchmark is already running; no additional job was started.")
         resolved = tier_value
         if resolved in {"auto", "custom"}:
             total = _gpu_total(device_value)
             resolved = str(auto_tier(total) if total else 6)
-        state_dir = ROOT / "outputs" / "vram_benchmark" / f"ui_{int(time.time())}"
+        state_dir = ROOT / "outputs" / "vram_benchmark" / f"ui_{time.time_ns()}"
         # The UI is an interactive fit/calibration check, so keep it short and
         # deterministic.  The CLI still exposes full tier-stress defaults and
         # explicit overrides for release benchmarking.
@@ -475,30 +601,44 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             "60",
             "--batch",
             "1",
+            "--idle-timeout",
+            str(wait_s),
         ]
         if emulate_value:
             command.append("--emulate")
         if subtitle_value:
             command.append("--subtitle")
-        device_match = re.search(r"(\d+)$", str(device_value or ""))
-        selected_env = {"CUDA_VISIBLE_DEVICES": device_match.group(1)} if device_match else None
-        job = PROCESS_MANAGER.start(
-            "vram_benchmark",
-            command,
-            state_dir=state_dir,
-            log_path=state_dir / "benchmark.log",
-            cwd=ROOT,
-            env=selected_env,
-        )
-        while job.running:
-            yield tail_text(job.log_path, 80) or "Benchmark starting..."
-            time.sleep(1)
-        output = tail_text(job.log_path, 120)
-        if job.process.returncode != 0:
-            raise gr.Error(f"VRAM benchmark failed with exit code {job.process.returncode}\n{output[-1500:]}")
-        yield output
+        try:
+            job = PROCESS_MANAGER.start(
+                "vram_benchmark",
+                command,
+                state_dir=state_dir,
+                log_path=state_dir / "benchmark.log",
+                cwd=ROOT,
+                env=selected_env,
+                metadata={"idle_timeout_s": wait_s},
+            )
+        except RuntimeError:
+            # Another browser session can win the start race.
+            current = PROCESS_MANAGER.get("vram_benchmark")
+            if current is not None and current.running:
+                return _benchmark_updates(current, "A benchmark is already running; no additional job was started.")
+            raise
+        return _benchmark_updates(job)
 
-    benchmark_button.click(benchmark, [tab.tier, tab.device, emulate, subtitle_bench], benchmark_output, concurrency_limit=1, concurrency_id="vram-benchmark")
+    benchmark_outputs = [benchmark_output, benchmark_state, benchmark_button, cancel_benchmark_button]
+    benchmark_button.click(
+        benchmark, [tab.tier, tab.device, emulate, subtitle_bench, idle_wait], benchmark_outputs,
+        concurrency_limit=1, concurrency_id="vram-benchmark",
+    )
+    cancel_benchmark_button.click(
+        _cancel_benchmark, benchmark_state, benchmark_outputs,
+        queue=False, show_progress="hidden",
+    )
+    benchmark_timer.tick(
+        _refresh_benchmark, outputs=benchmark_outputs,
+        queue=False, show_progress="hidden",
+    )
     return tab
 
 

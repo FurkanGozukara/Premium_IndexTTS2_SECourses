@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -12,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +30,17 @@ TEXT = (
     "while reading a practical passage about clear speech, patient listening, and the quiet confidence that "
     "comes from explaining a difficult idea in language that anyone can understand without rushing."
 )
+DEFAULT_IDLE_TIMEOUT_S = 1800.0
+
+
+def _non_negative_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Idle timeout must be a finite, non-negative number of seconds") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("Idle timeout must be a finite, non-negative number of seconds")
+    return seconds
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,6 +60,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--emulate", action="store_true")
     parser.add_argument("--subtitle", action="store_true", help="Also exercise the multi-text/subtitle path")
+    parser.add_argument(
+        "--idle-timeout", dest="idle_timeout_s", type=_non_negative_seconds,
+        default=DEFAULT_IDLE_TIMEOUT_S,
+        help="Maximum seconds to wait for an idle GPU (default: 1800); 0 checks once without waiting",
+    )
     parser.add_argument("--json-out", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     return parser
@@ -79,58 +97,104 @@ def _resolve_reference_audio(
     )
 
 
-def _wait_for_idle(timeout_s: float = 1800.0) -> None:
-    # Query the driver before Torch creates this process's CUDA context; otherwise
-    # the context itself looks like roughly 1.5 GB of unrelated GPU use on WDDM.
-    started = time.monotonic()
-    reported_at = 0.0
-    while True:
+def _memory_value(value: str) -> float | None:
+    try:
+        result = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result >= 0 else None
+
+
+def _query_idle_memory(device_id: str) -> dict[str, Any]:
+    """Read driver memory without creating a CUDA context in the benchmark."""
+    # Older drivers may not expose memory.reserved. If memory.used itself is
+    # unavailable, total-free is a conservative upper bound, not an idle pass.
+    queries = (
+        ("index", "memory.total", "memory.used", "memory.free", "memory.reserved"),
+        ("index", "memory.total", "memory.used", "memory.free"),
+        ("index", "memory.total", "memory.free"),
+    )
+    detail = "no memory row was returned"
+    for fields in queries:
         try:
             completed = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,memory.total,memory.free",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
+                ["nvidia-smi", "--id", device_id,
+                 "--query-gpu=" + ",".join(fields), "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=5.0, check=False,
             )
-        except OSError:
-            print(">> WARNING: nvidia-smi is unavailable; GPU-idle state could not be verified.")
-            return
-        row = next(
-            (
-                line.split(",")
-                for line in completed.stdout.splitlines()
-                if line.split(",", 1)[0].strip() == "0"
-            ),
-            None,
-        )
-        if row is None or len(row) < 3:
-            print(">> WARNING: GPU 0 was not reported by nvidia-smi.")
-            return
-        total_gb, free_gb = float(row[1]) / 1024.0, float(row[2]) / 1024.0
-        used = max(0.0, total_gb - free_gb)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Cannot verify idle GPU {device_id}: nvidia-smi failed ({exc})") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()[:500]
+            continue
+        rows = [row for row in csv.reader(completed.stdout.splitlines()) if row]
+        if len(rows) != 1 or len(rows[0]) != len(fields):
+            detail = "expected one complete memory row for the selected GPU"
+            continue
+        values = dict(zip(fields, rows[0]))
+        total = _memory_value(values["memory.total"])
+        free = _memory_value(values["memory.free"])
+        used = _memory_value(values.get("memory.used", ""))
+        reserved = _memory_value(values.get("memory.reserved", ""))
+        if total is None or total <= 0 or free is None or free > total:
+            detail = "the selected GPU reported invalid total/free memory"
+            continue
+        source = "memory.used"
+        if used is None:
+            if reserved is not None and reserved <= total - free:
+                used = max(0.0, total - free - reserved)
+                source = "total-free-reserved (fallback)"
+            else:
+                used = max(0.0, total - free)
+                source = "total-free (conservative fallback; reserved may be included)"
+        return {
+            "device_id": device_id,
+            "physical_index": values["index"].strip(),
+            "total_gb": total / 1024.0,
+            "free_gb": free / 1024.0,
+            "used_gb": used / 1024.0,
+            "reserved_gb": reserved / 1024.0 if reserved is not None else None,
+            "usage_source": source,
+        }
+    raise RuntimeError(f"Cannot verify idle GPU {device_id}: {detail}")
+
+
+def _wait_for_idle(timeout_s: float = DEFAULT_IDLE_TIMEOUT_S) -> dict[str, Any]:
+    # Query the driver before Torch creates this process's CUDA context; otherwise
+    # the context itself looks like roughly 1.5 GB of unrelated GPU use on WDDM.
+    timeout_s = _non_negative_seconds(str(timeout_s))
+    device_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",", 1)[0].strip()
+    if not device_id or device_id == "-1":
+        raise RuntimeError("The VRAM benchmark requires a CUDA-visible GPU; CUDA_VISIBLE_DEVICES disables it")
+    started = time.monotonic()
+    reported_at: float | None = None
+    while True:
+        snapshot = _query_idle_memory(device_id)
+        total_gb, free_gb, used = (snapshot[key] for key in ("total_gb", "free_gb", "used_gb"))
         # A display-connected WDDM GPU commonly holds 1-3 GB for the desktop,
         # browser, and compositor even when no model workload is active.  Treat
         # up to ten percent of a large card as the idle display baseline while
         # retaining the original 1 GB limit on small cards.
         idle_limit_gb = max(1.0, total_gb * 0.10)
-        if used <= idle_limit_gb:
-            return
         elapsed = time.monotonic() - started
-        if elapsed - reported_at >= 30.0 or reported_at == 0.0:
-            print(
-                f">> Waiting for idle GPU 0 ({used:.2f} GB in use; idle limit "
-                f"{idle_limit_gb:.2f} GB; {free_gb:.2f}/{total_gb:.2f} GB free)."
-            )
+        remaining = max(0.0, timeout_s - elapsed)
+        reserved = snapshot["reserved_gb"]
+        reserved_text = "unavailable" if reserved is None else f"{reserved:.2f} GiB"
+        detail = (
+            f"GPU {snapshot['physical_index']} (CUDA-visible GPU 0): {used:.2f} GiB device use; "
+            f"idle limit {idle_limit_gb:.2f} GiB; {free_gb:.2f}/{total_gb:.2f} GiB free; "
+            f"driver-reserved {reserved_text}; source {snapshot['usage_source']}"
+        )
+        if used <= idle_limit_gb:
+            print(f">> Idle check passed after {elapsed:.1f}s: {detail}.", flush=True)
+            return {**snapshot, "idle_limit_gb": idle_limit_gb, "waited_s": elapsed, "timeout_s": timeout_s}
+        if reported_at is None or elapsed - reported_at >= 10.0 or remaining == 0:
+            print(f">> Waiting for idle {detail}; {elapsed:.1f}s elapsed, {remaining:.1f}s remaining.", flush=True)
             reported_at = elapsed
         if elapsed >= timeout_s:
-            raise TimeoutError("GPU 0 remained above 1 GB of external use for 30 minutes")
-        time.sleep(5.0)
+            raise TimeoutError(f"GPU idle wait exceeded {timeout_s:g}s: {detail}")
+        time.sleep(min(5.0, remaining))
 
 
 def run_one(args: argparse.Namespace) -> dict[str, Any]:
@@ -167,20 +231,32 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = ROOT / "outputs" / "vram_benchmark"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"tier_{args.tier}_{os.getpid()}.wav"
+    cuda_started = False
+    measured_peaks: dict[str, float] = {}
+
+    def record_measured_peaks(*_completed_text: Any) -> None:
+        # Sequential infer_texts calls reset CUDA peak counters for each text.
+        # Sample before the next text resets them, and retain allocated/reserved
+        # maxima independently. This also preserves earlier peaks if a later
+        # text fails before its completion callback.
+        snapshot = memory_stats("cuda:0")
+        for key in ("peak_allocated_gb", "peak_reserved_gb"):
+            measured_peaks[key] = max(measured_peaks.get(key, 0.0), snapshot[key])
 
     try:
         reference_audio = _resolve_reference_audio(args.reference)
         result["reference_audio"] = str(reference_audio)
 
+        result["idle_check"] = _wait_for_idle(args.idle_timeout_s)
+
         import librosa
         import torch
-
-        _wait_for_idle()
         if args.emulate:
             cap_gb = max(0.5, args.tier - config.vram_reserve_gb)
             fraction = apply_vram_cap("cuda:0", cap_gb)
             print(f">> Emulating {args.tier} GB tier with a {cap_gb:.2f} GB allocator cap ({fraction:.3f}).")
 
+        cuda_started = True
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(0)
         load_started = time.perf_counter()
@@ -215,6 +291,7 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             generated = tts.infer_texts(
                 texts=texts,
                 section_batch_size=batch,
+                on_text_complete=record_measured_peaks,
                 **common,
             )
             audio_seconds = sum(item[1].shape[0] / float(item[0]) for item in generated if item is not None)
@@ -223,9 +300,16 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             audio_seconds = float(librosa.get_duration(path=str(output_path)))
         torch.cuda.synchronize(0)
         wall = time.perf_counter() - generation_started
-        peak = memory_stats("cuda:0")
-        generated_tokens = int(getattr(tts, "last_generation_stats", {}).get("generated_tokens", 0))
-        gpt_time = float(getattr(tts, "last_generation_stats", {}).get("gpt_time", 0.0))
+        record_measured_peaks()
+        generation_stats = getattr(tts, "last_generation_stats", {}) or {}
+        # The engine also keeps an allocated maximum across its text units.
+        # Accept only a finite non-negative value from that optional telemetry;
+        # reserved memory is measured by the callback above, not inferred from it.
+        engine_peak = _memory_value(str(generation_stats.get("peak_vram_gb", "")))
+        if engine_peak is not None:
+            measured_peaks["peak_allocated_gb"] = max(measured_peaks["peak_allocated_gb"], engine_peak)
+        generated_tokens = int(generation_stats.get("generated_tokens", 0))
+        gpt_time = float(generation_stats.get("gpt_time", 0.0))
         result.update(
             {
                 "generation_wall_s": wall,
@@ -235,8 +319,7 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
                 "gpt_time_s": gpt_time,
                 "tokens_per_s": generated_tokens / gpt_time if gpt_time > 0 else None,
                 "mel_tokens_per_s": generated_tokens / gpt_time if gpt_time > 0 else None,
-                "peak_allocated_gb": peak["peak_allocated_gb"],
-                "peak_reserved_gb": peak["peak_reserved_gb"],
+                **measured_peaks,
                 "fit": True,
             }
         )
@@ -244,14 +327,11 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         try:
-            import torch
-
-            if torch.cuda.is_available():
-                peak = memory_stats("cuda:0")
-                result["peak_allocated_gb"] = peak["peak_allocated_gb"]
-                result["peak_reserved_gb"] = peak["peak_reserved_gb"]
+            if cuda_started and torch.cuda.is_available():
+                record_measured_peaks()
         except Exception:
             pass
+        result.update(measured_peaks)
         print(f">> Benchmark failed: {result['error']}")
     finally:
         try:
@@ -312,8 +392,9 @@ def run_all(args: argparse.Namespace) -> int:
         if args.lora_path:
             command.extend(["--lora-path", str(args.lora_path)])
         command.extend(["--reference", str(reference_audio)])
+        command.extend(["--idle-timeout", str(args.idle_timeout_s)])
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
         env["PYTHONUNBUFFERED"] = "1"
         completed = subprocess.run(
             command,

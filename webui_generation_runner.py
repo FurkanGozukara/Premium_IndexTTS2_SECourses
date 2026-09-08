@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import shutil
@@ -181,7 +182,23 @@ def convert_wav_to_mp3(
 
     try:
         audio = AudioSegment.from_wav(wav_path)
-        audio.export(mp3_path, format="mp3", bitrate=bitrate)
+        bitrate_text = str(bitrate).strip().lower()
+        bitrate_bps = int(bitrate_text[:-1]) * 1000 if bitrate_text.endswith("k") else int(bitrate_text)
+        supported_kbps = {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 320}
+        if bitrate_bps not in {value * 1000 for value in supported_kbps}:
+            raise ValueError(f"Unsupported MP3 bitrate: {bitrate}")
+        export_parameters = []
+        if bitrate_bps > 160000 and audio.frame_rate < 32000:
+            # MPEG-2/2.5 (including our 22050 Hz WAVs) tops out at 160 kbps.
+            # Let FFmpeg resample for MPEG-1 instead of silently lowering the bitrate.
+            export_parameters = ["-ar", "44100"]
+            print(f">> MP3 export: resampling {audio.frame_rate} Hz to 44100 Hz for {bitrate_bps // 1000} kbps.")
+        elif (bitrate_bps < 32000 or bitrate_bps == 144000) and audio.frame_rate >= 32000:
+            export_parameters = ["-ar", "22050"]
+        audio.export(
+            mp3_path, format="mp3", codec="libmp3lame", bitrate=str(bitrate_bps),
+            parameters=export_parameters,
+        )
         if remove_source:
             os.remove(wav_path)
         return mp3_path
@@ -197,6 +214,15 @@ def create_mp4_from_image_audio(image_path: str, audio_path: str, mp4_path: str)
         raise FileNotFoundError(f"Image file not found: {image_path}")
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    import soundfile as sf
+
+    audio_info = sf.info(audio_path)
+    duration_seconds = audio_info.frames / float(audio_info.samplerate) if audio_info.samplerate else 0.0
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("MP4 output requires audio with a positive, finite duration.")
+    # Cover the complete audio with whole video frames, including sub-frame clips.
+    video_frames = max(1, (audio_info.frames * 30 + audio_info.samplerate - 1) // audio_info.samplerate)
+    video_duration_seconds = video_frames / 30.0
 
     if os.path.dirname(mp4_path):
         os.makedirs(os.path.dirname(mp4_path), exist_ok=True)
@@ -236,7 +262,11 @@ def create_mp4_from_image_audio(image_path: str, audio_path: str, mp4_path: str)
         "192k",
         "-pix_fmt",
         "yuv420p",
-        "-shortest",
+        # -shortest can retain queued image frames or truncate a final AAC
+        # packet when the duration is not frame-aligned. Bound by the source
+        # audio rounded up to a video frame; audio itself is not padded.
+        "-t",
+        f"{video_duration_seconds:.9f}",
         "-movflags",
         "+faststart",
         mp4_path,
@@ -461,10 +491,37 @@ def run_generation_request(
     request: Dict[str, Any],
     tts,
     progress_callback: Optional[Callable[..., Any]] = None,
+    *,
+    cancellation_check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     from indextts.runtime.progress import ProgressReporter
     from indextts.runtime.vram_presets import RuntimeConfig
 
+    def check_cancellation() -> None:
+        if cancellation_check is not None:
+            cancellation_check()
+
+    class RequestProgressReporter(ProgressReporter):
+        # Keep the cancellation hook when later candidates replace the engine's
+        # reporter. A Gradio callback cannot do this: its exceptions are ignored
+        # intentionally by ProgressReporter.
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            check_cancellation()
+            super().__init__(*args, **kwargs)
+
+        def update(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            check_cancellation()
+            return super().update(*args, **kwargs)
+
+        def set_stage(self, name: str) -> None:
+            check_cancellation()
+            super().set_stage(name)
+
+        def finish(self) -> dict[str, Any]:
+            check_cancellation()
+            return super().finish()
+
+    check_cancellation()
     prompt = request["prompt"]
     text = request["text"]
     subtitle_mode = bool(request["subtitle_mode"])
@@ -541,7 +598,7 @@ def run_generation_request(
     final_wav_audio_seconds = 0.0
     runtime_warning = str(getattr(tts, "runtime_warning", "") or "")
 
-    reporter = ProgressReporter(
+    reporter = RequestProgressReporter(
         "segments",
         progress_file=request.get("progress_file"),
         gr_progress=progress_callback,
@@ -559,7 +616,10 @@ def run_generation_request(
     raw_decoder_strength = request.get("decoder_adapter_strength", getattr(request_runtime, "decoder_adapter_strength", 1.0))
     decoder_adapter_strength = float(1.0 if raw_decoder_strength in (None, "") else raw_decoder_strength)
     normalized_lora_path = os.path.abspath(str(lora_path)) if lora_path else ""
-    tts.low_vram = bool(low_memory_mode or getattr(tts, "low_vram", False))
+    if not hasattr(tts, "_runtime_low_vram"):
+        # Compatibility with supplied engines created before this policy field.
+        tts._runtime_low_vram = bool(getattr(tts, "low_vram", False))
+    tts.low_vram = bool(low_memory_mode or tts._runtime_low_vram)
 
     try:
         if hasattr(tts, "set_lora") and (
@@ -755,7 +815,7 @@ def run_generation_request(
                     f">> Generating subtitle candidate {candidate_index + 1}/{num_candidates} "
                     f"with seed {candidate_seed}"
                 )
-                tts.progress_reporter = ProgressReporter(
+                tts.progress_reporter = RequestProgressReporter(
                     f"candidate {candidate_index + 1}",
                     progress_file=request.get("progress_file"),
                     gr_progress=progress_callback,
@@ -815,7 +875,7 @@ def run_generation_request(
         else:
             for candidate_index in range(num_candidates):
                 if candidate_index:
-                    tts.progress_reporter = ProgressReporter(
+                    tts.progress_reporter = RequestProgressReporter(
                         f"candidate {candidate_index + 1}",
                         progress_file=request.get("progress_file"),
                         gr_progress=progress_callback,
@@ -858,6 +918,7 @@ def run_generation_request(
             output = output_path
             print(">> Primary output uses candidate 1:", output)
 
+        check_cancellation()
         if save_used_audio and prompt:
             try:
                 shutil.copy2(prompt, task_layout["speaker_reference_copy_path"])
@@ -875,18 +936,25 @@ def run_generation_request(
             stem, extension = os.path.splitext(output_path)
             raw_output = f"{stem}_raw{extension or '.wav'}"
             shutil.copy2(output, raw_output)
+            tuning_warnings = []
             apply_audio_tuning(
                 raw_output,
                 output_path,
                 audio_tuning_preset,
+                warning_callback=tuning_warnings.append,
                 **audio_tuning_overrides,
             )
+            if tuning_warnings:
+                metadata["audio_tuning_warnings"] = tuning_warnings
+                runtime_warning = " ".join(filter(None, [runtime_warning, *tuning_warnings]))
+                reporter.update(reporter.completed, desc=runtime_warning)
             output = output_path
             print(f">> Audio tuning applied ({audio_tuning_preset}); untouched WAV: {raw_output}")
 
         final_rate, final_audio = read_pcm16_wav(output_path)
         final_wav_audio_seconds = final_audio.shape[0] / float(final_rate) if final_rate else 0.0
 
+        check_cancellation()
         if image_path:
             _emit_progress(progress_callback, 0.96, "rendering mp4...")
             video_output = create_mp4_from_image_audio(
@@ -895,6 +963,7 @@ def run_generation_request(
                 task_layout["final_mp4_path"],
             )
 
+        check_cancellation()
         if save_as_mp3 and MP3_AVAILABLE:
             output = convert_wav_to_mp3(
                 output,
@@ -903,6 +972,7 @@ def run_generation_request(
                 remove_source=not bool(image_path),
             )
 
+        check_cancellation()
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         primary_stats = dict(candidate_stats[0] if candidate_stats else getattr(tts, "last_generation_stats", {}))
         primary_stats.setdefault("seed", base_seed)
@@ -979,7 +1049,7 @@ def run_generation_request(
         }
     except Exception as exc:
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
-        metadata["status"] = "failed"
+        metadata["status"] = "canceled" if "cancel" in str(exc).lower() else "failed"
         metadata["updated_at"] = current_timestamp()
         metadata["error"] = str(exc)
         metadata["outputs"]["final_audio_path"] = abs_path_or_none(output)

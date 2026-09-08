@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import json
+import math
 from pathlib import Path
 import shutil
 import sys
@@ -283,36 +284,8 @@ def _verdict_text(phase: str) -> str:
 
 
 def recommended_generation_value(root: str | Path) -> str:
-    """An explicit Base recommendation is authoritative, even if a final file exists."""
-    from indextts.training.speech_eval import load_speech_evaluation
-    root = Path(root)
-    status = read_json(root / "status.json", {}) or {}
-    speech = load_speech_evaluation(root)
-    if speech is not None and status.get("speech_evaluation_status", "complete") == "complete":
-        if speech["recommended_kind"] == "base":
-            return ""
-        path = speech["recommended_checkpoint"]
-        if not Path(path).is_file():
-            raise ValueError("The speech-recommended checkpoint is missing; rerun evaluation or restore that file")
-        return str(Path(path).resolve())
-    measured = load_checkpoint_eval(root)
-    if measured is not None:
-        if measured.recommended_kind == "base":
-            return ""
-        path = measured.recommended_checkpoint
-        if not path or not Path(path).is_file():
-            raise ValueError("The measured checkpoint is missing; rerun evaluation or restore that file")
-        return str(Path(path).resolve())
-    analysis = load_training_analysis(root)
-    path = analysis.recommended_checkpoint if analysis is not None else status.get("recommended_checkpoint")
-    if not path or not Path(path).is_file():
-        path = status.get("last_checkpoint")
-    if not path or not Path(path).is_file():
-        candidates = sorted(root.glob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
-        path = str(candidates[0]) if candidates else ""
-    if not path:
-        raise ValueError("No completed checkpoint is available yet")
-    return str(Path(path).resolve())
+    from indextts.training.selection import recommended_generation_value as select
+    return select(root)
 
 
 def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.DataFrame]:
@@ -348,6 +321,13 @@ def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.Data
         sweep_text = (sweep_report["summary_markdown"] if sweep_report.get("summary_markdown") and sweep_status == "complete"
                       else f"**Decoding sweep: {sweep_status}** — {status.get('decoding_sweep_message', '')}")
         summary = summary + "\n\n" + sweep_text
+    final_status = str(status.get("final_test_status") or "")
+    if final_status:
+        final_report = read_json(root / "analysis" / "speech_evaluation" / "final_test" / "report.json", {}) or {}
+        final_text = (final_report["summary_markdown"] if final_status == "complete" and final_report.get("deployment_frozen")
+                      and final_report.get("summary_markdown") else
+                      f"**Frozen deployment final test: {final_status}** — {status.get('final_test_message', '')}")
+        summary = summary + "\n\n" + final_text
     return "### Generalization summary\n\n" + summary, analysis_epoch_frame(analysis)
 
 
@@ -405,6 +385,31 @@ def _training_vram_total(root: Path) -> float:
         return 0.0
 
 
+def _decoder_gate_progress(root: Path, status: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the gate's current grid/measurement, never completed optimizer metrics."""
+    fallback = {"fraction": 0.0, "completed": 0, "total": None,
+                "desc": str(status.get("message") or "Waiting for decoder validation progress")}
+    value = read_json(root / "analysis" / "speech_evaluation" / "decoder_test" / "test_job" / "progress.json", {})
+    if not isinstance(value, Mapping):
+        return fallback
+    payload = {**fallback, **value}
+    try:
+        for key in ("fraction", "completed", "total", "elapsed_s", "eta_s", "speed", "vram_used_gb", "vram_total_gb"):
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            number = float(raw)
+            if (isinstance(raw, bool) or not math.isfinite(number) or number < 0
+                    or (key == "fraction" and number > 1)
+                    or (key in {"completed", "total"} and not number.is_integer())):
+                return fallback
+            payload[key] = int(number) if key in {"completed", "total"} else number
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    payload["desc"] = str(payload.get("desc") or fallback["desc"])
+    return payload
+
+
 def training_status_updates(state_value: str, smoothing_value: float) -> tuple[Any, ...]:
     """Return the complete training dashboard update for polling and server push."""
 
@@ -431,6 +436,7 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
     total = int(status.get("total_steps", 0) or 0)
     fraction = step / total if total else 0.0
     phase = str(status.get("phase", "initializing")).strip().lower()
+    decoder_gate = phase == "adapting_decoder" and str(status.get("decoder_test_status") or "").strip().lower() == "running"
     terminal = phase in TRAINING_TERMINAL_PHASES
     payload = {
         "fraction": 1.0 if phase == "complete" else fraction,
@@ -448,17 +454,27 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         evaluation_progress = read_json(root / "analysis" / "eval_job" / "progress.json", {}) or {}
         payload = dict(evaluation_progress) or {"fraction": 0.0, "completed": 0, "total": None}
         payload["desc"] = str(status.get("message") or payload.get("desc") or "evaluating checkpoints")
+    if phase == "post_training":
+        payload = {"fraction": 0.0, "completed": 0, "total": None,
+                   "desc": str(status.get("message") or "Preparing automatic quality checks")}
     if phase == "evaluating_speech":
         payload = read_json(root / "analysis" / "speech_evaluation" / "eval_job" / "progress.json", {}) or {
             "fraction": 0.0, "completed": 0, "total": None,
         }
         payload["desc"] = str(payload.get("desc") or status.get("message") or "comparing generated speech")
+    if phase == "evaluating_final_test":
+        payload = read_json(root / "analysis" / "speech_evaluation" / "final_test" / "eval_job" / "progress.json", {}) or {
+            "fraction": 0.0, "completed": 0, "total": None,
+        }
+        payload["desc"] = str(payload.get("desc") or status.get("message") or "assessing the frozen deployment")
     if phase == "calibrating_decoding":
         payload = read_json(root / "analysis" / "speech_evaluation" / "decoding_sweep" / "sweep_job" / "progress.json", {}) or {
             "fraction": 0.0, "completed": 0, "total": None,
         }
         payload["desc"] = str(payload.get("desc") or status.get("message") or "sweeping decoding settings")
-    if phase == "adapting_decoder":
+    if decoder_gate:
+        payload = _decoder_gate_progress(root, status)
+    elif phase == "adapting_decoder":
         child = read_json(root / "analysis" / "decoder_adapter_job" / "status.json", {}) or {}
         decoder_step = int(child.get("step", 0) or 0)
         decoder_total = int(child.get("total_steps", 0) or 0)
@@ -468,8 +484,10 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
             "desc": str(child.get("message") or status.get("message") or "adapting the voice decoder"),
         }
     titles = {
+        "post_training": "Automatic quality checks in progress",
         "evaluating": "Evaluating checkpoints",
         "evaluating_speech": "Comparing generated speech",
+        "evaluating_final_test": "Assessing frozen deployment on final test",
         "adapting_decoder": "Adapting the voice decoder",
         "calibrating_decoding": "Sweeping decoding settings",
         "complete": "Training complete",
@@ -489,7 +507,8 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
     )
     generalization_summary, generalization_chart = _training_generalization(root)
     return (
-        progress_panel_html(payload, title=titles.get(phase, "Training in progress")),
+        progress_panel_html(payload, title="Validating the voice decoder through the full pipeline" if decoder_gate
+                            else titles.get(phase, "Training in progress")),
         _training_status_text(status, metrics),
         _loss_plot_frame(metrics, smoothing_value),
         lr_frame(metrics),
@@ -862,7 +881,7 @@ def build_training_tab(
             reference_typical = gr.Checkbox(value=TRAIN_DEFAULTS["reference_typical"], label="Prefer a reference near the speaker's median pitch and pace",
                 info="Among the cleanest training clips near 15 seconds, the saved recommended reference, training conditioning, and the speech benchmark use the clip whose pitch and words per second are closest to the dataset's medians.")
             final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
-                info="A prepared dataset with separate source recordings. After selection is frozen, compare only the chosen checkpoint and Base. Blank skips final testing; feature caching is not required for this speech check.")
+                info="Separate source recordings assessed only after checkpoint, decoder, speaking rate, and decoding choices are frozen on validation. Compare the deployed pipeline and Base without retuning. Blank skips this check; no feature cache is required.")
             for name, component, kind, minimum, maximum in (
                 ("speech_eval_enabled", speech_enabled, "bool", None, None),
                 ("reference_typical", reference_typical, "bool", None, None),

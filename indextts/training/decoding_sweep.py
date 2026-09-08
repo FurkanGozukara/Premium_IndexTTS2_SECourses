@@ -124,8 +124,8 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
                        knobs: Mapping[str, Sequence[float]] = DECODING_KNOBS, wer_weight: float = DECODING_WER_WEIGHT,
                        min_score_gain: float = DECODING_MIN_SCORE_GAIN) -> dict[str, Any]:
     """Sweep decoding settings for the selected checkpoint on the speech benchmark and save the winner."""
-    from .speech_eval import (_benchmark_infer_kwargs, _benchmark_runtime, _lenient_terms, load_decoder_test,
-                              render_benchmark_rows)
+    from .speech_eval import (_benchmark_infer_kwargs, _benchmark_runtime, _lenient_terms, _file_sha256,
+                              development_baseline, development_fingerprint, load_decoder_test, render_benchmark_rows)
     run_dir = Path(config.output_dir).resolve() / config.name
     root = run_dir / "analysis" / "speech_evaluation"
     out = root / "decoding_sweep"
@@ -147,41 +147,28 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
     # Baseline: the checkpoint as it is deployed. With an accepted decoder adapter that is the decoder
     # test's chosen render; otherwise the benchmark's own measurement of the checkpoint.
     runtime = _benchmark_runtime(config).to_dict()
+    plan, baseline_rows, label, report_path, inference = development_baseline(run_dir, checkpoint)
+    baseline_report = str(report_path)
+    measured_development = development_fingerprint(run_dir)
+    checkpoint_sha256 = _file_sha256(checkpoint)
     decoder = load_decoder_test(run_dir)
-    baseline_rows: list[dict[str, Any]] = []
-    label = ""
-    baseline_report = ""
     if decoder and decoder.get("accepted") and str(Path(str(decoder.get("checkpoint", ""))).resolve()) == checkpoint \
             and Path(str(decoder.get("adapter", ""))).is_file():
+        if (str(Path(str(decoder.get("baseline_report", ""))).resolve()) != str(report_path.resolve())
+                or decoder.get("evaluation_partition") != "validation"
+                or decoder.get("development_fingerprint") != measured_development):
+            raise ValueError("The accepted decoder must be gated on development data before decoding can be tuned")
+        if (decoder.get("adapter_sha256") != _file_sha256(decoder["adapter"])
+                or decoder.get("checkpoint_sha256") != _file_sha256(checkpoint)):
+            raise ValueError("The accepted decoder or checkpoint changed after the validation gate")
         baseline_rows = list(decoder["cells"])
         label = str(decoder["checkpoint_label"])
-        baseline_report = str(decoder.get("baseline_report", ""))
         runtime["decoder_adapter"] = str(decoder["adapter"])
         runtime["decoder_adapter_strength"] = float(decoder.get("strength", 1.0))
     else:
         runtime["decoder_adapter"] = "none"
-    plan: dict[str, Any] | None = None
-    inference: dict[str, Any] = {}
-    for base_root in (root / "final_test", root):
-        try:
-            report = json.loads((base_root / "report.json").read_text(encoding="utf-8"))
-            candidate_plan = json.loads((base_root / "plan.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        if not isinstance(report, dict) or report.get("status") != "complete":
-            continue
-        if baseline_report and str(Path(baseline_report).resolve()) != str((base_root / "report.json").resolve()):
-            continue
-        found = next((str(c["label"]) for c in report.get("candidates", [])
-                      if c.get("path") and str(Path(c["path"]).resolve()) == checkpoint), "")
-        rows = [row for row in report.get("cells", []) if found and row.get("checkpoint") == found]
-        if rows:
-            plan = candidate_plan
-            inference = report.get("inference") if isinstance(report.get("inference"), dict) else {}
-            if not baseline_rows:
-                baseline_rows, label, baseline_report = rows, found, str(base_root / "report.json")
-            break
-    if plan is None or not baseline_rows:
+    decoder_sha256 = _file_sha256(runtime["decoder_adapter"]) if runtime["decoder_adapter"] != "none" else ""
+    if not baseline_rows:
         raise ValueError("the speech benchmark has no measurement of the selected checkpoint to sweep decoding settings against")
     infer = dict(inference.get("infer_kwargs") or {}) or _benchmark_infer_kwargs(config)
     base_settings = {"temperature": float(infer.get("temperature", 0.8)), "inference_cfg_rate": float(infer.get("inference_cfg_rate", 0.7)),
@@ -223,11 +210,17 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
     if chosen is not None:
         chosen["chosen"] = True
     accepted = chosen is not None
-    report = {"status": "complete", "accepted": accepted, "settings": dict(chosen["settings"]) if chosen else dict(base_settings),
+    if (_file_sha256(checkpoint) != checkpoint_sha256 or development_fingerprint(run_dir) != measured_development
+            or (runtime["decoder_adapter"] != "none" and _file_sha256(runtime["decoder_adapter"]) != decoder_sha256)):
+        raise ValueError("A validation benchmark or deployment artifact changed during the decoding sweep")
+    report = {"status": "complete", "evaluation_partition": "validation",
+              "accepted": accepted, "settings": dict(chosen["settings"]) if chosen else dict(base_settings),
               "base_settings": base_settings, "score": float(chosen["score"]) if chosen else 0.0,
               "reasons": [] if accepted else ["no single or combined change beat the defaults by the required margin"],
               "variants": [{key: value for key, value in item.items()} for item in variants], "wer_weight": wer_weight,
               "min_score_gain": min_score_gain, "policy": policy, "checkpoint": checkpoint, "checkpoint_label": label,
+              "checkpoint_sha256": checkpoint_sha256, "decoder_adapter_sha256": decoder_sha256,
+              "development_fingerprint": measured_development,
               "decoder_adapter": runtime.get("decoder_adapter", "none"), "decoder_adapter_strength": runtime.get("decoder_adapter_strength", 1.0),
               "baseline_report": baseline_report, "baseline_clips": len(baseline_rows), "seeds": plan["seeds"],
               "generated_at": datetime.now(timezone.utc).isoformat(), "elapsed_s": time.perf_counter() - started}
@@ -237,7 +230,11 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
     (out / "report.md").write_text(report["summary_markdown"], encoding="utf-8")
     atomic_write_json(run_dir / "analysis" / "decoding.json", {
         "accepted": accepted, "settings": report["settings"], "base_settings": base_settings, "score": report["score"],
-        "checkpoint": checkpoint, "decoder_adapter": report["decoder_adapter"], "generated_at": report["generated_at"],
+        "checkpoint": checkpoint, "decoder_adapter": report["decoder_adapter"],
+        "decoder_adapter_strength": report["decoder_adapter_strength"], "evaluation_partition": "validation",
+        "checkpoint_sha256": checkpoint_sha256, "decoder_adapter_sha256": decoder_sha256,
+        "development_fingerprint": measured_development, "report_sha256": _file_sha256(out / "report.json"),
+        "generated_at": report["generated_at"],
         "report": str(out / "report.json")})
     atomic_write_json(state / "status.json", {"phase": "complete", "message": "Decoding sweep complete", "elapsed_s": report["elapsed_s"]})
     return report
