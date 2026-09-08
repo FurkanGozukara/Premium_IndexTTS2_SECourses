@@ -56,6 +56,7 @@ from indextts.utils.atomic_json import read_json_retry
 from indextts.version import APP_VERSION
 
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
+from .best_checkpoint import best_checkpoint_path, migrate_run_best_checkpoints
 from .dataset_manifest import atomic_write_json
 from .early_stopping import EarlyStopping
 from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
@@ -369,6 +370,7 @@ class LoraTrainer:
             Path(self.config.output_dir).expanduser().resolve() / self.config.name
         )
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
+        self._adopt_best_checkpoint_name()
         self.state_dir = (
             Path(state_dir).expanduser().resolve() if state_dir else self.adapter_dir
         )
@@ -380,7 +382,7 @@ class LoraTrainer:
         self.reporter = reporter
         self.started_perf = time.perf_counter()
         self.reference_copy = self.adapter_dir / f"{self.config.name}_reference.wav"
-        self.best_path = self.adapter_dir / "best" / f"{self.config.name}.safetensors"
+        self.best_path = best_checkpoint_path(self.adapter_dir, self.config.name)
         self.last_sample = ""
         self.last_checkpoint = ""
         self.resolved_sample_seed: int | None = None
@@ -389,6 +391,18 @@ class LoraTrainer:
         self.last_validation_metrics: dict[str, Any] = {}
         self.training_records: list[dict[str, Any]] = []
         self.speech_plan_ready = False
+
+    def _adopt_best_checkpoint_name(self) -> None:
+        """Rename a legacy ``best/<name>.safetensors`` of this training before resuming from it."""
+        renamed = {
+            str(record.old.resolve()): record.new
+            for record in migrate_run_best_checkpoints(self.adapter_dir, name=self.config.name, skip_active=False)
+            if not record.skipped
+        }
+        if renamed and self.config.resume_from:
+            resume = Path(self.config.resume_from).expanduser()
+            if not resume.is_file() and str(resume.resolve()) in renamed:
+                self.config.resume_from = str(renamed[str(resume.resolve())])
 
     def log(self, message: str) -> None:
         line = str(message)

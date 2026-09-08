@@ -27,6 +27,7 @@ from indextts.training.analysis import (
     load_training_analysis,
     phase_display_label,
 )
+from indextts.training.best_checkpoint import TRAINING_TERMINAL_PHASES as _TRAINING_TERMINAL_PHASES
 from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.dataset_manifest import load_manifest
 from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line, validation_record_ids
@@ -52,9 +53,7 @@ from .presets_store import PresetRegistry
 TRAIN_DEFAULTS = TrainConfig(dataset_dir="datasets/voice_dataset", name="voice_adapter").to_dict()
 TRAIN_BETAS_TEXT = ", ".join(str(value) for value in TRAIN_DEFAULTS["betas"])
 _LAST_TRAINING_FOLDER = ROOT / "loras"
-TRAINING_TERMINAL_PHASES = frozenset(
-    {"complete", "stopped", "failed", "error", "cancelled", "canceled"}
-)
+TRAINING_TERMINAL_PHASES = _TRAINING_TERMINAL_PHASES
 
 
 _NON_TRAINING_STATE_FOLDERS = frozenset({"analysis", "eval_jobs", "eval_job", ".sample_jobs", "samples"})
@@ -623,7 +622,7 @@ def build_training_tab(
                 name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="LoRA / DoRA name", info="Safe output folder and final safetensors basename.")
                 adapter_type = gr.Dropdown(choices=["lora", "dora"], value=TRAIN_DEFAULTS["adapter_type"], label="LoRA / DoRA type", info="DoRA is the quality default; LoRA uses slightly less compute.")
                 rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset.")
-                alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default is close to rank for a scale near one.")
+                alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default equals rank for a scale of exactly one.")
                 dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="Regularizes training by randomly dropping adapter inputs. More dropout is not always better.")
             with gr.Row():
                 target_attention = gr.Checkbox(value=TRAIN_DEFAULTS["target_attention"], label="Target attention", info="Adapts GPT attention projections; recommended.")

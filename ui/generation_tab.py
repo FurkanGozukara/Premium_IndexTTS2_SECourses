@@ -1244,7 +1244,7 @@ def _lora_choices() -> list[tuple[str, str]]:
             f"  ·  {int(info.get('steps', 0) or 0)} steps"
         )
         if source.parent.name.lower() == "best":
-            label += "  [lowest validation loss]"
+            label += "  [best - lowest validation loss]"
         choices.append((label, str(source)))
     return choices
 

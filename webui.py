@@ -10,6 +10,7 @@ import sys
 import webbrowser
 from typing import Any
 
+from indextts.training.best_checkpoint import describe_migration, migrate_legacy_best_checkpoints
 from indextts.utils.console_encoding import configure_console_output
 
 
@@ -76,6 +77,11 @@ def open_app_browser(url: str, browser: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
     args = build_parser().parse_args(argv)
+    try:
+        for line in describe_migration(migrate_legacy_best_checkpoints(ROOT / "loras")):
+            print(f">> best checkpoint naming: {line}", flush=True)
+    except Exception as exc:  # never keep the app from starting over a rename
+        print(f">> best checkpoint naming migration skipped: {exc}", flush=True)
     demo = create_demo(args)
     from ui.common import FAVICON_PATH
 

@@ -341,7 +341,7 @@ When caching completes in V6, the prepared dataset remains selected, its cached 
 
 ### Adapter architecture
 
-Select a prepared cached dataset, enter a new safe adapter name, and choose LoRA or DoRA. DoRA, rank 128, and alpha 129 are starting defaults; the useful capacity and training length depend on the dataset. Leave **Resume from** set to **Start fresh** for a new run. An existing training history cannot be overwritten by a fresh launch.
+Select a prepared cached dataset, enter a new safe adapter name, and choose LoRA or DoRA. DoRA, rank 128, and alpha 128 are starting defaults; the useful capacity and training length depend on the dataset. Leave **Resume from** set to **Start fresh** for a new run. An existing training history cannot be overwritten by a fresh launch.
 
 ![Annotated 4K LoRA and DoRA adapter setup](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/WNDpzWV-lwGmgxlXtqVcf.png)
 
@@ -1061,7 +1061,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Rank** - `training.rank`. Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset. *(default 128; minimum 1; maximum 256)*
 
-**Alpha** - `training.alpha`. Scales the update relative to rank; the default gives a scale near one. *(default 129; minimum 1; maximum 1024)*
+**Alpha** - `training.alpha`. Scales the update relative to rank; the default equals rank for a scale of exactly one. *(default 128; minimum 1; maximum 1024)*
 
 **Dropout** - `training.dropout`. Regularizes adapter inputs. Its useful strength depends on the dataset. *(default 0.05; minimum 0; maximum 0.5)*
 
@@ -1163,7 +1163,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Keep last N** - `training.keep_last_n`. 0 keeps every epoch checkpoint so measured checkpoint comparison can choose the best voice. *(default 0; minimum 0; maximum 10000)*
 
-**Save best** - `training.save_best`. Keeps the checkpoint with the lowest validation loss. *(default true)*
+**Save best** - `training.save_best`. Keeps the checkpoint with the lowest validation loss as `best/<name>_best.safetensors`; older trainings are renamed to that layout when the app starts. *(default true)*
 
 **LoRA / DoRA save dtype** - `training.save_dtype`. BF16 halves LoRA / DoRA file size; FP32 preserves full update precision. *(default "bf16"; choices "bf16", "fp32")*
 

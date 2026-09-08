@@ -17,7 +17,7 @@ class TrainConfig:
 
     adapter_type: str = "dora"
     rank: int = 128
-    alpha: float = 129.0
+    alpha: float = 128.0
     dropout: float = 0.05
     target_attention: bool = True
     target_mlp: bool = True

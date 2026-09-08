@@ -9,7 +9,7 @@ def test_reference_sampling_and_evaluation_defaults() -> None:
     config = TrainConfig(dataset_dir="dataset", name="adapter").validate()
 
     assert config.rank == 128
-    assert config.alpha == 129.0
+    assert config.alpha == 128.0
     assert config.learning_rate == 4e-5
     assert config.epochs == 10
     assert config.warmup_steps == 200

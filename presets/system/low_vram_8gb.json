@@ -195,7 +195,7 @@
     "runtime.vram_reserve_gb": 2.0,
     "runtime.vram_tier": "8",
     "training.adapter_type": "dora",
-    "training.alpha": 129.0,
+    "training.alpha": 128.0,
     "training.attention_backend": "sdpa",
     "training.auto_analyze": true,
     "training.auto_evaluate_checkpoints": true,

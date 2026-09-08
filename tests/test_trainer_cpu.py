@@ -486,6 +486,8 @@ def test_periodic_checkpoints_skip_train_state_but_best_and_final_keep_it(
     assert final_state.is_file()
     assert best_path.is_file()
     assert best_state.is_file()
+    assert best_path.parent.name == "best"
+    assert best_path.name == "compact_epochs_best.safetensors"
 
 
 def test_trainer_persists_sample_calibration_in_status(
@@ -577,3 +579,35 @@ def test_automatic_evaluation_uses_frontend_configured_settings(
     assert "automatic checkpoint evaluation settings" in trainer.log_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_continue_run_adopts_the_best_suffix_for_a_legacy_best_file(
+    tmp_path: Path, synthetic_cpu_trainer
+) -> None:
+    config = _config(tmp_path, "legacy_best", max_steps=2)
+    config.val_fraction = 0.25
+    config.val_every_steps = 0
+    config.save_best = True
+    config.save_train_state = True
+    source = run_training(config)
+    best = Path(source.best_path)
+    assert best.name == "legacy_best_best.safetensors"
+    legacy = best.with_name("legacy_best.safetensors")
+    best.replace(legacy)
+    best.with_name("legacy_best_best.train_state.pt").replace(legacy.with_name("legacy_best.train_state.pt"))
+
+    resumed = _config(tmp_path, "legacy_best", max_steps=3)
+    resumed.val_fraction = 0.25
+    resumed.val_every_steps = 0
+    resumed.save_best = True
+    resumed.save_train_state = True
+    resumed.resume_from = str(legacy)
+    resumed.resume_mode = "continue"
+
+    result = run_training(resumed)
+
+    assert result.status == "complete"
+    assert not legacy.exists()
+    assert not legacy.with_name("legacy_best.train_state.pt").exists()
+    assert best.is_file()
+    assert synthetic_cpu_trainer[-1] == (str(best), "continue")
