@@ -668,6 +668,16 @@ PROCESS_MANAGER = ProcessManager()
 atexit.register(PROCESS_MANAGER.terminate_all)
 
 
+class GenerationCanceled(RuntimeError):
+    """Raised cooperatively when the user cancels a running generation."""
+
+
+def is_cancellation(exc: BaseException) -> bool:
+    """True for a user cancellation, including ones surfaced by message only."""
+
+    return isinstance(exc, GenerationCanceled) or "cancel" in str(exc).lower()
+
+
 class LazyEngine:
     """Single lazily-created in-process engine, reloaded when runtime settings change."""
 
@@ -757,7 +767,7 @@ class LazyEngine:
 
     def raise_if_canceled(self) -> None:
         if self._cancel_requested.is_set():
-            raise RuntimeError("Generation canceled by user")
+            raise GenerationCanceled("Generation canceled by user")
 
     def unload(self) -> bool:
         with self._lock:

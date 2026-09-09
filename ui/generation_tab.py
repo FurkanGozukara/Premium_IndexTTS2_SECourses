@@ -49,12 +49,14 @@ from indextts.utils.text_segmentation import SpeechRecoveryConfig, default_segme
 from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
 
 from .common import (
+    GenerationCanceled,
     LAZY_ENGINE,
     PROCESS_MANAGER,
     ROOT,
     adopt_output_task,
     btn,
     extract_reference_audio,
+    is_cancellation,
     open_folder,
     output_task_is_active,
     progress_panel_html,
@@ -1835,7 +1837,10 @@ def _stream_generation_request(
         except BaseException as exc:
             result_box["error"] = exc
             result_box["traceback"] = traceback.format_exc()
-            print(result_box["traceback"], file=sys.stderr, flush=True)
+            if is_cancellation(exc):
+                print(">> Generation canceled by user; the in-process worker stopped.", flush=True)
+            else:
+                print(result_box["traceback"], file=sys.stderr, flush=True)
         finally:
             tee.close()
             result_box["done"] = True
@@ -1859,7 +1864,10 @@ def _stream_generation_request(
         if "error" in result_box:
             _record_generation_failure(request, str(result_box["error"]), time.perf_counter() - started)
     if "error" in result_box:
-        raise RuntimeError(str(result_box["error"]))
+        error = result_box["error"]
+        if is_cancellation(error):
+            raise GenerationCanceled(str(error))
+        raise RuntimeError(str(error))
     yield _result_updates(result_box["result"], request)
 
 
@@ -2960,8 +2968,11 @@ def bind_generation_events(
                 )
             print(f">> Generation finished in {time.perf_counter() - started:.2f}s", flush=True)
         except Exception as exc:
-            traceback.print_exc()
-            canceled = "cancel" in str(exc).lower()
+            canceled = is_cancellation(exc)
+            if canceled:
+                print(f">> Generation canceled by user after {time.perf_counter() - started:.2f}s", flush=True)
+            else:
+                traceback.print_exc()
             message = "Generation canceled by user." if canceled else f"Generation failed: {exc}"
             terminal = _terminal_generation_updates(
                 request,
