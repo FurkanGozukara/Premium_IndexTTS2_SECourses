@@ -69,6 +69,30 @@ class FeatureCacheConfig:
         return cls(**{key: item for key, item in value.items() if key in allowed}).validate()
 
 
+def feature_batch_size_for_free_vram(free_gb: float | None, *, requested: int = 4) -> int:
+    """Clips per feature-extraction batch that fit into the free VRAM.
+
+    The extractors (FP32 w2v-bert, codec, CAMPPlus and the GPT emotion modules) take
+    about 3.2 GB; measured on 4 to 20 s clips, each clip in a batch adds about 1.4 GB
+    of activations, so four clips peak near 8.9 GB, two near 6.1 GB and one near 4.7 GB
+    (whole-GPU, CUDA context included). ``requested`` caps the result; ``None`` or an
+    unknown free-memory value keeps it.
+    """
+
+    cap = max(1, int(requested))
+    if free_gb is None:
+        return cap
+    try:
+        available = float(free_gb)
+    except (TypeError, ValueError):
+        return cap
+    if available >= 10.5:
+        return cap
+    if available >= 7.0:
+        return min(cap, 2)
+    return 1
+
+
 @dataclass
 class FeatureCacheSummary:
     dataset_dir: str
@@ -781,5 +805,6 @@ __all__ = [
     "FeatureCacheSummary",
     "TextFeaturePipeline",
     "cache_dataset_features",
+    "feature_batch_size_for_free_vram",
     "verify_cached_codes",
 ]

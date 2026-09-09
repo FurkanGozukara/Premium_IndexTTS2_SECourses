@@ -2,6 +2,11 @@
 
 The registry is deliberately independent from Gradio.  Unit tests and command-line
 tools can therefore validate defaults and migrations without constructing a UI.
+
+The read-only system presets are the GPU VRAM tiers (``6 GB GPU`` through
+``32 GB GPU``). A fresh installation, or one whose last-used preset no longer
+exists, starts with the tier detected for the machine's GPU; a saved user preset
+or any preset the user loaded last is always restored instead.
 """
 
 from __future__ import annotations
@@ -17,15 +22,23 @@ import re
 import tempfile
 import threading
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from indextts.runtime.vram_presets import VRAM_TIERS
 from indextts.utils.atomic_json import read_json_retry, replace_with_retry
+
+from .gpu_tier_presets import (
+    LEGACY_SYSTEM_PRESETS,
+    detect_gpu_tier,
+    tier_from_preset_name,
+    tier_preset_name,
+    tier_registry_overrides,
+)
 
 
 PRESET_FORMAT = "indextts2_premium_universal"
 PRESET_VERSION = 2
 SYSTEM_PREFIX = "★ "
-FRESH_INSTALL_PRESET = "quality"
 
 
 @dataclass(slots=True)
@@ -289,6 +302,8 @@ class PresetStore:
         self,
         registry: PresetRegistry | str | os.PathLike[str],
         root: str | os.PathLike[str] | PresetRegistry = "presets",
+        *,
+        detect_tier: Callable[[], int] | None = None,
     ) -> None:
         # Accept both PresetStore(registry, root) and PresetStore(root, registry).
         if isinstance(registry, PresetRegistry):
@@ -304,25 +319,49 @@ class PresetStore:
         self.user_dir = self.root / "user"
         self.last_used_path = self.user_dir / ".last_used_preset.txt"
         self._last_used_memory: str | None = None
+        # The GPU is inspected once per store; the result names the fallback preset.
+        self._detect_tier = detect_tier or detect_gpu_tier
+        self._detected_tier: int | None = None
         self.system_dir.mkdir(parents=True, exist_ok=True)
         self.user_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def detected_tier(self) -> int:
+        """Nominal VRAM tier of this machine's GPU (the smallest tier without a GPU)."""
+
+        if self._detected_tier is None:
+            try:
+                tier = int(self._detect_tier())
+            except Exception:
+                tier = VRAM_TIERS[0]
+            self._detected_tier = tier if tier in VRAM_TIERS else VRAM_TIERS[0]
+        return self._detected_tier
+
+    def default_preset_name(self) -> str:
+        """The system preset selected when no saved or last-used preset applies."""
+
+        return tier_preset_name(self.detected_tier)
 
     def _path(self, name: str, *, system: bool) -> Path:
         clean = sanitize_preset_name(name)
         return (self.system_dir if system else self.user_dir) / f"{clean}.json"
 
     def _system_names(self) -> list[str]:
-        names = sorted(path.stem for path in self.system_dir.glob("*.json") if path.is_file())
-        return (["default"] if "default" in names else []) + [name for name in names if name != "default"]
+        names = [path.stem for path in self.system_dir.glob("*.json") if path.is_file()]
+        tiers = sorted(
+            (name for name in names if tier_from_preset_name(name) is not None),
+            key=lambda name: tier_from_preset_name(name) or 0,
+        )
+        others = sorted(name for name in names if tier_from_preset_name(name) is None)
+        return tiers + others
 
     def _user_names(self) -> list[str]:
-        protected = set(self._system_names())
         return sorted(
             path.stem
             for path in self.user_dir.glob("*.json")
             if path.is_file()
             and not path.name.startswith(".")
-            and path.stem not in protected
+            and not self.is_system(path.stem)
         )
 
     def list_presets(self) -> list[str]:
@@ -330,8 +369,30 @@ class PresetStore:
 
     list = list_presets
 
-    def is_system(self, name: str) -> bool:
+    def canonical_name(self, name: str) -> str:
+        """The stored spelling of a preset name.
+
+        A GPU VRAM tier written any way (``32 gb gpu``, ``★ 32GB GPU``) is the
+        tier's system preset, and a name that matches another system preset
+        regardless of case is that preset; every other name is kept as typed.
+        """
+
         clean = sanitize_preset_name(name)
+        tier = tier_from_preset_name(clean)
+        if tier is not None:
+            return tier_preset_name(tier)
+        lowered = clean.casefold()
+        for existing in self._system_names():
+            if existing.casefold() == lowered:
+                return existing
+        return clean
+
+    def is_system(self, name: str) -> bool:
+        """True for the read-only presets: every tier name and every file in the system folder."""
+
+        clean = self.canonical_name(name)
+        if tier_from_preset_name(clean) is not None:
+            return True
         return self._path(clean, system=True).is_file()
 
     def _payload(self, name: str, values: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
@@ -398,58 +459,44 @@ class PresetStore:
             self._write_atomic(path, serialized)
         return path
 
+    def tier_preset_values(self, tier: int | str) -> dict[str, Any]:
+        """Registry values of one GPU VRAM tier preset (defaults plus the tier's overrides)."""
+
+        values = self.registry.defaults()
+        values.update(tier_registry_overrides(tier))
+        return self.registry.coerce(values)
+
+    def retire_legacy_system_presets(self) -> list[str]:
+        """Remove the system presets older builds shipped; returns the names removed."""
+
+        removed: list[str] = []
+        with _PRESET_IO_LOCK:
+            for legacy in LEGACY_SYSTEM_PRESETS:
+                path = self.system_dir / f"{legacy}.json"
+                if not path.is_file():
+                    continue
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    print(f">> Warning: could not remove the retired system preset {path.name}: {exc}", flush=True)
+                    continue
+                removed.append(legacy)
+        return removed
+
     def ensure_system_presets(self) -> None:
-        defaults = self.registry.defaults()
-        self.write_system("default", defaults)
+        """Write the GPU VRAM tier presets and retire the system presets they replace."""
 
-        quality = dict(defaults)
-        quality.update(
-            {
-                "generation.diffusion_steps": 40,
-                "generation.num_beams": 4,
-                "generation.section_batch_size": 1,
-                "generation.cfm_temperature": 0.9,
-                "generation.audio_tuning_preset": "bypass",
-            }
-        )
-        self.write_system("quality", quality)
-
-        fast = dict(defaults)
-        fast.update(
-            {
-                "generation.diffusion_steps": 12,
-                "generation.num_beams": 1,
-                "generation.section_batch_size": 4,
-                "generation.max_mel_tokens": 1200,
-            }
-        )
-        self.write_system("fast", fast)
-
-        low = dict(defaults)
-        low.update(
-            {
-                "runtime.vram_tier": "8",
-                "runtime.model_variant": "int8_convrot",
-                "runtime.blocks_to_swap": 8,
-                "runtime.swap_ring_size": 2,
-                "runtime.aux_residency.semantic_model": "on_demand",
-                "runtime.aux_residency.qwen_emo": "on_demand",
-                "runtime.cfm_cache_length": 4096,
-                "runtime.max_section_batch_size_hint": 2,
-                "generation.section_batch_size": 2,
-                "generation.num_beams": 2,
-                "generation.max_text_tokens_per_segment": 80,
-                "generation.cfm_cache_length": 4096,
-                "generation.low_memory_mode": True,
-            }
-        )
-        self.write_system("low_vram_8gb", low)
+        self.retire_legacy_system_presets()
+        for tier in VRAM_TIERS:
+            self.write_system(tier_preset_name(tier), self.tier_preset_values(tier))
 
     def save(self, name: str, values: Mapping[str, Any] | Sequence[Any]) -> str:
         with _PRESET_IO_LOCK:
-            clean = sanitize_preset_name(name)
+            clean = self.canonical_name(name)
             if self.is_system(clean):
-                raise PermissionError(f"System preset '{clean}' is read-only")
+                raise PermissionError(
+                    f"System preset '{clean}' is read-only and cannot be overwritten; enter another name to save your own preset"
+                )
             if not isinstance(values, Mapping):
                 values = self.registry.values_from_sequence(list(values))
             payload = self._payload(clean, values, system=False)
@@ -458,7 +505,7 @@ class PresetStore:
             return clean
 
     def _read_payload(self, name: str) -> dict[str, Any] | None:
-        clean = sanitize_preset_name(name)
+        clean = self.canonical_name(name)
         system_path = self._path(clean, system=True)
         path = system_path if system_path.is_file() else self._path(clean, system=False)
         missing = object()
@@ -487,7 +534,7 @@ class PresetStore:
 
     def load(self, name: str | None) -> dict[str, Any]:
         with _PRESET_IO_LOCK:
-            requested = sanitize_preset_name(name or "default")
+            requested = self.canonical_name(name or self.default_preset_name())
             payload = self._read_payload(requested)
             if payload is None:
                 return self.registry.defaults()
@@ -510,20 +557,21 @@ class PresetStore:
         return [values[spec.key] for spec in self.registry.component_specs]
 
     def reset(self) -> dict[str, Any]:
+        """Return to the tier preset detected for this GPU."""
+
         with _PRESET_IO_LOCK:
-            self.set_last_used("default")
-            return self.registry.defaults()
+            return self.load(self.default_preset_name())
 
     def delete(self, name: str) -> bool:
         with _PRESET_IO_LOCK:
-            clean = sanitize_preset_name(name)
+            clean = self.canonical_name(name)
             if self.is_system(clean):
-                raise PermissionError(f"System preset '{clean}' is read-only")
+                raise PermissionError(f"System preset '{clean}' is read-only and cannot be deleted")
             path = self._path(clean, system=False)
             if not path.is_file():
                 return False
             path.unlink()
-            self.set_last_used("default")
+            self.set_last_used(self.default_preset_name())
             return True
 
     def set_last_used(self, name: str) -> bool:
@@ -545,7 +593,9 @@ class PresetStore:
                 return False
             return True
 
-    def get_last_used(self) -> str:
+    def stored_last_used(self) -> str | None:
+        """The bookmarked last-used preset when it still exists, else ``None``."""
+
         with _PRESET_IO_LOCK:
             candidates = (self.last_used_path, self.user_dir / ".last_used_ui_preset.txt")
             for path in candidates:
@@ -558,12 +608,16 @@ class PresetStore:
                     return value
             if self._last_used_memory and self._read_payload(self._last_used_memory) is not None:
                 return self._last_used_memory
-            return FRESH_INSTALL_PRESET
+            return None
+
+    def get_last_used(self) -> str:
+        """The preset loaded or saved last, else the tier preset detected for this GPU."""
+
+        return self.stored_last_used() or self.default_preset_name()
 
 
 __all__ = [
     "ControlSpec",
-    "FRESH_INSTALL_PRESET",
     "LEGACY_KEY_MAP",
     "PRESET_FORMAT",
     "PRESET_VERSION",

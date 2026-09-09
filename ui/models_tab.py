@@ -353,7 +353,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                 ring = gr.Slider(1, 4, value=2, step=1, label="Swap ring size", info="2 overlaps transfer and compute; 1 uses least VRAM.")
                 pinned = gr.Checkbox(value=True, label="Pinned swap memory", info="Recommended for faster CPU-to-GPU block transfers.")
                 cache = gr.Slider(1024, 32768, value=8192, step=256, label="Runtime CFM cache length", info="Upper cache reservation used when generation does not request a larger value.")
-                reserve = gr.Slider(0, 12, value=2.0, step=0.25, label="VRAM reserve (GB)", info="2 GB is recommended to absorb allocator and generation peaks.")
+                reserve = gr.Slider(0, 12, value=2.0, step=0.25, label="VRAM reserve (GB)", info="Memory left free for allocator and generation peaks; the GPU VRAM presets use 1 GB up to 16 GB cards and 2 GB above.")
                 hint = gr.Slider(1, 64, value=8, step=1, label="Section batch hint", info="Advisory maximum shown to generation controls for this runtime.")
             _register(registry, "runtime.blocks_to_swap", blocks, 0, kind="int", minimum=-1, maximum=24)
             _register(registry, "runtime.swap_ring_size", ring, 2, kind="int", minimum=1, maximum=4)

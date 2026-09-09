@@ -309,6 +309,9 @@ class DecoderAdapterTrainer:
         # record id -> GPT-predicted code variants (variant 0 greedy, the rest sampled); empty for real codes.
         self._gpt_codes: dict[str, list[torch.Tensor]] = {}
         self._gpt_code_agreement: float | None = None
+        # The FP32 semantic encoder (2.2 GB) is only needed for prompt features; once
+        # every prompt is cached it moves to the CPU so the decoder can train on small cards.
+        self._semantic_offloaded = False
 
     # ------------------------------------------------------------------ models
     def _load_models(self) -> None:
@@ -553,6 +556,54 @@ class DecoderAdapterTrainer:
         return mel, semantic
 
     @torch.no_grad()
+    def _semantic_encoder_on_device(self):
+        """Context that brings the semantic encoder back to the GPU for an uncached prompt."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def scope():
+            if not self._semantic_offloaded:
+                yield
+                return
+            self.features.semantic_model.to(self.device)
+            try:
+                yield
+            finally:
+                self.features.semantic_model.to("cpu")
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        return scope()
+
+    def _prepare_prompt_features(self, records: list[Mapping[str, Any]]) -> None:
+        """Cache the prompt features of every candidate clip, then move the semantic encoder off the GPU.
+
+        Prompt features never change during the run, and the decoder, vocoder, adapters and activations
+        need the memory the FP32 encoder holds (about 2.2 GB): with it resident the decoder could not
+        train on a 6 GB card. Prompts the cache limit cannot hold are recomputed on demand by moving the
+        encoder back for that clip.
+        """
+        seen: set[str] = set()
+        cached = 0
+        for record in records:
+            record_id = str(record["id"])
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            if self.cancel_callback():
+                break
+            self._prompt(record)
+            if record_id in self._prompt_cache:
+                cached += 1
+        if self.device.type != "cuda":
+            return
+        self.features.semantic_model.to("cpu")
+        self._semantic_offloaded = True
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.status.log(f">> decoder prompts: cached features of {cached}/{len(seen)} prompt clips "
+                        f"({self._cache_bytes / 1024 ** 2:.0f} MB) and moved the semantic encoder to the CPU")
+
     def _prompt(self, record: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(mel (1, 80, Tp), semantic features (1, Tw, 1024), style (1, 192)) of a prompt clip."""
         record_id = str(record["id"])
@@ -562,7 +613,8 @@ class DecoderAdapterTrainer:
                     style.to(self.device, dtype=torch.float32))
         mel_wave, semantic_wave = self._load_clip(record)
         mel = self.mel_fn(mel_wave)
-        feature = self.features.w2v_features([semantic_wave])[0].to(dtype=torch.float32)
+        with self._semantic_encoder_on_device():
+            feature = self.features.w2v_features([semantic_wave])[0].to(dtype=torch.float32)
         while feature.dim() > 2:
             feature = feature.squeeze(0)
         feature = feature.unsqueeze(0)  # (1, frames, 1024), the layout the length regulator expects
@@ -726,6 +778,8 @@ class DecoderAdapterTrainer:
                 if prompt is not None:
                     val_pairs.append((record, prompt))
         prompt_count = sum(len(items) for items in self._pool.values())
+        self.status.write(phase="initializing", message="caching prompt features")
+        self._prepare_prompt_features([record for items in self._pool.values() for record in items])
         self.status.log(f">> decoder adaptation plan | {len(train)} training clips, {prompt_count} prompt clips, "
                         f"{len(val_pairs)} validation pairs | {total_steps} updates over {config.epochs} epochs | "
                         f"learning rate {config.learning_rate:g} | codes from "

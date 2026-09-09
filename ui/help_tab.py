@@ -57,19 +57,21 @@ For **Evaluation references**, **Same as training validation** reuses the run's 
 
 Set **Keep last N** to 0 when you want every epoch available for comparison. Early stopping can end a run after validation stops improving, while the `analysis/` folder preserves the automatic verdict and any measured comparison.
 
-## VRAM Tiers
+## GPU VRAM Presets
 
-| Tier | GPT | Block swap | Large reference models | CFM cache | Typical section batch |
-|---:|---|---:|---|---:|---:|
-| 6 GB | INT8 ConvRot | 22 / 24 | CPU | 2048 | 1 |
-| 8 GB | INT8 ConvRot | 8 / 24 | On demand | 4096 | 2 |
-| 10 GB | BF16 | 8 / 24 | On demand | 6144 | 2 |
-| 12 GB | BF16 | 0 | Semantic on demand | 8192 | 4 |
-| 16 GB | BF16 | 0 | Emotion model on demand | 8192 | 4 |
-| 24 GB | BF16 | 0 | GPU resident | 8192 | 8 |
-| 32 GB | BF16 | 0 | GPU resident | 8192 | 8 |
+The read-only system presets in the header are the seven card sizes. On first start the app selects the preset of the detected GPU; a card counts as a tier from 500 MB below its nominal size, so 31.5 GB and above is a 32 GB card and 9.5 GB and above a 10 GB card. A saved user preset, or whichever preset was loaded last, is always restored instead, and **Reset** returns to the detected tier. The seven presets cannot be overwritten or deleted from the preset interface (Save and Delete refuse their names in any spelling, and their files are rewritten at every start); save your own settings under a new name. Each preset sets the inference runtime, the generation decoding and the training settings together. Every tier keeps the BF16 GPT, sampling, CFM temperature 0.9 and at least the 40 diffusion steps of the former quality preset; the 24 GB and 32 GB presets refine with 50 steps. Four beams are the measured optimum (the decoding sweeps of real training runs scored five beams worse than three), so every preset from 8 GB up uses four and only 6 GB drops to two. A smaller card pays with speed first: reference encoders on demand or on CPU, a shorter CFM cache, and on 6 GB frozen GPT blocks streamed from CPU.
 
-Named tiers are conservative and reserve about 2 GB. Select a tier in **Models & Performance**, then customize individual controls if needed. The estimate is a planning aid; the live panel reports actual process VRAM.
+| Preset | Whole-GPU peak | GPT blocks streamed | Reference and emotion models | CFM cache | Beams | Diffusion steps | Training |
+|---|---:|---:|---|---:|---:|---:|---|
+| 6 GB GPU | within 5 GB | 22 / 24, one ring slot | CPU | 2048 | 2 | 40 | BF16 base, 22 blocks streamed |
+| 8 GB GPU | within 7 GB | 0 | Semantic encoder on CPU, emotion model on demand | 4096 | 4 | 40 | BF16 base, resident |
+| 10 GB GPU | within 9 GB | 0 | On demand | 6144 | 4 | 40 | BF16 base, resident |
+| 12 GB GPU | within 11 GB | 0 | GPU resident | 8192 | 4 | 40 | BF16 base, resident |
+| 16 GB GPU | within 15 GB | 0 | GPU resident | 8192 | 4 | 40 | BF16 base, resident |
+| 24 GB GPU | within 22 GB | 0 | GPU resident | 8192 | 4 | 50 | BF16 base, resident |
+| 32 GB GPU | within 30 GB | 0 | GPU resident | 8192 | 4 | 50 | BF16 base, resident |
+
+The peak is the memory the whole card reports, every process and CUDA context included, measured while generating (base voice, a LoRA / DoRA with its decoder adapter, emotion-text mode), preparing and auditing a dataset, caching features and training with samples, evaluation and the decoder adapter (`tools/gpu_tier_calibration.py`). Training keeps rank 128 and batch size 1 on every tier; the per-epoch sample renders in its own process with the largest tier that fits into the memory left beside the training model, and the speech comparison after training uses the training's own tier with the measured benchmark settings (3 beams, 25 steps) so runs stay comparable. The **GPU VRAM preset** dropdown beside the training dataset fills the training controls for one tier without changing the rest of the preset; **Models & Performance** does the same for the runtime alone, and its estimate is a planning aid while the live panel reports actual process VRAM. **Prevent VRAM accumulation** stays off in every preset: on the 6 GB tier it raised the transient peak by about 1 GB instead of lowering it. Dataset preparation adapts on its own: Whisper alignment keeps only the decoder attentions it needs for word timestamps, the feature cache picks the largest clip batch that fits the free VRAM, and the audit's second-opinion Whisper model runs on the CPU when the card cannot hold it beside the first model. Models left resident by an in-process generation are released automatically when training, dataset preparation, feature caching, an audit, a grid, an evaluation, the isolated benchmark or an isolated generation starts, so the budget belongs to that worker; they reload at the next generation (a generation that is still running keeps them).
 
 ## Parameter Glossary
 
@@ -100,7 +102,7 @@ Caption cue timing owns its own gaps and target slots. It overrides section sile
 ## Troubleshooting
 
 - **No output / model file error:** use **Models & Performance** to download or verify the base files. Selecting INT8 downloads its GPT automatically; when the Hugging Face file is unavailable, the run clearly warns and uses BF16.
-- **CUDA out of memory:** select the next lower VRAM tier, lower section batch size and beams, enable low-memory mode, or increase blocks to swap.
+- **CUDA out of memory:** load the next smaller GPU VRAM preset (it lowers generation, training and runtime together), close other GPU applications, or lower section batch size and beams, enable low-memory mode, and increase blocks to swap by hand.
 - **Training cannot start:** verify `manifest.jsonl` and `cache/index.jsonl` exist in the selected dataset.
 - **Training stop takes a moment:** graceful stop finishes one optimizer step and writes an interrupted checkpoint. **Force stop** terminates the entire subprocess tree.
 - **Caption timing sounds stretched:** use sentence-length cues where possible and avoid extremely short slots for long phrases.

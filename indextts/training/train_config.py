@@ -26,6 +26,10 @@ class TrainConfig:
     train_mel_embed_head: bool = False
     train_full_modules_fp32: bool = True
 
+    # GPU VRAM tier the training settings were chosen for: "auto" (the detected
+    # card) or a nominal size such as "8". It records the choice and resolves the
+    # sample tier; the memory-relevant fields below carry the actual values.
+    vram_tier: str = "auto"
     base_variant: str = "bf16"
     base_dtype: str = "bf16"
     learning_rate: float = 4e-5
@@ -164,6 +168,12 @@ class TrainConfig:
             raise ValueError("at least one LoRA / DoRA target group must be enabled")
         self.train_full_modules_fp32 = bool(self.train_full_modules_fp32)
 
+        from indextts.runtime.vram_presets import VRAM_TIERS
+
+        tier = str(self.vram_tier or "auto").strip().lower()
+        if tier != "auto" and tier not in {str(item) for item in VRAM_TIERS}:
+            raise ValueError("vram_tier must be 'auto' or one of " + ", ".join(str(item) for item in VRAM_TIERS))
+        self.vram_tier = tier
         self.base_variant = str(self.base_variant).lower()
         if self.base_variant not in {"bf16", "int8_convrot"}:
             raise ValueError("base_variant must be 'bf16' or 'int8_convrot'")

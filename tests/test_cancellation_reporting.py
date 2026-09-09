@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +60,7 @@ def test_in_process_stream_prints_a_traceback_only_for_real_failures(
             get=lambda *_args, **_kwargs: object(),
             reset_cancel=lambda **_kwargs: None,
             raise_if_canceled=lambda: None,
+            in_use=contextlib.nullcontext,
         ),
     )
 

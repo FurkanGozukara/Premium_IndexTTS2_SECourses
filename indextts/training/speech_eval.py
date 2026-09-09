@@ -436,11 +436,10 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
 
 
 def _benchmark_runtime(config: Any) -> Any:
-    from indextts.runtime import gpu_free_gb, gpu_total_gb, resolve_preset
-    device_index = int(config.device.split(":")[-1]) if ":" in config.device else 0
-    runtime = resolve_preset(config.sample_runtime_tier, gpu_total_gb(device_index), gpu_free_gb(device_index))
-    runtime.device = config.device
-    return runtime
+    # The training model has been released before this phase, so the benchmark
+    # renders with the training's own tier instead of shrinking to free memory.
+    from .sampling import resolve_sample_runtime
+    return resolve_sample_runtime(config, share_gpu=False)
 
 
 def _benchmark_infer_kwargs(config: Any) -> dict[str, Any]:

@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from indextts.training.features import FeatureCacheConfig, cache_dataset_features
+from indextts.training.features import FeatureCacheConfig, cache_dataset_features, feature_batch_size_for_free_vram
 from indextts.runtime import ProgressReporter
 
 
@@ -23,7 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--semantic-layer", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Clips per extraction batch; omitted, the largest that fits the free VRAM (up to 4) is used")
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--verify-count", type=int, default=None)
     parser.add_argument("--verify-output-dir", default=None)
@@ -61,6 +62,19 @@ def main() -> int:
     if args.no_skip_existing:
         payload["skip_existing"] = False
     config = FeatureCacheConfig.from_dict(payload)
+    if args.batch_size is None and "batch_size" not in payload and config.device.lower().startswith("cuda"):
+        # The browser never passes a batch size: pick the largest that fits this card
+        # right now, so an 8 GB card caches features instead of running out of memory.
+        from indextts.runtime.gpu import gpu_free_gb
+
+        try:
+            index = int(config.device.split(":", 1)[1]) if ":" in config.device else 0
+            free_gb: float | None = gpu_free_gb(index)
+        except (RuntimeError, TypeError, ValueError):
+            free_gb = None
+        config.batch_size = feature_batch_size_for_free_vram(free_gb, requested=config.batch_size)
+        free_text = "unknown" if free_gb is None else f"{free_gb:.1f} GB"
+        print(f">> feature cache batch size {config.batch_size} for {free_text} free VRAM on {config.device}", flush=True)
     reporter = ProgressReporter("segments", progress_file=args.progress_file) if args.progress_file else None
     summary = cache_dataset_features(config, reporter=reporter)
     print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))

@@ -1,5 +1,6 @@
 """Batch workflow regression tests: no model loads, inference, or subprocesses."""
 
+import contextlib
 import json
 from pathlib import Path
 import threading
@@ -211,6 +212,7 @@ def test_inprocess_cancel_waits_for_worker_and_never_unloads_it_early(tmp_path, 
     engine = SimpleNamespace(
         get=lambda *_args, **_kwargs: object(), raise_if_canceled=check_cancel,
         request_cancel=lambda **_kwargs: canceled.set(), unload=unload,
+        in_use=contextlib.nullcontext,
     )
 
     def run(_request, _engine, *, cancellation_check):
@@ -252,7 +254,7 @@ def test_inprocess_load_failure_has_terminal_metadata_and_result(tmp_path, monke
         raise RuntimeError("synthetic model load failure")
 
     monkeypatch.setattr(batch, "LAZY_ENGINE", SimpleNamespace(
-        get=fail_load, raise_if_canceled=lambda: None,
+        get=fail_load, raise_if_canceled=lambda: None, in_use=contextlib.nullcontext,
     ))
     with pytest.raises(RuntimeError, match="synthetic model load failure"):
         list(batch._poll_batch_item(request, False, True))
@@ -268,6 +270,7 @@ def test_reload_policy_unloads_before_first_item_and_after_worker_finishes(tmp_p
     monkeypatch.setattr(batch, "LAZY_ENGINE", SimpleNamespace(
         get=lambda *_args, **_kwargs: actions.append("get"),
         raise_if_canceled=lambda: None, unload=lambda: actions.append("unload"),
+        in_use=contextlib.nullcontext,
     ))
 
     def run(*_args, **_kwargs):
@@ -390,7 +393,7 @@ def test_late_cancel_does_not_relabel_completed_inprocess_audio(tmp_path, monkey
     request = _item_request(tmp_path)
     monkeypatch.setattr(batch, "LAZY_ENGINE", SimpleNamespace(
         get=lambda *_args, **_kwargs: object(), raise_if_canceled=lambda: None,
-        request_cancel=lambda **_kwargs: None,
+        request_cancel=lambda **_kwargs: None, in_use=contextlib.nullcontext,
     ))
 
     def run(*_args, **_kwargs):

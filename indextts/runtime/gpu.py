@@ -14,6 +14,78 @@ import torch
 
 
 _GIB = float(1024**3)
+# Set INDEXTTS_VRAM_EMULATE_GB to a tier size (6, 8, 10, 12, 16, 24 or 32) to make every
+# process behave like a card of that size: the allocator is capped at the tier budget,
+# the card reports the tier size, and free memory is derived from this process's own
+# use. Calibration and tests use it; the app never sets it.
+EMULATE_ENV = "INDEXTTS_VRAM_EMULATE_GB"
+# A display-attached card keeps roughly this much memory for the driver and desktop.
+_EMULATED_DRIVER_RESERVE_GB = 0.45
+# The application process holds a CUDA context beside every worker it starts.
+_EMULATED_APP_CONTEXT_GB = 0.5
+_emulation_applied: set[int] = set()
+
+
+def emulated_gpu_gb() -> float | None:
+    """The emulated card size from the environment, or ``None`` when not emulating."""
+
+    raw = os.environ.get(EMULATE_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def emulated_cap_gb() -> float | None:
+    """Allocator cap for the emulated card: its tier budget."""
+
+    size = emulated_gpu_gb()
+    if size is None:
+        return None
+    from indextts.runtime.vram_presets import auto_tier, tier_budget_gb
+
+    return float(tier_budget_gb(auto_tier(size)))
+
+
+def apply_emulated_vram_cap(index: int = 0) -> float | None:
+    """Cap the allocator of this process at the emulated card budget (once per device)."""
+
+    cap = emulated_cap_gb()
+    if cap is None:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        resolved = int(index)
+        if resolved in _emulation_applied:
+            return cap
+        total_gb = float(torch.cuda.get_device_properties(resolved).total_memory) / _GIB
+        fraction = min(1.0, cap / total_gb) if total_gb > 0 else 1.0
+        torch.cuda.set_per_process_memory_fraction(fraction, resolved)
+        _emulation_applied.add(resolved)
+        print(
+            f">> VRAM emulation: behaving like a {emulated_gpu_gb():g} GB card; allocator capped at "
+            f"{cap:.2f} GB ({fraction:.3f} of cuda:{resolved})",
+            flush=True,
+        )
+    except (RuntimeError, AssertionError, ValueError) as exc:
+        print(f">> VRAM emulation could not cap cuda:{index}: {exc}", flush=True)
+        return None
+    return cap
+
+
+def _emulated_free_gb(index: int) -> float | None:
+    size = emulated_gpu_gb()
+    if size is None:
+        return None
+    try:
+        reserved = float(torch.cuda.memory_reserved(int(index))) / _GIB if torch.cuda.is_available() else 0.0
+    except (RuntimeError, AssertionError, ValueError):
+        reserved = 0.0
+    return max(0.0, size - _EMULATED_DRIVER_RESERVE_GB - _EMULATED_APP_CONTEXT_GB - reserved)
 
 
 @dataclass(frozen=True)
@@ -29,6 +101,7 @@ def _torch_gpus() -> list[GpuInfo]:
     if not torch.cuda.is_available():
         return []
     result: list[GpuInfo] = []
+    emulated = emulated_gpu_gb()
     try:
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)
@@ -37,12 +110,17 @@ def _torch_gpus() -> list[GpuInfo]:
             except (RuntimeError, TypeError):
                 total_bytes = int(props.total_memory)
                 free_bytes = max(0, total_bytes - torch.cuda.memory_reserved(index))
+            total_gb = float(total_bytes) / _GIB
+            free_gb = float(free_bytes) / _GIB
+            if emulated is not None:
+                total_gb = min(total_gb, emulated)
+                free_gb = min(free_gb, _emulated_free_gb(index) or 0.0)
             result.append(
                 GpuInfo(
                     index=index,
-                    name=str(props.name),
-                    total_gb=float(total_bytes) / _GIB,
-                    free_gb=float(free_bytes) / _GIB,
+                    name=str(props.name) + (f" (emulated {emulated:g} GB)" if emulated is not None else ""),
+                    total_gb=total_gb,
+                    free_gb=free_gb,
                     is_default=index == torch.cuda.current_device(),
                 )
             )
@@ -111,20 +189,24 @@ def _device_index(device: int | str | torch.device | None) -> int:
 
 
 def gpu_total_gb(index: int = 0) -> float:
+    emulated = emulated_gpu_gb()
     try:
-        return float(torch.cuda.get_device_properties(int(index)).total_memory) / _GIB
+        total = float(torch.cuda.get_device_properties(int(index)).total_memory) / _GIB
     except (RuntimeError, AssertionError, ValueError):
         match = next((gpu for gpu in list_gpus() if gpu.index == int(index)), None)
-        return float(match.total_gb) if match else 0.0
+        total = float(match.total_gb) if match else 0.0
+    return min(total, emulated) if emulated is not None and total > 0 else total
 
 
 def gpu_free_gb(index: int = 0) -> float:
     try:
         free_bytes, _ = torch.cuda.mem_get_info(int(index))
-        return float(free_bytes) / _GIB
+        free = float(free_bytes) / _GIB
     except (RuntimeError, AssertionError, ValueError):
         match = next((gpu for gpu in list_gpus() if gpu.index == int(index)), None)
-        return float(match.free_gb) if match else 0.0
+        free = float(match.free_gb) if match else 0.0
+    emulated_free = _emulated_free_gb(int(index))
+    return min(free, emulated_free) if emulated_free is not None else free
 
 
 def memory_stats(device: int | str | torch.device = "cuda:0") -> dict[str, float]:
@@ -194,8 +276,12 @@ def device_from_string(value: str | torch.device | None) -> torch.device:
 
 
 __all__ = [
+    "EMULATE_ENV",
     "GpuInfo",
+    "apply_emulated_vram_cap",
     "apply_vram_cap",
+    "emulated_cap_gb",
+    "emulated_gpu_gb",
     "device_from_string",
     "format_gb",
     "gpu_free_gb",

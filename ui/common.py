@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 from dataclasses import dataclass, field
 import gc
 import html
@@ -573,6 +574,24 @@ class ChildJob:
         return self.process.poll() is None
 
 
+# Child workers that load models on the GPU next to the app. Starting one of
+# them releases the in-process inference engine first, so the GPU VRAM preset
+# budget applies to the worker instead of being shared with idle resident models.
+GPU_WORKER_KINDS = frozenset(
+    {
+        "training",
+        "dataset_prep",
+        "dataset_cache",
+        "dataset_curation",
+        "checkpoint_eval",
+        "grid_generation",
+        "vram_benchmark",
+        "generation",
+        "batch_generation",
+    }
+)
+
+
 class ProcessManager:
     def __init__(self) -> None:
         self._jobs: dict[str, ChildJob] = {}
@@ -592,11 +611,14 @@ class ProcessManager:
         cwd: str | os.PathLike[str] = ROOT,
         env: Mapping[str, str] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        release_engine: bool | None = None,
     ) -> ChildJob:
         with self._lock:
             existing = self._jobs.get(kind)
             if existing is not None and existing.running:
                 raise RuntimeError(f"A {kind.replace('_', ' ')} job is already running")
+            if release_engine if release_engine is not None else kind in GPU_WORKER_KINDS:
+                LAZY_ENGINE.release_for_worker(kind)
             state = Path(state_dir).expanduser().resolve()
             state.mkdir(parents=True, exist_ok=True)
             log = Path(log_path).expanduser().resolve() if log_path else state / "ui_console.log"
@@ -689,6 +711,8 @@ class LazyEngine:
         self._cancel_lock = threading.Lock()
         self._active_task = ""
         self._canceled_reporters: list[tuple[Any, Any, Any, Any]] = []
+        self._busy_lock = threading.Lock()
+        self._busy = 0
 
     def get(
         self,
@@ -732,6 +756,64 @@ class LazyEngine:
     def peek(self) -> Any:
         with self._lock:
             return self._instance
+
+    @contextlib.contextmanager
+    def in_use(self):
+        """Mark an in-process generation as running so workers never unload under it."""
+
+        with self._busy_lock:
+            self._busy += 1
+        try:
+            yield
+        finally:
+            with self._busy_lock:
+                self._busy = max(0, self._busy - 1)
+
+    @property
+    def busy(self) -> bool:
+        with self._busy_lock:
+            return self._busy > 0
+
+    def release_for_worker(self, kind: str) -> bool:
+        """Unload idle resident models before a GPU child worker starts.
+
+        The GPU VRAM presets budget each worker (training, dataset preparation,
+        feature caching, audits, grids, isolated generation) for the whole card,
+        so models left resident by an earlier in-process generation must not
+        stay on the GPU beside them. They reload at the next generation.
+        A generation that is running in process keeps its engine.
+        """
+
+        label = kind.replace("_", " ")
+        # Never wait behind a model load (minutes) while holding the process
+        # manager's lock: a load in progress means the engine is about to be
+        # used, so it is kept like a running generation.
+        if not self._lock.acquire(blocking=False):
+            print(
+                f">> Keeping the in-process inference models: a model load is in progress while the {label} worker starts",
+                flush=True,
+            )
+            return False
+        try:
+            if self._instance is None:
+                return False
+            # in_use() marks the engine busy before get() takes this lock, so
+            # holding the lock while reading the flag closes the start-up race.
+            if self.busy:
+                print(
+                    f">> Keeping the in-process inference models loaded: a generation is running while the {label} worker starts",
+                    flush=True,
+                )
+                return False
+            released = self.unload()
+        finally:
+            self._lock.release()
+        if released:
+            print(
+                f">> Released the in-process inference models before the {label} worker so the GPU VRAM preset budget applies to it; they reload at the next generation",
+                flush=True,
+            )
+        return released
 
     def request_cancel(self, *, expected_task: str | None = None) -> bool:
         # Do not acquire the model-load lock here: loading may take minutes.
@@ -1078,6 +1160,7 @@ __all__ = [
     "CONFIRM_FORCE_JS",
     "CONFIRM_STOP_JS",
     "FAVICON_PATH",
+    "GPU_WORKER_KINDS",
     "LAZY_ENGINE",
     "PROCESS_MANAGER",
     "ROOT",

@@ -20,7 +20,7 @@ from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript, 
 from indextts.training.speech_metrics import lenient_units, transcript_metrics
 from indextts.training.media import measure_edge_silence
 from indextts.training.features import _load_audio_16k, _read_audio
-from indextts.training.whisper_asr import _ensure_model
+from indextts.training.whisper_asr import _ensure_model, whisper_device_for_free_vram
 
 # Whisper accepts a short prompt of expected spellings, derived here from the
 # speaker's own subtitles. Optional: on a 17-recording narration dataset it
@@ -55,6 +55,25 @@ def transcribe_clip(pipe, waveform, language: str, beams: int, prompt_ids=None) 
     result = pipe({"array": waveform.squeeze().numpy(), "sampling_rate": 16000}, return_timestamps=True,
                   generate_kwargs=generate_kwargs)
     return str(result["text"]).strip()
+
+
+SECOND_OPINION_MIN_FREE_GB = 4.5
+
+
+def _second_opinion_device(args) -> str:
+    """Device for the second-opinion model: the audit device when its VRAM fits, else the CPU."""
+    requested = str(getattr(args, "second_opinion_device", "auto") or "auto").strip()
+    if requested.lower() != "auto":
+        return requested
+    device = str(args.device)
+    if not device.lower().startswith("cuda"):
+        return device
+    try:
+        from indextts.runtime.gpu import gpu_free_gb
+        free_gb = gpu_free_gb(int(device.split(":", 1)[1]) if ":" in device else 0)
+    except (RuntimeError, TypeError, ValueError, ImportError):
+        free_gb = None
+    return whisper_device_for_free_vram(device, free_gb, required_gb=SECOND_OPINION_MIN_FREE_GB)
 
 
 def whisper_prompt_ids(pipe, prompt: str):
@@ -99,6 +118,8 @@ def main() -> None:
                         help="Prompt Whisper with the spellings used in the dataset transcripts. Measured: a few more rejected clips pass, but some clean clips start failing, so it is off by default")
     parser.add_argument("--second-opinion-whisper", default=DEFAULT_SECOND_OPINION_WHISPER,
                         help="Re-transcribe clips that failed only transcript checks with this model and keep them when it agrees with the transcript; pass an empty string to disable")
+    parser.add_argument("--second-opinion-device", default="auto",
+                        help="Device for the second-opinion model: auto uses --device when at least 4.5 GB of VRAM are free beside the first model, otherwise the CPU")
     parser.add_argument("--state-dir", type=Path, help="Optional UI status and graceful-stop directory")
     args = parser.parse_args()
     try:
@@ -243,9 +264,10 @@ def run_curation(args: argparse.Namespace) -> None:
                 # Only transcript checks failed: a stronger recognizer decides
                 # whether the recording says what the transcript says.
                 if second_pipe is None:
-                    from transformers import pipeline
+                    second_device = _second_opinion_device(args)
+                    print(f">> second-opinion Whisper {second_opinion_model} on {second_device}", flush=True)
                     second_pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(second_opinion_model)),
-                                           device=args.device, dtype=torch.bfloat16 if args.device.startswith("cuda") else torch.float32)
+                                           device=second_device, dtype=torch.bfloat16 if second_device.startswith("cuda") else torch.float32)
                 if waveform is None:
                     waveform, _ = _load_audio_16k(audio)
                 second_text = transcribe_clip(second_pipe, waveform, str(row.get("language", "EN")), asr_beams)

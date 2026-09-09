@@ -10,6 +10,46 @@ from typing import Any, Mapping
 
 VRAM_TIERS = [6, 8, 10, 12, 16, 24, 32]
 
+# A card counts as a tier from 500 MB below the tier's nominal size, because
+# drivers advertise slightly less than the marketing figure (a 32 GB card
+# reports 31.8 GB, a 10 GB card 9.9 GB).
+AUTO_TIER_TOLERANCE_GB = 0.5
+
+# Whole-GPU peak (GiB as reported by nvidia-smi for every process on the GPU,
+# CUDA contexts included) that a tier's presets may reach. Cards up to 16 GB
+# keep 1 GB free; 24 GB and 32 GB cards keep 2 GB free.
+TIER_BUDGET_GB: dict[int, float] = {6: 5.0, 8: 7.0, 10: 9.0, 12: 11.0, 16: 15.0, 24: 22.0, 32: 30.0}
+
+
+def tier_budget_gb(tier: str | int | float) -> float:
+    """Whole-GPU memory a tier's presets may use at their peak."""
+
+    return TIER_BUDGET_GB[_normalize_tier(tier, 32.0)]
+
+
+def tier_reserve_gb(tier: str | int | float) -> float:
+    """VRAM a tier deliberately leaves free (1 GB up to 16 GB, 2 GB above)."""
+
+    resolved = _normalize_tier(tier, 32.0)
+    return float(resolved) - TIER_BUDGET_GB[resolved]
+
+
+def fit_tier_to_free_vram(tier: str | int | float, free_gb: float) -> int:
+    """Shrink a requested tier until its budget fits into the memory that is free now.
+
+    Used when a second model process must share the GPU with a running job, such
+    as the epoch sample rendered while training holds its model. The smallest tier
+    is returned when nothing fits; callers gate on their own free-memory threshold.
+    """
+
+    requested = _normalize_tier(tier, 32.0)
+    try:
+        available = float(free_gb)
+    except (TypeError, ValueError):
+        available = 0.0
+    eligible = [item for item in VRAM_TIERS if item <= requested and TIER_BUDGET_GB[item] <= available]
+    return eligible[-1] if eligible else VRAM_TIERS[0]
+
 
 def _default_aux_residency() -> dict[str, str]:
     return {
@@ -193,33 +233,86 @@ def auto_tier(total_gb: float) -> int:
         capacity = max(0.0, float(total_gb))
     except (TypeError, ValueError):
         capacity = 0.0
-    # CUDA reports a nominal 32 GB card a little below 32 GiB.
-    eligible = [tier for tier in VRAM_TIERS if tier <= capacity + 0.5]
+    eligible = [tier for tier in VRAM_TIERS if tier <= capacity + AUTO_TIER_TOLERANCE_GB]
     return eligible[-1] if eligible else VRAM_TIERS[0]
 
 
-# Calibrated on the RTX 5090 with ``tools/vram_benchmark.py --all --emulate``.
-# The measured per-tier load/peak table lives in ARCHITECTURE_NOTES.md.
+# Inference runtime per tier. Quality is kept as long as possible: every tier keeps
+# the BF16 GPT and pays for a smaller card with speed first (auxiliary models on
+# demand or on CPU, a shorter CFM cache, block streaming) and only then with
+# decoding settings. Calibrated with ``tools/gpu_tier_calibration.py`` on GPU 0
+# (whole-GPU peaks, every process and CUDA context included): 12 GB and above
+# keep everything resident (8.7 GB peak with a LoRA and its decoder adapter);
+# 10 GB moves the two large reference models on demand (6.9 GB); 8 GB runs the
+# semantic encoder on CPU, which frees the 2.2 GB it needs on the GPU during
+# reference encoding, so the GPT no longer streams blocks (5.6 GB, twice as fast
+# as streaming twelve); 6 GB streams 22 of 24 blocks through one ring slot with
+# every reference encoder on CPU (4.3 GB). The measured table is in
+# ARCHITECTURE_NOTES.md.
 _PRESETS: dict[int, dict[str, Any]] = {
     32: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "gpu", "campplus": "gpu", "qwen_emo": "gpu", "cfm": 8192, "s2mel_bf16": False},
     24: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "gpu", "campplus": "gpu", "qwen_emo": "gpu", "cfm": 8192, "s2mel_bf16": False},
-    16: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "gpu", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 8192, "s2mel_bf16": False},
-    12: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "on_demand", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 8192, "s2mel_bf16": False},
-    10: {"model_variant": "bf16", "blocks_to_swap": 8, "ring": 2, "semantic_model": "on_demand", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 6144, "s2mel_bf16": False},
-    8: {"model_variant": "int8_convrot", "blocks_to_swap": 8, "ring": 2, "semantic_model": "on_demand", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 4096, "s2mel_bf16": False},
-    6: {"model_variant": "int8_convrot", "blocks_to_swap": 22, "ring": 1, "semantic_model": "cpu", "campplus": "cpu", "qwen_emo": "cpu", "cfm": 2048, "s2mel_bf16": True},
+    16: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "gpu", "campplus": "gpu", "qwen_emo": "gpu", "cfm": 8192, "s2mel_bf16": False},
+    12: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "gpu", "campplus": "gpu", "qwen_emo": "gpu", "cfm": 8192, "s2mel_bf16": False},
+    10: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "on_demand", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 6144, "s2mel_bf16": False},
+    8: {"model_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "semantic_model": "cpu", "campplus": "gpu", "qwen_emo": "on_demand", "cfm": 4096, "s2mel_bf16": False},
+    6: {"model_variant": "bf16", "blocks_to_swap": 22, "ring": 1, "semantic_model": "cpu", "campplus": "cpu", "qwen_emo": "cpu", "cfm": 2048, "s2mel_bf16": True},
 }
 
 
+# Upper limits used by the stress benchmark and the section-batch hint.
 _HINTS: dict[int, dict[str, int]] = {
-    6: {"num_beams_max": 1, "section_batch_size_max": 1, "max_text_tokens_per_segment": 40, "cfm_cache_length": 2048},
-    8: {"num_beams_max": 2, "section_batch_size_max": 2, "max_text_tokens_per_segment": 80, "cfm_cache_length": 4096},
-    10: {"num_beams_max": 3, "section_batch_size_max": 2, "max_text_tokens_per_segment": 100, "cfm_cache_length": 6144},
-    12: {"num_beams_max": 3, "section_batch_size_max": 4, "max_text_tokens_per_segment": 120, "cfm_cache_length": 8192},
+    6: {"num_beams_max": 2, "section_batch_size_max": 1, "max_text_tokens_per_segment": 60, "cfm_cache_length": 2048},
+    8: {"num_beams_max": 4, "section_batch_size_max": 2, "max_text_tokens_per_segment": 80, "cfm_cache_length": 4096},
+    10: {"num_beams_max": 4, "section_batch_size_max": 2, "max_text_tokens_per_segment": 100, "cfm_cache_length": 6144},
+    12: {"num_beams_max": 4, "section_batch_size_max": 4, "max_text_tokens_per_segment": 120, "cfm_cache_length": 8192},
     16: {"num_beams_max": 4, "section_batch_size_max": 4, "max_text_tokens_per_segment": 120, "cfm_cache_length": 8192},
     24: {"num_beams_max": 6, "section_batch_size_max": 8, "max_text_tokens_per_segment": 160, "cfm_cache_length": 8192},
     32: {"num_beams_max": 8, "section_batch_size_max": 8, "max_text_tokens_per_segment": 200, "cfm_cache_length": 8192},
 }
+
+
+# Generation settings a tier preset selects. Every tier keeps sampling, CFM
+# temperature 0.9 and at least the 40 diffusion steps of the former quality
+# preset; 24 GB and 32 GB cards refine with 50 steps, which costs time, not
+# memory. Four beams are the measured optimum: the decoding sweeps of real
+# training runs scored five beams worse than three on the speech benchmark, so
+# no tier goes higher, and only the 6 GB tier drops to two because the
+# key/value cache grows with the beam count.
+_GENERATION: dict[int, dict[str, Any]] = {
+    32: {"num_beams": 4, "low_memory_mode": False, "diffusion_steps": 50},
+    24: {"num_beams": 4, "low_memory_mode": False, "diffusion_steps": 50},
+    16: {"num_beams": 4, "low_memory_mode": False, "diffusion_steps": 40},
+    12: {"num_beams": 4, "low_memory_mode": False, "diffusion_steps": 40},
+    10: {"num_beams": 4, "low_memory_mode": False, "diffusion_steps": 40},
+    8: {"num_beams": 4, "low_memory_mode": True, "diffusion_steps": 40},
+    6: {"num_beams": 2, "low_memory_mode": True, "diffusion_steps": 40},
+}
+QUALITY_DIFFUSION_STEPS = 40
+BEST_DIFFUSION_STEPS = 50
+QUALITY_CFM_TEMPERATURE = 0.9
+
+
+# LoRA / DoRA training per tier. Training keeps the BF16 base, rank 128, batch
+# size 1 and gradient checkpointing everywhere (checkpointing changed neither the
+# 2.8 GB allocated peak nor the step speed on this model, so it stays on). The
+# resident training run peaks near 4 GB of whole-GPU use, which fits every tier
+# from 8 GB up; only the 6 GB tier streams frozen GPT blocks from CPU (3.2 GB).
+_TRAINING: dict[int, dict[str, Any]] = {
+    32: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    24: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    16: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    12: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    10: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    8: {"base_variant": "bf16", "blocks_to_swap": 0, "ring": 2, "gradient_checkpointing": True},
+    6: {"base_variant": "bf16", "blocks_to_swap": 22, "ring": 1, "gradient_checkpointing": True},
+}
+# Free VRAM a second model process (the per-epoch sample) needs before it is
+# started beside a running training job; the sample shrinks to the tier that
+# fits into the free memory, and the smallest tier needs about 3.5 GB with its
+# CUDA context. Measured beside the resident training run, an 8 GB card has
+# about 4 GB free and skips the sample; a 10 GB card keeps it.
+TRAINING_SAMPLE_MIN_FREE_GB = 4.5
 
 
 def _normalize_tier(tier: str | int | float, gpu_total_gb: float | None = None) -> int:
@@ -250,6 +343,7 @@ def resolve_preset(
         swap_ring_size=row["ring"],
         cfm_cache_length=row["cfm"],
         s2mel_estimator_autocast=row["s2mel_bf16"],
+        vram_reserve_gb=tier_reserve_gb(resolved),
         vram_tier=str(resolved),
         max_section_batch_size_hint=_HINTS[resolved]["section_batch_size_max"],
     )
@@ -264,25 +358,72 @@ def generation_hints(tier: str | int | float) -> dict[str, int]:
     return dict(_HINTS[resolved])
 
 
+def generation_preset(tier: str | int | float) -> dict[str, Any]:
+    """Generation settings selected by a tier preset (beams, batch, cache, quality decoding)."""
+
+    resolved = _normalize_tier(tier, 32.0)
+    row = _GENERATION[resolved]
+    return {
+        "num_beams": int(row["num_beams"]),
+        "section_batch_size": 1,
+        "max_text_tokens_per_segment": 60,
+        "cfm_cache_length": int(_PRESETS[resolved]["cfm"]),
+        "low_memory_mode": bool(row["low_memory_mode"]),
+        "diffusion_steps": int(row["diffusion_steps"]),
+        "cfm_temperature": QUALITY_CFM_TEMPERATURE,
+    }
+
+
+def resolve_training_preset(tier: str | int | float, gpu_total_gb: float | None = None) -> dict[str, Any]:
+    """Training settings selected by a tier preset, keyed like ``TrainConfig`` fields."""
+
+    resolved = _normalize_tier(tier, 32.0 if gpu_total_gb is None else gpu_total_gb)
+    row = _TRAINING[resolved]
+    return {
+        "vram_tier": str(resolved),
+        "base_variant": str(row["base_variant"]),
+        "base_dtype": "bf16",
+        "mixed_precision": "bf16",
+        "gradient_checkpointing": bool(row["gradient_checkpointing"]),
+        "blocks_to_swap": int(row["blocks_to_swap"]),
+        "swap_ring_size": int(row["ring"]),
+        "pin_swap_memory": True,
+        "sample_runtime_tier": "auto",
+        "sample_min_free_vram_gb": TRAINING_SAMPLE_MIN_FREE_GB,
+    }
+
+
 def preset_notes(tier: str | int | float) -> str:
     resolved = _normalize_tier(tier, 32.0)
     config = resolve_preset(resolved, float(resolved))
-    if resolved >= 24:
+    generation = generation_preset(resolved)
+    training = resolve_training_preset(resolved)
+    if resolved >= 12:
         detail = "All core and auxiliary models remain resident for fastest repeated generation."
-    elif resolved >= 16:
-        detail = "GPT stays resident; rarely used emotion analysis moves on demand."
-    elif resolved == 12:
+    elif resolved == 10:
         detail = "GPT stays resident while the two large reference-only models move on demand."
-    elif resolved == 6:
+    elif resolved == 8:
         detail = (
-            "Uses INT8 GPT, streams 22/24 GPT blocks through one ring slot, keeps the reference "
-            "encoders and Qwen emotion model on CPU, uses a 2048-frame CFM cache, and runs only "
-            "the s2mel DiT estimator under BF16 autocast. Beams and section batch are limited to 1. "
-            "The strict 4 GB emulated budget measured 2.63 GB peak reserved, so the 2 GB reserve is retained."
+            "GPT stays resident; the semantic reference encoder runs on CPU (a few seconds per new reference) "
+            "and the emotion-text model moves on demand, with a 4096-frame CFM cache."
         )
     else:
-        detail = f"Streams {config.blocks_to_swap} of 24 GPT blocks and moves large auxiliary models on demand."
-    return f"{resolved} GB preset: {detail} Keeps about {config.vram_reserve_gb:.0f} GB free for generation peaks."
+        detail = (
+            f"Keeps the BF16 GPT but streams {config.blocks_to_swap}/24 GPT blocks through one ring slot, "
+            "keeps the reference encoders and the emotion-text model on CPU, uses a 2048-frame CFM cache, "
+            "and runs only the s2mel DiT estimator under BF16 autocast."
+        )
+    training_detail = (
+        f"Training keeps the BF16 base with rank 128 and streams {training['blocks_to_swap']} of 24 frozen blocks."
+        if training["blocks_to_swap"]
+        else "Training keeps the BF16 base with rank 128 fully resident"
+        + ("." if training["gradient_checkpointing"] else " without gradient checkpointing.")
+    )
+    return (
+        f"{resolved} GB preset: {detail} Generation uses {generation['num_beams']} beams, section batch 1, "
+        f"{generation['diffusion_steps']} diffusion steps. {training_detail} "
+        f"Peak use stays within {tier_budget_gb(resolved):.0f} GB, leaving about {config.vram_reserve_gb:.0f} GB free."
+    )
 
 
 def describe(config: RuntimeConfig) -> str:
@@ -362,12 +503,23 @@ def estimate_vram_gb(config: RuntimeConfig, gpu_total_gb: float) -> dict[str, An
 
 
 __all__ = [
+    "AUTO_TIER_TOLERANCE_GB",
+    "BEST_DIFFUSION_STEPS",
+    "QUALITY_CFM_TEMPERATURE",
+    "QUALITY_DIFFUSION_STEPS",
     "RuntimeConfig",
+    "TIER_BUDGET_GB",
+    "TRAINING_SAMPLE_MIN_FREE_GB",
     "VRAM_TIERS",
     "auto_tier",
     "describe",
     "estimate_vram_gb",
+    "fit_tier_to_free_vram",
     "generation_hints",
+    "generation_preset",
     "preset_notes",
     "resolve_preset",
+    "resolve_training_preset",
+    "tier_budget_gb",
+    "tier_reserve_gb",
 ]

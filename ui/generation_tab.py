@@ -1824,7 +1824,7 @@ def _stream_generation_request(
             # Redirect only this worker's writes while keeping the real console live.
             import contextlib
 
-            with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee), LAZY_ENGINE.in_use():
                 engine = LAZY_ENGINE.get(
                     request["runtime"],
                     progress_file=progress_file,

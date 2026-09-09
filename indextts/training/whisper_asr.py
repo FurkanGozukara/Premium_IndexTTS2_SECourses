@@ -408,6 +408,61 @@ def load_word_timestamps(path: str | Path) -> Transcript:
     return _transcript_from_words(words)
 
 
+def install_lean_encoder(model: Any) -> bool:
+    """Keep the Whisper encoder's attention maps out of memory while generating word timestamps.
+
+    ``return_timestamps="word"`` makes ``generate`` request attention outputs from the
+    whole model, so the encoder stores one 1500 x 1500 map per head and layer for every
+    30 s window (about 6 GB, with a 9 GB peak, for the large-v3-turbo encoder) although
+    the timestamps only use the decoder's cross-attentions. Running the encoder first
+    without attention outputs and handing its result to ``generate`` gives the same
+    timestamps within a fraction of the memory, which is what lets an 8 GB card prepare a
+    dataset. Returns ``False`` when the model has no encoder to wrap.
+    """
+
+    get_encoder = getattr(model, "get_encoder", None)
+    if get_encoder is None or getattr(model, "_indextts_lean_encoder", False):
+        return False
+    encoder = get_encoder()
+    original_forward = getattr(encoder, "forward", None)
+    if original_forward is None:
+        return False
+
+    # Everything else in ``generate`` stays as it is (same inputs, same frame counts,
+    # same eager decoder cross-attentions), so the word times are unchanged; the
+    # encoder simply does not keep its own attention maps.
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        kwargs["output_attentions"] = False
+        return original_forward(*args, **kwargs)
+
+    encoder.forward = forward
+    model._indextts_lean_encoder = True
+    return True
+
+
+def whisper_device_for_free_vram(
+    requested_device: str,
+    free_gb: float | None,
+    *,
+    required_gb: float,
+) -> str:
+    """Return ``requested_device`` when the free VRAM covers ``required_gb``, else ``cpu``.
+
+    A second Whisper model beside the first one on a small card would exceed the card's
+    tier budget; a slower CPU pass for the few clips it is needed for keeps the same
+    result. A CPU request or an unknown free-memory value is returned unchanged.
+    """
+
+    device = str(requested_device or "cuda:0").strip()
+    if not device.lower().startswith("cuda") or free_gb is None:
+        return device
+    try:
+        available = float(free_gb)
+    except (TypeError, ValueError):
+        return device
+    return device if available >= float(required_gb) else "cpu"
+
+
 def transcribe(
     audio_path_or_array: str | Path | np.ndarray,
     sr: int = 24000,
@@ -439,6 +494,7 @@ def transcribe(
             dtype=dtype,
             chunk_length_s=30,
         )
+        install_lean_encoder(pipe.model)
         total_s = waveform.size / float(sample_rate)
         manual_chunk_s = 120.0
         overlap_s = 5.0
@@ -565,8 +621,10 @@ __all__ = [
     "Word",
     "align_caption_words",
     "align_segments_with_words",
+    "install_lean_encoder",
     "load_word_timestamps",
     "normalize_alignment_token",
     "save_word_timestamps",
     "transcribe",
+    "whisper_device_for_free_vram",
 ]

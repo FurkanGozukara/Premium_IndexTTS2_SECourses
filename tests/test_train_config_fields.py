@@ -38,6 +38,16 @@ def test_reference_sampling_and_evaluation_defaults() -> None:
     assert config.eval_train_subset == 48
     assert config.eval_strengths == "1.0"
     assert config.eval_include_base is True
+    assert config.vram_tier == "auto"
+
+
+def test_vram_tier_records_the_selected_gpu_tier() -> None:
+    config = TrainConfig(dataset_dir="dataset", name="adapter", vram_tier="8").validate()
+    assert config.vram_tier == "8"
+    assert TrainConfig.from_dict(config.to_dict()).vram_tier == "8"
+    assert TrainConfig(dataset_dir="dataset", name="adapter", vram_tier=" AUTO ").validate().vram_tier == "auto"
+    old = TrainConfig.from_dict({"dataset_dir": "dataset", "name": "old-adapter"})
+    assert old.vram_tier == "auto"
 
 
 def test_new_fields_round_trip_and_old_configs_receive_defaults() -> None:
@@ -104,6 +114,8 @@ def test_new_fields_round_trip_and_old_configs_receive_defaults() -> None:
         ("sample_speaking_rate", 1.51),
         ("eval_train_subset", -1),
         ("eval_strengths", "1.0, 4.1"),
+        ("vram_tier", "9"),
+        ("vram_tier", "custom"),
     ],
 )
 def test_invalid_new_config_values_raise(field_name: str, value: object) -> None:

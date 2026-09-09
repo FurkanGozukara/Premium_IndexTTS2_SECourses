@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from indextts.runtime import gpu_free_gb, gpu_total_gb, resolve_preset
+from indextts.runtime.vram_presets import RuntimeConfig, auto_tier, fit_tier_to_free_vram
 from indextts.utils.atomic_json import read_json_retry, write_json_atomic
 
 from .dataset_manifest import load_manifest
@@ -48,6 +49,33 @@ def _device_index(device: str) -> int:
         return int(str(device).split(":", 1)[1]) if ":" in str(device) else 0
     except (TypeError, ValueError):
         return 0
+
+
+def resolve_sample_runtime(
+    config: TrainConfig,
+    *,
+    share_gpu: bool,
+    free_gb: float | None = None,
+) -> RuntimeConfig:
+    """Runtime for the isolated generation processes a training run starts.
+
+    ``sample_runtime_tier`` "auto" follows the training's own GPU tier
+    (``vram_tier``) and falls back to the detected card. When the process must
+    share the GPU with the training model (``share_gpu``), the tier shrinks to the
+    largest one whose budget fits into the VRAM that is free right now.
+    """
+
+    index = _device_index(config.device)
+    total = gpu_total_gb(index)
+    free = gpu_free_gb(index) if free_gb is None else float(free_gb)
+    requested = str(config.sample_runtime_tier or "auto").strip().lower()
+    if requested == "auto":
+        training_tier = str(getattr(config, "vram_tier", "auto") or "auto").strip().lower()
+        requested = training_tier if training_tier != "auto" else str(auto_tier(total))
+    resolved = fit_tier_to_free_vram(requested, free) if share_gpu else requested
+    runtime = resolve_preset(str(resolved), total, free)
+    runtime.device = config.device
+    return runtime
 
 
 def _sample_language(config: TrainConfig) -> str:
@@ -98,12 +126,14 @@ def generate_training_sample(
         emit(message)
         return SampleResult(False, message=message, elapsed_s=time.perf_counter() - started)
 
-    runtime = resolve_preset(
-        config.sample_runtime_tier,
-        gpu_total_gb(index),
-        free_gb,
-    )
-    runtime.device = config.device
+    # Training still holds its model, so the sample renders with the largest tier
+    # that fits into the free memory instead of the card's nominal tier.
+    runtime = resolve_sample_runtime(config, share_gpu=True, free_gb=free_gb)
+    if runtime.vram_tier != str(config.sample_runtime_tier).strip().lower():
+        emit(
+            f">> sample runtime tier {runtime.vram_tier} GB fits the {free_gb:.1f} GB free "
+            "beside the training model"
+        )
     runtime.lora_path = str(adapter)
 
     job_dir = output.parent / ".sample_jobs" / f"epoch_{int(epoch):03d}"
@@ -251,4 +281,5 @@ __all__ = [
     "SAMPLE_FIXED_INFER_KWARGS",
     "SampleResult",
     "generate_training_sample",
+    "resolve_sample_runtime",
 ]

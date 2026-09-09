@@ -101,7 +101,7 @@ class RuntimeConfig:
     use_cuda_kernel_bigvgan: bool = False
     s2mel_estimator_autocast: bool = False # BF16 autocast for the CFM DiT only; vocoder stays FP32
     cfm_cache_length: int = 8192           # s2mel CFM estimator cache length
-    vram_reserve_gb: float = 2.0           # VRAM to keep free (presets are designed to leave 2 GB free)
+    vram_reserve_gb: float = 2.0           # VRAM to keep free (tier presets set 1 GB up to 16 GB cards, 2 GB above)
     vram_tier: str = "auto"                # "auto" | "6" | "8" | "10" | "12" | "16" | "24" | "32" | "custom"
     lora_path: str = ""                    # optional LoRA/DoRA safetensors to apply on the GPT
     lora_strength: float = 1.0
@@ -110,37 +110,134 @@ class RuntimeConfig:
 ```
 `RuntimeConfig.to_dict()/from_dict()` must round-trip JSON. `resolve_preset(tier: str, gpu_total_gb: float,
 gpu_free_gb: float) -> RuntimeConfig` returns the preset for a tier (tiers: 6, 8, 10, 12, 16, 24, 32).
-`auto_tier(gpu_total_gb)` picks the largest tier <= physical VRAM. Presets are conservative and leave
-`vram_reserve_gb` (2 GB) free on a GPU of exactly the tier size.
+`auto_tier(gpu_total_gb)` picks the largest tier <= advertised VRAM + 0.5 GB (`AUTO_TIER_TOLERANCE_GB`):
+31.5 GB and above is a 32 GB card, 9.5 GB and above a 10 GB card. `TIER_BUDGET_GB` is the whole-GPU peak a
+tier may reach (6: 5, 8: 7, 10: 9, 12: 11, 16: 15, 24: 22, 32: 30 GiB), `tier_reserve_gb(tier)` the memory
+it leaves free (1 GB up to 16 GB, 2 GB above) and the value `resolve_preset` writes into `vram_reserve_gb`.
+`fit_tier_to_free_vram(tier, free_gb)` shrinks a tier until its budget fits into the free memory; the trainer
+uses it for the per-epoch sample process that runs beside the training model. `generation_preset(tier)` and
+`resolve_training_preset(tier)` return the decoding and `TrainConfig` values a tier selects.
 
-| tier | variant | swap/ring | semantic | CAMPPlus | Qwen | CFM | DiT BF16 | beams/batch/text hints |
-|------|---------|-----------|----------|----------|------|-----|----------|------------------------|
-| 32 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 8 / 8 / 200 |
-| 24 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 6 / 8 / 160 |
-| 16 | bf16 | 0/2 | gpu | gpu | on_demand | 8192 | no | 4 / 4 / 120 |
-| 12 | bf16 | 0/2 | on_demand | gpu | on_demand | 8192 | no | 3 / 4 / 120 |
-| 10 | bf16 | 8/2 | on_demand | gpu | on_demand | 6144 | no | 3 / 2 / 100 |
-| 8 | int8_convrot | 8/2 | on_demand | gpu | on_demand | 4096 | no | 2 / 2 / 80 |
-| 6 | int8_convrot | 22/1 | cpu | cpu | cpu | 2048 | yes | 1 / 1 / 40 |
+## GPU VRAM tier presets (ui/gpu_tier_presets.py, presets/system)
+The read-only system presets are one per tier, named `6 GB GPU` ... `32 GB GPU`; `tier_registry_overrides(tier)`
+flattens the three tables onto registry keys and `PresetStore.ensure_system_presets()` writes them (and removes
+the retired `default`, `quality`, `fast`, `low_vram_8gb` files). Every tier keeps the BF16 GPT, sampling,
+40 diffusion steps and CFM temperature 0.9; a smaller card pays with speed first (block streaming, on-demand
+or CPU auxiliary models, a shorter CFM cache) and only then with fewer beams. Voice, device and optional-loader
+runtime keys (`device`, `lora_*`, `decoder_adapter*`, `use_qwen_emo`, `use_deepspeed`, `attention_backend`,
+`use_accel`, `torch_compile_s2mel`, `use_cuda_kernel_bigvgan`, `gpt_dtype`) stay at the registry defaults.
 
-Calibration was run on idle GPU 0 with `tools/vram_benchmark.py --all --emulate` (seed 123, 2 GB
-allocator reserve) on 2026-09-02. All tiers fit. Values are per-process GiB; high-tier reserved peaks
-reach the deliberate allocator cap.
+| tier | GPT | swap/ring | semantic | CAMPPlus | Qwen | CFM | DiT BF16 | beams | steps | low-memory mode | training swap/ring | sample gate |
+|------|-----|-----------|----------|----------|------|-----|----------|-------|-------|-----------------|--------------------|-------------|
+| 32 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 4 | 50 | off | 0/2 | 4.5 GB |
+| 24 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 4 | 50 | off | 0/2 | 4.5 GB |
+| 16 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 4 | 40 | off | 0/2 | 4.5 GB |
+| 12 | bf16 | 0/2 | gpu | gpu | gpu | 8192 | no | 4 | 40 | off | 0/2 | 4.5 GB |
+| 10 | bf16 | 0/2 | on_demand | gpu | on_demand | 6144 | no | 4 | 40 | off | 0/2 | 4.5 GB |
+| 8 | bf16 | 0/2 | cpu | gpu | on_demand | 4096 | no | 4 | 40 | on | 0/2 | 4.5 GB |
+| 6 | bf16 | 22/1 | cpu | cpu | cpu | 2048 | yes | 2 | 40 | on | 22/1 | 4.5 GB |
 
-| tier | load alloc | peak alloc | peak reserved | audio s | wall s | RTF | mel tok/s |
-|------|-----------:|-----------:|--------------:|--------:|-------:|----:|----------:|
-| 6 | 1.703 | 2.253 | 2.629 | 28.403 | 35.665 | 1.256 | 23.774 |
-| 8 | 2.016 | 4.939 | 4.984 | 48.489 | 29.729 | 0.613 | 53.168 |
-| 10 | 2.364 | 5.287 | 5.357 | 49.533 | 27.910 | 0.563 | 59.523 |
-| 12 | 2.609 | 5.532 | 8.191 | 85.449 | 18.422 | 0.216 | 210.157 |
-| 16 | 4.774 | 7.099 | 12.084 | 85.449 | 17.453 | 0.204 | 192.137 |
-| 24 | 5.884 | 9.952 | 21.996 | 170.899 | 24.359 | 0.143 | 343.382 |
-| 32 | 5.884 | 11.180 | 29.998 | 179.908 | 26.830 | 0.149 | 316.423 |
+The budgets assume the worker owns the card. `ProcessManager.start` (ui/common.py) therefore calls
+`LAZY_ENGINE.release_for_worker(kind)` for every kind in `GPU_WORKER_KINDS` (training, dataset_prep,
+dataset_cache, dataset_curation, checkpoint_eval, grid_generation, vram_benchmark, generation,
+batch_generation) before spawning the child, which unloads models an earlier in-process generation left
+resident (a 32 GB run keeps about 7 GB loaded after one generation; an 8 GB card would otherwise start
+training with 4.6 GB already taken). `LazyEngine.in_use()` wraps the in-process generation and batch
+paths so a running generation is never unloaded underneath; the release then logs that it kept the
+models. `release_engine=` overrides the kind policy for a single start. Measured from the browser on the
+32 GB tier (RTX 5090, one in-process generation followed by a one-epoch training run): the generation
+peaked at 7.15 GiB of whole-GPU use and left 7.1 GiB resident; without the release the training pipeline
+then peaked at 17.71 GiB (resident models + trainer + epoch sample), with it at 11.40 GiB.
 
-The 6 GB tier therefore keeps its strict 2 GB reserve: its 4 GB allocator budget peaked at only 2.629 GiB
-reserved. Its DiT-only BF16 path was compared with FP32 using identical GPT codes, conditioning, CFM noise,
-and 25 diffusion steps on the demo text: mel MSE `0.000255775`, relative MSE `1.6762e-5`, maximum absolute
-mel delta `0.141567` (FP32 mel mean-square `15.2592`).
+Section batch size is 1, text tokens per segment 60 and CFM temperature 0.9 on every tier; `_HINTS` keeps
+the stress maxima the CLI benchmark and the section-batch hint use. Beams stop at four because the decoding
+sweeps of three real training runs scored five beams worse than three (word error +0.1 to +0.8 points,
+identity flat or lower). Training keeps rank 128, alpha 128, batch size 1 and the BF16 base on every tier,
+and its sample, speech-benchmark and decoding-sweep settings stay at the measured defaults (3 beams, 25
+steps) so runs stay comparable across releases; `TrainConfig.vram_tier` records the tier, and
+`indextts.training.sampling.resolve_sample_runtime(config, share_gpu=...)` resolves `sample_runtime_tier`
+"auto" to it (shrinking to the free memory when the sample renders beside the training model, keeping the
+tier for the speech comparison, decoder test and decoding sweep after the model is released).
+
+Calibration is the whole-GPU `nvidia-smi memory.used` peak (every process and CUDA context included) sampled
+every 200 ms by `tools/gpu_tier_calibration.py` while it runs the real workers with a tier's preset values:
+the generation worker (base voice, a LoRA / DoRA with its decoder adapter, emotion-text mode), the dataset
+preparation worker, the voice audit, the feature cache and a one-epoch training run with its sample,
+checkpoint evaluation, speech comparison and decoder adaptation phases. Measured on idle GPU 0 (RTX 5090,
+31.8 GiB) on 2026-09-09 with the tables above; generation of the 29 s calibration passage in a separate
+worker process, so two CUDA contexts (about 1 GB) are included and an in-process generation uses about
+0.5 GB less:
+
+| tier | budget | base voice | LoRA + decoder adapter | emotion text | RTF base / LoRA | notes |
+|------|-------:|-----------:|-----------------------:|-------------:|----------------:|-------|
+| 32 | 30 | 7.89 | 8.68 | 7.88 | 0.58 / 1.04 | |
+| 24 | 22 | 7.89 | 8.68 | 7.88 | 0.56 / 1.05 | same runtime as 32 |
+| 16 | 15 | 7.89 | 8.68 | 7.88 | 0.56 / 1.01 | same runtime as 32 |
+| 12 | 11 | 7.89 | 8.68 | 7.88 | 0.63 / 1.01 | same runtime as 32 |
+| 10 | 9 | 6.62 | 6.90 | | 0.72 / 1.07 | peak while the on-demand semantic encoder is on the GPU |
+| 8 | 7 | 4.60 | 5.64 | 4.80 | 0.61 / 1.07 | streaming 12 blocks with the encoder on demand measured 5.54 / 6.48 at RTF 1.08 / 1.20 |
+| 6 | 5 | 3.62 | 4.34 | 3.58 | 1.92 / 2.19 | a passage twice as long peaked at 3.79; **Prevent VRAM accumulation** raised it to 4.82 |
+
+The training pipeline was measured the same way on a 98-clip, two-recording dataset (one epoch, four
+speech-benchmark prompts, one decoder epoch, no decoding sweep). Whole-GPU peaks per phase, in GiB; the
+"sample beside training" column is the epoch sample rendered while the training model is still loaded,
+which the free-VRAM gate skips on the real card when the two do not fit:
+
+| tier (training swap/ring) | training steps | sample beside training | checkpoint evaluation | speech comparison | decoder adaptation |
+|------|---:|---:|---:|---:|---:|
+| 32, 24, 16, 12 (0/2) | 3.99 | 10.88 | 4.08 | 8.5 to 9.1 | 7.97 |
+| 10 (8/2) | 3.7 (5.8 for 0.4 s at the first validation) | 10.07 | 4.11 | 7.16 | 7.99 |
+| 8 (12/2) | 3.59 | 8.04 | 4.11 | 6.64 | 7.99 |
+| 6 (22/1) | 3.15 | 6.45 | 4.11 | 7.55 | 7.99 |
+
+Training keeps the same speed with or without gradient checkpointing on this model (3.4 versus 3.5 it/s,
+2.8 GB allocated either way), so checkpointing stays on for every tier. Dataset preparation of the two
+recordings peaked at 9.03 GB with the former Whisper alignment path (encoder attention maps), the audit at
+6.70 GB with both Whisper models on the GPU, and the feature cache at 8.90 GB with four clips per batch;
+the fixes described in the release notes (lean encoder, free-VRAM batch size, CPU second opinion) exist for
+those three stages, and the emulated small-card runs below record what remains. The lean encoder
+(`whisper_asr.install_lean_encoder`) was checked on a 150 s excerpt: same 348 words with identical times,
+peak allocated 2.09 GB instead of 4.78 GB, 8.9 s instead of 23.0 s.
+
+Whole-GPU `memory.used` on a large card overstates what a small card needs, because the caching allocator
+keeps freed blocks instead of reclaiming them (the 6 GB speech comparison showed 7.5 GB used while the
+engine's allocated peak stayed at 2.6 GB). `INDEXTTS_VRAM_EMULATE_GB=<tier size>` therefore makes every
+process that imports `indextts.runtime` behave like a card of that size: `apply_emulated_vram_cap()` caps
+its allocator at the tier budget (`torch.cuda.set_per_process_memory_fraction`), `gpu_total_gb()` and
+`list_gpus()` report the tier size (so `auto_tier` detects that tier), and `gpu_free_gb()` returns the
+size minus a driver reserve, an application-context allowance and the process's own reserved memory (so
+the epoch-sample gate and `fit_tier_to_free_vram` decide as they would on the real card). An allocation
+beyond the budget raises `torch.OutOfMemoryError` instead of spilling into shared system memory, which is
+the definitive "does not fit". `tools/gpu_tier_calibration.py --emulate` sets it per tier for every worker
+(dataset preparation, audit and feature cache emulate the smallest requested tier); the app never sets it.
+
+Emulated small-card runs (whole-GPU peaks in GiB, including the calibration process's own context, which
+stands in for the app's; every stage completed under its cap unless noted):
+
+| stage (emulated card) | peak | notes |
+|------|---:|---|
+| dataset preparation, two recordings (6 GB) | 3.67 | lean Whisper encoder; same 104 segments as the unemulated run |
+| voice audit (6 GB) | 4.18 | second-opinion Whisper on the CPU; same 98 retained clips |
+| feature cache (6 GB) | 5.25 | one clip per batch |
+| training 8 GB: steps / sample beside training / checkpoint evaluation / speech comparison / decoder | 3.59 / 6.88 / 4.11 / 8.83 / 5.83 | decoder adaptation completed with the semantic encoder offloaded; the sample ran at exactly the old 4.0 GB gate, which is why the gate is now 4.5 GB |
+| training 10 GB: steps / sample / evaluation / speech / decoder | 3.74 / 6.96 / 4.11 / 7.16 / 5.83 | sample rendered with the 6 GB tier |
+| inference 6 GB: base / LoRA + decoder adapter / emotion text | 3.62 / 4.34 / 3.58 | RTF 1.9 to 2.2 |
+| inference 8 GB: base / LoRA + decoder adapter / emotion text | 4.60 / 5.64 / 4.80 | RTF 0.6 to 1.1 |
+| inference 10 GB: base / LoRA + decoder adapter | 5.95 / 6.90 | RTF 0.6 to 1.1 |
+
+The first emulated 6 GB training run reached the decoder phase with the FP32 semantic encoder still resident
+and ran out of memory there even at the lowest frame limit; `DecoderAdapterTrainer._prepare_prompt_features`
+now caches every prompt clip's features before training and moves the encoder to the CPU, after which the
+decoder phase of the 8 GB and 10 GB emulations peaked at 5.83 GB. With that change the emulated 6 GB
+training pipeline completes end to end: steps 3.8 GB (block streaming), the epoch sample skipped by the
+4.5 GB gate (2.9 GB were free), checkpoint evaluation 4.1 GB, the speech comparison 7.2 GB and the decoder
+adaptation 5.8 GB of whole-GPU use. The post-training phases run in child processes while the trainer keeps
+its CUDA context (about 0.7 GB) beside the application's, so their whole-GPU figure exceeds the 5 GB target
+of the 6 GB tier even though every process stayed under its 5 GB cap; what a real 6 GB card needs is the
+sum of the two idle contexts and the child's allocated peak (about 5.4 GB), which still fits the card.
+The emulated 8 GB re-run with the final table (resident training, 4.5 GB sample gate) measured steps
+3.99 GB, sample skipped, checkpoint evaluation 4.08 GB, speech comparison 6.62 GB and decoder adaptation
+5.80 GB, all within the 7 GB budget.
 
 The engine (`IndexTTS2`) takes a `RuntimeConfig` and must honour every field. The UI must expose every field.
 
@@ -307,10 +404,15 @@ fine-tuned small modules (e.g. `spk_emb_proj`). Metadata (safetensors header `__
 `sample_rate`. Loading must auto-detect rank/alpha/DoRA from metadata (and from tensor shapes as fallback).
 
 ## Presets contract (ui/presets_store.py)
-`presets/system/*.json` are read-only defaults shipped with the app (never written by user actions);
-`presets/user/*.json` are user presets. Each tab registers its components with a key; one universal preset
-stores all tabs' values under `{"_meta": {...}, "values": {key: value}}`. Last used preset name is remembered in
-`presets/user/.last_used_preset.txt`. Loading coerces/clamps values and skips unknown keys.
+`presets/system/*.json` are the read-only GPU VRAM tier presets, regenerated from the registry at every start
+(never written by user actions); `presets/user/*.json` are user presets. Each tab registers its components
+with a key; one universal preset stores all tabs' values under `{"_meta": {...}, "values": {key: value}}`.
+The last used preset name is remembered in `presets/user/.last_used_preset.txt`; when it names a preset that
+no longer exists (a fresh install, or the retired system presets) `PresetStore.get_last_used()` returns
+`default_preset_name()`, the tier preset detected for the GPU (`detect_tier` is injectable for tests).
+Reset and the fallback after deleting a user preset load that preset too. Loading coerces/clamps values and
+skips unknown keys. The runtime saved by **Apply runtime** (`presets/user/.last_runtime.json`) is overlaid
+at start only on a system preset of the same tier (or when it was applied as `custom`), never on a user preset.
 
 ## Console + UI information policy
 Everything the user might want to know is printed to the console AND shown in the UI: model load times and VRAM,

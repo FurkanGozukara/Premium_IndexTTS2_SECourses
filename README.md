@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.12 GPU VRAM presets:** the read-only system presets are now one preset per card size, 6 GB GPU through 32 GB GPU. Each sets the inference runtime, the generation decoding settings and the training settings together, keeps the BF16 GPT and at least the former quality decoding on every card (the 24 and 32 GB presets refine with 50 diffusion steps), and pays for a smaller card with speed before beams. The preset matching the detected GPU is selected on first start (a card counts as a tier from 500 MB below its nominal size); a saved user preset or the preset loaded last is always restored instead. The LoRA / DoRA Training tab gains a **GPU VRAM preset** dropdown beside the dataset, epoch samples render with the tier that fits beside the training model, and `tools/gpu_tier_calibration.py` measures the whole-GPU peak of every stage against each tier's budget.
+
 **V6.11 selection score and clip-length mix:** the speech comparison selects checkpoints by one deployment score (identity gain over Base, minus four times any word-error increase, plus a pause term), dataset preparation aims a quarter of the clips at single sentences and a quarter at medium clips by default (cut only between clear pauses), and training gains checkpoint averaging and decoder training on the GPT's own codes as options, both off by default because they measured worse than the existing defaults. `tools/compare_checkpoint_benchmark.py` compares any checkpoint or decoder on a run's frozen benchmark.
 
 **V6.10 reliability and training safeguards:** fixes cold-start/AUTO decoder loading, checkpoint recommendations, stale speaking-rate settings, cancellation and reconnect races, batch error handling and input forwarding, high-bitrate MP3 and MP4 duration, audio-filter warnings, concurrent logging, and VRAM benchmark accounting. Automatic checkpoint, decoder-strength, and decoding choices now use validation only; an optional independent final test runs after a hash-verified deployment freeze and never retunes that deployment. Unverified decoder gates retain evidence outside automatic loading. The Gradio Changelog contains the full public, product-focused release notes.
@@ -91,13 +93,13 @@ If startup reports missing model files, run `Windows_Model_Download_and_Fix.bat`
 
 ## 2. Know the Workspace Before Generating
 
-The header controls reusable settings; the tab row separates generation, batch work, dataset preparation, training, checkpoint comparison, performance, help, and release history. A fresh V6 install selects the quality preset automatically; an updated installation restores its last-used preset. Start in **Voice Generation** and keep the quality preset for the first successful output.
+The header controls reusable settings; the tab row separates generation, batch work, dataset preparation, training, checkpoint comparison, performance, help, and release history. The read-only system presets are the GPU VRAM tiers, **6 GB GPU** through **32 GB GPU**. A fresh install selects the preset of the detected card automatically (a card counts as a tier from 500 MB below its nominal size); an updated installation restores its last-used preset, and a saved user preset always wins. Start in **Voice Generation** and keep the detected GPU preset for the first successful output.
 
 ![Annotated 4K overview of the IndexTTS 2.5 Premium workspace](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/97GX_9lELPBHRPwdwMxVg.png)
 
 *Figure 1. The first screen is a working console, not a landing page: reference and text are on the left and center, while run controls, progress, results, and logs stay on the right. **Open / close all sections** is the fastest way to expose or collapse advanced controls.*
 
-At startup, earlier result panels stay clean. **Load last values** restores the most recently saved values across every tab. A system preset is marked with a star and is read-only; a user preset can be created, overwritten, loaded, or deleted. **Reset** returns the registered controls to the system default preset without deleting model files or generated outputs.
+At startup, earlier result panels stay clean. **Load last values** restores the most recently saved values across every tab. A system preset is marked with a star and is read-only; a user preset can be created, overwritten, loaded, or deleted. **Reset** returns the registered controls to the GPU VRAM preset detected for this card without deleting model files or generated outputs.
 
 - Voice Generation: one script, one reference workflow, optional candidates and media output.
 - Batch Generation: many TXT, SRT, VTT, or SBV jobs with shared or per-file references.
@@ -322,7 +324,7 @@ For single-speaker narration that includes demonstrations or music, open **Voice
 
 The audit trusts the transcripts you supplied for how names and terms are written. It collects mixed-case words, acronyms, version numbers, and mid-sentence capitalized names from your own subtitles, decodes fresh clip transcriptions with a small beam search, and does not count a recognizer spelling of one of those terms (for example "Swarm UI" or "Rumpod") as a transcript error. Contractions, joined compounds, and okay/OK are normalized on both sides. Missing words, extra words, and different ordinary words still count, so cut endings and music bleed are still rejected.
 
-Clips that fail only the transcript checks get a second opinion from the full `openai/whisper-large-v3` model, which spells technical vocabulary better than the fast turbo model; a clip is kept when the stronger model agrees with your transcript. Numbers, currency, and storage or frequency units are compared in their spoken forms, so "$0.61" matches "61 cents" and "6 GB" matches "6 gigabytes".
+Clips that fail only the transcript checks get a second opinion from the full `openai/whisper-large-v3` model, which spells technical vocabulary better than the fast turbo model; a clip is kept when the stronger model agrees with your transcript. When the card cannot hold that model beside the first one (about 4.5 GB free is needed), the second opinion runs on the CPU for those clips, so a 6 GB card still gets it. Numbers, currency, and storage or frequency units are compared in their spoken forms, so "$0.61" matches "61 cents" and "6 GB" matches "6 gigabytes".
 
 The command-line audit remains available. Add `--transcribe-all --check-boundary-words --min-edge-silence-ms 30` for the same additional checks, and `--second-opinion-whisper ""` to disable the second opinion. `--asr-beams 1` restores greedy decoding, and `--term-prompt` additionally prompts Whisper with each recording's own terms; in measurements that recovered a few more rejected clips but made some clean clips fail, so it is off by default:
 
@@ -332,7 +334,7 @@ python tools/curate_voice_dataset.py datasets/raw datasets/clean --reference ref
 
 Source names are the media filename stems from the manifest. Similarity thresholds screen for contamination and can also reject quiet or atypical clean speech; inspect `quality_audit.jsonl` and `quality_summary.json`. The original dataset remains available. `tools/measure_grid_quality.py` measures a completed listening grid with ASR, speaker/style similarity, pitch and matched-text speaking rate when real target recordings are supplied.
 
-Feature caching runs the expensive base-model preprocessing once and lets training consume compact cached samples. Choose the intended model directory and device, then press **Cache features now**. The semantic encoder uses FP32 to match inference. Cache entries track the audio, transcript and extraction assets; caching regenerates entries made with an older format or changed inputs.
+Feature caching runs the expensive base-model preprocessing once and lets training consume compact cached samples. Choose the intended model directory and device, then press **Cache features now**. The semantic encoder uses FP32 to match inference, and the cache processes as many clips at once as the free VRAM allows (four on a large card, two or one on 8 GB and 6 GB cards). Cache entries track the audio, transcript and extraction assets; caching regenerates entries made with an older format or changed inputs.
 
 ![Annotated 4K training feature-cache workflow](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/9jmwh812EicQJF8oMPO2v.png)
 
@@ -387,7 +389,7 @@ BF16 base weights and BF16 mixed precision are recommended on modern NVIDIA card
 
 *Figure 24. INT8 ConvRot reduces frozen base-weight memory. Block swapping streams selected frozen GPT blocks through a CPU ring; pinned memory improves transfer speed, while ring size 1 uses the least VRAM.*
 
-Use **Apply VRAM tier defaults** instead of guessing a low-memory combination. If training still OOMs, reduce batch size first, keep gradient checkpointing enabled, add block swap, and close other GPU applications. Do not compensate by raising gradient accumulation unless you intentionally want a different optimization regime.
+Use the **GPU VRAM preset** dropdown beside the dataset instead of guessing a low-memory combination: it fills base precision, mixed precision, block swapping, and the sample tier for the training device, is auto-loaded for the detected card, and **Apply VRAM tier defaults** re-applies it. Every tier trains the BF16 base at rank 128 with batch size 1 and gradient checkpointing; the resident run peaks near 4 GB, so only the 6 GB tier streams frozen GPT blocks from CPU, and the per-epoch sample renders with the largest tier that fits into the memory left beside the training model (it is skipped on cards where nothing fits). Starting training releases the models an earlier in-process generation left resident, so the preset budget belongs to the training worker; they reload at the next generation. If training still OOMs, reduce batch size first, keep gradient checkpointing enabled, add block swap, and close other GPU applications. Do not compensate by raising gradient accumulation unless you intentionally want a different optimization regime.
 
 ### Saving, resume modes, and automatic evaluation
 
@@ -538,7 +540,7 @@ Training saves a first estimate from the short epoch sample. Because that compar
 
 ### Inventory, tiers, and applying settings
 
-Refresh GPU inventory, select the actual device, and choose Auto or a 6, 8, 10, 12, 16, 24, or 32 GB tier. Every tier is a coordinated set of model, swapping, cache, and batch hints designed to retain roughly 2 GB of headroom.
+Refresh GPU inventory, select the actual device, and choose Auto or a 6, 8, 10, 12, 16, 24, or 32 GB tier. Every tier is a coordinated set of model, swapping, cache, and batch hints; the 6 GB tier keeps its whole-GPU use within 5 GB, the 8 GB tier within 7 GB, tiers up to 16 GB leave 1 GB free, and the 24 and 32 GB tiers leave 2 GB free. The universal GPU VRAM preset selects the same tier here together with the generation and training settings, so this dropdown is only needed to try another runtime on its own. Any GPU worker started from another tab (training, dataset preparation, feature caching, audits, grids, evaluations, the isolated benchmark, isolated generation) releases the in-process models first, the same way **Unload model / free VRAM** does; a generation that is still running keeps them.
 
 ![Annotated 4K GPU inventory and VRAM tier controls](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/Mm1439DIwxoKjRNJJpYYY.png)
 
@@ -627,15 +629,15 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.11 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.12 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
-A universal preset stores every registered setting across every tab. Select a system preset for a protected baseline, or type a new name and press **Save** to create a user preset. Selecting an existing user preset allows an intentional overwrite.
+A universal preset stores every registered setting across every tab. The seven system presets are the GPU VRAM tiers: **6 GB GPU**, **8 GB GPU**, **10 GB GPU**, **12 GB GPU**, **16 GB GPU**, **24 GB GPU**, and **32 GB GPU**. Each sets the inference runtime, the generation decoding settings, and the LoRA / DoRA training settings together so that generation, dataset preparation, and training fit that card: every tier keeps the BF16 GPT, sampling, CFM temperature 0.9, and at least the 40 diffusion steps of the former quality preset (the 24 and 32 GB presets use 50), every preset from 8 GB up uses the measured optimum of four beams, and a smaller card pays with speed first (reference encoders on demand or on CPU, a shorter CFM cache, and on 6 GB frozen GPT blocks streamed from CPU) before the 6 GB preset drops to two beams. The 6 GB preset stays within 5 GB of whole-GPU use, the 8 GB preset within 7 GB, the 10, 12, and 16 GB presets leave 1 GB free, and the 24 and 32 GB presets leave 2 GB free. Select a system preset for a protected baseline, or type a new name and press **Save** to create a user preset. Selecting an existing user preset allows an intentional overwrite. The seven GPU VRAM presets are read-only in every spelling: **Save** and **Delete** refuse their names with a warning, and the app rewrites their files at every start, so an edited file does not persist either.
 
 ![Annotated 4K universal preset management](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/G7FIvkLqWtjxZbcnQKPJm.png)
 
-*Figure 54. **Load** applies a preset, **Delete** requires the confirmation flow and only removes user presets, **Reset** restores defaults, and **Load last values** recovers the most recent working state. Fresh installs select the quality system preset; upgrades retain the last-used preset. Unknown old keys are ignored and missing new keys receive defaults.*
+*Figure 54. **Load** applies a preset, **Delete** requires the confirmation flow and only removes user presets, **Reset** returns to the GPU VRAM preset detected for this card, and **Load last values** recovers the most recent working state. Fresh installs select the detected GPU's preset; upgrades retain the last-used preset, and an installation that last used one of the retired `default`, `quality`, `fast`, or `low_vram_8gb` presets starts on its GPU's tier. The last runtime applied in Models & Performance is restored only over the preset of its own tier. Unknown old keys are ignored and missing new keys receive defaults. The screenshot predates the tier presets, so its dropdown still lists the old names.*
 
 Press **Light / dark theme** for the preferred presentation. Theme changes the interface only; it does not change audio, model precision, presets, or output files.
 
@@ -701,7 +703,7 @@ All three active paths were generated. A 3-second Natural target produced about 
 
 ### Clean first clone
 
-1. Select the quality system preset and Base model.
+1. Keep the GPU VRAM preset detected for your card and select Base model.
 2. Use one clean 8-15 second speaker reference and one short script in the correct language.
 3. Keep same-speaker emotion, natural rate 1.0, seed fixed, one candidate, and section batch 1.
 4. Generate, inspect the log, and save the good result plus used reference.
@@ -729,10 +731,10 @@ All three active paths were generated. A 3-second Natural target produced about 
 
 ### Recover from low VRAM or OOM
 
-1. Cancel the job and use **Unload model / free VRAM**.
-2. Close other GPU workloads and select the matching conservative VRAM tier.
-3. Use INT8, more block swap, ring 1, lower CFM cache, on-demand auxiliary models, and section batch 1.
-4. Shorten text sections, keep beams 1, apply runtime, and pass the isolated benchmark before retrying.
+1. Cancel the job and use **Unload model / free VRAM** (workers started from other tabs already release the in-process models on their own).
+2. Close other GPU workloads and load the next smaller GPU VRAM preset; it lowers generation, training, and runtime together.
+3. If that is not enough, add block swap, use ring 1, lower the CFM cache, move auxiliary models on demand, and keep section batch 1.
+4. Shorten text sections, reduce beams, apply runtime, and pass the isolated benchmark before retrying.
 
 ### Reproducible A/B test
 
@@ -755,7 +757,7 @@ Reliability improvements cover generation, batching, dataset preparation, featur
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.11-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.12-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -765,7 +767,7 @@ Reliability improvements cover generation, batching, dataset preparation, featur
 
 These are the non-setting actions and result surfaces a regular user will encounter. The numbered guide above shows each in context.
 
-**Header:** Load last values; open/close all sections; switch theme; save, load, delete, or reset a universal preset.
+**Header:** Load last values; open/close all sections; switch theme; save, load, delete, or reset a universal preset (the read-only system presets are the GPU VRAM tiers, and Reset returns to the detected tier).
 
 **Voice Generation:** Upload/load/clear a reference; record a microphone reference; extract time ranges; refresh the reference library; auto-select token budget; upload captions and a still image; generate; cancel; open outputs; refresh adapters; play generated/candidate audio; inspect recent outputs; load a selected output as a new reference.
 
@@ -773,7 +775,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Dataset Preparation:** Refresh/open existing datasets; upload media; scan; prepare; cancel; audit voice and transcripts; stop an audit; cache features; open output; inspect discovered media and stats; select and play prepared segments. Preparation records unresolved sentences in `sentence_rejections.jsonl` and unsafe exported edges in `boundary_rejections.jsonl`; the separate audit records each clip's decision in `quality_audit.jsonl`.
 
-**Training:** Refresh datasets; apply tier defaults; refresh resume sources; start; graceful stop; force stop; open output; compare in grid; use best checkpoint; inspect charts/sample/checkpoints; refresh/open/delete adapter-manager entries.
+**Training:** Refresh datasets; choose a GPU VRAM preset beside the dataset (auto-loaded for the detected card); apply tier defaults; refresh resume sources; start; graceful stop; force stop; open output; compare in grid; use best checkpoint; inspect charts/sample/checkpoints; refresh/open/delete adapter-manager entries.
 
 **Checkpoint Grid:** Refresh adapters; analyze logs; evaluate checkpoints; use best; use stored reference; add dataset candidates; upload a reference; generate/cancel a grid; open saved grid; calibrate speaking rate; play every result cell.
 
@@ -781,11 +783,11 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.11-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.12-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
-The appendix below covers all 267 registered controls, including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs.
+The appendix below covers all 268 registered controls, including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs; the GPU VRAM presets change the runtime, decoding, and training values noted below and keep every other control at its default.
 
 ### Voice Generation - 70 settings
 
@@ -961,7 +963,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Whisper model** - `dataset.whisper_model`. Hugging Face model id or local path used when transcription/alignment is needed. *(default "openai/whisper-large-v3-turbo")*
 
-**Whisper device** - `dataset.whisper_device`. CUDA device recommended for sentence alignment; CPU works but is much slower. *(default "cuda:0")*
+**Whisper device** - `dataset.whisper_device`. CUDA device recommended for sentence alignment; CPU works but is much slower. Word-timestamp alignment keeps only the decoder attentions it needs, so it fits small cards. *(default "cuda:0")*
 
 **Segmentation mode** - `dataset.segmentation_mode`. Sentence aligned uses Whisper word times with caption sentences and is recommended on CUDA. *(default "sentence_aligned"; choices "auto", "sentence_aligned", "cue_boundaries", "whisper_only")*
 
@@ -1059,6 +1061,8 @@ The appendix below covers all 267 registered controls, including current default
 ### LoRA / DoRA Training
 
 **Dataset** - `training.dataset_dir`. Prepared manifest dataset used for cached-feature training. *(default "datasets/voice_dataset")*
+
+**GPU VRAM preset** - `training.vram_tier`. Fits training to the card: base precision, block swap, and the sample tier. The universal preset selects the detected tier; choose another to prepare a run for a smaller GPU. Selecting a value fills the VRAM controls; loading a preset restores it together with them. *(default "auto"; choices "auto", "6", "8", "10", "12", "16", "24", "32")*
 
 **LoRA / DoRA name** - `training.name`. Safe output folder and final safetensors basename. *(default "voice_adapter")*
 
@@ -1216,9 +1220,9 @@ The appendix below covers all 267 registered controls, including current default
 
 **Sample every epochs** - `training.sample_every_epochs`. 1 provides a sample after each completed epoch. *(default 1; minimum 1; maximum 10000)*
 
-**Sample runtime tier** - `training.sample_runtime_tier`. Memory tier for the isolated sampling process. *(default "auto"; choices "auto", "6", "8", "10", "12", "16", "24", "32")*
+**Sample runtime tier** - `training.sample_runtime_tier`. Memory tier for the isolated sampling process. Auto follows the training's GPU VRAM preset; a per-epoch sample rendered beside the training model shrinks further to the largest tier whose budget fits into the free VRAM, while the speech comparison after training keeps the training's tier. *(default "auto"; choices "auto", "6", "8", "10", "12", "16", "24", "32")*
 
-**Minimum free VRAM (GB)** - `training.sample_min_free_vram_gb`. Skips sampling rather than risking training OOM below this free-memory threshold. *(default 6; minimum 0; maximum 128)*
+**Minimum free VRAM (GB)** - `training.sample_min_free_vram_gb`. Skips sampling rather than risking training OOM below this free-memory threshold. The GPU VRAM presets set 4.5 GB, enough for the smallest sample tier beside the training model; an 8 GB card skips the sample, a 10 GB card keeps it. *(default 6; minimum 0; maximum 128)*
 
 **Sample timeout (s)** - `training.sample_timeout_s`. Kills a stuck sampling subprocess after this time. *(default 300; minimum 1; maximum 100000)*
 
@@ -1348,7 +1352,7 @@ The appendix below covers all 267 registered controls, including current default
 
 **Runtime CFM cache length** - `runtime.cfm_cache_length`. Upper cache reservation used when generation does not request a larger value. *(default 8192; minimum 1024; maximum 32768)*
 
-**VRAM reserve (GB)** - `runtime.vram_reserve_gb`. 2 GB is recommended to absorb allocator and generation peaks. *(default 2; minimum 0; maximum 12)*
+**VRAM reserve (GB)** - `runtime.vram_reserve_gb`. Memory the runtime leaves free for allocator and generation peaks; the GPU VRAM presets set 1 GB up to the 16 GB tier and 2 GB for the 24 and 32 GB tiers. *(default 2; minimum 0; maximum 12)*
 
 **Section batch hint** - `runtime.max_section_batch_size_hint`. Advisory maximum shown to generation controls for this runtime. *(default 8; minimum 1; maximum 64)*
 

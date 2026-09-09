@@ -10,6 +10,7 @@ from ui.app import build_app
 from ui.batch_tab import _batch_items, _batch_timer, _item_generation_values
 from ui.common import APP_CSS
 from ui.generation_tab import GENERATION_DEFAULTS
+from ui.gpu_tier_presets import tier_registry_overrides
 from ui.models_tab import _estimate_html, _gpu_total
 from ui.presets_store import PresetStore
 from ui.training_tab import TRAIN_DEFAULTS, _refresh_dataset_updates
@@ -114,7 +115,7 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
         "grid.eval_include_base",
         "grid.num_beams",
     }.issubset(keys)
-    default_path = demo.preset_store.system_dir / "default.json"
+    default_path = demo.preset_store.system_dir / f"{demo.preset_store.default_preset_name()}.json"
     before = {
         path.name: path.read_bytes()
         for path in demo.preset_store.system_dir.glob("*.json")
@@ -129,7 +130,10 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
     assert values["grid.eval_reference_mode"] == ""
     assert values["grid.eval_train_subset"] == 48
     assert values["grid.eval_include_base"] is True
-    assert values["grid.num_beams"] == GENERATION_DEFAULTS["generation.num_beams"]
+    detected = demo.preset_store.detected_tier
+    assert values["grid.num_beams"] == tier_registry_overrides(detected)["grid.num_beams"]
+    assert values["training.vram_tier"] == str(detected)
+    assert values["runtime.vram_tier"] == str(detected)
     assert values["dataset.boundary_mode"] == "sentence"
     assert values["dataset.min_pause_boundary_ms"] == 400
     for preset_path in demo.preset_store.system_dir.glob("*.json"):

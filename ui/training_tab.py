@@ -17,7 +17,7 @@ import pandas as pd
 
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.gpu import gpu_total_gb
-from indextts.runtime.vram_presets import auto_tier, resolve_preset
+from indextts.runtime.vram_presets import VRAM_TIERS, auto_tier, preset_notes, resolve_training_preset
 from indextts.training.charts import GRAD_SERIES, LOSS_SERIES, LR_SERIES, SPEED_SERIES, downsample_series, empty_series_frame, load_metrics, lr_frame, speed_frame
 from indextts.training.analysis import (
     ANALYSIS_SERIES,
@@ -46,7 +46,7 @@ from .common import (
 )
 from .dataset_tab import scan_datasets
 from .generation_tab import GenerationTab
-from .models_tab import ModelsTab, _gpu_total
+from .models_tab import _gpu_total
 from .presets_store import PresetRegistry
 
 
@@ -54,6 +54,96 @@ TRAIN_DEFAULTS = TrainConfig(dataset_dir="datasets/voice_dataset", name="voice_a
 TRAIN_BETAS_TEXT = ", ".join(str(value) for value in TRAIN_DEFAULTS["betas"])
 _LAST_TRAINING_FOLDER = ROOT / "loras"
 TRAINING_TERMINAL_PHASES = _TRAINING_TERMINAL_PHASES
+
+# Training controls a GPU VRAM preset fills, in the order the tier callback returns them.
+TRAINING_TIER_FIELDS = (
+    "base_variant",
+    "base_dtype",
+    "mixed_precision",
+    "gradient_checkpointing",
+    "blocks_to_swap",
+    "swap_ring_size",
+    "pin_swap_memory",
+    "sample_runtime_tier",
+    "sample_min_free_vram_gb",
+)
+_TRAINING_PATH_FIELDS = ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset")
+
+
+def train_config_from_values(values: Mapping[str, Any]) -> TrainConfig:
+    """Build the training contract from flat ``training.*`` preset values."""
+
+    payload = {
+        key.removeprefix("training."): value
+        for key, value in values.items()
+        if key.startswith("training.")
+    }
+    beta_value = payload.get("betas", TRAIN_BETAS_TEXT)
+    if isinstance(beta_value, str):
+        pieces = [piece.strip() for piece in beta_value.split(",")]
+        if len(pieces) != 2:
+            raise ValueError("Adam betas must contain exactly two comma-separated values")
+        payload["betas"] = [float(piece) for piece in pieces]
+    for path_field in _TRAINING_PATH_FIELDS:
+        value = str(payload.get(path_field) or "")
+        if value and path_field in {"dataset_dir", "output_dir", "model_dir", "model_config", "final_test_dataset"}:
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = ROOT / path
+            payload[path_field] = str(path.resolve())
+    return TrainConfig.from_dict(payload)
+
+
+def _training_tier_choices(device_value: str | None) -> list[tuple[str, str]]:
+    total = _gpu_total(device_value)
+    if total > 0:
+        auto_label = f"Auto (detected {total:.1f} GB, tier {auto_tier(total)})"
+    elif str(device_value or "").strip().lower() == "cpu":
+        auto_label = "Auto (CPU training)"
+    else:
+        auto_label = "Auto (no CUDA GPU detected)"
+    return [(auto_label, "auto")] + [(f"{tier} GB", str(tier)) for tier in VRAM_TIERS]
+
+
+def _resolved_training_tier(tier_value: str | None, device_value: str | None) -> str | None:
+    """The nominal tier a selection means on the given device, or ``None`` for CPU."""
+
+    device = str(device_value or "").strip().lower()
+    total = _gpu_total(device)
+    if device == "cpu" or (device in {"", "auto"} and not total):
+        return None
+    requested = str(tier_value or "auto").strip().lower()
+    if requested in {"auto", "custom", ""}:
+        return str(auto_tier(total)) if total else str(VRAM_TIERS[0])
+    return requested
+
+
+def training_tier_values(tier_value: str | None, device_value: str | None) -> dict[str, Any]:
+    """Training settings for a GPU VRAM preset on the selected training device."""
+
+    tier = _resolved_training_tier(tier_value, device_value)
+    if tier is None:
+        return {
+            "base_variant": "bf16",
+            "base_dtype": "fp32",
+            "mixed_precision": "fp32",
+            "gradient_checkpointing": True,
+            "blocks_to_swap": 0,
+            "swap_ring_size": 2,
+            "pin_swap_memory": False,
+            "sample_runtime_tier": "auto",
+            "sample_min_free_vram_gb": TRAIN_DEFAULTS["sample_min_free_vram_gb"],
+        }
+    preset = resolve_training_preset(tier)
+    return {key: preset[key] for key in TRAINING_TIER_FIELDS}
+
+
+def _training_tier_note(tier_value: str | None, device_value: str | None) -> str:
+    tier = _resolved_training_tier(tier_value, device_value)
+    if tier is None:
+        return "CPU training: FP32 base precision, no block swap; samples render on the same device."
+    prefix = "Detected GPU tier" if str(tier_value or "auto").strip().lower() in {"auto", "custom", ""} else "Selected GPU tier"
+    return f"**{prefix}: {tier} GB.** {preset_notes(tier)}"
 
 
 _NON_TRAINING_STATE_FOLDERS = frozenset({"analysis", "eval_jobs", "eval_job", ".sample_jobs", "samples"})
@@ -563,6 +653,9 @@ class TrainingTab:
     dataset_info: Any
     training_plan: Any
     start_event: Any = None
+    vram_tier: Any = None
+    tier_note: Any = None
+    device: Any = None
 
 
 def _reg(
@@ -614,8 +707,20 @@ def build_training_tab(
                 scale=5,
             )
             refresh_dataset = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
+            vram_tier = gr.Dropdown(
+                choices=_training_tier_choices(device_default),
+                value=TRAIN_DEFAULTS["vram_tier"],
+                label="GPU VRAM preset",
+                info=(
+                    "Fits training to the card: base precision, block swap and the sample tier. "
+                    "The universal preset selects the detected tier; choose another to prepare a run for a smaller GPU."
+                ),
+                scale=3,
+            )
         dataset_info = gr.Markdown(_dataset_summary(initial_dataset if Path(initial_dataset).is_dir() else None))
+        tier_note = gr.Markdown(_training_tier_note(TRAIN_DEFAULTS["vram_tier"], device_default), elem_classes=["section-note"])
         _reg(registry, controls, "dataset_dir", dataset, kind="str")
+        _reg(registry, controls, "vram_tier", vram_tier, kind="choice", choices=["auto", *[str(tier) for tier in VRAM_TIERS]])
 
         with gr.Accordion("LoRA / DoRA", open=True):
             with gr.Row():
@@ -777,7 +882,10 @@ def build_training_tab(
                 ring = gr.Slider(1, 4, value=TRAIN_DEFAULTS["swap_ring_size"], step=1, label="Swap ring size", info="2 balances overlap and VRAM; 1 uses the least memory.")
                 pinned = gr.Checkbox(value=TRAIN_DEFAULTS["pin_swap_memory"], label="Pinned swap memory", info="Recommended for faster CPU-to-GPU transfers.")
                 apply_tier = gr.Button("🎚️  Apply VRAM tier defaults", elem_classes=btn("orange"))
-            gr.Markdown("Applies the Models tab's selected tier and device to base precision, mixed precision, and block swapping. Auto and Custom detect that device's VRAM; the training device selection stays separate.")
+            gr.Markdown(
+                "Re-applies the GPU VRAM preset selected beside the dataset to base precision, mixed precision, "
+                "block swapping, and the sample tier for the training device below. Auto detects that device's VRAM."
+            )
             _reg(registry, controls, "base_variant", base_variant, kind="choice", choices=["bf16", "int8_convrot"])
             _reg(registry, controls, "base_dtype", base_dtype, kind="choice", choices=["bf16", "fp16", "fp32"])
             _reg(registry, controls, "mixed_precision", precision, kind="choice", choices=["bf16", "fp16", "fp32"])
@@ -1158,22 +1266,7 @@ def build_training_tab(
     config_components = [spec.component for spec in config_specs]
 
     def build_config(*items: Any) -> TrainConfig:
-        values = dict(zip(config_keys, items))
-        payload = {key.removeprefix("training."): value for key, value in values.items()}
-        beta_value = payload.get("betas", TRAIN_BETAS_TEXT)
-        if isinstance(beta_value, str):
-            pieces = [piece.strip() for piece in beta_value.split(",")]
-            if len(pieces) != 2:
-                raise ValueError("Adam betas must contain exactly two comma-separated values")
-            payload["betas"] = [float(piece) for piece in pieces]
-        for path_field in ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset"):
-            value = str(payload.get(path_field) or "")
-            if value and path_field in {"dataset_dir", "output_dir", "model_dir", "model_config", "final_test_dataset"}:
-                path = Path(value).expanduser()
-                if not path.is_absolute():
-                    path = ROOT / path
-                payload[path_field] = str(path.resolve())
-        return TrainConfig.from_dict(payload)
+        return train_config_from_values(dict(zip(config_keys, items)))
 
     def start_training(*items: Any):
         global _LAST_TRAINING_FOLDER
@@ -1370,6 +1463,27 @@ def build_training_tab(
 
     resume.change(inspect_resume, [resume, adapter_type, rank, alpha], resume_info, queue=False)
 
+    tier_outputs = [controls[f"training.{field_name}"] for field_name in TRAINING_TIER_FIELDS]
+
+    def apply_training_tier(tier_value: str, device_value: str):
+        values = training_tier_values(tier_value, device_value)
+        return (*[values[field_name] for field_name in TRAINING_TIER_FIELDS], _training_tier_note(tier_value, device_value))
+
+    # A user's own selection fills the VRAM controls. Presets restore the dropdown
+    # programmatically together with the controls, so a change event only refreshes the note.
+    vram_tier.input(apply_training_tier, [vram_tier, device], [*tier_outputs, tier_note], queue=False)
+    apply_tier.click(apply_training_tier, [vram_tier, device], [*tier_outputs, tier_note], queue=False)
+    for component in (vram_tier, device):
+        component.change(
+            _training_tier_note,
+            [vram_tier, device],
+            tier_note,
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+            api_name=False,
+        )
+
     def manager_select(paths: list[str], evt: gr.SelectData):
         index = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
         try:
@@ -1442,31 +1556,17 @@ def build_training_tab(
         dataset_info=dataset_info,
         training_plan=training_plan_readout,
         start_event=start_event,
+        vram_tier=vram_tier,
+        tier_note=tier_note,
+        device=device,
     )
 
 
 def bind_training_events(
     tab: TrainingTab,
-    models: ModelsTab,
     generation: GenerationTab,
     main_tabs: Any,
 ) -> None:
-    def apply_tier(tier_value: str, device_value: str):
-        total = _gpu_total(device_value)
-        if device_value == "cpu" or (device_value == "auto" and not total):
-            return "bf16", "fp32", "fp32", 0, 2, False
-        if tier_value in {"auto", "custom"}:
-            tier_value = str(auto_tier(total or 6.0))
-        cfg = resolve_preset(tier_value, total or 6.0)
-        return cfg.model_variant, cfg.gpt_dtype, cfg.gpt_dtype, max(0, cfg.blocks_to_swap), cfg.swap_ring_size, cfg.pin_swap_memory
-
-    tab.apply_tier_button.click(
-        apply_tier,
-        [models.tier, models.device],
-        [tab.base_variant, tab.base_dtype, tab.mixed_precision, tab.blocks_to_swap, tab.swap_ring_size, tab.pin_swap_memory],
-        queue=False,
-    )
-
     lora_component = generation.controls.get("runtime.lora_path")
     if lora_component is not None:
         def refresh_generation_adapters():
@@ -1506,12 +1606,15 @@ def bind_training_events(
 __all__ = [
     "TRAIN_DEFAULTS",
     "TRAINING_TERMINAL_PHASES",
+    "TRAINING_TIER_FIELDS",
     "TrainingTab",
     "adopt_training_state",
     "adapter_rows",
     "bind_training_events",
     "build_training_tab",
     "latest_training_state",
+    "train_config_from_values",
     "training_poll_updates",
     "training_status_updates",
+    "training_tier_values",
 ]

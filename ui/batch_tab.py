@@ -322,7 +322,7 @@ def _poll_batch_item(request: dict[str, Any], subprocess_mode: bool, reuse_model
         def worker() -> None:
             tee = _Tee(sys.stdout, log_path)
             try:
-                with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+                with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee), LAZY_ENGINE.in_use():
                     # "Reload per item" also means reload before the first item,
                     # not just unload the model after it happened to be reused.
                     if not reuse_model:

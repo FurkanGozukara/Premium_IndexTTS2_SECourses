@@ -19,7 +19,7 @@ install_native_enum_pytree_compatibility()
 import gradio as gr
 
 from indextts.runtime.gpu import list_gpus
-from indextts.runtime.vram_presets import RuntimeConfig, auto_tier, describe, resolve_preset
+from indextts.runtime.vram_presets import VRAM_TIERS, RuntimeConfig, auto_tier, describe, resolve_preset
 
 from .batch_tab import bind_batch_events, build_batch_tab
 from .changelog_tab import build_changelog_tab
@@ -52,7 +52,8 @@ from .models_tab import (
     load_persisted_runtime,
     runtime_registry_values,
 )
-from .presets_store import FRESH_INSTALL_PRESET, PresetRegistry, PresetStore, SYSTEM_PREFIX
+from .gpu_tier_presets import tier_preset_name
+from .presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
 from .request_guard import configure_request_guard
 from .training_tab import bind_training_events, build_training_tab
 
@@ -211,8 +212,24 @@ def overlay_persisted_runtime(
     persisted: RuntimeConfig | None,
     *,
     system_preset: bool,
+    detected_tier: int | None = None,
 ) -> dict[str, Any]:
+    """Restore the last applied runtime over a system preset's runtime values.
+
+    The runtime saved by **Apply runtime** belongs to the tier it was applied
+    under. It is restored over a GPU tier preset of the same tier (or a custom
+    runtime the user chose deliberately), never over a different tier's preset,
+    so selecting the 8 GB preset on a 32 GB card keeps the 8 GB runtime after a
+    restart. User presets always keep their own saved runtime.
+    """
+
     if persisted is None or not system_preset:
+        return dict(values)
+    preset_tier = str(values.get("runtime.vram_tier", "auto") or "auto").strip().lower()
+    persisted_tier = str(persisted.vram_tier or "auto").strip().lower()
+    if persisted_tier == "auto" and detected_tier is not None:
+        persisted_tier = str(int(detected_tier))
+    if persisted_tier != "custom" and preset_tier not in {"auto", persisted_tier}:
         return dict(values)
     return registry.coerce({**dict(values), **runtime_registry_values(persisted)})
 
@@ -256,12 +273,35 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     options = _args(args)
     registry = PresetRegistry()
     store = PresetStore(registry, ROOT / "presets")
-    initial_last = store.get_last_used()
-    initial_preset_choices = store.list_presets() or [SYSTEM_PREFIX + FRESH_INSTALL_PRESET]
+    # Retire the old system presets before reading the last-used bookmark, so an
+    # upgraded installation that last used one of them starts on its GPU's tier.
+    retired = store.retire_legacy_system_presets()
+    if retired:
+        print(f">> Retired system presets replaced by GPU VRAM tiers: {', '.join(retired)}", flush=True)
+    default_preset = store.default_preset_name()
+    stored_last = store.stored_last_used()
+    initial_last = stored_last or default_preset
+    # The tier presets are written once every tab has registered its controls;
+    # their names are fixed, so the dropdown can list them before that happens.
+    tier_choices = [SYSTEM_PREFIX + tier_preset_name(tier) for tier in VRAM_TIERS]
+    initial_preset_choices = list(
+        dict.fromkeys(tier_choices + [name for name in store.list_presets() if not name.startswith(SYSTEM_PREFIX)])
+    )
     initial_preset_display = _display_name(store, initial_last)
     if initial_preset_display not in initial_preset_choices:
-        initial_preset_display = SYSTEM_PREFIX + FRESH_INSTALL_PRESET
+        initial_preset_display = SYSTEM_PREFIX + default_preset
     persisted_runtime = load_persisted_runtime()
+    gpus = list_gpus()
+    detected_total = float(gpus[0].total_gb) if gpus else 0.0
+    print(
+        f">> GPU VRAM preset | detected {detected_total:.1f} GB -> {store.detected_tier} GB tier | "
+        + (
+            f"restoring last used preset '{stored_last}'"
+            if stored_last
+            else f"no saved preset; selecting '{default_preset}' for this GPU"
+        ),
+        flush=True,
+    )
 
     with gr.Blocks(title=APP_TITLE) as demo:
         with gr.Row(elem_classes=["app-header"]):
@@ -301,11 +341,15 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 value=initial_preset_display,
                 allow_custom_value=True,
                 label="Universal preset",
-                info="System presets appear first and are read-only; user presets include every registered tab setting.",
+                info=(
+                    "★ GPU VRAM presets (6 to 32 GB) are read-only and fit generation, dataset preparation and "
+                    "training to that card; the one matching your GPU is selected on first start. "
+                    "User presets store every registered setting of every tab."
+                ),
                 scale=4,
             )
             preset_name = gr.Textbox(
-                value="default",
+                value=initial_last,
                 label="Preset name",
                 info="Enter a new user preset name or select an existing user preset to overwrite it.",
                 scale=3,
@@ -339,7 +383,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         bind_generation_events(generation, options, registry)
         bind_batch_events(batch, generation, options, registry)
         bind_dataset_events(dataset, training)
-        bind_training_events(training, models, generation, main_tabs)
+        bind_training_events(training, generation, main_tabs)
         bind_grid_events(grid, training, generation, models, main_tabs)
 
         def loaded_last_values_notice() -> None:
@@ -355,10 +399,6 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         )
 
         store.ensure_system_presets()
-        choices = store.list_presets()
-        selected = _display_name(store, store.get_last_used())
-        if selected not in choices:
-            selected = SYSTEM_PREFIX + "default"
 
         component_specs = registry.component_specs
         preset_components = [spec.component for spec in component_specs]
@@ -368,7 +408,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             requested: str | None,
             runtime_overlay: RuntimeConfig | None = None,
         ):
-            name = requested or "default"
+            name = requested or store.default_preset_name()
             clean = name[len(SYSTEM_PREFIX):] if name.startswith(SYSTEM_PREFIX) else name
             values = store.load(clean)
             values = overlay_persisted_runtime(
@@ -376,9 +416,10 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 values,
                 runtime_overlay,
                 system_preset=store.is_system(clean),
+                detected_tier=store.detected_tier,
             )
             display = _display_name(store, clean)
-            scope = "read-only system" if store.is_system(clean) else "user"
+            scope = "read-only GPU VRAM" if store.is_system(clean) else "user"
             return (
                 gr.update(choices=store.list_presets(), value=display),
                 clean,
@@ -430,7 +471,11 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             try:
                 if not store.delete(clean):
                     gr.Warning(f"User preset '{clean}' was not found")
-                return load_values("default")[:-2] + (f"Deleted user preset **{clean}** and reset to defaults.", "default")
+                fallback = store.default_preset_name()
+                return load_values(fallback)[:-2] + (
+                    f"Deleted user preset **{clean}** and loaded the **{fallback}** preset detected for this GPU.",
+                    fallback,
+                )
             except PermissionError as exc:
                 gr.Warning(str(exc))
                 return (gr.update(choices=store.list_presets(), value=_display_name(store, clean)), clean, *[gr.skip()] * len(preset_components), str(exc), clean)
@@ -444,8 +489,11 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         )
 
         def reset_values():
-            store.set_last_used("default")
-            return load_values("default")[:-2] + ("Reset every registered control to system defaults.", "default")
+            fallback = store.default_preset_name()
+            return load_values(fallback)[:-2] + (
+                f"Reset every registered control to the **{fallback}** preset detected for this GPU.",
+                fallback,
+            )
 
         reset_button.click(
             reset_values,
@@ -455,9 +503,9 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         )
 
         def initial_load(browser_value: str | None):
-            requested = (browser_value or store.get_last_used() or "default").removeprefix(SYSTEM_PREFIX)
+            requested = (browser_value or store.get_last_used()).removeprefix(SYSTEM_PREFIX)
             if _display_name(store, requested) not in store.list_presets():
-                requested = "default"
+                requested = store.default_preset_name()
             overlay = persisted_runtime if store.is_system(requested) else None
             return load_values(requested, overlay)
 
@@ -476,7 +524,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         )
         def refresh_preset_choices(requested: str | None):
             available = store.list_presets()
-            selected_value = requested if requested in available else SYSTEM_PREFIX + "default"
+            selected_value = requested if requested in available else SYSTEM_PREFIX + store.default_preset_name()
             return gr.update(choices=available, value=selected_value)
 
         for refresh_component in (models.refresh_gpu, models.refresh_files):
@@ -491,13 +539,18 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     coverage = startup_request_self_check(registry, options.model_dir)
     startup_values = store.load(initial_last)
     if store.is_system(initial_last) and persisted_runtime is not None:
-        startup_values = overlay_persisted_runtime(
+        overlaid = overlay_persisted_runtime(
             registry,
             startup_values,
             persisted_runtime,
             system_preset=True,
+            detected_tier=store.detected_tier,
         )
-        runtime_source = f"{initial_last} system preset + presets/user/.last_runtime.json"
+        if overlaid != startup_values:
+            startup_values = overlaid
+            runtime_source = f"{initial_last} system preset + presets/user/.last_runtime.json"
+        else:
+            runtime_source = f"{initial_last} system preset"
     else:
         runtime_source = (
             f"{initial_last} user preset"
