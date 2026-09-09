@@ -501,7 +501,12 @@ def build_dataset_tab(
                 short_share = gr.Slider(
                     0, 0.8, value=DATASET_DEFAULTS["short_clip_fraction"], step=0.05,
                     label="Share of single-sentence clips",
-                    info="Sentence-aligned preparation aims this share of clips at one short sentence (about 6 seconds) instead of the target length. 0 keeps every clip near the target. Experimental: in one blind listening comparison a 0.3 share made the adapter rush between sentences and lowered naturalness ratings, while identity and pace measurements improved.",
+                    info="Sentence-aligned preparation aims this share of clips at one short sentence (about 6 seconds) instead of the target length; such a clip is only cut where a clear pause surrounds it, otherwise that start keeps the target. 0 keeps every clip near the target. The default 0.25, with the medium share below, measured better than 0 on the reference voice: higher identity and style similarity at every prompt length, pauses closer to the speaker's, and no change in word error.",
+                )
+                medium_share = gr.Slider(
+                    0, 0.8, value=DATASET_DEFAULTS["medium_clip_fraction"], step=0.05,
+                    label="Share of medium clips",
+                    info="Aims this share of clips at about 10 seconds (one long sentence or two short ones), again only between clear pauses, so the dataset covers every prompt length between a single sentence and a paragraph. Short and medium shares together may not exceed 0.9.",
                 )
             with gr.Row():
                 pad = gr.Slider(0, 500, value=60, step=10, label="Edge padding (ms)", info="Small context padding avoids clipped consonants.")
@@ -513,6 +518,7 @@ def build_dataset_tab(
                 ("target_s", target_s, "float", 1, 30), ("min_s", min_s, "float", 0.5, 15),
                 ("max_s", max_s, "float", 2, 40), ("max_gap_ms", max_gap, "int", 0, 3000),
                 ("short_clip_fraction", short_share, "float", 0, 0.8),
+                ("medium_clip_fraction", medium_share, "float", 0, 0.8),
                 ("pad_ms", pad, "int", 0, 500), ("snap_to_silence", snap, "bool", None, None),
                 ("snap_window_ms", snap_window, "int", 0, 1000), ("min_words", min_words, "int", 0, 30),
                 ("max_words", max_words, "int", 10, 200),

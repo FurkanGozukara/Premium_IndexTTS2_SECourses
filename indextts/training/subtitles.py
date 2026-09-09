@@ -31,6 +31,8 @@ class Segment:
     alignment_coverage: float | None = None
     sentence_aligned: bool | None = None
     boundary: str | None = None
+    # Which clip length the packer aimed this group at: "short", "medium" or "target" (None when not packed).
+    length_aim: str | None = None
 
     @property
     def duration_ms(self) -> int:

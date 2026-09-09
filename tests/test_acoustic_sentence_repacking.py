@@ -211,3 +211,37 @@ def test_single_sentence_share_prefers_short_clips_reproducibly():
     assert [(s.start_ms, s.end_ms) for s in again] == [(s.start_ms, s.end_ms) for s in short]
     with pytest.raises(ValueError, match="short_clip_fraction"):
         _long_config(short_clip_fraction=0.9).validate()
+
+
+def test_medium_share_aims_at_ten_seconds_and_the_two_shares_are_bounded_together():
+    caption, aligned, energy = _long_sentence_fixture()
+    medium, rejected = build_safe_sentence_segments(
+        caption, aligned.words, energy, _long_config(medium_clip_fraction=1.0))
+    assert not rejected
+    # Two sentences (about 12 s) sit closer to the 10 s aim than one (about 6 s); the rest stays whole.
+    assert [s.text for s in medium] == ["Alpha ends. Bravo continues.", "Charlie finishes."]
+    # About 12 s is labeled by the reached class (target-length), the 6 s clip as short.
+    assert medium[0].length_aim in {"medium", "target"} and medium[1].length_aim == "short"
+    assert " ".join(s.text for s in medium) == caption.text
+    packed, _ = build_safe_sentence_segments(caption, aligned.words, energy, _long_config())
+    assert [s.length_aim for s in packed] == ["target"]
+    with pytest.raises(ValueError, match="together"):
+        _long_config(short_clip_fraction=0.5, medium_clip_fraction=0.5).validate()
+    with pytest.raises(ValueError, match="medium_clip_fraction"):
+        _long_config(medium_clip_fraction=0.9).validate()
+
+
+def test_shorter_clips_are_only_cut_between_clear_pauses():
+    caption, aligned, energy = _long_sentence_fixture()
+    # The pause after "ends." is real but narrow: after padding, less than the clear-pause minimum.
+    energy[600:640] = .2
+    energy[600:614] = 0
+    short, rejected = build_safe_sentence_segments(
+        caption, aligned.words, energy, _long_config(short_clip_fraction=1.0))
+    assert not rejected
+    # "Alpha ends." cannot become a short clip at that edge, so its start falls back to the target
+    # length and keeps the sentence inside a longer clip; the clear pause later still yields a short one.
+    assert [s.text for s in short] == ["Alpha ends. Bravo continues.", "Charlie finishes."]
+    # The first clip is labeled by the length it reached (a two-sentence clip), never as short.
+    assert short[0].length_aim != "short" and short[1].length_aim == "short"
+    assert " ".join(s.text for s in short) == caption.text

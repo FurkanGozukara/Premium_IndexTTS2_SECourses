@@ -287,6 +287,30 @@ def paired_difference(rows: list[dict[str, Any]], baseline: list[dict[str, Any]]
             "prompts": len(values), "cluster": "prompt (all generation seeds together)"}
 
 
+# The deployment score ranks the candidates that pass the Base guards, the same way the voice decoder
+# gate judges an adapter: the paired speaker-similarity gain over Base, minus SCORE_WER_WEIGHT times any
+# paired word-error increase (one point of word error costs 0.04 of similarity), plus a pause term that
+# rewards pausing more like the person than Base does (a total pause-time ratio moving from 1.5 to 1.0
+# of the real recordings' earns about 0.02). Candidates within SCORE_MIN_DELTA are tied and the lower
+# validation loss decides, so a run never selects on a difference the benchmark cannot resolve.
+SCORE_WER_WEIGHT = 4.0
+SCORE_PAUSE_WEIGHT = 0.05
+SCORE_MIN_DELTA = 0.002
+
+
+def deployment_score(summary: dict[str, Any], base: dict[str, Any], speaker_gain: float | None,
+                     error_increase: float | None, *, wer_weight: float = SCORE_WER_WEIGHT,
+                     pause_weight: float = SCORE_PAUSE_WEIGHT) -> dict[str, float]:
+    """Speaker gain minus weighted word-error increase plus the pause term, with its parts."""
+    gain = float(speaker_gain) if speaker_gain is not None else 0.0
+    penalty = float(wer_weight) * max(0.0, float(error_increase)) if error_increase is not None else 0.0
+    pause_term = 0.0
+    candidate_ratio, base_ratio = summary.get("pause_ratio_vs_real"), base.get("pause_ratio_vs_real")
+    if candidate_ratio and base_ratio and float(candidate_ratio) > 0 and float(base_ratio) > 0:
+        pause_term = float(pause_weight) * (abs(math.log(float(base_ratio))) - abs(math.log(float(candidate_ratio))))
+    return {"score": gain - penalty + pause_term, "speaker_gain": gain, "wer_penalty": penalty, "pause_term": pause_term}
+
+
 def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str, Any]],
                           policy: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
@@ -306,6 +330,9 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
             sum(row.get("speaker_similarity_real") is not None for row in grouped[c["label"]]) >= MIN_REAL_SPEAKER_ROWS
             for c in candidates):
         speaker_metric = "speaker_similarity_real"
+    wer_weight = float(policy.get("score_wer_weight", SCORE_WER_WEIGHT))
+    pause_weight = float(policy.get("score_pause_weight", SCORE_PAUSE_WEIGHT))
+    score_min_delta = float(policy.get("score_min_delta", SCORE_MIN_DELTA))
     results = []
     for candidate in candidates:
         measured = grouped[candidate["label"]]
@@ -320,24 +347,25 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
                 reasons.append("speaker similarity falls below the allowed Base margin")
             if summary["failure_count"] > base["failure_count"]:
                 reasons.append("more invalid, possibly truncated, or repetitive clips than Base")
+        score = deployment_score(summary, base, speaker["mean"], delta["mean"], wer_weight=wer_weight, pause_weight=pause_weight)
         results.append({**candidate, **summary, "error_delta_vs_base": delta, "speaker_metric": speaker_metric,
-                        "speaker_delta_vs_base": speaker, "eligible": not reasons, "rejection_reasons": reasons})
+                        "speaker_delta_vs_base": speaker, "deployment_score": score, "eligible": not reasons,
+                        "rejection_reasons": reasons})
     eligible = [r for r in results if r["eligible"]]
-    lowest = min(eligible, key=lambda r: r["mean_error_rate"])
-    comparable = []
-    for item in eligible:
-        delta = paired_difference(grouped[item["label"]], grouped[lowest["label"]], "error_rate")
-        # Do not select on a tiny ASR difference within this prompt suite's uncertainty.
-        if delta["mean"] <= 0.002 or delta["ci95"][0] <= 0 <= delta["ci95"][1]:
-            comparable.append(item)
-    best = min(comparable, key=lambda r: (float(r.get("val_loss") if r.get("val_loss") is not None else float("inf")),
-                                          r["mean_error_rate"], r["label"]))
+    top = max(r["deployment_score"]["score"] for r in eligible)
+    # Candidates the score cannot separate are tied; the lower validation loss decides among them.
+    tied = [r for r in eligible if r["deployment_score"]["score"] >= top - score_min_delta]
+    best = min(tied, key=lambda r: (float(r.get("val_loss") if r.get("val_loss") is not None else float("inf")),
+                                    r["mean_error_rate"], r["label"]))
     speaker_note = ("speaker similarity is measured against the real recording of each sentence"
                     if speaker_metric == "speaker_similarity_real" else "speaker similarity is measured against the reference clip")
     return {"status": "complete", "recommended_kind": "adapter" if best["path"] else "base",
             "recommended_checkpoint": best["path"], "recommended_label": best["label"],
             "candidates": results, "listening_status": "not_rated", "speaker_metric": speaker_metric,
-            "decision": f"Observed Base regression guards ({speaker_note}), then paired transcript comparison; validation loss breaks unresolved ties.",
+            "score_policy": {"wer_weight": wer_weight, "pause_weight": pause_weight, "min_delta": score_min_delta},
+            "decision": (f"Observed Base regression guards ({speaker_note}), then the deployment score: paired speaker-similarity "
+                         f"gain over Base minus {wer_weight:g} times any paired word-error increase, plus a pause-time term "
+                         f"(weight {pause_weight:g}); validation loss breaks ties within {score_min_delta:g}."),
             "scope": "Provisional automatic recommendation for this development suite; human listening is still needed to judge naturalness."}
 
 

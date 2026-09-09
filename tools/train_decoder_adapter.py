@@ -40,17 +40,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-test", action="store_true",
                         help="Skip the full-pipeline test against the training's speech benchmark (the adapter is kept regardless)")
     parser.add_argument("--checkpoint", default="", help="GPT checkpoint for the full-pipeline test (default: the speech recommendation)")
+    parser.add_argument("--code-source", choices=("real", "gpt", "mixed"), default="real",
+                        help="Semantic codes the targets are rendered from: the recordings' (real), the GPT checkpoint's teacher-forced predictions (gpt), or half of each (mixed)")
+    parser.add_argument("--gpt-checkpoint", default="", help="GPT checkpoint whose codes are predicted for --code-source gpt/mixed (default: --checkpoint)")
     args = parser.parse_args(argv)
     adapter_dir = Path(args.adapter_dir).expanduser().resolve()
     name = args.name or adapter_dir.name
     output = adapter_dir / f"{name}{DECODER_ADAPTER_SUFFIX}"
     if output.is_file() and not args.overwrite:
         raise SystemExit(f"decoder adapter already exists: {output} (pass --overwrite to replace it)")
+    gpt_checkpoint = args.gpt_checkpoint or args.checkpoint
+    if args.code_source != "real" and not gpt_checkpoint:
+        raise SystemExit("--code-source gpt/mixed needs --gpt-checkpoint (or --checkpoint) to predict the codes with")
     config = DecoderAdapterConfig(
         dataset_dir=str(Path(args.dataset_dir).expanduser().resolve()), output_path=str(output), name=name,
         model_dir=args.model_dir, model_config=str(Path(args.model_dir) / "config.yaml"), device=args.device,
         adapter_type=args.adapter_type, rank=args.rank, alpha=args.alpha, epochs=args.epochs, max_steps=args.max_steps,
-        learning_rate=args.learning_rate, val_split_mode=args.val_split_mode, val_fraction=args.val_fraction, seed=args.seed)
+        learning_rate=args.learning_rate, val_split_mode=args.val_split_mode, val_fraction=args.val_fraction, seed=args.seed,
+        code_source=args.code_source, gpt_checkpoint=str(Path(gpt_checkpoint).expanduser().resolve()) if gpt_checkpoint else "")
     state_dir = adapter_dir / "analysis" / "decoder_adapter_job"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "stop.flag").unlink(missing_ok=True)

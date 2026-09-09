@@ -7,6 +7,22 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.11",
+        "2026-09-09",
+        """
+### Selection by one deployment score, clip-length mix by default, and two new training options
+
+- **Checkpoint selection:** among the checkpoints that pass the Base guards, the speech comparison now selects by the same score the voice decoder gate uses: the paired speaker-similarity gain over Base, minus four times any paired word-error increase, plus a small term for pausing more like the person than Base does; validation loss only breaks ties within 0.002. The report lists the score and its parts for every candidate. Base wins when no adapter beats it on that score.
+- **Clip lengths:** dataset preparation gains **Share of medium clips** (about 10 seconds) beside **Share of single-sentence clips** (about 6 seconds). A shorter clip is only cut where each inner edge sits in a clear pause (about 200 ms of quiet with the default padding); a start that finds none keeps the target length. Each clip records which aim produced it and `dataset_info.json` counts them. Both shares now default to 0.25, so a dataset built from long narration also covers single sentences and short paragraphs; set both to 0 for the previous behavior.
+- **Average the last saved checkpoints** (training, default 0): averages the last N saved updates in parameter space into one more speech-comparison candidate, `<name>_avg_ep<first>_<last>.safetensors`, chosen only when it scores best.
+- **Decoder training codes** (training, default `real`): the voice decoder adapter can train on the selected checkpoint's own teacher-forced code predictions (`gpt`) or half real and half predicted codes (`mixed`) instead of the recordings' codes; `tools/train_decoder_adapter.py --code-source` does the same for an existing folder.
+- **New tool** `tools/compare_checkpoint_benchmark.py`: renders a training's frozen speech benchmark with any checkpoint or decoder adapter and compares it pairwise with the run's own measurement.
+- The learning-rate default stays 4e-5; a sweep found that higher rates reach a lower token loss but generate more word errors.
+
+Restart after updating. Existing adapters, datasets and saved outputs remain compatible; existing presets keep their own clip-share values.
+""".strip(),
+    ),
+    (
         "v6.10",
         "2026-09-08",
         """

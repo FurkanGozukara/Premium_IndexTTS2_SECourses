@@ -1,5 +1,7 @@
 # Best checkpoints of V5, V6, V7 and V8 compared on one recording none of them trained on (7 September 2026)
 
+**Update, 8 September 2026:** the two runs trained since, V9 and V10, were added to this comparison on the same 12 sentences, seeds and settings, with a third condition that generates each run as the app deploys it (own reference, saved rate, voice decoder adapter, swept decoding). See `ADAPTER_COMPARISON_V6_V10_2026-09-08.md`; as deployed, V8, V9 and V10 are within listener noise of each other and V10 is now the recommended default.
+
 Four DoRA adapters of the same voice, each the checkpoint its run selected automatically, compared on identical inputs. Earlier head-to-head grids used sentences from three recordings that V6, V7 and V8 held out but V5 trained on, so they cannot rank V5 fairly. The one recording that none of the four runs trained on is `qwen_2511_tutorial` (V5's independent test recording; a validation recording for V6, V7 and V8, used for their loss checks and checkpoint selection but never for optimization). Twelve of its audited clips (8 to 16 seconds, 20 to 45 words, spread across the recording) are the comparison sentences, each with the narrator's real recording for matched measurements.
 
 Two conditions were generated, three seeds per sentence, the same shared reference clip (V6's frozen final-test reference), strength 1.0 and the fixed comparison settings (3 beams, temperature and top-p 0.8, top-k 30, repetition penalty 10, 25 diffusion steps, CFG 0.7):

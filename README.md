@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.11 selection score and clip-length mix:** the speech comparison selects checkpoints by one deployment score (identity gain over Base, minus four times any word-error increase, plus a pause term), dataset preparation aims a quarter of the clips at single sentences and a quarter at medium clips by default (cut only between clear pauses), and training gains checkpoint averaging and decoder training on the GPT's own codes as options, both off by default because they measured worse than the existing defaults. `tools/compare_checkpoint_benchmark.py` compares any checkpoint or decoder on a run's frozen benchmark.
+
 **V6.10 reliability and training safeguards:** fixes cold-start/AUTO decoder loading, checkpoint recommendations, stale speaking-rate settings, cancellation and reconnect races, batch error handling and input forwarding, high-bitrate MP3 and MP4 duration, audio-filter warnings, concurrent logging, and VRAM benchmark accounting. Automatic checkpoint, decoder-strength, and decoding choices now use validation only; an optional independent final test runs after a hash-verified deployment freeze and never retunes that deployment. Unverified decoder gates retain evidence outside automatic loading. The Gradio Changelog contains the full public, product-focused release notes.
 
 **V6.9 voice decoder adaptation, median-matched references, and a decoding sweep:** training can adapt the semantic-to-mel decoder as an automatic second phase, choose clean reference clips near the speaker's median pitch and pace, and evaluate alternative temperatures, guidance rates, and beam counts. Voice Generation offers automatic, disabled, or explicit decoder selection with an independent strength slider, and can apply the saved speaking rate and accepted decoding settings.
@@ -281,6 +283,7 @@ Press **Scan inputs** before processing. The discovered-media table and statisti
 - Sentence-or-pause recovers more material at aligned-word pauses, with a small risk of less natural cuts.
 - Maximum cue gap controls when nearby caption cues may merge.
 - Minimum pause boundary controls how much silence is needed when punctuation does not provide an edge.
+- Share of single-sentence clips and share of medium clips aim reproducible shares of the packed clips at about 6 and 10 seconds instead of the target, so a dataset built from long narration also covers the single sentences and short paragraphs users type. A shorter clip is only cut where each inner edge sits in a clear pause (about 200 ms of quiet with the default padding); a start that finds none keeps the target length. The dataset summary counts how many clips each aim produced. Both shares default to 0.25: trained on the same audio cut this way, a voice measured higher speaker and style similarity at every prompt length, pauses closer to the speaker's, and a speaking rate that needed no correction, at the same word error.
 - Minimum and maximum word counts remove fragments and implausibly dense transcripts.
 
 ### Cleanup and objective quality gates
@@ -401,7 +404,7 @@ Save an epoch checkpoint so the best-sounding voice is not forced to be the fina
 
 ### Automatic speech comparison and final testing
 
-Before training, the app freezes held-out prompts, training-only voice references and deterministic generation seeds. After token-loss evaluation, it compares Base and up to three checkpoints from this run on 12 balanced prompts plus a longer prompt per voice, using three seeds by default. Transcript errors, speaker similarity and failure checks screen regressions against Base; Base can remain the recommendation. The report also lists each candidate's internal pause time relative to the person's recording of the same sentences, so a voice that rushes between sentences or lingers longer than the narrator is visible even when word error and pace match. **Use best checkpoint** follows the completed speech recommendation.
+Before training, the app freezes held-out prompts, training-only voice references and deterministic generation seeds. After token-loss evaluation, it compares Base and up to three checkpoints from this run on 12 balanced prompts plus a longer prompt per voice, using three seeds by default. Transcript errors, speaker similarity and failure checks screen regressions against Base; Base can remain the recommendation. Among the candidates that pass those guards, one deployment score decides, the same score the voice decoder gate uses: the paired speaker-similarity gain over Base, minus four times any paired word-error increase (a point of word error costs 0.04 of similarity), plus a small term that rewards pausing more like the person than Base does; validation loss only breaks ties within 0.002. The report lists the score and its parts for every candidate, and each candidate's internal pause time relative to the person's recording of the same sentences, so a voice that rushes between sentences or lingers longer than the narrator is visible even when word error and pace match. **Use best checkpoint** follows the completed speech recommendation. **Average the last saved checkpoints** can add the parameter-space mean of the last N saved updates as one more candidate; it is off by default because on the measured voice the averages of the last two and three updates both scored below the final file.
 
 An optional **Final-test dataset** reserves separate source recordings. Its prompts are frozen before training, and only Base and the selected checkpoint are compared after selection is fixed. Final-test results do not reselect another checkpoint. The reports include paired uncertainty estimates, per-clip results and a blind listening-review file. Automated measures do not establish naturalness; see the [selection guide](docs/TRAINING_SELECTION.md) for the policy and limits.
 
@@ -411,7 +414,7 @@ Automatic references (the saved recommended reference, training conditioning, th
 
 ### Voice decoder adaptation
 
-A LoRA / DoRA on the GPT decides what is said and when; the semantic-to-mel decoder decides how the voice sounds and, until now, knew a voice only through the reference clip of each generation. With **Adapt the voice decoder after training** enabled (the default), the run trains a second small adapter on the decoder from the same cached dataset after checkpoint selection, using the decoder's own flow-matching objective with a randomly drawn clip of the speaker as the in-context prompt for every target clip. Checkpoints are selected by how much closer re-rendered held-out clips come to the real recordings, and the adapter is installed only after it also wins a full-pipeline test: the selected checkpoint renders the speech benchmark again with the adapter at strengths 1.0 and 0.6, speaker similarity to the real recordings must rise without a word-error-rate regression, and the better-scoring strength is saved as the adapter's recommended strength. It is saved as `<name>.s2mel.safetensors` next to the GPT adapter, shared by every checkpoint of that training, and Voice Generation applies it automatically whenever that adapter is selected; a rejected file is parked in `analysis/` and the pretrained decoder is kept. Selecting a LoRA / DoRA sets the **Voice decoder adapter** dropdown to the adapter saved with it; choose **None** there to hear the GPT adapter alone, or any other decoder adapter file, and set its strength with the **Voice decoder adapter strength** slider. `tools/train_decoder_adapter.py` adds one to an existing training folder. See the [selection guide](docs/TRAINING_SELECTION.md) for the measurements and limits.
+A LoRA / DoRA on the GPT decides what is said and when; the semantic-to-mel decoder decides how the voice sounds and, until now, knew a voice only through the reference clip of each generation. With **Adapt the voice decoder after training** enabled (the default), the run trains a second small adapter on the decoder from the same cached dataset after checkpoint selection, using the decoder's own flow-matching objective with a randomly drawn clip of the speaker as the in-context prompt for every target clip. Checkpoints are selected by how much closer re-rendered held-out clips come to the real recordings, and the adapter is installed only after it also wins a full-pipeline test: the selected checkpoint renders the speech benchmark again with the adapter at strengths 1.0 and 0.6, speaker similarity to the real recordings must rise without a word-error-rate regression, and the better-scoring strength is saved as the adapter's recommended strength. It is saved as `<name>.s2mel.safetensors` next to the GPT adapter, shared by every checkpoint of that training, and Voice Generation applies it automatically whenever that adapter is selected; a rejected file is parked in `analysis/` and the pretrained decoder is kept. Selecting a LoRA / DoRA sets the **Voice decoder adapter** dropdown to the adapter saved with it; choose **None** there to hear the GPT adapter alone, or any other decoder adapter file, and set its strength with the **Voice decoder adapter strength** slider. `tools/train_decoder_adapter.py` adds one to an existing training folder. **Decoder training codes** chooses what the adapter learns to render: the recordings' own semantic codes (`real`, the default), the selected checkpoint's teacher-forced predictions for the same clips (`gpt`, closer to what generation feeds the decoder), or half of each (`mixed`). On the measured voice the GPT's codes cost more intelligibility than the identity they added at strength 1.0 and kept little identity at 0.6, so `real` remains the default; the option and `--code-source` on the tool are there for other voices. See the [selection guide](docs/TRAINING_SELECTION.md) for the measurements and limits.
 
 ### Per-epoch listening samples
 
@@ -624,7 +627,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.10 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.11 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -752,7 +755,7 @@ Reliability improvements cover generation, batching, dataset preparation, featur
 - Dynamic candidate and dataset-reference players render after reload, feature caching refreshes the training handoff, and completed batch summaries are no longer overwritten by a polling race.
 - Acceleration now honors disabled top-k/top-p limits, preserves stop tokens and compute dtype, and surfaces internal failures instead of silently returning an empty result.
 - Audio tuning preserves sample rate, text-normalization failures retain the original fragment, zero-item validation skips automatic evaluation cleanly, and CPU mode no longer claims a GPU VRAM fit.
-- The Changelog tab renders only when opened and presents the public v6.10-to-v4.0 history plus official project links without slowing initial tab rendering.
+- The Changelog tab renders only when opened and presents the public v6.11-to-v4.0 history plus official project links without slowing initial tab rendering.
 - Every final annotated image passed an exact 3840 x 2160 dimension gate and was individually uploaded to the dedicated Hugging Face discussion.
 - The repaired selectable copy source passed a complete Patreon paste: all 62 hosted images became full-width native image blocks with all 62 alt texts, and the headings, lists, links, and final paragraph were retained.
 
@@ -778,7 +781,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.10-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v6.11-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
@@ -986,7 +989,9 @@ The appendix below covers all 267 registered controls, including current default
 
 **Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. When no pause follows the aligned end of a word, the search may look up to 200 ms back into that word, but only a quiet stretch longer than a stop-consonant closure counts. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
 
-**Share of single-sentence clips** - `dataset.short_clip_fraction`. Sentence-aligned preparation aims this reproducible share of clips at one short sentence of about 6 seconds instead of the target length, so the dataset also contains the sentence lengths generation typically uses. 0 keeps every clip near the target. *(default 0; minimum 0; maximum 0.8)*
+**Share of single-sentence clips** - `dataset.short_clip_fraction`. Sentence-aligned preparation aims this reproducible share of clips at one short sentence of about 6 seconds instead of the target length, so the dataset also contains the sentence lengths generation typically uses; such a clip is only cut between clear pauses, otherwise that start keeps the target. 0 keeps every clip near the target. *(default 0.25; minimum 0; maximum 0.8)*
+
+**Share of medium clips** - `dataset.medium_clip_fraction`. Aims this share of clips at about 10 seconds (one long sentence or two short ones), again only between clear pauses. Short and medium shares together may not exceed 0.9. *(default 0.25; minimum 0; maximum 0.8)*
 
 **Minimum words** - `dataset.min_words`. Drops fragments with too little transcript context. *(default 2; minimum 0; maximum 30)*
 
@@ -1200,6 +1205,10 @@ The appendix below covers all 267 registered controls, including current default
 **Allowed transcript error increase over Base** - `training.speech_eval_max_wer_increase`. Absolute screening margin; 0.02 means two percentage points. Uses CER for Chinese/Japanese and WER for other supported languages. *(default 0.02)*
 
 **Allowed speaker-similarity drop from Base** - `training.speech_eval_max_speaker_drop`. Absolute screening margin for mean speaker similarity. *(default 0.03)*
+
+**Average the last saved checkpoints** - `training.average_last_checkpoints`. After training, this many of the last saved updates (epoch files and the final file) are averaged in parameter space into one more speech-comparison candidate, `<name>_avg_ep<first>_<last>.safetensors`, selected only when it scores best. 0 disables it. *(default 0; minimum 0; maximum 20)*
+
+**Decoder training codes** - `training.decoder_adapter_code_source`. Semantic codes the voice decoder adapter learns to render: `real` (quantized from the recordings, as the decoder was pretrained), `gpt` (the selected checkpoint's teacher-forced predictions for the same clips, predicted once before the decoder trains, greedy plus sampled variants), or `mixed` (half of each). *(default "real"; choices "real", "gpt", "mixed")*
 
 **Final-test dataset (optional)** - `training.final_test_dataset`. Separate prepared source recordings, checked only after selection is fixed. Feature caching is not required for this speech test. *(default blank)*
 

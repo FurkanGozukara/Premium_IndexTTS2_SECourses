@@ -92,6 +92,20 @@ class DecoderAdapterConfig:
     cache_gb: float = 4.0
     max_codes: int = 1500
     max_text_tokens: int = 600
+    # Which semantic codes the targets are rendered from. "real": the codes quantized from the recordings, as
+    # the decoder was pretrained. "gpt": the GPT checkpoint's own teacher-forced predictions for the same
+    # clips, which is what generation actually hands the decoder; "mixed": half of each. The predictions
+    # are made once before training, greedily plus ``gpt_code_variants - 1`` samples drawn with the
+    # generation settings, and a clip uses a different variant every epoch.
+    code_source: str = "real"
+    gpt_checkpoint: str = ""
+    gpt_code_variants: int = 3
+    gpt_code_temperature: float = 0.8
+    gpt_code_top_k: int = 30
+    gpt_code_top_p: float = 0.8
+    base_variant: str = "bf16"
+    base_dtype: str = "bf16"
+    attention_backend: str = "sdpa"
 
     def validate(self) -> "DecoderAdapterConfig":
         self.dataset_dir = str(self.dataset_dir or "")
@@ -158,6 +172,23 @@ class DecoderAdapterConfig:
         self.cache_gb = max(0.0, float(self.cache_gb))
         self.max_codes = max(1, int(self.max_codes))
         self.max_text_tokens = max(1, int(self.max_text_tokens))
+        self.code_source = str(self.code_source or "real").strip().lower()
+        if self.code_source not in {"real", "gpt", "mixed"}:
+            raise ValueError("code_source must be 'real', 'gpt', or 'mixed'")
+        self.gpt_checkpoint = str(self.gpt_checkpoint or "")
+        if self.code_source != "real" and not self.gpt_checkpoint:
+            raise ValueError("gpt_checkpoint is required when code_source is 'gpt' or 'mixed'")
+        self.gpt_code_variants = max(1, int(self.gpt_code_variants))
+        self.gpt_code_temperature = float(self.gpt_code_temperature)
+        if not math.isfinite(self.gpt_code_temperature) or self.gpt_code_temperature <= 0:
+            raise ValueError("gpt_code_temperature must be positive")
+        self.gpt_code_top_k = max(0, int(self.gpt_code_top_k))
+        self.gpt_code_top_p = float(self.gpt_code_top_p)
+        if not 0.0 < self.gpt_code_top_p <= 1.0:
+            raise ValueError("gpt_code_top_p must be in (0, 1]")
+        self.base_variant = str(self.base_variant or "bf16")
+        self.base_dtype = str(self.base_dtype or "bf16")
+        self.attention_backend = str(self.attention_backend or "sdpa")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -219,6 +250,22 @@ def reject_decoder_adapter(output_path: str | Path) -> Path:
     return destination
 
 
+def _sample_codes(logits: torch.Tensor, generator: torch.Generator, *, temperature: float, top_k: int,
+                  top_p: float) -> torch.Tensor:
+    """Draw one code per position from ``logits`` (positions, vocabulary) with the generation sampling rules."""
+    scaled = logits / max(1e-4, float(temperature))
+    if top_k and top_k > 0:
+        threshold = torch.topk(scaled, min(int(top_k), scaled.shape[-1]), dim=-1).values[..., -1:]
+        scaled = scaled.masked_fill(scaled < threshold, float("-inf"))
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_index = torch.sort(scaled, descending=True, dim=-1)
+        probabilities = torch.softmax(sorted_logits, dim=-1)
+        remove = probabilities.cumsum(dim=-1) - probabilities > top_p
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        scaled = torch.full_like(scaled, float("-inf")).scatter(-1, sorted_index, sorted_logits)
+    return torch.multinomial(torch.softmax(scaled, dim=-1), 1, generator=generator).squeeze(-1)
+
+
 class _StatusWriter:
     def __init__(self, state_dir: Path, log_fn: Callable[[str], None] | None) -> None:
         self.state_dir = state_dir
@@ -259,6 +306,9 @@ class DecoderAdapterTrainer:
         self._target_cache: dict[str, torch.Tensor] = {}
         self._cache_bytes = 0
         self._cache_limit = int(self.config.cache_gb * 1024 ** 3)
+        # record id -> GPT-predicted code variants (variant 0 greedy, the rest sampled); empty for real codes.
+        self._gpt_codes: dict[str, list[torch.Tensor]] = {}
+        self._gpt_code_agreement: float | None = None
 
     # ------------------------------------------------------------------ models
     def _load_models(self) -> None:
@@ -397,12 +447,100 @@ class DecoderAdapterTrainer:
         semantic_wave = waveform if sample_rate == SEMANTIC_SAMPLE_RATE else torchaudio.functional.resample(waveform, sample_rate, SEMANTIC_SAMPLE_RATE)
         return mel_wave.to(self.device), semantic_wave.contiguous()
 
+    # ------------------------------------------------------------ GPT codes
+    def _code_variant(self, epoch: int, record: Mapping[str, Any]) -> int | None:
+        """Which content a target renders from this epoch: None for the real codes, else a GPT variant index."""
+        config = self.config
+        record_id = str(record["id"])
+        if config.code_source == "real" or record_id not in self._gpt_codes:
+            return None
+        if config.code_source == "mixed" and _stable_unit_interval(config.seed, "decoder_code_source", epoch, record_id) < 0.5:
+            return None
+        variants = len(self._gpt_codes[record_id])
+        return min(variants - 1, int(_stable_unit_interval(config.seed, "decoder_code_variant", epoch, record_id) * variants))
+
+    def _measured_variant(self) -> int | None:
+        """The variant validation and identity checks render from: the greedy GPT prediction when codes come from the GPT."""
+        return 0 if self.config.code_source != "real" and self._gpt_codes else None
+
     @torch.no_grad()
-    def _target(self, record: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-        """(mel (1, 80, T), semantic content (1, Ts, D)) of a target clip."""
+    def _precompute_gpt_codes(self, datasets: list[LoraTrainDataset]) -> None:
+        """Predict every clip's codes with the GPT checkpoint, teacher-forced, before the decoder trains.
+
+        Generation feeds the decoder the GPT's codes, not the codes quantized from a recording; predicting
+        them with the real prefix keeps them aligned with the real mel frame by frame, which free-running
+        generation would not. Variant 0 is the greedy prediction; the others are sampled with the generation
+        settings. A predicted start or stop token keeps the real code at that position.
+        """
+        from indextts.lora.apply import apply_lora, move_adapters_to_device, remove_lora
+        from .checkpoint_eval import CheckpointEvalConfig, build_evaluation_model
+        from .dataset import collate
+        from .model_forward import gpt_train_step_logits
+
+        config = self.config
+        checkpoint = Path(config.gpt_checkpoint).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"GPT checkpoint for code prediction not found: {checkpoint}")
+        total = sum(len(dataset) for dataset in datasets)
+        self.status.write(phase="initializing", message="predicting semantic codes with the GPT checkpoint")
+        self.status.log(f">> decoder adaptation: predicting the codes of {total} clips with {checkpoint.name} (teacher-forced; "
+                        f"greedy plus {max(0, config.gpt_code_variants - 1)} sampled variants at temperature "
+                        f"{config.gpt_code_temperature:g}, top-k {config.gpt_code_top_k}, top-p {config.gpt_code_top_p:g})")
+        eval_config = CheckpointEvalConfig(adapter_dir=str(checkpoint.parent), dataset_dir=config.dataset_dir,
+                                           device=config.device, base_variant=config.base_variant, base_dtype=config.base_dtype,
+                                           model_dir=config.model_dir, model_config=config.model_config,
+                                           attention_backend=config.attention_backend)
+        gpt = build_evaluation_model(eval_config)
+        apply_lora(gpt, str(checkpoint), 1.0)
+        move_adapters_to_device(gpt, self.device)
+        gpt.eval()
+        limit = min(int(getattr(gpt, "start_mel_token", 8192)), int(getattr(gpt, "stop_mel_token", 8193)))
+        generator = torch.Generator(device=self.device).manual_seed(config.seed + 7)
+        agree = positions = 0
+        done = 0
+        started = time.perf_counter()
+        try:
+            for dataset in datasets:
+                dataset.set_epoch(0)
+                for index in range(len(dataset)):
+                    item = dataset[index]
+                    batch = {key: (value.to(self.device) if isinstance(value, torch.Tensor) else value)
+                             for key, value in collate([item]).items()}
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+                        _text_logits, mel_logits, _values = gpt_train_step_logits(gpt, batch)
+                    length = int(batch["code_lengths"][0])
+                    real = batch["codes"][0, :length].long()
+                    logits = mel_logits[0, :length].float()
+                    variants = [logits.argmax(dim=-1)]
+                    for _ in range(max(0, config.gpt_code_variants - 1)):
+                        variants.append(_sample_codes(logits, generator, temperature=config.gpt_code_temperature,
+                                                      top_k=config.gpt_code_top_k, top_p=config.gpt_code_top_p))
+                    agree += int((variants[0] == real).sum())
+                    positions += length
+                    self._gpt_codes[str(item["id"])] = [torch.where(codes >= limit, real, codes).to(torch.int32).cpu()
+                                                        for codes in variants]
+                    done += 1
+                    if done % 200 == 0 or done == total:
+                        self.status.write(message=f"predicting semantic codes {done}/{total}")
+                        self.status.log(f">> predicted codes for {done}/{total} clips | greedy agreement with the real codes "
+                                        f"{100 * agree / max(1, positions):.1f}% | {time.perf_counter() - started:.0f}s")
+        finally:
+            remove_lora(gpt)
+            del gpt
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        self._gpt_code_agreement = agree / max(1, positions)
+
+    @torch.no_grad()
+    def _target(self, record: Mapping[str, Any], variant: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mel (1, 80, T), semantic content (1, Ts, D)) of a target clip, from its real or GPT-predicted codes."""
         record_id = str(record["id"])
         cached = torch.load(record["cache_path"], map_location="cpu", weights_only=False)
-        codes = torch.as_tensor(cached["codes"], dtype=torch.long).flatten().unsqueeze(0).to(self.device)
+        if variant is not None and record_id in self._gpt_codes:
+            codes = self._gpt_codes[record_id][variant].to(self.device, dtype=torch.long).unsqueeze(0)
+        else:
+            codes = torch.as_tensor(cached["codes"], dtype=torch.long).flatten().unsqueeze(0).to(self.device)
         if record_id in self._target_cache:
             mel = self._target_cache[record_id].to(self.device, dtype=torch.float32)
         else:
@@ -435,9 +573,10 @@ class DecoderAdapterTrainer:
             self._prompt_cache[record_id] = stored
         return mel, feature, style
 
-    def _example(self, target: Mapping[str, Any], prompt: Mapping[str, Any]) -> dict[str, torch.Tensor] | None:
+    def _example(self, target: Mapping[str, Any], prompt: Mapping[str, Any],
+                 variant: int | None = None) -> dict[str, torch.Tensor] | None:
         """One in-context training example: prompt mel and content followed by the target's."""
-        target_mel, target_semantic = self._target(target)
+        target_mel, target_semantic = self._target(target, variant)
         prompt_mel, prompt_feature, style = self._prompt(prompt)
         target_frames, prompt_frames = int(target_mel.shape[-1]), int(prompt_mel.shape[-1])
         if prompt_frames < int(self.config.min_prompt_seconds * self.mel_sample_rate / self.hop_size):
@@ -516,9 +655,10 @@ class DecoderAdapterTrainer:
         self.estimator.eval()
         self._set_adapter_strength(1.0 if adapted else 0.0)
         similarities: list[float] = []
+        variant = self._measured_variant()
         try:
             for target, prompt in pairs:
-                example = self._example(target, prompt)
+                example = self._example(target, prompt, variant)
                 if example is None:
                     continue
                 # The solver draws its own noise; the same seed per clip makes checks comparable.
@@ -540,9 +680,10 @@ class DecoderAdapterTrainer:
         self.estimator.eval()
         losses: list[float] = []
         generator = torch.Generator(device=self.device).manual_seed(self.config.seed)
+        variant = self._measured_variant()
         with torch.no_grad():
             for target, prompt in pairs:
-                example = self._example(target, prompt)
+                example = self._example(target, prompt, variant)
                 if example is None:
                     continue
                 losses.append(float(self._loss(example, generator)))
@@ -566,8 +707,11 @@ class DecoderAdapterTrainer:
     def run(self) -> DecoderAdapterResult:
         config = self.config
         started = time.perf_counter()
-        self._load_models()
         train, val = self._datasets()
+        if config.code_source != "real":
+            # Predict the codes before the decoder models are loaded, so the GPT never shares the GPU with them.
+            self._precompute_gpt_codes([train] + ([val] if val is not None else []))
+        self._load_models()
         total_steps = len(train) * config.epochs
         if config.max_steps:
             total_steps = min(total_steps, config.max_steps)
@@ -584,7 +728,10 @@ class DecoderAdapterTrainer:
         prompt_count = sum(len(items) for items in self._pool.values())
         self.status.log(f">> decoder adaptation plan | {len(train)} training clips, {prompt_count} prompt clips, "
                         f"{len(val_pairs)} validation pairs | {total_steps} updates over {config.epochs} epochs | "
-                        f"learning rate {config.learning_rate:g}")
+                        f"learning rate {config.learning_rate:g} | codes from "
+                        + ("the recordings" if config.code_source == "real" else
+                           f"the GPT checkpoint ({config.code_source}, greedy agreement with the real codes "
+                           f"{100 * (self._gpt_code_agreement or 0):.1f}%)"))
         optimizer = torch.optim.AdamW(self.trainable, lr=config.learning_rate, betas=(0.9, 0.99), eps=1e-8,
                                       weight_decay=config.weight_decay)
         warmup = min(config.warmup_steps, max(1, total_steps // 10))
@@ -738,7 +885,7 @@ class DecoderAdapterTrainer:
                     break
                 record = train.records[index]
                 prompt = self._sample_prompt(record, "train", epoch, record["id"])  # a new clip every epoch
-                example = self._example(record, prompt) if prompt is not None else None
+                example = self._example(record, prompt, self._code_variant(epoch, record)) if prompt is not None else None
                 if example is None:
                     skipped += 1
                     continue
@@ -833,6 +980,7 @@ class DecoderAdapterTrainer:
             **result.to_dict(), "config": config.to_dict(), "validation": val_history, "lr_reductions": lr_reductions,
             "selection": "identity" if select_identity else "loss", "identity_clips": len(identity_pairs),
             "identity_source": identity_source, "target_modules": list(self.adapters),
+            "code_source": config.code_source, "gpt_code_agreement": self._gpt_code_agreement,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "note": ("identity: CAMPPlus similarity between clips re-rendered from their own codes (a different clip of the "
                      "speaker as the prompt) and the real recordings, higher is better; val_loss: flow-matching loss on "

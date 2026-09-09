@@ -246,23 +246,28 @@ def shortlist_checkpoints(run_dir: str | Path, limit: int) -> list[dict[str, Any
             raise ValueError("Speech candidates must belong to this training run")
         row = measured.get(str(path))
         entries.append({"path": str(path), "label": str(item["label"]), "steps": int(item.get("steps", 0)),
-                        "val_loss": row.val_loss if row else item.get("val_loss")})
+                        "val_loss": row.val_loss if row else item.get("val_loss"), "kind": str(item.get("kind") or "")})
     entries.sort(key=lambda r: (r["val_loss"] if r["val_loss"] is not None else float("inf"), -r["steps"], r["path"]))
     distinct = []
     seen = set()
     for item in entries:
-        # Best/final/epoch files can contain exactly the same training update.
-        identity = item["steps"] if item["steps"] else item["path"]
+        # Best/final/epoch files can contain exactly the same training update; an averaged file shares
+        # the newest member's step count but is a different model, so it keeps its own identity.
+        identity = item["path"] if item.get("kind") == "averaged" or not item["steps"] else item["steps"]
         if identity not in seen:
             distinct.append(item)
             seen.add(identity)
     if not distinct:
         raise ValueError("No checkpoints from this run are available for speech evaluation")
-    selected = distinct[:max(1, limit)]
-    latest = max(distinct, key=lambda r: r["steps"])
+    members = [item for item in distinct if item.get("kind") != "averaged"] or distinct
+    selected = members[:max(1, limit)]
+    latest = max(members, key=lambda r: r["steps"])
     if limit > 1 and latest not in selected:
         selected[-1] = latest
-    return [{"label": "Base", "path": "", "steps": 0, "val_loss": base_loss}, *selected]
+    # The averaged checkpoint is always judged by the speech comparison, in addition to the shortlist.
+    selected.extend(item for item in distinct if item.get("kind") == "averaged" and item not in selected)
+    return [{"label": "Base", "path": "", "steps": 0, "val_loss": base_loss},
+            *[{key: value for key, value in item.items() if key != "kind"} for item in selected]]
 
 
 def report_markdown(report: dict[str, Any]) -> str:

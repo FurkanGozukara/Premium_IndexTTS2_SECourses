@@ -542,6 +542,23 @@ class LoraTrainer:
             shutil.copy2(candidate, self.reference_copy)
         return self.reference_copy if self.reference_copy.is_file() else candidate
 
+    def _write_averaged_checkpoint(self) -> None:
+        """Average the last saved updates into one more speech-comparison candidate; never fails training."""
+
+        count = int(getattr(self.config, "average_last_checkpoints", 0) or 0)
+        if count < 2:
+            return
+        if self.stop_path.exists():
+            self.log(">> checkpoint averaging skipped after user cancellation")
+            return
+        try:
+            from .checkpoint_average import write_averaged_checkpoint
+
+            _path, message = write_averaged_checkpoint(self.adapter_dir, self.config.name, count)
+            self.log(">> " + message)
+        except Exception as exc:
+            self.log(f">> checkpoint averaging failed but training weights are safe: {exc}")
+
     def _write_automatic_analysis(self) -> tuple[str, str]:
         """Analyze saved metrics without allowing a reporting error to fail training."""
 
@@ -804,13 +821,21 @@ class LoraTrainer:
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "stop.flag").unlink(missing_ok=True)
         decoder_report_path(output_path).unlink(missing_ok=True)  # a stale report must not describe this run
+        code_source = str(getattr(config, "decoder_adapter_code_source", "real") or "real")
+        gpt_checkpoint = str(recommended_checkpoint or "")
+        if code_source != "real" and not (gpt_checkpoint and Path(gpt_checkpoint).is_file()):
+            # The GPT's own codes need a selected adapter; a Base recommendation trains on the recordings' codes.
+            self.log(">> voice decoder adaptation uses the recordings' codes: no adapter checkpoint was recommended")
+            code_source, gpt_checkpoint = "real", ""
         decoder_config = DecoderAdapterConfig(
             dataset_dir=config.dataset_dir, output_path=str(output_path), name=config.name, model_dir=config.model_dir,
             model_config=config.model_config, device=config.device, adapter_type=config.adapter_type,
             rank=config.decoder_adapter_rank, alpha=config.decoder_adapter_alpha, epochs=config.decoder_adapter_epochs,
             learning_rate=config.decoder_adapter_learning_rate, val_fraction=config.val_fraction,
             val_split_mode=config.val_split_mode, seed=config.seed, max_codes=config.max_codes,
-            max_text_tokens=config.max_text_tokens).validate()
+            max_text_tokens=config.max_text_tokens, code_source=code_source, gpt_checkpoint=gpt_checkpoint,
+            base_variant=config.base_variant, base_dtype=config.base_dtype,
+            attention_backend=config.attention_backend).validate()
         config_path = job_dir / "decoder_config.json"
         atomic_write_json(config_path, decoder_config.to_dict())
         self.write_status(phase="adapting_decoder", decoder_adapter_status="running",
@@ -2084,6 +2109,7 @@ class LoraTrainer:
         stats = memory_stats(device)
         self.write_status(phase="post_training")
         _analysis_path, recommended_checkpoint = self._write_automatic_analysis()
+        self._write_averaged_checkpoint()
         self._write_speaking_rate_calibration()
         terminal_status = read_json_retry(self.status_path, {}) or {}
         terminal_message = str(

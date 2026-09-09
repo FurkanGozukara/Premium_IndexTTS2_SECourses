@@ -23,6 +23,13 @@ PAUSE_LOOKBACK_MS = 200
 CLOSURE_SAFE_QUIET_MS = 100
 # Target used for the share of groups that should stay one short sentence.
 SHORT_CLIP_TARGET_S = 6.0
+# Target used for the share of groups that should stay one long sentence or two short ones.
+MEDIUM_CLIP_TARGET_S = 10.0
+# A group aimed at a short or medium length is only taken when each of its inner edges sits in a
+# pause at least this wide after padding (about 200 ms of quiet with the default 60 ms padding),
+# so the clip keeps the silence a spoken sentence has around it instead of being cut where the
+# speaker ran on; a start that finds no such group falls back to the normal target.
+SHORT_CLIP_MIN_PAUSE_MS = 80
 
 
 def _get(word: Any, key: str, default: Any = None) -> Any:
@@ -189,36 +196,77 @@ def build_safe_sentence_segments(
                   for index, gain in enumerate(boundary_gains)]
 
     short_fraction = min(1.0, max(0.0, float(getattr(config, "short_clip_fraction", 0.0) or 0.0)))
+    medium_fraction = min(1.0 - short_fraction, max(0.0, float(getattr(config, "medium_clip_fraction", 0.0) or 0.0)))
     short_target_s = max(float(config.min_s), min(SHORT_CLIP_TARGET_S, float(config.target_s)))
+    medium_target_s = max(float(config.min_s), min(MEDIUM_CLIP_TARGET_S, float(config.target_s)))
 
-    def target_for(first_index: int) -> float:
-        # A reproducible share of groups aims for one short sentence, so the
-        # dataset also contains the sentence lengths generation typically uses.
-        if short_fraction <= 0.0:
-            return float(config.target_s)
+    def target_for(first_index: int) -> tuple[float, bool]:
+        # A reproducible share of groups aims for one short sentence, and another share for a
+        # medium clip, so the dataset also contains the sentence lengths generation typically
+        # uses. The flag says the aim is shorter than the target: such a group is taken only
+        # between clear pauses, so it keeps the natural silence around a sentence instead of
+        # being clipped out of a run-on, and otherwise the start falls back to the target.
+        if short_fraction <= 0.0 and medium_fraction <= 0.0:
+            return float(config.target_s), False
         digest = hashlib.sha256(f"{config.seed}:{n}:{first_index}".encode("utf-8")).digest()
-        return short_target_s if int.from_bytes(digest[:8], "big") / 2 ** 64 < short_fraction else float(config.target_s)
+        unit = int.from_bytes(digest[:8], "big") / 2 ** 64
+        if unit < short_fraction:
+            return short_target_s, True
+        if unit < short_fraction + medium_fraction:
+            return medium_target_s, True
+        return float(config.target_s), False
+
+    def pause_width_ms(index: int) -> int | None:
+        # Width of the shared pause a boundary sits in, after padding; None at the media edges.
+        if index <= 0 or index >= n:
+            return None
+        end_previous, start_next = boundaries[index]
+        if end_previous is None or start_next is None:
+            return None
+        return int(start_next) - int(end_previous)
+
+    def clear_edges(first_index: int, last_index: int) -> bool:
+        for index in (first_index, last_index + 1):
+            width = pause_width_ms(index)
+            if width is not None and width < SHORT_CLIP_MIN_PAUSE_MS:
+                return False
+        return True
 
     scores: list[tuple[int, float]] = [(0, 0.0)] * (n + 1)
     choices: list[int | None] = [None] * n
     chosen_times: list[tuple[int, int] | None] = [None] * n
+    chosen_aims: list[str] = ["target"] * n
     for first_index in range(n - 1, -1, -1):
         scores[first_index] = scores[first_index + 1]
-        target_s = target_for(first_index)
-        for last_index, word_count in groups[first_index]:
-            start = boundaries[first_index][1]
-            end = boundaries[last_index + 1][0]
-            if start is None or end is None:
-                continue
-            duration = (end - start) / 1000
-            if not (config.min_s <= duration <= config.max_s):
-                continue
-            future = scores[last_index + 1]
-            score = (future[0] + word_count, future[1] - abs(duration - target_s))
-            if score > scores[first_index]:
-                scores[first_index] = score
-                choices[first_index] = last_index
-                chosen_times[first_index] = (start, end)
+        aimed_target_s, shorter = target_for(first_index)
+        attempts = ((aimed_target_s, True), (float(config.target_s), False)) if shorter else ((aimed_target_s, False),)
+        for target_s, strict in attempts:
+            for last_index, word_count in groups[first_index]:
+                start = boundaries[first_index][1]
+                end = boundaries[last_index + 1][0]
+                if start is None or end is None:
+                    continue
+                if strict and not clear_edges(first_index, last_index):
+                    continue
+                duration = (end - start) / 1000
+                if not (config.min_s <= duration <= config.max_s):
+                    continue
+                future = scores[last_index + 1]
+                score = (future[0] + word_count, future[1] - abs(duration - target_s))
+                if score > scores[first_index]:
+                    scores[first_index] = score
+                    choices[first_index] = last_index
+                    chosen_times[first_index] = (start, end)
+                    # Label the length class the clip actually reached, not the aim: a short aim that only
+                    # found a clear-edged two-sentence group is a medium or target-length clip.
+                    if not strict or duration > (medium_target_s + float(config.target_s)) / 2:
+                        chosen_aims[first_index] = "target"
+                    elif duration > (short_target_s + medium_target_s) / 2:
+                        chosen_aims[first_index] = "medium"
+                    else:
+                        chosen_aims[first_index] = "short"
+            if choices[first_index] is not None:
+                break
 
     result: list[Segment] = []
     rejected: list[dict[str, Any]] = []
@@ -248,7 +296,7 @@ def build_safe_sentence_segments(
                 "matched": bool(_get(word, "matched", False)),
             } for word in selected],
             alignment_coverage=sum(bool(_get(word, "matched", False)) for word in selected) / len(selected),
-            sentence_aligned=True, boundary="sentence",
+            sentence_aligned=True, boundary="sentence", length_aim=chosen_aims[index],
         ))
         index = last_index + 1
     return result, rejected

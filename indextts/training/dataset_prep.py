@@ -117,7 +117,12 @@ class DatasetPrepConfig:
     snap_to_silence: bool = True
     snap_window_ms: int = 400
     min_edge_silence_ms: int = 30
-    short_clip_fraction: float = 0.0
+    # Shares of packed clips aimed at one short sentence (about 6 s) and at a medium clip (about 10 s),
+    # cut only between clear pauses. 0.25 and 0.25 measured better than 0 and 0 on the reference voice:
+    # higher identity and style similarity at every prompt length, pauses closer to the speaker's,
+    # a speaking rate that no longer needs correcting, and no change in word error.
+    short_clip_fraction: float = 0.25
+    medium_clip_fraction: float = 0.25
     trim_silence: bool = True
     trim_top_db: float = 40.0
     loudness_normalize: bool = True
@@ -173,6 +178,10 @@ class DatasetPrepConfig:
             raise ValueError("min_edge_silence_ms must be between zero and 500")
         if not 0.0 <= float(self.short_clip_fraction) <= 0.8:
             raise ValueError("short_clip_fraction must be between zero and 0.8")
+        if not 0.0 <= float(self.medium_clip_fraction) <= 0.8:
+            raise ValueError("medium_clip_fraction must be between zero and 0.8")
+        if float(self.short_clip_fraction) + float(self.medium_clip_fraction) > 0.9:
+            raise ValueError("short_clip_fraction and medium_clip_fraction together must not exceed 0.9")
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if not 0 < self.min_s <= self.target_s <= self.max_s:
@@ -1585,6 +1594,8 @@ def run_dataset_prep(
                         )
                         row.update(edge_quality)
                         row["boundary_method"] = "acoustic_sentence_repack" if acoustic_repacked else "silence_snap"
+                        if acoustic_repacked and getattr(segment, "length_aim", None):
+                            row["length_aim"] = str(segment.length_aim)
                         append_manifest_row(manifest_handle, row)
                         rows.append(row)
                         candidates.append(
@@ -1759,6 +1770,10 @@ def run_dataset_prep(
             "minimum_quiet_ms": config.min_edge_silence_ms,
             "pause_lookback_ms": PAUSE_LOOKBACK_MS,
             "short_clip_fraction": float(config.short_clip_fraction),
+            "medium_clip_fraction": float(config.medium_clip_fraction),
+            # How many packed clips were actually cut at each aim; a short or medium aim that found no
+            # clear pause on both edges was packed at the target length instead.
+            "length_aims": {aim: sum(1 for row in rows if row.get("length_aim") == aim) for aim in ("short", "medium", "target")},
             "threshold_dbfs": config.silence_threshold_dbfs,
             "rejected_segments": len(boundary_rejections),
             "rejections": "boundary_rejections.jsonl",

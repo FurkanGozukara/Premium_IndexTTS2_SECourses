@@ -116,6 +116,11 @@ class TrainConfig:
     speech_eval_timeout_s: float = 7200.0
     speech_eval_max_wer_increase: float = 0.02
     speech_eval_max_speaker_drop: float = 0.03
+    # After training, the last N saved updates (epoch files and the final file) can be averaged in parameter
+    # space into one more candidate for the speech comparison. Off by default: on the measured voice the
+    # average of the last two and of the last three updates both lost to the final file (identity -0.004 to
+    # -0.006, word error +0.6 to +1.1 points on the speech benchmark).
+    average_last_checkpoints: int = 0
     final_test_dataset: str = ""
     decoder_adapter_enabled: bool = True
     decoder_adapter_rank: int = 128
@@ -123,6 +128,10 @@ class TrainConfig:
     decoder_adapter_epochs: int = 10
     decoder_adapter_learning_rate: float = 2e-4
     decoder_adapter_timeout_s: float = 7200.0
+    # Which semantic codes the decoder adapter learns to render: "real" (quantized from the recordings, as
+    # the decoder was pretrained), "gpt" (the selected checkpoint's own teacher-forced predictions for the
+    # same clips, what generation actually feeds the decoder), or "mixed" (half of each).
+    decoder_adapter_code_source: str = "real"
     # After the decoder adapter is judged, sweep temperature, guidance rate, and beams on the speech
     # benchmark for the selected checkpoint and save the winner for Voice Generation.
     decoding_sweep_enabled: bool = True
@@ -225,6 +234,7 @@ class TrainConfig:
         self.resume_mode = str(self.resume_mode or "weights_only").lower()
         if self.resume_mode not in {"weights_only", "continue"}:
             raise ValueError("resume_mode must be 'weights_only' or 'continue'")
+        self.average_last_checkpoints = max(0, int(self.average_last_checkpoints))
         self.decoder_adapter_enabled = bool(self.decoder_adapter_enabled)
         self.decoder_adapter_rank = max(1, int(self.decoder_adapter_rank))
         self.decoder_adapter_alpha = _finite_float(self.decoder_adapter_alpha, "decoder_adapter_alpha")
@@ -235,6 +245,9 @@ class TrainConfig:
         if self.decoder_adapter_learning_rate <= 0:
             raise ValueError("decoder_adapter_learning_rate must be positive")
         self.decoder_adapter_timeout_s = max(60.0, float(self.decoder_adapter_timeout_s))
+        self.decoder_adapter_code_source = str(self.decoder_adapter_code_source or "real").strip().lower()
+        if self.decoder_adapter_code_source not in {"real", "gpt", "mixed"}:
+            raise ValueError("decoder_adapter_code_source must be 'real', 'gpt', or 'mixed'")
         self.sample_every_epochs = max(1, int(self.sample_every_epochs))
         self.sample_min_free_vram_gb = max(0.0, float(self.sample_min_free_vram_gb))
         self.sample_timeout_s = max(1.0, float(self.sample_timeout_s))

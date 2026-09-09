@@ -877,6 +877,9 @@ def build_training_tab(
                     label="Allowed transcript error increase over Base", info="Absolute fraction: 0.02 allows two percentage points. Uses CER for Chinese/Japanese and WER for other supported languages.")
                 speech_speaker = gr.Number(value=TRAIN_DEFAULTS["speech_eval_max_speaker_drop"], minimum=0, maximum=1,
                     label="Allowed speaker-similarity drop from Base")
+                average_last = gr.Number(value=TRAIN_DEFAULTS["average_last_checkpoints"], minimum=0, maximum=20, precision=0,
+                    label="Average the last saved checkpoints",
+                    info="After training, this many of the last saved updates (epoch files and the final file) are averaged in parameter space into one more candidate for the speech comparison, which selects it only when it measures best. 0 (the default) disables it: on the measured voice, averages of the last two and three updates both scored below the final file.")
             reference_typical = gr.Checkbox(value=TRAIN_DEFAULTS["reference_typical"], label="Prefer a reference near the speaker's median pitch and pace",
                 info="Among the cleanest training clips near 15 seconds, the saved recommended reference, training conditioning, and the speech benchmark use the clip whose pitch and words per second are closest to the dataset's medians.")
             final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
@@ -890,6 +893,7 @@ def build_training_tab(
                 ("speech_eval_timeout_s", speech_timeout, "float", 1, 100000),
                 ("speech_eval_max_wer_increase", speech_wer, "float", 0, 1),
                 ("speech_eval_max_speaker_drop", speech_speaker, "float", 0, 1),
+                ("average_last_checkpoints", average_last, "int", 0, 20),
                 ("final_test_dataset", final_test, "str", None, None),
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
@@ -906,6 +910,9 @@ def build_training_tab(
             with gr.Row():
                 decoder_lr = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_learning_rate"], minimum=1e-6, maximum=1e-2, label="Decoder learning rate")
                 decoder_timeout = gr.Number(value=TRAIN_DEFAULTS["decoder_adapter_timeout_s"], minimum=60, label="Decoder adaptation timeout (s)")
+                decoder_codes = gr.Dropdown(choices=["real", "gpt", "mixed"], value=TRAIN_DEFAULTS["decoder_adapter_code_source"],
+                    label="Decoder training codes",
+                    info="real: the semantic codes quantized from the recordings, as the decoder was pretrained. gpt: the selected checkpoint's own teacher-forced predictions for the same clips, which is what generation feeds the decoder. mixed: half of each.")
             with gr.Row():
                 decoding_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoding_sweep_enabled"], label="Sweep decoding settings after training",
                     info="Renders the speech benchmark with the selected checkpoint at other temperatures, guidance rates, and beam counts; a change is kept only when it scores better than the defaults, and Voice Generation applies the winner with the adapter.")
@@ -917,6 +924,7 @@ def build_training_tab(
                 ("decoder_adapter_epochs", decoder_epochs, "int", 1, 50),
                 ("decoder_adapter_learning_rate", decoder_lr, "float", 1e-6, 1e-2),
                 ("decoder_adapter_timeout_s", decoder_timeout, "float", 60, 1000000),
+                ("decoder_adapter_code_source", decoder_codes, "str", None, None),
                 ("decoding_sweep_enabled", decoding_enabled, "bool", None, None),
                 ("decoding_sweep_timeout_s", decoding_timeout, "float", 60, 1000000),
             ):

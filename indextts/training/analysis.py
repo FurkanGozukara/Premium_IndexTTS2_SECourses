@@ -43,6 +43,8 @@ GENERALIZATION_LEGEND = (
 
 _EPOCH_RE = re.compile(r"_epoch_(\d+)$", re.IGNORECASE)
 _STEP_RE = re.compile(r"_step_(\d+)$", re.IGNORECASE)
+# ``<name>_avg_ep<first>_<last>``: the parameter-space mean of the last saved updates of a training.
+_AVERAGED_RE = re.compile(r"_avg_ep(\d+)_(\d+)$", re.IGNORECASE)
 
 
 def _utc_now() -> str:
@@ -212,8 +214,11 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     stem = source.stem
     epoch_match = _EPOCH_RE.search(stem)
     step_match = _STEP_RE.search(stem)
+    averaged_match = _AVERAGED_RE.search(stem)
     if source.parent.name.lower() == "best":
         kind = "best"
+    elif averaged_match:
+        kind = "averaged"
     elif epoch_match:
         kind = "epoch"
     elif step_match:
@@ -223,7 +228,7 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     else:
         kind = "final"
     epoch = _integer(info.get("epochs")) or (
-        int(epoch_match.group(1)) if epoch_match else 0
+        int(epoch_match.group(1)) if epoch_match else (int(averaged_match.group(2)) if averaged_match else 0)
     )
     steps = _integer(info.get("steps")) or (
         int(step_match.group(1)) if step_match else 0
@@ -240,6 +245,10 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
             else f"best ({checkpoint_type})"
         )
         file_label = f"best_ep{epoch}" if epoch else "best"
+    elif kind == "averaged":
+        first_epoch, last_epoch = int(averaged_match.group(1)), int(averaged_match.group(2))
+        label = f"averaged (epochs {first_epoch} to {last_epoch} {checkpoint_type})"
+        file_label = f"avg_ep{first_epoch}_{last_epoch}"
     elif kind == "epoch":
         label = f"epoch {epoch} ({checkpoint_type})"
         file_label = f"epoch_{epoch:03d}"
@@ -365,7 +374,7 @@ def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, 
                 descriptors.append(descriptor)
         except Exception:
             continue
-    order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4}
+    order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4, "averaged": 5}
     descriptors.sort(
         key=lambda item: (
             order.get(str(item["kind"]), 9),
