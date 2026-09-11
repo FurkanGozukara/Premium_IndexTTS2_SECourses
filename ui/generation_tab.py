@@ -24,6 +24,7 @@ import gradio as gr
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
 from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
+from indextts.utils.subtitle_utils import SUBTITLE_FORMAT_SUMMARY, SUPPORTED_SUBTITLE_EXTENSIONS
 from indextts.lora.decoder import decoder_adapter_choices, find_decoder_adapter, recommended_decoder_strength
 from indextts.training.dataset_profile import (
     budget_scale_for,
@@ -2813,8 +2814,8 @@ def build_generation_tab(
 
                 with gr.Row():
                     tab.subtitle_file = gr.File(
-                        label="Captions (SRT / VTT / SBV)",
-                        file_types=[".srt", ".vtt", ".sbv"],
+                        label=f"Captions ({SUBTITLE_FORMAT_SUMMARY})",
+                        file_types=list(SUPPORTED_SUBTITLE_EXTENSIONS),
                         type="filepath",
                     )
                     caption_timing = gr.Checkbox(

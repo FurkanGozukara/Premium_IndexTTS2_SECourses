@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.15 broader media and caption format support:** dataset preparation, Voice Generation and Batch Generation accept every caption format in common use (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, and the JSON/TSV transcripts speech recognizers write), recognize the format from the file's content so a mislabeled extension still loads, and skip stray text, missing milliseconds and cue-end mistakes instead of failing the whole file. Media discovery covers the full set of containers and audio formats ffmpeg decodes (WebM, MKV, MOV, MXF, VOB, 3GP, OGV, MKA, Opus, AC3, AMR and more), an explicitly listed file with an unfamiliar extension is kept when it contains audio, damaged downloads are decoded with corrupt packets dropped, and download metadata such as `video.info.json` is never mistaken for captions. The training dashboard now stays responsive for the whole run: each browser tab receives a component only when it changed, charts and tables refresh every few seconds instead of every second, the metrics file is parsed incrementally, and opening the training tab shows the newest run with its charts drawn. A count followed by a plus sign, such as `30+`, no longer breaks English text normalization and is read as "30 plus".
+
 **V6.14 sentence-aware text splitting, speaker-derived pauses, and EMA weights:** the Text & Timing block is redesigned around a **Text splitting** selector with three modes. **Smart sentences** (the new default) packs whole sentences into each speech segment so every line lands near the trained voice's typical clip length and never cuts inside a sentence shorter than the token limit; **Every sentence** renders one sentence per segment; **Token budget** keeps the former greedy splitter. **Sentence pause (ms)** sets the pause between two sentences the splitter separated, measured from the last word to the next, and **Maximum pause (ms)** now sits beside it; with **Auto pauses from LoRA / DoRA dataset** both come from the speaker's own recordings (the median pause between sentences and the length only one in ten of them exceeds), measured once per dataset and shown in a new **Pauses of this speaker** card of the Voice LoRA / DoRA panel. Explicit `[pause:…]` tags are never shortened by the cap, the live preview shows words and seconds per section, **Repetition window (codes)** limits the repetition penalty to the last N generated codes, **Max consecutive silence tokens** is hidden for the IndexTTS 2.5 codec, and training gains **EMA of the adapter weights**, saved beside every epoch and final file and judged by the speech comparison.
 
 
@@ -107,7 +109,7 @@ The header controls reusable settings; the tab row separates generation, batch w
 At startup, earlier result panels stay clean. **Load last values** restores the most recently saved values across every tab. A system preset is marked with a star and is read-only; a user preset can be created, overwritten, loaded, or deleted. **Reset** returns the registered controls to the GPU VRAM preset detected for this card without deleting model files or generated outputs.
 
 - Voice Generation: one script, one reference workflow, optional candidates and media output.
-- Batch Generation: many TXT, SRT, VTT, or SBV jobs with shared or per-file references.
+- Batch Generation: many TXT or caption jobs (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, JSON, TSV) with shared or per-file references.
 - LoRA Dataset Preparation: turn raw audio/video/captions into quality-controlled training clips.
 - LoRA / DoRA Training: train, validate, sample, save, resume, analyze, and manage adapters.
 - Checkpoint Grid: compare base, recommended, final, and epoch checkpoints with identical inputs.
@@ -152,7 +154,7 @@ Use punctuation to create natural boundaries. Enable pause tags when you need ex
 
 ### Use captions and create an MP4
 
-Upload SRT, VTT, or SBV captions to replace or organize the script. With **Use caption cue timing**, each caption unit is retimed to its cue slot and cue start times are preserved. Add a still image only when an MP4 is required.
+Upload captions in any common format (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, or the JSON/TSV files speech recognizers write) to replace or organize the script; the format is recognized from the content, so a mislabeled extension still loads. With **Use caption cue timing**, each caption unit is retimed to its cue slot and cue start times are preserved. Add a still image only when an MP4 is required.
 
 ![Annotated 4K captions, cue timing, and still-image MP4 controls](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/8eVvUoZoJ2GkHOnzgRJfy.png)
 
@@ -253,7 +255,7 @@ Build a queue from uploaded TXT/caption files, pasted text, or a local folder. T
 
 *Figure 11. Naming supports `{index}`, `{name}`, and `{stem}`. Keep output in a safe subfolder under `outputs`, choose shared or same-stem per-file references, then choose cancellable subprocess execution or faster in-process reuse.*
 
-1. Load mixed TXT, SRT, VTT, and SBV sources or point the folder field at a local collection.
+1. Load mixed TXT and caption sources (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, JSON, TSV) or point the folder field at a local collection.
 2. Choose **Shared reference** to use the active Voice Generation reference for every item.
 3. Choose **Per-file reference** when each text/caption file has a same-stem audio file beside it.
 4. Enable **Continue after item errors** for unattended queues; failed rows are recorded while later items continue.
@@ -283,7 +285,7 @@ Press **Scan inputs** before processing. The discovered-media table and statisti
 
 ### Transcripts and sentence-aligned segmentation
 
-**Prefer sidecars** uses SRT/VTT/SBV text and timing when available and lets Whisper fill missing alignment. Sentence-aligned mode with Whisper word times is the recommended CUDA workflow because it preserves complete phrases instead of arbitrary waveform chunks.
+**Prefer sidecars** uses sidecar caption text and timing when available (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, and recognizer JSON/TSV; a `video.en.vtt` next to `video.webm` is matched by its stem, and the format is recognized from the content) and lets Whisper fill missing alignment. Sentence-aligned mode with Whisper word times is the recommended CUDA workflow because it preserves complete phrases instead of arbitrary waveform chunks.
 
 ![Annotated 4K transcript, Whisper, and segmentation controls](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/d5-Whc2PWD4iOAGIhUNab.png)
 
@@ -450,7 +452,7 @@ The final group sets output root, model directory and YAML, training device, att
 
 ### Start, stop, and read the live dashboard
 
-Press **Start training** only after the optimizer-update plan looks sensible. The live dashboard reports epoch, optimizer step, loss, validation, learning rate, gradient norm, throughput, elapsed time, ETA, VRAM, samples, and the worker log.
+Press **Start training** only after the optimizer-update plan looks sensible. The live dashboard reports epoch, optimizer step, loss, validation, learning rate, gradient norm, throughput, elapsed time, ETA, VRAM, samples, and the worker log. The progress panel, status line and log refresh every second; the charts, checkpoint table and sample player refresh every few seconds and only when they changed, so the page stays responsive however long the run lasts.
 
 ![Annotated 4K live DoRA training dashboard](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/D5RqDxQcubEHWzZqHLo5M.png)
 
@@ -650,7 +652,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.14 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.15 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -738,7 +740,7 @@ All three active paths were generated. A 3-second Natural target produced about 
 
 ### Subtitle-timed localization video
 
-1. Upload the translated SRT/VTT/SBV and enable caption cue timing.
+1. Upload the translated captions (SRT, VTT, SBV, ASS, TTML or another supported format) and enable caption cue timing.
 2. Choose Natural duration behavior for model-based timing or Trim/Pad only when mechanical bounds are acceptable.
 3. Add a still image for MP4, generate one representative cue set, and check starts and final duration.
 4. Batch the remaining caption files only after the representative item passes.

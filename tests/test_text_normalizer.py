@@ -72,3 +72,12 @@ def test_normalizer_preserves_text_when_wetext_rejects_fragment(
     output = capsys.readouterr().out
     assert "using the original text" in output
     assert "Traceback" not in output
+
+
+def test_number_followed_by_plus_is_spoken_as_plus(normalizer, capsys):
+    normalized = normalizer.normalize("I am downloading automatically 30+ pre-trained demo voices.", lang="EN")
+
+    assert "thirty plus" in normalized.lower()
+    assert "30+" not in normalized
+    assert "normalization failed" not in capsys.readouterr().out
+    assert "five plus five" in normalizer.normalize("It costs 5+5 dollars.", lang="EN").lower()

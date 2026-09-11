@@ -7,6 +7,24 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.15",
+        "2026-09-11",
+        """
+### Every caption format and every media container
+
+- **Caption formats:** dataset preparation sidecars, the Voice Generation caption upload and Batch Generation now accept SRT, WebVTT, SBV, Advanced SubStation Alpha (ASS/SSA), SUB (MicroDVD frame timing with its declared frame rate, and SubViewer), LRC lyrics, TTML/DFXP (clock, offset and frame timecodes), SAMI, and the JSON and TSV transcripts speech recognizers write (Whisper segments, YouTube json3 events, or any list of start/end/text records). Sidecars are still matched by filename stem, so `talk.en.vtt` or `talk.ass` next to `talk.webm` is found.
+- **Content before extension:** the format is recognized from the file's text, so a WebVTT file saved as `.srt` loads, and a file whose content does not read as captions reports one clear error instead of a parser traceback.
+- **Lenient SRT and WebVTT:** stray text blocks, a missing index line, timestamps without milliseconds, single-digit hours, cue settings after the end time and a cue that ends before it starts no longer abort the whole file; the bad cue is skipped or clamped and the rest is kept.
+- **Ambiguous extensions:** `.json`, `.tsv` and `.sub` files count as captions only when their content looks like captions, so download metadata such as `video.info.json`, unrelated data files and binary VobSub tracks are never picked up as sidecars or reported as orphan subtitles.
+- **Media discovery:** the accepted list now covers every container and audio format ffmpeg decodes, including OGV/OGM, MXF, VOB, ASF, 3G2, F4V, RM/RMVB, DV, WTV, MKA, Opus/Speex, AC3/E-AC3, DTS, AMR, WavPack, TTA, M4B and more. A file listed explicitly with an unfamiliar extension is kept when ffprobe finds an audio stream in it; folder scans stay extension-based.
+- **Damaged sources:** audio extraction retries with corrupt packets dropped and timestamps regenerated before giving up on a truncated download or a container with damaged packets.
+- **Training dashboard stays responsive for the whole run:** the page used to receive every chart, the checkpoint table and the sample player once a second from two update streams for as long as a run lasted, and after a few hours the browser tab froze for minutes at a time. Each open tab now receives a component only when its value changed, the charts and tables refresh at most every five seconds while a run is active (immediately on a reload, a phase change or a smoothing change), the Start button no longer streams a second copy of the dashboard, and the metrics file is parsed incrementally instead of being re-read in full every second. Opening the LoRA / DoRA Training tab now shows the newest run, finished or live, with its charts drawn; previously a finished run appeared only after **Load last values**.
+- **Counts followed by a plus sign:** a text such as `30+ voices` or `Windows 10+` made the English text normalizer fail and left the whole sentence un-normalized (numbers unread) in generation, feature caching and evaluation; it is now read as "30 plus".
+
+Restart after updating. Existing datasets, adapters, presets and outputs remain compatible.
+""".strip(),
+    ),
+    (
         "v6.14",
         "2026-09-11",
         """

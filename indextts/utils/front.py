@@ -8,6 +8,11 @@ from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
 from sentencepiece import SentencePieceProcessor
 
 
+# "30+" (a count followed by a plus sign) is spoken as "30 plus"; the English normalizer
+# asserts on the raw form and would otherwise leave the whole sentence un-normalized.
+_SPOKEN_PLUS_RE = re.compile(r"(?<=\d)\s*\+(?![\w+])")
+
+
 class TextNormalizer:
     def __init__(self, enable_glossary=False):
         self.zh_normalizer = None
@@ -196,6 +201,10 @@ class TextNormalizer:
                 # 应用术语词汇表（优先级最高，在所有保护之前）
                 if self.enable_glossary:
                     text = self.apply_glossary_terms(text, lang="en")
+                # A number followed by a plus sign ("30+ voices", "Windows 10+") makes the
+                # English normalizer assert, which used to leave the whole sentence
+                # un-normalized; read it as the speaker does, "30 plus".
+                text = _SPOKEN_PLUS_RE.sub(" plus", text)
                 # 保护技术术语（如 GPT-5-Nano）避免被英文normalizer错误处理
                 replaced_text, tech_list = self.save_tech_terms(text)
                 result = self.en_normalizer.normalize(replaced_text)

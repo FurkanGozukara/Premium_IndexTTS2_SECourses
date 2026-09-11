@@ -56,7 +56,7 @@ def test_readme_release_summary_is_current_and_public() -> None:
 def test_release_version_is_shared_with_adapter_metadata() -> None:
     from indextts.version import APP_VERSION as metadata_version
 
-    assert APP_VERSION == metadata_version == "6.14"
+    assert APP_VERSION == metadata_version == "6.15"
 
 
 @pytest.mark.parametrize("text", [

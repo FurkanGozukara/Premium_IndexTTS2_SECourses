@@ -12,38 +12,33 @@ from typing import Iterable, Sequence
 import numpy as np
 import soundfile as sf
 
-
-SUPPORTED_MEDIA_EXTENSIONS = (
-    ".mp4",
-    ".mkv",
-    ".webm",
-    ".mov",
-    ".avi",
-    ".flv",
-    ".wmv",
-    ".m4v",
-    ".ts",
-    ".mts",
-    ".m2ts",
-    ".mpg",
-    ".mpeg",
-    ".3gp",
-    ".mp3",
-    ".wav",
-    ".flac",
-    ".ogg",
-    ".oga",
-    ".opus",
-    ".m4a",
-    ".aac",
-    ".wma",
-    ".aiff",
-    ".aif",
-    ".ape",
-    ".alac",
-    ".caf",
+from indextts.utils.subtitle_utils import (
+    AMBIGUOUS_SUBTITLE_EXTENSIONS,
+    SUPPORTED_SUBTITLE_EXTENSIONS,
+    looks_like_subtitle_file,
 )
-SUPPORTED_SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".sbv")
+
+
+# Every container and audio format ffmpeg decodes for us. Video files are demuxed
+# for their audio track only, so a 4K AV1 or HEVC source costs no more than an
+# audio file of the same length.
+SUPPORTED_MEDIA_EXTENSIONS = (
+    # video containers
+    ".mp4", ".m4v", ".mov", ".qt", ".mkv", ".webm", ".avi", ".flv", ".f4v", ".wmv", ".asf",
+    ".ts", ".mts", ".m2ts", ".m2t", ".tp", ".mpg", ".mpeg", ".mpe", ".m2v", ".vob", ".3gp", ".3g2",
+    ".ogv", ".ogm", ".mxf", ".rm", ".rmvb", ".divx", ".dv", ".wtv", ".dvr-ms", ".nut", ".mj2",
+    # audio
+    ".mp3", ".mp2", ".mpga", ".wav", ".w64", ".rf64", ".flac", ".ogg", ".oga", ".opus", ".spx",
+    ".m4a", ".m4b", ".m4r", ".aac", ".wma", ".aiff", ".aif", ".aifc", ".ape", ".alac", ".caf",
+    ".mka", ".weba", ".ac3", ".eac3", ".dts", ".amr", ".awb", ".wv", ".tta", ".au", ".snd", ".voc",
+    ".mpc", ".tak", ".shn", ".gsm", ".ra", ".3ga",
+)
+# Files that are never media, so an explicitly listed one is not handed to ffprobe.
+_NON_MEDIA_EXTENSIONS = frozenset(
+    {".txt", ".csv", ".md", ".log", ".xml", ".yaml", ".yml", ".ini", ".cfg", ".html", ".htm", ".pdf",
+     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".zip", ".7z", ".rar", ".py", ".bat", ".sh"}
+    | set(SUPPORTED_SUBTITLE_EXTENSIONS)
+)
 
 
 @dataclass(frozen=True)
@@ -169,7 +164,18 @@ def extract_audio(
     if mono:
         args.extend(["-ac", "1"])
     args.extend(["-ar", str(int(sample_rate)), "-c:a", "pcm_s16le", str(output)])
-    _run(args, f"audio extraction for {source}")
+    try:
+        _run(args, f"audio extraction for {source}")
+    except RuntimeError as first_error:
+        # Truncated downloads and containers with damaged packets decode once ffmpeg
+        # is told to drop the corrupt parts instead of aborting; retry that way first.
+        tolerant = list(args)
+        insert_at = tolerant.index("-i")
+        tolerant[insert_at:insert_at] = ["-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err"]
+        try:
+            _run(tolerant, f"tolerant audio extraction for {source}")
+        except RuntimeError:
+            raise first_error
     if not output.is_file() or output.stat().st_size < 44:
         raise RuntimeError(f"ffmpeg produced no usable audio for {source}")
     _read_audio_cached.cache_clear()
@@ -247,13 +253,28 @@ def _iter_media_in_folder(folder: Path, recursive: bool) -> Iterable[Path]:
             yield candidate
 
 
+def _has_audio_stream(path: Path) -> bool:
+    try:
+        return probe_media(path).has_audio
+    except Exception:
+        return False
+
+
 def find_media_files(inputs: list[str], recursive: bool = True) -> list[str]:
     found: dict[str, str] = {}
     for raw_input in inputs:
         path = Path(raw_input).expanduser()
         candidates: Iterable[Path]
         if path.is_file():
-            candidates = [path] if path.suffix.casefold() in SUPPORTED_MEDIA_EXTENSIONS else []
+            suffix = path.suffix.casefold()
+            if suffix in SUPPORTED_MEDIA_EXTENSIONS:
+                candidates = [path]
+            elif suffix in _NON_MEDIA_EXTENSIONS:
+                candidates = []
+            else:
+                # A file the user listed explicitly is kept, whatever its extension,
+                # when ffprobe finds an audio stream in it; folder scans stay by extension.
+                candidates = [path] if _has_audio_stream(path) else []
         elif path.is_dir():
             candidates = _iter_media_in_folder(path, recursive)
         else:
@@ -271,11 +292,19 @@ def find_sidecar_subtitles(media_path: str | Path, language: str | None = None) 
     stem = media.stem.casefold()
     matches: list[Path] = []
     for candidate in media.parent.iterdir():
-        if not candidate.is_file() or candidate.suffix.casefold() not in SUPPORTED_SUBTITLE_EXTENSIONS:
+        suffix = candidate.suffix.casefold()
+        if not candidate.is_file() or suffix not in SUPPORTED_SUBTITLE_EXTENSIONS:
             continue
         candidate_stem = candidate.stem.casefold()
-        if candidate_stem == stem or candidate_stem.startswith(stem + "."):
-            matches.append(candidate)
+        if candidate_stem != stem and not candidate_stem.startswith(stem + "."):
+            continue
+        # Download metadata (``video.info.json``) and unrelated JSON/TSV/VobSub files share
+        # caption extensions; only files whose content reads as captions are sidecars.
+        if candidate_stem.endswith(".info") and suffix.startswith(".json"):
+            continue
+        if suffix in AMBIGUOUS_SUBTITLE_EXTENSIONS and not looks_like_subtitle_file(candidate):
+            continue
+        matches.append(candidate)
 
     aliases = {
         "en": {"en", "eng", "english"}, "es": {"es", "spa", "spanish"},
@@ -293,7 +322,12 @@ def find_sidecar_subtitles(media_path: str | Path, language: str | None = None) 
         detected = next((key for key, names in aliases.items() if tag in names), None)
         return 0 if detected == requested else 1 if detected is None else 2
 
-    extension_order = {".srt": 0, ".vtt": 1, ".sbv": 2}
+    extension_order = {
+        extension: position
+        for position, extension in enumerate(
+            (".srt", ".vtt", ".ass", ".ssa", ".sbv", ".ttml", ".dfxp", ".sub", ".smi", ".sami", ".lrc", ".tsv", ".json", ".json3")
+        )
+    }
     matches.sort(
         key=lambda p: (
             language_priority(p),

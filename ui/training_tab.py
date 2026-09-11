@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, fields
 import json
 import math
 from pathlib import Path
 import shutil
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Mapping, Sequence
@@ -18,7 +20,18 @@ import pandas as pd
 from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.gpu import gpu_total_gb
 from indextts.runtime.vram_presets import VRAM_TIERS, auto_tier, preset_notes, resolve_training_preset
-from indextts.training.charts import GRAD_SERIES, LOSS_SERIES, LR_SERIES, SPEED_SERIES, downsample_series, empty_series_frame, load_metrics, lr_frame, speed_frame
+from indextts.training.charts import (
+    GRAD_SERIES,
+    LOSS_SERIES,
+    LR_SERIES,
+    SPEED_SERIES,
+    _canonical_metrics,
+    downsample_series,
+    empty_series_frame,
+    load_metrics,
+    lr_frame,
+    speed_frame,
+)
 from indextts.training.analysis import (
     ANALYSIS_SERIES,
     analysis_epoch_frame,
@@ -54,6 +67,82 @@ TRAIN_DEFAULTS = TrainConfig(dataset_dir="datasets/voice_dataset", name="voice_a
 TRAIN_BETAS_TEXT = ", ".join(str(value) for value in TRAIN_DEFAULTS["betas"])
 _LAST_TRAINING_FOLDER = ROOT / "loras"
 TRAINING_TERMINAL_PHASES = _TRAINING_TERMINAL_PHASES
+
+# Dashboard polling. Every open browser tab polls once a second while a run is active. The
+# progress panel, status line and log are cheap to update; the five Vega charts, the
+# checkpoint table and the sample player are not, and re-rendering all of them every second
+# for hours left the page frozen. Each session therefore receives a component only when its
+# value changed since that session last saw it, and the heavy components at most every
+# HEAVY_REFRESH_SECONDS while a run is active (immediately on a page load, a phase change,
+# a smoothing change, or once the run is idle or finished).
+HEAVY_REFRESH_SECONDS = 5.0
+_POLL_CACHE_LIMIT = 64
+_POLL_LOCK = threading.Lock()
+_POLL_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_METRICS_LOCK = threading.Lock()
+_METRICS_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_METRICS_CACHE_LIMIT = 8
+
+
+def _cached_metrics(root: Path) -> pd.DataFrame:
+    """Return the run's metrics, parsing only the lines appended since the previous poll.
+
+    ``metrics.jsonl`` grows by one line per optimizer step and reaches tens of thousands of
+    lines in a long run; re-reading it whole once a second for every open dashboard was a
+    large share of the app's CPU time. The file is append-only, so the parsed rows are kept
+    and only complete new lines are decoded; a truncated or rewritten file is reloaded.
+    """
+
+    path = root / "metrics.jsonl"
+    key = str(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        with _METRICS_LOCK:
+            _METRICS_CACHE.pop(key, None)
+        return load_metrics(root)
+    with _METRICS_LOCK:
+        entry = _METRICS_CACHE.get(key)
+        if entry is not None and entry["size"] == size:
+            _METRICS_CACHE.move_to_end(key)
+            return entry["frame"]
+        if entry is None or size < entry["offset"]:
+            entry = {"offset": 0, "rows": [], "size": 0, "frame": None}
+        try:
+            with path.open("rb") as handle:
+                handle.seek(entry["offset"])
+                chunk = handle.read()
+        except OSError:
+            return entry["frame"] if entry["frame"] is not None else load_metrics(root)
+        cut = chunk.rfind(b"\n")
+        complete = chunk[: cut + 1] if cut >= 0 else b""
+        for line in complete.decode("utf-8-sig", errors="replace").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                entry["rows"].append(value)
+        entry["offset"] += len(complete)
+        entry["size"] = size
+        frame = pd.DataFrame(entry["rows"])
+        if "step" not in frame:
+            frame["step"] = pd.Series(dtype="int64")
+        entry["frame"] = _canonical_metrics(frame)
+        _METRICS_CACHE[key] = entry
+        _METRICS_CACHE.move_to_end(key)
+        while len(_METRICS_CACHE) > _METRICS_CACHE_LIMIT:
+            _METRICS_CACHE.popitem(last=False)
+        return entry["frame"]
+
+
+def reset_dashboard_caches() -> None:
+    """Forget cached metrics and per-session dashboard signatures (tests and diagnostics)."""
+
+    with _METRICS_LOCK:
+        _METRICS_CACHE.clear()
+    with _POLL_LOCK:
+        _POLL_CACHE.clear()
 
 # Training controls a GPU VRAM preset fills, in the order the tier callback returns them.
 TRAINING_TIER_FIELDS = (
@@ -499,8 +588,13 @@ def _decoder_gate_progress(root: Path, status: Mapping[str, Any]) -> dict[str, A
     return payload
 
 
-def training_status_updates(state_value: str, smoothing_value: float) -> tuple[Any, ...]:
-    """Return the complete training dashboard update for polling and server push."""
+def training_status_updates(state_value: str, smoothing_value: float, *, heavy: bool = True) -> tuple[Any, ...]:
+    """Return the complete training dashboard update for polling and server push.
+
+    With ``heavy=False`` the charts, sample player, checkpoint table and generalization
+    summary are neither computed nor sent (``gr.skip()``); the panel, status line and log
+    are always returned.
+    """
 
     if not state_value:
         return (
@@ -520,7 +614,7 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         )
     root = Path(state_value)
     status = read_json(root / "status.json", {}) or {}
-    metrics = load_metrics(root)
+    metrics = _cached_metrics(root)
     step = int(status.get("step", 0) or 0)
     total = int(status.get("total_steps", 0) or 0)
     fraction = step / total if total else 0.0
@@ -594,23 +688,51 @@ def training_status_updates(state_value: str, smoothing_value: float) -> tuple[A
         if sample
         else "No sample yet."
     )
+    panel = progress_panel_html(payload, title="Validating the voice decoder through the full pipeline" if decoder_gate
+                                else titles.get(phase, "Training in progress"))
+    status_line = _training_status_text(status, metrics)
+    log_text = tail_text(root / "log.txt", 60) or tail_text(root / "worker_console.log", 60)
+    timer_update = gr.Timer(5.0 if terminal else 1.0, active=True)
+    if not heavy:
+        return (
+            panel,
+            status_line,
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            log_text,
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            timer_update,
+        )
     generalization_summary, generalization_chart = _training_generalization(root)
     return (
-        progress_panel_html(payload, title="Validating the voice decoder through the full pipeline" if decoder_gate
-                            else titles.get(phase, "Training in progress")),
-        _training_status_text(status, metrics),
+        panel,
+        status_line,
         _loss_plot_frame(metrics, smoothing_value),
         lr_frame(metrics),
         _grad_frame(metrics),
         speed_frame(metrics),
-        tail_text(root / "log.txt", 60) or tail_text(root / "worker_console.log", 60),
+        log_text,
         sample,
         sample_text_value,
         _checkpoint_rows(root),
         generalization_summary,
         generalization_chart,
-        gr.Timer(5.0 if terminal else 1.0, active=True),
+        timer_update,
     )
+
+
+def _finish_poll_updates(updates: list[Any], adopted_state: str, running: bool) -> None:
+    if running and adopted_state:
+        updates[1] = f"Attached to running run {Path(adopted_state).name} | {updates[1]}"
+        updates[-1] = gr.Timer(1.0, active=True)
+    else:
+        updates[-1] = gr.Timer(5.0, active=True)
 
 
 def training_poll_updates(
@@ -619,21 +741,65 @@ def training_poll_updates(
     *,
     state_root: str | Path = ROOT / "loras",
     page_load: bool = False,
+    request: gr.Request | None = None,
+    force_heavy: bool = False,
 ) -> tuple[Any, ...]:
-    """Adopt a live run when idle, then return state plus the full dashboard."""
+    """Adopt a live run when idle, then return state plus the dashboard.
+
+    Direct callers (tests, the start handler) receive every value. A browser session,
+    identified by ``request.session_hash``, receives each component only when it changed
+    since that session last saw it, and the charts, checkpoint table and sample player at
+    most every ``HEAVY_REFRESH_SECONDS`` while a run is active; a phase change,
+    ``force_heavy`` (the smoothing slider) or an idle/finished run refreshes them at once.
+    ``page_load`` (Load last values, and opening the training tab) adopts the newest run
+    even when it is finished and forgets what the session has seen, so everything is sent
+    again: the charts render blank while their tab is hidden and only draw when they
+    receive a value.
+    """
 
     adopted_state, running = adopt_training_state(
         state_value,
         root=state_root,
         page_load=page_load,
     )
-    updates = list(training_status_updates(adopted_state, smoothing_value))
-    if running and adopted_state:
-        updates[1] = f"Attached to running run {Path(adopted_state).name} | {updates[1]}"
-        updates[-1] = gr.Timer(1.0, active=True)
-    else:
-        updates[-1] = gr.Timer(5.0, active=True)
-    return adopted_state, *updates
+    session = str(getattr(request, "session_hash", "") or "") if request is not None else ""
+    if not session:
+        updates = list(training_status_updates(adopted_state, smoothing_value))
+        _finish_poll_updates(updates, adopted_state, running)
+        return adopted_state, *updates
+
+    phase = ""
+    if adopted_state:
+        phase = str((read_json(Path(adopted_state) / "status.json", {}) or {}).get("phase") or "")
+    key = f"{session}|{adopted_state}"
+    now = time.monotonic()
+    with _POLL_LOCK:
+        entry = None if page_load else _POLL_CACHE.get(key)
+    heavy = (
+        force_heavy
+        or entry is None
+        or not running
+        or phase != entry.get("phase")
+        or now - float(entry.get("heavy_at", 0.0)) >= HEAVY_REFRESH_SECONDS
+    )
+    updates = list(training_status_updates(adopted_state, smoothing_value, heavy=heavy))
+    _finish_poll_updates(updates, adopted_state, running)
+    emitted, signatures = dedupe_updates(
+        [adopted_state, *updates],
+        None if entry is None else entry.get("signatures"),
+    )
+    emitted = list(emitted)
+    emitted[-1] = updates[-1]  # the timer interval follows the run state and is tiny; always send it
+    with _POLL_LOCK:
+        _POLL_CACHE[key] = {
+            "signatures": signatures,
+            "phase": phase,
+            "heavy_at": now if heavy else float(entry.get("heavy_at", now)),
+        }
+        _POLL_CACHE.move_to_end(key)
+        while len(_POLL_CACHE) > _POLL_CACHE_LIMIT:
+            _POLL_CACHE.popitem(last=False)
+    return tuple(emitted)
 
 
 @dataclass
@@ -1318,13 +1484,12 @@ def build_training_tab(
             updates[-1] = gr.Timer(1.0, active=True)
             emitted, fingerprints = dedupe_updates(updates)
             yield emitted
+            # The dashboard timer is the only live poller. Streaming a second copy of every
+            # chart and table from this handler doubled the browser's rendering work for the
+            # whole run and left long runs frozen; the timer's per-session change detection
+            # sends each component only when it changed.
             while job.running:
                 time.sleep(1.0)
-                updates = list(training_poll_updates(str(adapter_dir), smoothing_value))
-                updates[0] = gr.skip()
-                updates[-1] = gr.skip()
-                emitted, fingerprints = dedupe_updates(updates, fingerprints)
-                yield emitted
             current = read_json(adapter_dir / "status.json", {}) or {}
             phase = str(current.get("phase") or "")
             if phase not in TRAINING_TERMINAL_PHASES:
@@ -1376,11 +1541,28 @@ def build_training_tab(
     )
 
     poll_outputs = [state_dir, dashboard_progress, status_text, loss_plot, lr_plot_component, grad_plot, speed_plot_component, log, latest_sample, sample_label, checkpoints, generalization_summary, generalization_plot, timer]
-    timer.tick(training_poll_updates, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
-    smoothing_slider.change(training_poll_updates, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden", trigger_mode="always_last")
+
+    # Gradio injects the per-tab request so the poller can remember what each tab has seen.
+    def poll_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, request=gr_request)
+
+    def refresh_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, request=gr_request, force_heavy=True)
+
+    def attach_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request)
+
+    def reopen_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
+        # Opening the tab shows the newest run, finished or live, and re-sends the dashboard:
+        # charts rendered while the tab was hidden stay blank until they receive a value.
+        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request)
+
+    timer.tick(poll_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
+    tab_block.select(reopen_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
+    smoothing_slider.change(refresh_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden", trigger_mode="always_last")
     if load_hook is not None:
         load_hook(
-            lambda state, smooth: training_poll_updates(state, smooth, page_load=True),
+            attach_dashboard,
             [state_dir, smoothing_slider],
             poll_outputs,
             queue=False,

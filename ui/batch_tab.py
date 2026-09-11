@@ -18,7 +18,14 @@ import uuid
 import gradio as gr
 
 from indextts.runtime.progress import read_progress_file
-from indextts.utils.subtitle_utils import parse_subtitle_file, subtitle_cues_to_text
+from indextts.utils.subtitle_utils import (
+    AMBIGUOUS_SUBTITLE_EXTENSIONS,
+    SUBTITLE_FORMAT_SUMMARY,
+    SUPPORTED_SUBTITLE_EXTENSIONS,
+    looks_like_subtitle_file,
+    parse_subtitle_file,
+    subtitle_cues_to_text,
+)
 from indextts.utils.task_output_utils import write_metadata_file
 from webui_generation_runner import run_generation_request
 
@@ -77,13 +84,24 @@ def _safe_subfolder(value: str) -> str:
     return str(Path(*parts)) if parts else "batch"
 
 
+def _is_batch_text_file(path: Path) -> bool:
+    """TXT scripts and every supported caption format; ambiguous extensions need caption content."""
+
+    suffix = path.suffix.lower()
+    if suffix == ".txt":
+        return True
+    if suffix not in SUPPORTED_SUBTITLE_EXTENSIONS:
+        return False
+    return suffix not in AMBIGUOUS_SUBTITLE_EXTENSIONS or looks_like_subtitle_file(path)
+
+
 def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[dict[str, Any]]:
     """Collect ordered work without parsing a file ahead of its item boundary."""
 
     paths: list[Path] = []
     for value in files or []:
         path = Path(str(value))
-        if path.is_file() and path.suffix.lower() in {".txt", ".srt", ".vtt", ".sbv"}:
+        if path.is_file() and _is_batch_text_file(path):
             paths.append(path.resolve())
     folder_text = str(folder or "").strip()
     folder_path = Path(folder_text).expanduser() if folder_text else None
@@ -93,7 +111,7 @@ def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[
                 (
                     path.resolve()
                     for path in folder_path.rglob("*")
-                    if path.is_file() and path.suffix.lower() in {".txt", ".srt", ".vtt", ".sbv"}
+                    if path.is_file() and _is_batch_text_file(path)
                 ),
                 key=lambda path: str(path).lower(),
             )
@@ -103,7 +121,7 @@ def _batch_items(files: list[str] | None, paragraphs: str, folder: str) -> list[
     unique = dict.fromkeys(paths)
     items: list[dict[str, Any]] = []
     for path in unique:
-        subtitle = str(path) if path.suffix.lower() in {".srt", ".vtt", ".sbv"} else None
+        subtitle = str(path) if path.suffix.lower() in SUPPORTED_SUBTITLE_EXTENSIONS else None
         items.append({"name": path.stem, "path": str(path), "text": None, "subtitle": subtitle})
     for index, paragraph in enumerate(re.split(r"\n\s*\n", str(paragraphs or "")), start=1):
         text = paragraph.strip()
@@ -382,10 +400,10 @@ def build_batch_tab(
                 files = gr.File(
                     label="Text or caption files",
                     file_count="multiple",
-                    file_types=[".txt", ".srt", ".vtt", ".sbv"],
+                    file_types=[".txt", *SUPPORTED_SUBTITLE_EXTENSIONS],
                     type="filepath",
                 )
-                gr.Markdown("Selected text and caption files are processed sequentially.", elem_classes=["section-note"])
+                gr.Markdown(f"Selected text and caption files ({SUBTITLE_FORMAT_SUMMARY}) are processed sequentially.", elem_classes=["section-note"])
                 text = gr.Textbox(
                     label="Pasted items",
                     lines=8,
@@ -394,7 +412,7 @@ def build_batch_tab(
                 )
                 folder = gr.Textbox(
                     label="Input folder path",
-                    info="Scans recursively for TXT, SRT, VTT, and SBV files.",
+                    info=f"Scans recursively for TXT and caption files ({SUBTITLE_FORMAT_SUMMARY}).",
                 )
             with gr.Column(scale=1):
                 naming = gr.Textbox(

@@ -19,6 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from indextts.utils.pause_tags import TextChunk, split_text_with_pauses
+from indextts.utils.subtitle_utils import AMBIGUOUS_SUBTITLE_EXTENSIONS, looks_like_subtitle_file
 from indextts.utils.text_encoding import read_text_resilient
 
 from .dataset_manifest import (
@@ -468,6 +469,9 @@ def _orphan_subtitle_warnings(
             continue
         for candidate in candidates:
             if not candidate.is_file() or candidate.suffix.casefold() not in SUPPORTED_SUBTITLE_EXTENSIONS:
+                continue
+            if candidate.suffix.casefold() in AMBIGUOUS_SUBTITLE_EXTENSIONS and not looks_like_subtitle_file(candidate):
+                # Download metadata, recognizer side files and binary VobSub are not orphan captions.
                 continue
             parent_key = str(candidate.parent.resolve()).casefold()
             subtitle_stem = candidate.stem.casefold()
