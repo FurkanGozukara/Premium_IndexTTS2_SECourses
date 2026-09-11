@@ -191,6 +191,151 @@ def choose_typical_reference(dataset_dir: str | Path, records: Sequence[Mapping[
             "candidates": [{key: value for key, value in item.items() if key != "record"} for item in candidates]}
 
 
+EXPRESSIVE_SHORTLIST = 120  # clean clips measured before choosing the liveliest one
+EXPRESSIVE_MIN_SECONDS = 8.0
+EXPRESSIVE_MAX_SECONDS = 16.0
+EXPRESSIVE_SAMPLE_RATE = 16000
+
+
+def measure_clip_expressiveness(path: str | Path) -> dict[str, float] | None:
+    """Pitch variability (semitones) and loudness variability (dB) of a recording, or None without voiced audio."""
+    import librosa
+    import numpy as np
+    import soundfile as sf
+
+    try:
+        array, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    wave = array.mean(axis=1)
+    if sample_rate != EXPRESSIVE_SAMPLE_RATE:
+        wave = librosa.resample(wave, orig_sr=sample_rate, target_sr=EXPRESSIVE_SAMPLE_RATE)
+    if wave.size < EXPRESSIVE_SAMPLE_RATE // 2:
+        return None
+    frame, hop = 1024, 160
+    f0 = librosa.yin(wave, fmin=70, fmax=350, sr=EXPRESSIVE_SAMPLE_RATE, frame_length=frame, hop_length=hop)
+    rms = librosa.feature.rms(y=wave, frame_length=frame, hop_length=hop)[0]
+    count = min(len(f0), len(rms))
+    f0, rms = f0[:count], rms[:count]
+    level = 20.0 * np.log10(np.maximum(rms, 1e-6))
+    if not count or level.max() < -60.0:
+        return None
+    voiced = (level > level.max() - 30.0) & (f0 > 75.0) & (f0 < 340.0)
+    speech = level > level.max() - 35.0
+    if voiced.sum() < 10:
+        return None
+    semitones = 12.0 * np.log2(f0[voiced] / 100.0)
+    return {
+        "pitch_std_st": round(float(np.std(semitones)), 3),
+        "pitch_range90_st": round(float(np.percentile(semitones, 95) - np.percentile(semitones, 5)), 3),
+        "energy_std_db": round(float(np.std(level[speech])), 3) if speech.any() else 0.0,
+        "voiced_fraction": round(float(voiced.mean()), 3),
+    }
+
+
+class ExpressivenessCache:
+    """Per-clip expressiveness measurements stored beside the dataset, keyed by file size and modification time."""
+
+    def __init__(self, dataset_dir: str | Path) -> None:
+        self.dataset_dir = Path(dataset_dir)
+        self.path = self.dataset_dir / "analysis" / "expressiveness_cache.json"
+        loaded = read_json_retry(self.path, None)
+        self._entries: dict[str, dict[str, Any]] = dict(loaded) if isinstance(loaded, dict) else {}
+        self._dirty = False
+
+    def metrics_of(self, record: Mapping[str, Any]) -> dict[str, float] | None:
+        path = _audio_path(self.dataset_dir, record)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = str(record.get("id") or path.name)
+        entry = self._entries.get(key)
+        if isinstance(entry, dict) and entry.get("size") == stat.st_size and entry.get("mtime") == int(stat.st_mtime):
+            metrics = entry.get("metrics")
+            return dict(metrics) if isinstance(metrics, dict) else None
+        metrics = measure_clip_expressiveness(path)
+        self._entries[key] = {"metrics": metrics, "size": stat.st_size, "mtime": int(stat.st_mtime)}
+        self._dirty = True
+        return metrics
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(self.path, self._entries, indent=1, ensure_ascii=False)
+            self._dirty = False
+        except OSError:
+            pass
+
+
+def choose_expressive_reference(dataset_dir: str | Path, records: Sequence[Mapping[str, Any]], *,
+                                shortlist: int = EXPRESSIVE_SHORTLIST, min_seconds: float = EXPRESSIVE_MIN_SECONDS,
+                                max_seconds: float = EXPRESSIVE_MAX_SECONDS,
+                                cache: ExpressivenessCache | None = None) -> dict[str, Any] | None:
+    """Among the cleanest clips of prompt length, the one whose pitch and loudness move the most.
+
+    The typical reference (median pitch and pace) is the safest identity prompt; this clip is the
+    liveliest delivery of the same speaker and serves as the emotion prompt, so the voice speaks
+    with the person's own energy instead of an average one. Candidates keep the best transcript
+    and boundary class (as the typical reference does) and a duration between ``min_seconds`` and
+    ``max_seconds``; up to ``shortlist`` of them are measured. Returns
+    ``{"record", "metrics", "score", "candidates"}`` or None when nothing can be measured.
+    """
+    existing = [row for row in records if row.get("audio") and _audio_path(dataset_dir, row).is_file()]
+    if not existing:
+        return None
+    ranked = sorted(existing, key=lambda row: (*training_reference_priority(row), str(row["id"])))
+    best_class = training_reference_priority(ranked[0])[:2]
+    pool = [row for row in ranked if training_reference_priority(row)[:2] == best_class]
+
+    def duration_of(row: Mapping[str, Any]) -> float:
+        try:
+            return float(row.get("duration_s") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    windowed = [row for row in pool if min_seconds <= duration_of(row) <= max_seconds]
+    if len(windowed) >= 8:
+        pool = windowed
+    pool = sorted(pool, key=lambda row: _stable_order(str(row.get("id", ""))))[: max(1, int(shortlist))]
+    cache = cache or ExpressivenessCache(dataset_dir)
+    measured = []
+    for row in pool:
+        metrics = cache.metrics_of(row)
+        if metrics and metrics.get("pitch_std_st", 0.0) > 0.0:
+            measured.append((row, metrics))
+    cache.save()
+    if not measured:
+        return None
+    import statistics
+
+    pitch_values = [item[1]["pitch_std_st"] for item in measured]
+    energy_values = [item[1]["energy_std_db"] for item in measured]
+    pitch_mean, energy_mean = statistics.fmean(pitch_values), statistics.fmean(energy_values)
+    pitch_sd = statistics.pstdev(pitch_values) or 1.0
+    energy_sd = statistics.pstdev(energy_values) or 1.0
+    candidates = []
+    for row, metrics in measured:
+        score = (metrics["pitch_std_st"] - pitch_mean) / pitch_sd + (metrics["energy_std_db"] - energy_mean) / energy_sd
+        candidates.append({"id": str(row["id"]), "duration_s": duration_of(row), "score": round(float(score), 3),
+                           "metrics": metrics, "record": row})
+    best = max(candidates, key=lambda item: (item["score"], -candidates.index(item)))
+    return {"record": best["record"], "metrics": best["metrics"], "score": best["score"],
+            "pool_pitch_std_st": round(pitch_mean, 3), "pool_energy_std_db": round(energy_mean, 3),
+            "candidates": [{key: value for key, value in item.items() if key != "record"} for item in candidates]}
+
+
+def describe_expressive_choice(choice: Mapping[str, Any]) -> str:
+    metrics = choice.get("metrics") or {}
+    return (
+        f"expressive clip {choice['record'].get('id', '')}: pitch std {float(metrics.get('pitch_std_st', 0.0)):.2f} st "
+        f"(pool {float(choice.get('pool_pitch_std_st', 0.0)):.2f}), loudness std {float(metrics.get('energy_std_db', 0.0)):.2f} dB "
+        f"(pool {float(choice.get('pool_energy_std_db', 0.0)):.2f}), {len(choice.get('candidates') or [])} clips measured"
+    )
+
+
 def describe_reference_choice(choice: Mapping[str, Any]) -> str:
     profile = choice.get("profile") or {}
     pitch = choice.get("pitch_hz")

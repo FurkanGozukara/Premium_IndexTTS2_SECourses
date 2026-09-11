@@ -25,11 +25,43 @@ from indextts.lora.io import inspect_lora, scan_lora_files
 from indextts.runtime.progress import read_progress_file
 from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
 from indextts.lora.decoder import decoder_adapter_choices, find_decoder_adapter, recommended_decoder_strength
+from indextts.training.dataset_profile import (
+    budget_scale_for,
+    dataset_dir_for_adapter,
+    ensure_dataset_profile,
+    expressive_profile_entry,
+    expressive_reference_path,
+    load_dataset_vocabulary,
+    profile_path,
+    recommended_max_tokens,
+    recommended_pauses,
+    save_expressive_reference,
+    smart_target_tokens,
+    seconds_for_words,
+    update_profile_expressive_reference,
+    words_for_max_tokens,
+)
 from indextts.training.decoding_sweep import load_decoding_settings
 from indextts.training.speaking_rate import (
+    ensure_calibration_fields,
     load_speaking_rate,
+    original_calibration,
     save_manual_speaking_rate,
     speaking_rate_method_label,
+)
+from indextts.utils.pronunciation import (
+    DictionaryEntry,
+    apply_dictionary,
+    builtin_entries,
+    check_text,
+    cmu_available,
+    default_dictionary_path,
+    dictionary_rows,
+    entries_from_rows,
+    load_dictionary,
+    merge_entries,
+    normalize_entry,
+    save_dictionary,
 )
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
 from indextts.utils.subtitle_utils import (
@@ -45,7 +77,14 @@ from indextts.utils.task_output_utils import (
     normalize_file_extension,
     write_metadata_file,
 )
-from indextts.utils.text_segmentation import SpeechRecoveryConfig, default_segment_tokens, split_text_by_tokens
+from indextts.utils.text_segmentation import (
+    DEFAULT_SEGMENTATION_MODE,
+    SEGMENTATION_MODES,
+    SpeechRecoveryConfig,
+    default_segment_tokens,
+    normalize_segmentation_mode,
+    split_text_by_tokens,
+)
 from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
 
 from .common import (
@@ -136,9 +175,14 @@ class PreparedReference:
 GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.language": "EN",
     "generation.max_text_tokens_per_segment": 60,
+    "generation.auto_lora_max_tokens": True,
+    "generation.segmentation_mode": DEFAULT_SEGMENTATION_MODE,
+    "generation.sentence_pause_ms": 0,
+    "generation.auto_lora_pauses": True,
     "generation.use_caption_timing": False,
     "generation.auto_lora_reference": True,
     "generation.auto_lora_speaking_rate": True,
+    "generation.auto_lora_emotion_reference": True,
     "generation.emotion_mode": EMOTION_MODES[0],
     "generation.emotion_weight": 0.65,
     "generation.emotion_random": False,
@@ -151,6 +195,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.top_k": 30,
     "generation.num_beams": 3,
     "generation.repetition_penalty": 10.0,
+    "generation.repetition_window": 0,
     "generation.length_penalty": 0.0,
     "generation.max_mel_tokens": 1500,
     "generation.seed": -1,
@@ -162,12 +207,14 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.segment_budget_scale_non_cjk": 0.72,
     "generation.interval_silence": 200,
     "generation.max_consecutive_silence": 0,
+    "generation.max_pause_ms": 0,
     "generation.latent_multiplier": 1.72,
     "generation.speaking_rate": 1.0,
     "generation.target_duration_s": None,
     "generation.target_duration_mode": "off",
     "generation.enable_pause_tags": True,
     "generation.text_normalization": True,
+    "generation.apply_pronunciation_dictionary": True,
     "generation.auto_retry_incomplete_speech": SpeechRecoveryConfig.enabled,
     "generation.max_speech_retries": SpeechRecoveryConfig.max_attempts,
     "generation.max_speech_split_depth": SpeechRecoveryConfig.max_split_depth,
@@ -207,6 +254,7 @@ INFER_KWARG_KEYS = frozenset(
         "length_penalty",
         "num_beams",
         "repetition_penalty",
+        "repetition_window",
         "max_mel_tokens",
         "emo_audio_prompt",
         "emo_alpha",
@@ -267,6 +315,10 @@ RUNNER_REQUEST_KEYS = frozenset(
         "reuse_spk_cond_for_emo",
         "enable_pause_tags",
         "trim_silence_ms_threshold",
+        "max_pause_ms",
+        "segmentation_mode",
+        "segment_target_tokens",
+        "sentence_pause_ms",
         "target_duration_s",
         "target_duration_mode",
     }
@@ -319,6 +371,11 @@ def build_generation_request(
     emotion_vector = _normalize_emotion_vector(merged)
     if mode_index != 1:
         emotion_audio = None
+    if mode_index == 0 and bool(_value(merged, "generation.auto_lora_emotion_reference")):
+        # The adapter's expressive training clip drives the delivery while the speaker prompt keeps the identity.
+        expressive = expressive_reference_path(str(merged.get("runtime.lora_path") or ""))
+        if expressive:
+            emotion_audio = expressive
     emotion_text = str(_value(merged, "generation.emotion_text") or "") or None
     top_k_value = int(_value(merged, "generation.top_k") or 0)
     target_duration = _value(merged, "generation.target_duration_s")
@@ -335,6 +392,7 @@ def build_generation_request(
         "length_penalty": float(_value(merged, "generation.length_penalty")),
         "num_beams": int(_value(merged, "generation.num_beams")),
         "repetition_penalty": float(_value(merged, "generation.repetition_penalty")),
+        "repetition_window": int(_value(merged, "generation.repetition_window") or 0),
         "max_mel_tokens": int(_value(merged, "generation.max_mel_tokens")),
         "emo_audio_prompt": emotion_audio,
         "emo_alpha": float(_value(merged, "generation.emotion_weight")),
@@ -403,6 +461,10 @@ def build_generation_request(
         if item not in (None, ""):
             overrides[backend_key] = float(item)
 
+    segmentation_mode = normalize_segmentation_mode(_value(merged, "generation.segmentation_mode"))
+    segment_target_tokens = (
+        smart_segment_target(str(merged.get("runtime.lora_path") or "")) if segmentation_mode == "smart" else None
+    )
     request = {
         "prompt": str(prompt or ""),
         "text": str(text or ""),
@@ -434,6 +496,10 @@ def build_generation_request(
         "reuse_spk_cond_for_emo": bool(_value(merged, "generation.reuse_spk_cond_for_emo")),
         "enable_pause_tags": bool(_value(merged, "generation.enable_pause_tags")),
         "trim_silence_ms_threshold": int(_value(merged, "generation.trim_silence_ms_threshold")),
+        "max_pause_ms": int(_value(merged, "generation.max_pause_ms") or 0),
+        "segmentation_mode": segmentation_mode,
+        "segment_target_tokens": segment_target_tokens,
+        "sentence_pause_ms": int(_value(merged, "generation.sentence_pause_ms") or 0),
         "target_duration_s": target_duration,
         "target_duration_mode": str(_value(merged, "generation.target_duration_mode") or "off"),
     }
@@ -491,6 +557,8 @@ def prepare_generation_request(
         raise ValueError("Enter text or load a caption file")
     if image_source and not Path(image_source).is_file():
         raise ValueError(f"Image file not found: {image_source}")
+    if bool(_value(values, "generation.apply_pronunciation_dictionary")):
+        text = apply_pronunciation_dictionary(text, str(values.get("runtime.lora_path") or ""))
     # Validate captions before allocating an output task.
     cues = parse_subtitle_file(subtitle_path) if subtitle_mode else []
     units = build_subtitle_render_units(cues) if cues else []
@@ -631,6 +699,44 @@ def _preview_capacity(model_dir: str) -> int:
         return 602
 
 
+@lru_cache(maxsize=8)
+def model_version(model_dir: str) -> str:
+    """The ``version`` field of the model folder's config.yaml ("2.5" for IndexTTS 2.5), or ""."""
+
+    try:
+        from omegaconf import OmegaConf
+
+        return str(OmegaConf.load(str(Path(model_dir) / "config.yaml")).get("version", "") or "")
+    except Exception:
+        return ""
+
+
+def codec_has_silence_runs(model_dir: str) -> bool:
+    """Whether **Max consecutive silence tokens** can do anything: the 2.5 codec never repeats a code."""
+
+    version = model_version(str(Path(model_dir).resolve()))
+    return not version.startswith("2.5")
+
+
+def smart_segment_target(lora_path: str | None) -> int | None:
+    """Text tokens the smart splitter aims for with the selected voice (None for the base model)."""
+
+    if not lora_path:
+        return None
+    try:
+        return smart_target_tokens(adapter_dataset_profile(str(lora_path)))
+    except Exception:
+        return None
+
+
+SEGMENTATION_CHOICES: tuple[tuple[str, str], ...] = (
+    ("Smart sentences", "smart"),
+    ("Every sentence", "sentence"),
+    ("Token budget", "budget"),
+)
+_SEGMENTATION_LABELS = {value: label for label, value in SEGMENTATION_CHOICES}
+
+
 def preview_segments(
     text: str,
     language: str,
@@ -640,6 +746,9 @@ def preview_segments(
     enable_pause_tags: bool = True,
     segment_scale: float = 0.72,
     model_dir: str = "models",
+    segmentation_mode: str = "budget",
+    target_tokens: int | None = None,
+    words_per_second: float = 0.0,
 ) -> tuple[list[list[Any]], str]:
     subtitle_path = resolve_path_value(subtitle_file)
     if caption_timing and subtitle_path:
@@ -660,6 +769,7 @@ def preview_segments(
     except Exception:
         token_len = lambda value: max(1, len(str(value).split()) * 2)
     prefix = f"<|{str(language or 'EN').lower()}|> "
+    mode = normalize_segmentation_mode(segmentation_mode) if str(segmentation_mode or "budget") != "budget" else "budget"
     rows: list[list[Any]] = []
     section_index = 0
     row_index = 0
@@ -667,7 +777,7 @@ def preview_segments(
     for chunk in chunks:
         if isinstance(chunk, PauseChunk):
             row_index += 1
-            rows.append([row_index, "Pause", f"{chunk.duration_ms} ms", "Inserted silence"])
+            rows.append([row_index, "Pause", f"{chunk.duration_ms} ms", "Inserted silence (kept exactly)"])
             continue
         for segment in split_text_by_tokens(
             chunk.text,
@@ -676,14 +786,23 @@ def preview_segments(
             token_len=token_len,
             lang_prefix=prefix,
             segment_budget_scale_non_cjk=float(segment_scale),
+            mode=mode,
+            target_tokens=target_tokens,
         ):
             if not segment.strip():
                 continue
             section_index += 1
             row_index += 1
-            rows.append([row_index, "Text segment", segment, f"{token_len(prefix + segment)} tokens"])
+            word_count = len(segment.split())
+            details = f"{token_len(prefix + segment)} tokens · {word_count} words"
+            if words_per_second and words_per_second > 0.0:
+                details += f" · about {word_count / float(words_per_second):.1f} s"
+            rows.append([row_index, "Text segment", segment, details])
     pause_note = describe_pauses(text) if enable_pause_tags else "Pause tags disabled"
-    return rows, f"{section_index} speech section(s) | {pause_note}"
+    mode_note = _SEGMENTATION_LABELS.get(mode, mode)
+    if mode == "smart" and target_tokens:
+        mode_note += f", aiming at {int(target_tokens)} tokens per section"
+    return rows, f"{section_index} speech section(s) | {mode_note} | {pause_note}"
 
 
 def reference_audio_choices(
@@ -991,6 +1110,7 @@ def _resolve_lora_reference_path(
                 path
                 for path in run_dir.glob("*_reference.*")
                 if path.suffix.lower() in REFERENCE_AUDIO_EXTENSIONS
+                and "_expressive_reference" not in path.name.lower()  # the emotion clip is not the speaker reference
             ),
             key=lambda path: path.name.casefold(),
         )
@@ -1251,52 +1371,639 @@ def _lora_choices() -> list[tuple[str, str]]:
     return choices
 
 
-def _lora_info(path: str | None) -> tuple[str, str | None]:
+_MODEL_DIR = str(ROOT / "models")
+_PROFILE_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_DICTIONARY_CACHE: dict[str, tuple[float, tuple[DictionaryEntry, ...]]] = {}
+
+
+def set_model_dir(model_dir: str | os.PathLike[str]) -> None:
+    """Remember the model folder so adapter panels can count text tokens like the engine."""
+
+    global _MODEL_DIR
+    _MODEL_DIR = str(model_dir)
+
+
+def _token_len_for_profiles():
+    try:
+        tokenizer = _preview_tokenizer(str(Path(_MODEL_DIR).resolve()))
+    except Exception:
+        return None
+    return lambda value: len(tokenizer.encode(value, allowed_special="all"))
+
+
+def adapter_dataset_profile(path: str | None) -> dict[str, Any] | None:
+    """The adapter's dataset profile, measured on first use while its dataset still exists."""
+
     if not path:
-        return "No LoRA / DoRA selected. Base model (no LoRA / DoRA) will clone from the reference only.", None
+        return None
+    key = os.path.normcase(str(Path(path).expanduser().resolve()))
+    try:
+        stamp = profile_path(path).stat().st_mtime
+    except OSError:
+        stamp = 0.0
+    cached = _PROFILE_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    profile = ensure_dataset_profile(path, token_len=_token_len_for_profiles(), datasets_root=ROOT / "datasets")
+    try:
+        stamp = profile_path(path).stat().st_mtime
+    except OSError:
+        stamp = 0.0
+    _PROFILE_CACHE[key] = (stamp, profile)
+    return profile
+
+
+def adapter_vocabulary(path: str | None) -> frozenset[str]:
+    """Every word the adapter's training transcripts contain (empty for the base model)."""
+
+    if not path:
+        return frozenset()
+    adapter_dataset_profile(path)
+    return load_dataset_vocabulary(path)
+
+
+def pronunciation_dictionary_path() -> Path:
+    return default_dictionary_path(ROOT)
+
+
+def pronunciation_entries(path: str | os.PathLike[str] | None = None) -> list[DictionaryEntry]:
+    """The user's pronunciation dictionary, created with the built-in technical terms on first use."""
+
+    target = Path(path) if path else pronunciation_dictionary_path()
+    if not target.is_file():
+        try:
+            save_dictionary(target, builtin_entries())
+        except OSError:
+            return builtin_entries()
+    key = os.path.normcase(str(target.resolve()))
+    try:
+        stamp = target.stat().st_mtime
+    except OSError:
+        stamp = 0.0
+    cached = _DICTIONARY_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return list(cached[1])
+    entries = load_dictionary(target)
+    _DICTIONARY_CACHE[key] = (stamp, tuple(entries))
+    return entries
+
+
+def apply_pronunciation_dictionary(text: str, lora_path: str | None) -> str:
+    """Rewrite words with dictionary readings, leaving words the selected voice was trained on alone."""
+
+    entries = pronunciation_entries()
+    if not entries:
+        return str(text or "")
+    return apply_dictionary(str(text or ""), entries, known_words=adapter_vocabulary(lora_path))
+
+
+def check_unknown_words(text: str, lora_path: str | None, table_rows: Any) -> tuple[list[list[Any]], str]:
+    """Words in the text that neither the dictionary, the voice's training transcripts nor the CMU dictionary cover."""
+
+    entries = entries_from_rows(table_rows) if table_rows else pronunciation_entries()
+    if not str(text or "").strip():
+        return [], "Enter text first; the check lists the words that need a reading."
+    known = adapter_vocabulary(lora_path)
+    rows = check_text(str(text), known_words=known, entries=entries, token_len=_token_len_for_profiles())
+    table = [
+        [row["word"], row["suggestion"], row["kind"], row["method"], row["confidence"], int(row["fragments"] or 0)]
+        for row in rows
+    ]
+    voice = (
+        f"the selected voice's {len(known)} training words" if known
+        else ("the base model" if not lora_path else "this voice (no training vocabulary saved)")
+    )
+    cmu_note = "" if cmu_available() else " The CMU dictionary package is not installed, so only letter rules propose readings."
+    if not table:
+        return [], f"Every word is covered by the pronunciation dictionary, {voice}, or the CMU dictionary.{cmu_note}"
+    return table, (
+        f"{len(table)} word(s) have no reading from the dictionary, {voice}, or the CMU dictionary. "
+        "Review the suggested ARPAbet (stress digits, dots between syllables). Dictionary-backed readings (medium or high confidence) "
+        "are added by the button; low-confidence letter-rule guesses are listed for you to correct by hand."
+        + cmu_note
+    )
+
+
+def add_suggestions_to_dictionary(unknown_rows: Any, table_rows: Any) -> tuple[list[list[Any]], str]:
+    """Add the dictionary-backed suggestions; letter-rule guesses (low confidence) are left for hand editing.
+
+    A listening check found that annotations built from dictionary parts fix words the voice mangles,
+    while guessed readings can make a word worse than its plain spelling.
+    """
+
+    current = entries_from_rows(table_rows)
+    additions: list[DictionaryEntry] = []
+    skipped: list[str] = []
+    for row in unknown_rows or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        confidence = str(row[4] or "").strip().lower() if len(row) > 4 else ""
+        if confidence == "low":
+            skipped.append(str(row[0] or ""))
+            continue
+        entry = normalize_entry(str(row[0] or ""), str(row[1] or ""), source="suggested")
+        if entry is not None:
+            additions.append(entry)
+    note = (
+        f" Left out {len(skipped)} letter-rule guess(es) ({', '.join(skipped[:6])}{'…' if len(skipped) > 6 else ''}): "
+        "type their readings by hand, a wrong guess sounds worse than the plain spelling."
+        if skipped else ""
+    )
+    if not additions:
+        return dictionary_rows(current), ("No suggestions to add; run the check first." if not skipped else "No dictionary-backed suggestions to add." + note)
+    merged = merge_entries(current, additions)
+    return dictionary_rows(merged), f"Added {len(additions)} reading(s) to the dictionary." + note
+
+
+def add_suggestions_and_save(unknown_rows: Any, table_rows: Any) -> tuple[list[list[Any]], str]:
+    """Merge the suggested readings into the dictionary and store it at once."""
+
+    rows, message = add_suggestions_to_dictionary(unknown_rows, table_rows)
+    if "No suggestions" in message:
+        return rows, message
+    saved_rows, saved_message = save_dictionary_rows(rows)
+    return saved_rows, saved_message
+
+
+def save_dictionary_rows(table_rows: Any) -> tuple[list[list[Any]], str]:
+    entries = entries_from_rows(table_rows)
+    try:
+        path = save_dictionary(pronunciation_dictionary_path(), entries)
+    except OSError as exc:
+        return dictionary_rows(entries), f"The dictionary was not saved: {exc}"
+    _DICTIONARY_CACHE.clear()
+    return dictionary_rows(entries), f"Saved {len(entries)} entrie(s) to `{path}`."
+
+
+def reload_dictionary_rows() -> tuple[list[list[Any]], str]:
+    _DICTIONARY_CACHE.clear()
+    entries = pronunciation_entries()
+    return dictionary_rows(entries), f"Loaded {len(entries)} entrie(s) from `{pronunciation_dictionary_path()}`."
+
+
+def _lora_reference(path: str | None) -> str | None:
+    if not path:
+        return None
     try:
         info = inspect_lora(path)
-        targets = info.get("targets") or []
-        speaking_rate = load_speaking_rate(path)
-        if speaking_rate is None:
-            rate_line = (
-                "Speaking rate: **no calibrated speaking rate yet**; train with epoch "
-                "samples or use the Checkpoint Grid calibration button."
-            )
-        else:
-            rate_line = (
-                f"Speaking rate: **{speaking_rate.recommended_speaking_rate:.3f}** "
-                f"(recordings {speaking_rate.dataset_words_per_second:.2f} words/s, "
-                f"generated {speaking_rate.generated_words_per_second:.2f} words/s; "
-                f"calibration: {speaking_rate_method_label(speaking_rate.method)})."
-            )
-        decoder_path = find_decoder_adapter(path)
-        decoder_line = (
-            f"Voice decoder adapter: **found** (`{Path(decoder_path).name}`, selected automatically; choose **None** under "
-            "Voice decoder adapter to hear the GPT adapter alone)."
-            if decoder_path else
-            "Voice decoder adapter: **none** (train with **Adapt the voice decoder after training** enabled to add one)."
+    except Exception:
+        return None
+    return _resolve_lora_reference_path(path, info.get("recommended_reference"))
+
+
+def _seconds_cell(words: float | None, words_per_second: float) -> str:
+    if words is None or words_per_second <= 0.0:
+        return "–"
+    return f"{seconds_for_words(float(words), words_per_second):.1f}"
+
+
+def _range_cells(words: Sequence[int] | None, words_per_second: float) -> tuple[str, str]:
+    if not words or len(words) < 2:
+        return "–", "–"
+    low, high = int(words[0]), int(words[1])
+    if low == high:
+        return str(low), _seconds_cell(low, words_per_second)
+    return f"{low} to {high}", (
+        f"{seconds_for_words(low, words_per_second):.1f} to {seconds_for_words(high, words_per_second):.1f}"
+        if words_per_second > 0.0 else "–"
+    )
+
+
+def _histogram_notes(profile: Mapping[str, Any], words_per_second: float, recommendation: Mapping[str, Any]) -> list[str]:
+    notes: list[str] = []
+    histogram = profile.get("duration_histogram") or {}
+    clips = int(profile.get("clips") or 0)
+    duration = profile.get("duration_s") or {}
+    words = profile.get("words") or {}
+    if histogram and clips:
+        peak_label, peak_count = max(histogram.items(), key=lambda item: item[1])
+        under_six = int(histogram.get("<3s", 0)) + int(histogram.get("3-6s", 0))
+        over_fifteen = int(histogram.get(">15s", 0))
+        notes.append(
+            f"The training clips peak at {html.escape(str(peak_label))} ({peak_count / clips:.0%} of {clips} clips); "
+            f"the median clip is {float(duration.get('p50', 0.0)):.1f} s and {float(words.get('p50', 0.0)):.0f} words. "
+            f"{under_six / clips:.0%} are under 6 s and {over_fifteen / clips:.0%} over 15 s (longest {float(duration.get('max', 0.0)):.1f} s)."
         )
-        decoding = load_decoding_settings(path)
-        decoding_line = (
-            f"Decoding settings from the sweep: temperature **{decoding['temperature']:g}**, guidance **{decoding['inference_cfg_rate']:g}**, "
-            f"beams **{decoding['num_beams']}** (applied with the calibrated speaking rate)."
-            if decoding else "Decoding settings: **defaults** (no accepted sweep override for this training)."
+    budget_words = recommendation.get("sentence_max_words")
+    minimum = recommendation.get("sentence_min_alone_words")
+    if budget_words:
+        notes.append(
+            f"Sentences are merged into one line up to the token budget, so lines land between about "
+            f"{max(1, int(budget_words) - int(round(float((profile.get('words_per_sentence') or {}).get('p50', 0) or 0))))} and {int(budget_words)} words; "
+            f"a single sentence longer than {int(budget_words)} words is cut at a comma or a word boundary."
         )
-        markdown = (
-            f"**{str(info['adapter_type']).upper()}** | rank **{info['rank']}** | alpha **{info['alpha']}**  \n"
-            f"Steps: **{info.get('steps', 0)}** | Dataset: **{info.get('dataset') or 'not recorded'}** | "
-            f"Date: **{info.get('date') or 'not recorded'}**  \n"
-            f"Targets: {len(targets)} | Size: **{info.get('size_mb', 0):.2f} MB**  \n"
-            f"{rate_line}  \n"
-            f"{decoder_line}  \n"
-            f"{decoding_line}  \n"
-            f"Full path: `{Path(path).expanduser().resolve()}`"
+    if minimum:
+        notes.append(
+            f"A sentence under {int(minimum)} words standing alone is shorter than 95 percent of the training clips, "
+            "where the voice has the least practice; join it with its neighbours."
+        )
+    if words_per_second > 0.0:
+        notes.append(
+            f"Seconds are computed at {words_per_second:.2f} words/s, the pace of this voice at the current speaking rate; "
+            "move the slider and they update."
+        )
+    return notes
+
+
+def adapter_panel_html(
+    info: Mapping[str, Any],
+    path: str,
+    *,
+    rate_report: Any,
+    calibrated_rate: float | None,
+    calibration_method: str,
+    profile: Mapping[str, Any] | None,
+    decoder_path: str,
+    decoding: Mapping[str, Any] | None,
+    speaking_rate: float | None,
+    max_tokens: int | None,
+    budget_scale: float | None,
+    language: str | None,
+    auto_tokens: bool | None,
+    expressive_path: str | None = None,
+    auto_pauses: bool | None = None,
+    segmentation_mode: str | None = None,
+) -> str:
+    """The Voice LoRA / DoRA panel: identity, speaking rate, line-length rules, pauses, decoder and decoding."""
+
+    esc = html.escape
+    chips = [
+        f"rank {esc(str(info.get('rank', '?')))} · alpha {esc(str(info.get('alpha', '?')))}",
+        f"{int(info.get('steps', 0) or 0)} steps",
+        f"dataset {esc(str(info.get('dataset') or 'not recorded'))}",
+        f"{esc(str(info.get('date') or 'date not recorded')[:19])}",
+        f"{len(info.get('targets') or [])} targets · {float(info.get('size_mb', 0.0) or 0.0):.2f} MB",
+    ]
+    head = (
+        f'<div class="adapter-head"><b>{esc(str(info.get("adapter_type", "adapter")).upper())}</b>'
+        + "".join(f'<span class="adapter-chip">{chip}</span>' for chip in chips)
+        + "</div>"
+    )
+
+    # ---- speaking rate ------------------------------------------------------------------
+    current_rate = float(speaking_rate) if isinstance(speaking_rate, (int, float)) else None
+    dataset_wps = 0.0
+    generated_wps = 0.0
+    if rate_report is not None:
+        dataset_wps = float(rate_report.dataset_words_per_second or 0.0)
+        generated_wps = float(rate_report.generated_words_per_second or 0.0)
+    if dataset_wps <= 0.0 and profile:
+        dataset_wps = float(profile.get("words_per_second") or 0.0)
+    if current_rate is None:
+        current_rate = float(rate_report.recommended_speaking_rate) if rate_report is not None else 1.0
+    effective_wps = generated_wps * current_rate if generated_wps > 0.0 else dataset_wps
+    def rate_row(label: str, note: str, rate: str, pace: str, css: str = "") -> str:
+        # The provenance note wraps under the label, so the card never clips a long source.
+        sub = f'<span class="sub">{note}</span>' if note else ""
+        return f'<tr class="{css}"><td>{esc(label)}{sub}</td><td>{rate}</td><td>{pace}</td></tr>'
+
+    rate_rows: list[str] = []
+    if rate_report is None:
+        rate_rows.append(
+            "<tr><td colspan=\"3\">No calibrated speaking rate yet: train with epoch samples or use the "
+            "Checkpoint Grid calibration button. The slider value is used as is.</td></tr>"
+        )
+    else:
+        if calibrated_rate is not None:
+            calibrated_wps = generated_wps * float(calibrated_rate)
+            rate_rows.append(
+                rate_row(
+                    "Calibrated (original)",
+                    esc(speaking_rate_method_label(calibration_method)),
+                    f"{float(calibrated_rate):.3f}",
+                    f"{calibrated_wps:.2f} words/s",
+                )
+            )
+        saved_note = (
+            f"set manually {esc(str(rate_report.generated_at)[:10])}" if rate_report.is_manual
+            else "the calibration is in use"
+        )
+        rate_rows.append(
+            rate_row(
+                "Saved for this adapter",
+                saved_note,
+                f"{float(rate_report.recommended_speaking_rate):.3f}",
+                f"{generated_wps * float(rate_report.recommended_speaking_rate):.2f} words/s",
+            )
+        )
+        difference = ""
+        if dataset_wps > 0.0 and effective_wps > 0.0:
+            ratio = effective_wps / dataset_wps - 1.0
+            difference = (
+                "at the narrator's pace" if abs(ratio) < 0.005
+                else f"{abs(ratio) * 100:.0f} % {'faster' if ratio > 0 else 'slower'} than the recordings"
+            )
+        rate_rows.append(
+            rate_row("Speaking rate slider now", esc(difference), f"{current_rate:.3f}", f"{effective_wps:.2f} words/s", "target")
+        )
+    if dataset_wps > 0.0:
+        clips = f"{int(profile.get('clips', 0))} clips" if profile else f"{int(getattr(rate_report, 'clips_used', 0) or 0)} matched clips"
+        rate_rows.append(rate_row("Recordings", esc(clips), "–", f"{dataset_wps:.2f} words/s"))
+    rate_card = (
+        '<div class="adapter-card rate"><h4>Speaking rate</h4><table>'
+        "<tr><th>Source</th><th>Rate</th><th>Pace</th></tr>" + "".join(rate_rows) + "</table></div>"
+    )
+
+    # ---- words per line -----------------------------------------------------------------
+    scale = float(budget_scale) if isinstance(budget_scale, (int, float)) and budget_scale else 0.72
+    lang = str(language or (profile or {}).get("language") or "EN")
+    if profile:
+        recommendation = profile.get("recommendation") or {}
+        target = _range_cells(recommendation.get("target_words"), effective_wps)
+        acceptable = _range_cells(recommendation.get("acceptable_words"), effective_wps)
+        rows = [
+            ("Target", *target, "target"),
+            ("Acceptable range", *acceptable, ""),
+            ("Hard minimum", str(recommendation.get("hard_min_words", "–")), _seconds_cell(recommendation.get("hard_min_words"), effective_wps), ""),
+            ("Hard maximum", str(recommendation.get("hard_max_words", "–")), _seconds_cell(recommendation.get("hard_max_words"), effective_wps), ""),
+            ("Never exceed", str(recommendation.get("never_exceed_words", "–")), _seconds_cell(recommendation.get("never_exceed_words"), effective_wps), ""),
+        ]
+        line_table = (
+            f"<table><tr><th>Rule</th><th>Words</th><th>Seconds at {effective_wps:.2f} words/s</th></tr>"
+            + "".join(
+                f'<tr class="{css}"><td>{esc(label)}</td><td>{esc(words)}</td><td>{esc(seconds)}</td></tr>'
+                for label, words, seconds, css in rows
+            )
+            + "</table>"
+        )
+        recommended = recommended_max_tokens(profile, language=lang, budget_scale=scale)
+        current_tokens = int(max_tokens) if isinstance(max_tokens, (int, float)) else None
+        token_lines: list[str] = []
+        if recommended is not None:
+            rec_words = words_for_max_tokens(profile, recommended, language=lang, budget_scale=scale)
+            token_lines.append(
+                f"<b>Max tokens per segment {recommended}</b> fits this voice: one line holds up to about {rec_words:.0f} words "
+                f"({_seconds_cell(rec_words, effective_wps)} s)"
+                + (" and is applied automatically." if auto_tokens else "; enable <b>Auto from LoRA / DoRA dataset</b> to apply it.")
+            )
+        if current_tokens is not None and (recommended is None or current_tokens != recommended):
+            cur_words = words_for_max_tokens(profile, current_tokens, language=lang, budget_scale=scale)
+            token_lines.append(
+                f"The current setting {current_tokens} cuts lines at about {cur_words:.0f} words ({_seconds_cell(cur_words, effective_wps)} s)."
+            )
+        target_tokens = smart_target_tokens(profile)
+        if target_tokens:
+            tokens_per_word = float(profile.get("tokens_per_word") or 0.0) or 1.3
+            target_words = target_tokens / tokens_per_word
+            selected = " (selected)" if str(segmentation_mode or "") == "smart" else ""
+            token_lines.append(
+                f"<b>Smart sentences</b>{selected} packs whole sentences to about {target_words:.0f} words "
+                f"({_seconds_cell(target_words, effective_wps)} s) per line, the median training clip, and only cuts inside a "
+                "sentence that is longer than the token limit."
+            )
+        if budget_scale_for(lang, scale) != 1.0:
+            token_lines.append(f"Budget scale {scale:.2f} is included in these counts.")
+        lines_card = (
+            '<div class="adapter-card lines"><h4>Words per generated line'
+            '<span class="adapter-hint">one speech segment</span></h4>'
+            + line_table + "<div>" + " ".join(token_lines) + "</div></div>"
+        )
+        sentence_rows = [
+            ("Minimum standing alone", recommendation.get("sentence_min_alone_words")),
+            ("Maximum", recommendation.get("sentence_max_words")),
+        ]
+        sentence_card = (
+            '<div class="adapter-card sentences"><h4>Per sentence inside a line</h4><table>'
+            "<tr><th>Rule</th><th>Words</th><th>Seconds</th></tr>"
+            + "".join(
+                f"<tr><td>{esc(label)}</td><td>{esc(str(value if value is not None else '–'))}</td>"
+                f"<td>{_seconds_cell(value, effective_wps)}</td></tr>"
+                for label, value in sentence_rows
+            )
+            + "</table><ul>"
+            + "".join(f"<li>{note}</li>" for note in _histogram_notes(profile, effective_wps, recommendation))
+            + "</ul></div>"
+        )
+    else:
+        lines_card = (
+            '<div class="adapter-card lines"><h4>Words per generated line</h4>'
+            "<div>No dataset statistics: the training dataset of this adapter is not available, so the line-length "
+            "rules and the automatic token budget cannot be derived. Keep the dataset folder next to the app or "
+            "retrain with the current version, which saves the profile with the adapter.</div></div>"
+        )
+        sentence_card = ""
+
+    pause_card = _pause_card_html(profile, auto_pauses)
+
+    # ---- decoder, decoding, provenance ----------------------------------------------------
+    decoder_line = (
+        f"Voice decoder adapter <b>found</b> (<code>{esc(Path(decoder_path).name)}</code>, selected automatically; "
+        "choose <b>None</b> under Voice decoder adapter to hear the GPT adapter alone)."
+        if decoder_path else
+        "Voice decoder adapter <b>none</b> (train with <b>Adapt the voice decoder after training</b> enabled to add one)."
+    )
+    decoding_line = (
+        f"Decoding settings from the sweep: temperature <b>{decoding['temperature']:g}</b>, guidance "
+        f"<b>{decoding['inference_cfg_rate']:g}</b>, beams <b>{decoding['num_beams']}</b> (applied with the calibrated speaking rate)."
+        if decoding else "Decoding settings: <b>defaults</b> (no accepted sweep override for this training)."
+    )
+    provenance = ""
+    if profile:
+        provenance = (
+            f"Dataset profile: {int(profile.get('clips', 0))} training clips of <code>{esc(str(profile.get('dataset_name') or ''))}</code>, "
+            f"measured {esc(str(profile.get('generated_at') or '')[:10])}."
+        )
+    expressive_entry = (profile or {}).get("expressive_reference") or {}
+    if expressive_path:
+        detail = ""
+        if expressive_entry.get("pitch_std_st"):
+            detail = (
+                f" (pitch std {float(expressive_entry['pitch_std_st']):.2f} st against {float(expressive_entry.get('pool_pitch_std_st', 0.0)):.2f} "
+                f"for the pool, loudness std {float(expressive_entry.get('energy_std_db', 0.0)):.2f} dB)"
+            )
+        expressive_line = (
+            f"Expressive emotion clip <b>found</b> (<code>{esc(Path(expressive_path).name)}</code>{esc(detail)}): used as the emotion prompt "
+            "while Emotion source is <b>Same as speaker voice</b> and <b>Use the LoRA / DoRA expressive clip</b> is on; the speaker "
+            "reference keeps the identity."
+        )
+    else:
+        expressive_line = (
+            "Expressive emotion clip <b>none</b>: press <b>Pick expressive clip</b> to choose the liveliest clean training clip "
+            "(new training runs save one automatically)."
+        )
+    notes_card = (
+        '<div class="adapter-card notes"><h4>Decoder, decoding and files</h4>'
+        f"<div>{decoder_line}</div><div>{decoding_line}</div><div>{expressive_line}</div>"
+        + (f"<div>{provenance}</div>" if provenance else "")
+        + f'<div class="adapter-path">{esc(str(Path(path).expanduser().resolve()))}</div></div>'
+    )
+    return (
+        '<div class="adapter-panel">' + head
+        + '<div class="adapter-grid">' + rate_card + lines_card + sentence_card + pause_card + notes_card + "</div></div>"
+    )
+
+
+def _pause_card_html(profile: Mapping[str, Any] | None, auto_pauses: bool | None) -> str:
+    """The panel card with the speaker's measured pauses and the settings they recommend."""
+
+    esc = html.escape
+    pauses = (profile or {}).get("pauses") or {}
+    recommendation = pauses.get("recommendation") or {}
+    if not recommendation:
+        return (
+            '<div class="adapter-card pauses"><h4>Pauses</h4>'
+            "<div>No pause statistics yet: they are measured from the training clips when the dataset folder is present "
+            "(select the adapter again) or saved by a new training run.</div></div>"
+        )
+    sentence = pauses.get("sentence_pauses_ms") or {}
+    within = pauses.get("within_sentence_pauses_ms") or {}
+    fraction = pauses.get("pause_time_fraction") or {}
+    rows = [
+        (
+            "Sentence pause", f"{int(recommendation.get('sentence_pause_ms', 0))} ms",
+            f"median of {int(sentence.get('count', 0) or 0)} pauses between sentences "
+            f"({float(sentence.get('p25', 0.0)):.0f} to {float(sentence.get('p75', 0.0)):.0f} ms for half of them)"
+            if int(sentence.get("count", 0) or 0) else f"estimated from {esc(str(recommendation.get('sentence_pause_source') or 'the recordings'))}",
+            "target",
+        ),
+        (
+            "Maximum pause", f"{int(recommendation.get('max_pause_ms', 0))} ms",
+            "only one in ten of the speaker's sentence pauses is longer; generated pauses above it are shortened", "",
+        ),
+        (
+            "Inside a sentence", f"{float(within.get('p50', 0.0)):.0f} ms",
+            f"median pause at commas and breaths; nine in ten are under {float(within.get('p90', 0.0)):.0f} ms"
+            if int(within.get("count", 0) or 0) else "not measured", "",
+        ),
+        (
+            "Pause share", f"{float(fraction.get('mean', 0.0) or 0.0) * 100:.0f} %",
+            f"of clip time is silence between words, over {int(pauses.get('clips', 0))} clips", "",
+        ),
+    ]
+    note = (
+        "Applied to <b>Sentence pause</b> and <b>Maximum pause</b> automatically." if auto_pauses
+        else "Enable <b>Auto pauses from LoRA / DoRA dataset</b> to apply them to Sentence pause and Maximum pause."
+    )
+    return (
+        '<div class="adapter-card pauses"><h4>Pauses of this speaker</h4><table>'
+        "<tr><th>Setting</th><th>Value</th></tr>"
+        + "".join(
+            # The measurement wraps under the setting name instead of sitting in a clipped third column.
+            f'<tr class="{css}"><td>{esc(label)}<span class="sub">{detail}</span></td><td>{esc(value)}</td></tr>'
+            for label, value, detail, css in rows
+        )
+        + f"</table><div>{note}</div></div>"
+    )
+
+
+def _lora_info(
+    path: str | None,
+    *,
+    speaking_rate: float | None = None,
+    max_tokens: int | None = None,
+    budget_scale: float | None = None,
+    language: str | None = None,
+    auto_tokens: bool | None = None,
+    auto_pauses: bool | None = None,
+    segmentation_mode: str | None = None,
+) -> tuple[str, str | None]:
+    """HTML for the Voice LoRA / DoRA panel and the adapter's recommended reference path."""
+
+    if not path:
+        return (
+            '<div class="adapter-panel"><div class="adapter-head">No LoRA / DoRA selected. Base model (no LoRA / DoRA) '
+            "will clone from the reference only.</div></div>",
+            None,
+        )
+    try:
+        info = inspect_lora(path)
+        rate_report = ensure_calibration_fields(path, load_speaking_rate(path))
+        calibrated_rate, calibration_method = original_calibration(path, rate_report) if rate_report is not None else (None, "")
+        markdown = adapter_panel_html(
+            info,
+            str(path),
+            rate_report=rate_report,
+            calibrated_rate=calibrated_rate,
+            calibration_method=calibration_method,
+            profile=adapter_dataset_profile(str(path)),
+            decoder_path=find_decoder_adapter(path),
+            decoding=load_decoding_settings(path),
+            speaking_rate=speaking_rate,
+            max_tokens=max_tokens,
+            budget_scale=budget_scale,
+            language=language,
+            auto_tokens=auto_tokens,
+            expressive_path=expressive_reference_path(str(path)),
+            auto_pauses=auto_pauses,
+            segmentation_mode=segmentation_mode,
         )
         reference = _resolve_lora_reference_path(path, info.get("recommended_reference"))
         return markdown, reference
     except Exception as exc:
-        return f"LoRA / DoRA inspection failed: {exc}", None
+        return f'<div class="adapter-panel">LoRA / DoRA inspection failed: {html.escape(str(exc))}</div>', None
+
+
+def pick_expressive_clip(path: str | None) -> str:
+    """Choose the liveliest clean training clip of the adapter's dataset and save it beside the adapter."""
+
+    if not path or not Path(path).expanduser().is_file():
+        return "Select a LoRA / DoRA file first."
+    dataset_dir = dataset_dir_for_adapter(path, datasets_root=ROOT / "datasets")
+    if dataset_dir is None:
+        return "The adapter's training dataset was not found, so no clip can be measured. Keep the dataset folder next to the app."
+    from indextts.training.dataset_manifest import load_manifest
+    from indextts.training.voice_profile import choose_expressive_reference, describe_expressive_choice
+
+    rows = load_manifest(dataset_dir)
+    has_split = any(row.get("split") for row in rows)
+    records = [row for row in rows if not has_split or str(row.get("split") or "train") == "train"]
+    try:
+        choice = choose_expressive_reference(dataset_dir, records)
+    except Exception as exc:  # measurement failures must not break the tab
+        return f"Expressive clip selection failed: {exc}"
+    if choice is None:
+        return "No clean clip of prompt length could be measured in the training split."
+    adapter_dir = Path(path).expanduser().resolve().parent
+    if adapter_dir.name.lower() == "best":
+        adapter_dir = adapter_dir.parent
+    try:
+        saved = save_expressive_reference(adapter_dir, adapter_dir.name, dataset_dir, choice)
+        adapter_dataset_profile(str(path))
+        update_profile_expressive_reference(path, expressive_profile_entry(choice, saved))
+    except OSError as exc:
+        return f"The expressive clip could not be saved: {exc}"
+    _PROFILE_CACHE.clear()
+    return f"Saved {saved.name}: {describe_expressive_choice(choice)}."
+
+
+def preview_words_per_second(lora_path: str | None, speaking_rate: Any = None) -> float:
+    """Words per second the live preview uses for its seconds estimate: the voice's pace at the slider's rate."""
+
+    if not lora_path:
+        return 0.0
+    try:
+        report = load_speaking_rate(lora_path)
+        rate = float(speaking_rate) if isinstance(speaking_rate, (int, float)) and speaking_rate else None
+        if report is not None and float(report.generated_words_per_second or 0.0) > 0.0:
+            return float(report.generated_words_per_second) * (rate if rate else float(report.recommended_speaking_rate or 1.0))
+        profile = adapter_dataset_profile(str(lora_path))
+        return float((profile or {}).get("words_per_second") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def auto_pause_updates(path: str | None, enabled: bool) -> tuple[Any, Any]:
+    """**Sentence pause** and **Maximum pause** values measured from the adapter's recordings, or no change."""
+
+    if not enabled or not path:
+        return gr.skip(), gr.skip()
+    values = recommended_pauses(adapter_dataset_profile(str(path)))
+    if not values:
+        return gr.skip(), gr.skip()
+    return gr.update(value=int(values[0])), gr.update(value=int(values[1]))
+
+
+def auto_max_tokens_update(path: str | None, enabled: bool, budget_scale: float | None, language: str | None) -> Any:
+    """The **Max tokens per segment** value the selected adapter's dataset calls for, or no change."""
+
+    if not enabled or not path:
+        return gr.skip()
+    profile = adapter_dataset_profile(str(path))
+    if not profile:
+        return gr.skip()
+    scale = float(budget_scale) if isinstance(budget_scale, (int, float)) and budget_scale else 0.72
+    value = recommended_max_tokens(profile, language=str(language or profile.get("language") or "EN"), budget_scale=scale)
+    return gr.skip() if value is None else gr.update(value=int(value))
 
 
 def lora_selection_updates(
@@ -1305,10 +2012,16 @@ def lora_selection_updates(
     auto_reference: bool,
     auto_speaking_rate: bool,
     reference_source: str | None = "empty",
+    *,
+    panel: Mapping[str, Any] | None = None,
 ) -> tuple[Any, Any, str, Any, Any]:
-    """Apply adapter metadata to the reference and speaking-rate controls."""
+    """Apply adapter metadata to the reference and speaking-rate controls.
 
-    info, recommended_reference = _lora_info(path)
+    ``panel`` carries the current slider values (speaking_rate, max_tokens,
+    budget_scale, language, auto_tokens) so the adapter panel reflects them.
+    """
+
+    recommended_reference = _lora_reference(path)
     reference_update: Any = gr.skip()
     source_update: Any = gr.skip()
     messages: list[str] = []
@@ -1359,6 +2072,10 @@ def lora_selection_updates(
             if path
             else "Base model (no LoRA / DoRA) selected."
         )
+    panel_kwargs = dict(panel or {})
+    if isinstance(rate_update, (int, float)):
+        panel_kwargs["speaking_rate"] = float(rate_update)
+    info, _reference = _lora_info(path, **panel_kwargs)
     return info, reference_update, " ".join(messages), rate_update, source_update
 
 
@@ -1388,12 +2105,15 @@ def save_lora_speaking_rate(
     path: str | None,
     value: float | None,
     auto_speaking_rate: bool,
+    *,
+    panel: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, Any, Any]:
     """Store a manual speaking rate for the selected adapter and refresh its summary."""
 
+    panel_kwargs = dict(panel or {})
     if not path or not Path(path).expanduser().is_file():
         return (
-            _lora_info(path)[0],
+            _lora_info(path, **panel_kwargs)[0],
             "Select a LoRA / DoRA file before saving a speaking rate.",
             gr.skip(),
             gr.skip(),
@@ -1403,13 +2123,16 @@ def save_lora_speaking_rate(
             raise ValueError("enter a speaking rate between 0.5 and 1.5")
         report = save_manual_speaking_rate(path, float(value))
     except (TypeError, ValueError, OSError) as exc:
-        return _lora_info(path)[0], f"Speaking rate was not saved: {exc}", gr.skip(), gr.skip()
+        return _lora_info(path, **panel_kwargs)[0], f"Speaking rate was not saved: {exc}", gr.skip(), gr.skip()
     message = f"Saved speaking rate {report.recommended_speaking_rate:.3f} for {Path(path).name}."
+    if report.calibrated_speaking_rate is not None:
+        message += f" The automatic calibration {report.calibrated_speaking_rate:.3f} stays on record."
     rate_update: Any = gr.skip()
     if auto_speaking_rate:
         rate_update = report.recommended_speaking_rate
+        panel_kwargs["speaking_rate"] = float(report.recommended_speaking_rate)
         message += " Applied it to the Speaking rate slider."
-    return _lora_info(path)[0], message, rate_update, report.recommended_speaking_rate
+    return _lora_info(path, **panel_kwargs)[0], message, rate_update, report.recommended_speaking_rate
 
 
 def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int = 10) -> list[list[Any]]:
@@ -2035,19 +2758,58 @@ def build_generation_tab(
                     buttons=["copy"],
                     info="Text to synthesize; long text is split by the shared language-aware segmenter.",
                 )
-                with gr.Row():
-                    language = gr.Dropdown(
-                        choices=list(LANGUAGES), value="EN", label="Language",
-                        info="Language code used by text normalization and pronunciation.",
+                with gr.Group(elem_classes=["timing-panel"]):
+                    with gr.Row(equal_height=False):
+                        language = gr.Dropdown(
+                            choices=list(LANGUAGES), value="EN", label="Language",
+                            info="Normalization and pronunciation.", scale=1, min_width=100,
+                        )
+                        max_tokens = gr.Slider(
+                            20, 300, value=60, step=1, label="Max tokens per segment",
+                            info="Hard limit per speech segment; longer segments need more VRAM.",
+                            scale=2, min_width=180,
+                        )
+                        with gr.Column(scale=1, min_width=150):
+                            auto_lora_tokens = gr.Checkbox(
+                                value=GENERATION_DEFAULTS["generation.auto_lora_max_tokens"],
+                                label="Auto from LoRA / DoRA dataset",
+                                info="Limit from the voice's training clips.",
+                            )
+                            auto_tokens = gr.Button("✨  Language default", elem_classes=btn("lime"), size="sm")
+                    segmentation_mode = gr.Radio(
+                        choices=list(SEGMENTATION_CHOICES),
+                        value=GENERATION_DEFAULTS["generation.segmentation_mode"],
+                        label="Text splitting",
+                        info="Smart sentences packs whole sentences to the voice's typical clip length without exceeding the token limit; Every sentence renders one sentence per segment; Token budget cuts at any punctuation up to the limit.",
                     )
-                    max_tokens = gr.Slider(
-                        20, 300, value=60, step=1, label="Max tokens per segment",
-                        info="Per-language defaults are recommended; shorter segments use less VRAM.",
+                    with gr.Row(equal_height=False):
+                        sentence_pause = gr.Slider(
+                            0, 2000, value=GENERATION_DEFAULTS["generation.sentence_pause_ms"], step=10, label="Sentence pause (ms)",
+                            info="Pause between two sentences the splitter separated, measured word to word; 0 uses Section silence.",
+                            scale=1, min_width=150,
+                        )
+                        max_pause = gr.Slider(
+                            0, 2000, value=GENERATION_DEFAULTS["generation.max_pause_ms"], step=10, label="Maximum pause (ms)",
+                            info="Longer pauses in the finished audio are shortened to this; 0 keeps the model's pauses. Tagged pauses and caption timing stay as written.",
+                            scale=1, min_width=150,
+                        )
+                        auto_lora_pauses = gr.Checkbox(
+                            value=GENERATION_DEFAULTS["generation.auto_lora_pauses"],
+                            label="Auto pauses from LoRA / DoRA dataset",
+                            info="Both values from the speaker's own recordings.",
+                            scale=1, min_width=150,
+                        )
+                    gr.Markdown(
+                        "Pause syntax: `[pause:500ms]`, `[pause:0.8s]`, or `<pause=0.5>`. Tagged pauses are inserted exactly as written.",
+                        elem_classes=["section-note"],
                     )
-                    auto_tokens = gr.Button("✨  Auto", elem_classes=btn("lime"))
                 _register(registry, "generation.language", language, kind="choice", choices=LANGUAGES)
                 _register(registry, "generation.max_text_tokens_per_segment", max_tokens, kind="int", minimum=20, maximum=300)
-                gr.Markdown("Pause syntax: `[pause:500ms]`, `[pause:0.8s]`, or `<pause=0.5>`.", elem_classes=["section-note"])
+                _register(registry, "generation.auto_lora_max_tokens", auto_lora_tokens, kind="bool")
+                _register(registry, "generation.segmentation_mode", segmentation_mode, kind="choice", choices=list(SEGMENTATION_MODES))
+                _register(registry, "generation.sentence_pause_ms", sentence_pause, kind="int", minimum=0, maximum=2000)
+                _register(registry, "generation.max_pause_ms", max_pause, kind="int", minimum=0, maximum=2000)
+                _register(registry, "generation.auto_lora_pauses", auto_lora_pauses, kind="bool")
 
                 with gr.Row():
                     tab.subtitle_file = gr.File(
@@ -2082,6 +2844,49 @@ def build_generation_tab(
                     label="Live section preview",
                     buttons=["fullscreen"],
                 )
+                with gr.Accordion("🔤 Pronunciation check & dictionary", open=False):
+                    gr.Markdown(
+                        "The engine reads `<word|PHONES>` annotations natively: ARPAbet phones with stress digits and dots between "
+                        "syllables, for example `<Qwen|K W EH1 N>`. **Check unknown words** lists the words in the text that the "
+                        "selected voice never spoke in training and the base model has no dictionary reading for, with a proposed "
+                        "reading. **Add suggestions and save** stores the ones listed; edits in the dictionary table are saved as you "
+                        "make them. Entries with scope `unseen` never override a word the voice learned from its recordings; `always` "
+                        "applies everywhere. A plain respelling (`Comfy U I`) is also accepted and replaces the word as text.",
+                        elem_classes=["section-note"],
+                    )
+                    with gr.Row():
+                        apply_pronunciation = gr.Checkbox(
+                            value=GENERATION_DEFAULTS["generation.apply_pronunciation_dictionary"],
+                            label="Apply the pronunciation dictionary when generating",
+                            info="Rewrites dictionary words before synthesis and in the live preview; also used by Batch Generation.",
+                            scale=3,
+                        )
+                        check_words = gr.Button("🔍  Check unknown words", elem_classes=btn("olive"), scale=1)
+                    unknown_words = gr.Dataframe(
+                        headers=["Word", "Suggested reading", "Kind", "How it was derived", "Confidence", "Tokenizer pieces"],
+                        datatype=["str", "str", "str", "str", "str", "number"],
+                        value=[],
+                        type="array",
+                        interactive=False,
+                        wrap=True,
+                        max_height=220,
+                        label="Words without a known reading",
+                        buttons=["fullscreen"],
+                    )
+                    pronunciation_status = gr.Markdown("", elem_classes=["section-note"])
+                    add_suggestions = gr.Button("➕  Add suggestions and save", elem_classes=btn("coral"))
+                    dictionary_table = gr.Dataframe(
+                        headers=["Word", "Reading (ARPAbet phones or respelling)", "Kind", "Scope (unseen / always)", "Source"],
+                        datatype=["str", "str", "str", "str", "str"],
+                        value=dictionary_rows(pronunciation_entries()),
+                        type="array",
+                        interactive=True,
+                        wrap=True,
+                        max_height=280,
+                        label="Pronunciation dictionary (pronunciations/dictionary.json)",
+                        buttons=["fullscreen"],
+                    )
+                _register(registry, "generation.apply_pronunciation_dictionary", apply_pronunciation, kind="bool")
 
             with gr.Column(scale=1, min_width=320):
                 gr.Markdown("### Run")
@@ -2116,54 +2921,58 @@ def build_generation_tab(
                 tab.task_timer = gr.Timer(5.0, active=True)
 
         gr.Markdown("### Voice LoRA / DoRA")
+        # Three rows of like with like: the two adapter pickers (one Refresh reloads
+        # both), the two strengths side by side, then the four automation switches at
+        # equal width so the long notes wrap in wide columns instead of tall slivers.
         with gr.Row():
             lora = gr.Dropdown(
                 choices=_lora_choices(),
                 value="",
                 label="LoRA / DoRA",
                 info="Select a trained LoRA / DoRA, or None for Base model (no LoRA / DoRA), which clones from the reference only.",
-                scale=12,
-            )
-            refresh_lora = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
-        with gr.Row(equal_height=False):
-            strength = gr.Slider(
-                0.0, 2.0, value=1.0, step=0.05,
-                label="LoRA / DoRA strength",
-                info="1.0 is the trained strength; lower is subtler and higher is stronger.",
-                scale=2,
-            )
-            auto_ref = gr.Checkbox(
-                value=GENERATION_DEFAULTS["generation.auto_lora_reference"],
-                label="Auto-load the LoRA / DoRA recommended reference audio",
-                info="Loads the LoRA / DoRA's saved reference whenever no manual Reference Voice is selected.",
-                scale=2,
-            )
-            auto_rate = gr.Checkbox(
-                value=GENERATION_DEFAULTS["generation.auto_lora_speaking_rate"],
-                label="Auto-apply the LoRA / DoRA calibrated speaking rate and decoding settings",
-                info="Uses the selected voice's measured pace and the temperature, guidance, and beams its decoding sweep adopted; selecting None restores the defaults.",
-                scale=2,
-            )
-            merge_lora = gr.Checkbox(
-                value=False,
-                label="Merge LoRA / DoRA into base weights for speed (BF16 only)",
-                info="Temporarily folds the selected LoRA / DoRA into floating GPT weights and restores them before switching.",
-                scale=3,
+                scale=6,
             )
             use_decoder = gr.Dropdown(
                 choices=decoder_adapter_choices("", ROOT / "loras"),
                 value="auto",
                 label="Voice decoder adapter",
                 info="Selecting a LoRA / DoRA picks the decoder adapter saved with it. Choose None to hear the GPT adapter alone, or any other decoder adapter file.",
-                scale=3,
+                scale=6,
+            )
+            refresh_lora = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
+        with gr.Row(equal_height=True):
+            strength = gr.Slider(
+                0.0, 2.0, value=1.0, step=0.05,
+                label="LoRA / DoRA strength",
+                info="1.0 is the trained strength; lower is subtler and higher is stronger.",
             )
             decoder_strength = gr.Slider(
                 0.0, 2.0, value=1.0, step=0.05,
                 label="Voice decoder adapter strength",
                 info="1.0 is the trained strength of the decoder adapter; it is independent of the LoRA / DoRA strength.",
-                scale=2,
             )
-        lora_info = gr.Markdown("No LoRA / DoRA selected.", elem_classes=["section-note"])
+        with gr.Row(equal_height=True):
+            auto_ref = gr.Checkbox(
+                value=GENERATION_DEFAULTS["generation.auto_lora_reference"],
+                label="Auto-load the LoRA / DoRA recommended reference audio",
+                info="Loads the LoRA / DoRA's saved reference whenever no manual Reference Voice is selected.",
+            )
+            auto_rate = gr.Checkbox(
+                value=GENERATION_DEFAULTS["generation.auto_lora_speaking_rate"],
+                label="Auto-apply the LoRA / DoRA calibrated speaking rate and decoding settings",
+                info="Uses the selected voice's measured pace and the temperature, guidance, and beams its decoding sweep adopted; selecting None restores the defaults.",
+            )
+            auto_emotion = gr.Checkbox(
+                value=GENERATION_DEFAULTS["generation.auto_lora_emotion_reference"],
+                label="Use the LoRA / DoRA expressive clip as the emotion prompt",
+                info="While Emotion source is Same as speaker voice, the liveliest clean training clip saved with the adapter drives the delivery (Emotion weight applies) and the speaker reference keeps the identity. Measured: fewer word errors and more pitch movement at unchanged identity; blind listening rounds were split (a hand-picked clip was preferred, the automatically chosen one slightly not), so listen and uncheck if you prefer the plain prompt.",
+            )
+            merge_lora = gr.Checkbox(
+                value=False,
+                label="Merge LoRA / DoRA into base weights for speed (BF16 only)",
+                info="Temporarily folds the selected LoRA / DoRA into floating GPT weights and restores them before switching.",
+            )
+        lora_info = gr.HTML(_lora_info("")[0])
         with gr.Row(equal_height=True):
             lora_saved_rate = gr.Number(
                 value=None, step=0.01, precision=3,
@@ -2172,6 +2981,7 @@ def build_generation_tab(
                 scale=4,
             )
             save_lora_rate = gr.Button("⏱️  Save speaking rate", elem_classes=btn("purple"), scale=1)
+            pick_expressive = gr.Button("🎭  Pick expressive clip", elem_classes=btn("mint"), scale=1)
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
@@ -2184,6 +2994,7 @@ def build_generation_tab(
             auto_rate,
             kind="bool",
         )
+        _register(registry, "generation.auto_lora_emotion_reference", auto_emotion, kind="bool")
 
         with gr.Accordion("Emotion Control", open=False):
             emotion_mode = gr.Radio(
@@ -2249,7 +3060,11 @@ def build_generation_tab(
                 top_k = gr.Slider(0, 100, value=30, step=1, label="Top-k", info="Candidate token cutoff; 0 disables top-k filtering.")
             with gr.Row():
                 beams = gr.Slider(1, 10, value=3, step=1, label="Beams", info="More beams can improve stability but increase time and VRAM.")
-                repetition = gr.Slider(1, 20, value=10.0, step=0.1, label="Repetition penalty", info="10 is the established model default.")
+                repetition = gr.Slider(1, 20, value=10.0, step=0.1, label="Repetition penalty", info="10 is the established model default. Above about 1.3 it works as a ban on every code the segment has already used.")
+                repetition_window = gr.Slider(
+                    0, 256, value=GENERATION_DEFAULTS["generation.repetition_window"], step=1, label="Repetition window (codes)",
+                    info="0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second.",
+                )
                 length = gr.Slider(-2, 2, value=0, step=0.05, label="Length penalty", info="Only affects beam search; 0 is neutral.")
                 max_mel = gr.Slider(50, 1815, value=1500, step=5, label="Max mel tokens", info="Upper limit on generated semantic tokens per section.")
             with gr.Row():
@@ -2262,6 +3077,7 @@ def build_generation_tab(
                 ("generation.top_k", top_k, "int", 0, 100),
                 ("generation.num_beams", beams, "int", 1, 10),
                 ("generation.repetition_penalty", repetition, "float", 1, 20),
+                ("generation.repetition_window", repetition_window, "int", 0, 256),
                 ("generation.length_penalty", length, "float", -2, 2),
                 ("generation.max_mel_tokens", max_mel, "int", 50, 1815),
                 ("generation.seed", seed, "int", -1, 4294967295),
@@ -2284,7 +3100,11 @@ def build_generation_tab(
             with gr.Row():
                 budget_scale = gr.Slider(0.3, 1.0, value=0.72, step=0.01, label="Non-CJK token budget scale", info="0.72 leaves room for subword expansion in English, Arabic, and Spanish.")
                 interval = gr.Slider(0, 2000, value=200, step=10, label="Section silence (ms)", info="Silence inserted between generated text sections; cue timing overrides this to zero.")
-                max_silence = gr.Slider(0, 200, value=0, step=1, label="Max consecutive silence tokens", info="0 disables token trimming; use only to suppress unusually long model silences.")
+                max_silence = gr.Slider(
+                    0, 200, value=0, step=1, label="Max consecutive silence tokens",
+                    info="Trims runs of the codec's silence token (IndexTTS 2.0 codec only; the 2.5 codec never repeats a code, so the control is hidden there). Use Maximum pause instead.",
+                    visible=codec_has_silence_runs(model_dir),
+                )
                 latent = gr.Slider(0.5, 3.0, value=1.72, step=0.01, label="Latent multiplier", info="1.72 is natural duration; the runner converts this to the engine duration factor.")
                 speaking_rate = gr.Slider(
                     0.5,
@@ -2776,10 +3596,29 @@ def build_generation_tab(
     refresh_lora.click(lambda path: gr.update(choices=decoder_adapter_choices(str(path or ""), ROOT / "loras")),
                        inputs=lora, outputs=use_decoder, queue=False)
 
-    lora_selection_inputs = [lora, tab.prompt_audio, auto_ref, auto_rate, tab.reference_source]
+    lora_selection_inputs = [
+        lora, tab.prompt_audio, auto_ref, auto_rate, tab.reference_source,
+        auto_lora_tokens, budget_scale, language, speaking_rate, max_tokens,
+        auto_lora_pauses, segmentation_mode,
+    ]
 
     def on_lora_selection(*items: Any):
-        info, audio_update, message, rate_update, source_update = lora_selection_updates(*items)
+        path = str(items[0] or "")
+        auto_tokens_on, scale, lang, current_rate, current_tokens = items[5:10]
+        auto_pauses_on, split_mode = items[10:12]
+        tokens_update = auto_max_tokens_update(path, bool(auto_tokens_on), scale, lang)
+        panel_tokens = tokens_update["value"] if isinstance(tokens_update, dict) and "value" in tokens_update else current_tokens
+        sentence_pause_update, max_pause_update = auto_pause_updates(path, bool(auto_pauses_on))
+        panel = {
+            "speaking_rate": current_rate,
+            "max_tokens": panel_tokens,
+            "budget_scale": scale,
+            "language": lang,
+            "auto_tokens": bool(auto_tokens_on),
+            "auto_pauses": bool(auto_pauses_on),
+            "segmentation_mode": str(split_mode or ""),
+        }
+        info, audio_update, message, rate_update, source_update = lora_selection_updates(*items[:5], panel=panel)
         media_update: Any = gr.skip()
         video_update: Any = gr.skip()
         if source_update == "lora_auto":
@@ -2806,6 +3645,9 @@ def build_generation_tab(
             # The strength its full-pipeline test chose, or the trained strength when nothing was measured.
             gr.update(value=recommended_decoder_strength(str(items[0] or "")) or 1.0),
             *decoding_updates(str(items[0] or ""), bool(items[3])),
+            tokens_update,
+            sentence_pause_update,
+            max_pause_update,
         )
 
     lora_selection_outputs = [
@@ -2822,13 +3664,59 @@ def build_generation_tab(
         temperature,
         cfg,
         beams,
+        max_tokens,
+        sentence_pause,
+        max_pause,
     ]
+    panel_inputs = [lora, speaking_rate, max_tokens, budget_scale, language, auto_lora_tokens, auto_lora_pauses, segmentation_mode]
+
+    def _panel_values(rate: Any, tokens: Any, scale: Any, lang: Any, auto_tokens_on: Any, auto_pauses_on: Any, split_mode: Any) -> dict[str, Any]:
+        return {
+            "speaking_rate": rate, "max_tokens": tokens, "budget_scale": scale, "language": lang,
+            "auto_tokens": bool(auto_tokens_on), "auto_pauses": bool(auto_pauses_on), "segmentation_mode": str(split_mode or ""),
+        }
+
+    def on_save_lora_rate(path: Any, value: Any, auto: Any, *panel_values: Any):
+        return save_lora_speaking_rate(str(path or ""), value, bool(auto), panel=_panel_values(*panel_values))
+
     save_lora_rate.click(
-        save_lora_speaking_rate,
-        [lora, lora_saved_rate, auto_rate],
+        on_save_lora_rate,
+        [lora, lora_saved_rate, auto_rate, *panel_inputs[1:]],
         [lora_info, reference_status, speaking_rate, lora_saved_rate],
         queue=False,
     )
+
+    def on_pick_expressive(path: Any, *panel_values: Any):
+        message = pick_expressive_clip(str(path or ""))
+        return _lora_info(str(path or ""), **_panel_values(*panel_values))[0], message
+
+    pick_expressive.click(on_pick_expressive, panel_inputs, [lora_info, reference_status], show_progress="full")
+
+    def refresh_adapter_panel(path: Any, *panel_values: Any) -> str:
+        return _lora_info(str(path or ""), **_panel_values(*panel_values))[0]
+
+    # The panel's seconds follow the speaking-rate slider and its token and pause lines follow the timing controls.
+    for component in (speaking_rate, max_tokens, budget_scale, language, auto_lora_tokens, auto_lora_pauses, segmentation_mode):
+        component.change(
+            refresh_adapter_panel, panel_inputs, lora_info,
+            queue=False, show_progress="hidden", trigger_mode="always_last",
+        )
+
+    def on_auto_tokens(path: Any, enabled: Any, scale: Any, lang: Any):
+        return auto_max_tokens_update(str(path or ""), bool(enabled), scale, lang)
+
+    for component in (auto_lora_tokens, budget_scale, language):
+        component.change(on_auto_tokens, [lora, auto_lora_tokens, budget_scale, language], max_tokens, queue=False, show_progress="hidden")
+
+    def on_auto_pauses(path: Any, enabled: Any):
+        return auto_pause_updates(str(path or ""), bool(enabled))
+
+    auto_lora_pauses.change(on_auto_pauses, [lora, auto_lora_pauses], [sentence_pause, max_pause], queue=False, show_progress="hidden")
+
+    check_words.click(check_unknown_words, [tab.text, lora, dictionary_table], [unknown_words, pronunciation_status], queue=False)
+    add_suggestions.click(add_suggestions_and_save, [unknown_words, dictionary_table], [dictionary_table, pronunciation_status], queue=False)
+    # Every edit in the table is saved; only the status is returned so the table does not re-trigger itself.
+    dictionary_table.change(lambda rows: save_dictionary_rows(rows)[1], dictionary_table, pronunciation_status, queue=False, show_progress="hidden")
     lora.change(
         on_lora_selection,
         lora_selection_inputs,
@@ -2849,12 +3737,26 @@ def build_generation_tab(
     )
     auto_tokens.click(lambda lang: default_segment_tokens(lang), language, max_tokens, queue=False)
 
-    preview_inputs = [tab.text, language, max_tokens, caption_timing, tab.subtitle_file, pause_tags, budget_scale]
+    preview_inputs = [
+        tab.text, language, max_tokens, caption_timing, tab.subtitle_file, pause_tags, budget_scale, apply_pronunciation, lora,
+        segmentation_mode, speaking_rate,
+    ]
 
     def update_preview(*items: Any):
-        return preview_segments(*items, model_dir=model_dir)
+        text, lang, tokens, timing, subtitle, pauses, scale, apply_pron, lora_path, split_mode, rate = items
+        if apply_pron:
+            try:
+                text = apply_pronunciation_dictionary(str(text or ""), str(lora_path or ""))
+            except Exception:
+                pass
+        mode = normalize_segmentation_mode(split_mode)
+        target = smart_segment_target(str(lora_path or "")) if mode == "smart" else None
+        return preview_segments(
+            text, lang, tokens, timing, subtitle, pauses, scale, model_dir=model_dir,
+            segmentation_mode=mode, target_tokens=target, words_per_second=preview_words_per_second(str(lora_path or ""), rate),
+        )
 
-    for component in (tab.text, language, max_tokens, caption_timing, pause_tags, budget_scale):
+    for component in (tab.text, language, max_tokens, caption_timing, pause_tags, budget_scale, apply_pronunciation, lora, segmentation_mode, speaking_rate):
         component.change(update_preview, preview_inputs, [segment_preview, preview_count], queue=False, show_progress="hidden", trigger_mode="always_last")
     for component in (tab.text, max_tokens, budget_scale):
         component.input(update_preview, preview_inputs, [segment_preview, preview_count], queue=False, show_progress="hidden", trigger_mode="always_last")
@@ -2928,6 +3830,7 @@ def bind_generation_events(
     tab.request_keys = [spec.key for spec in request_specs]
     tab.request_components = [spec.component for spec in request_specs]
     model_dir = str(getattr(args, "model_dir", ROOT / "models"))
+    set_model_dir(model_dir)
 
     def generate(
         prompt: str,

@@ -988,6 +988,9 @@ def build_training_tab(
                 average_last = gr.Number(value=TRAIN_DEFAULTS["average_last_checkpoints"], minimum=0, maximum=20, precision=0,
                     label="Average the last saved checkpoints",
                     info="After training, this many of the last saved updates (epoch files and the final file) are averaged in parameter space into one more candidate for the speech comparison, which selects it only when it measures best. 0 (the default) disables it: on the measured voice, averages of the last two and three updates both scored below the final file.")
+                ema_decay = gr.Number(value=TRAIN_DEFAULTS["ema_decay"], minimum=0, maximum=0.9999, step=0.0001,
+                    label="EMA of the adapter weights (decay)",
+                    info="0 is off. Otherwise a running average of the trainable weights is kept during training (0.999 averages roughly the last thousand updates) and saved beside every epoch and final file as <name>_ema*.safetensors; the final EMA file joins the speech comparison as one more candidate and is selected only when it measures best.")
             reference_typical = gr.Checkbox(value=TRAIN_DEFAULTS["reference_typical"], label="Prefer a reference near the speaker's median pitch and pace",
                 info="Among the cleanest training clips near 15 seconds, the saved recommended reference, training conditioning, and the speech benchmark use the clip whose pitch and words per second are closest to the dataset's medians.")
             final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
@@ -1002,6 +1005,7 @@ def build_training_tab(
                 ("speech_eval_max_wer_increase", speech_wer, "float", 0, 1),
                 ("speech_eval_max_speaker_drop", speech_speaker, "float", 0, 1),
                 ("average_last_checkpoints", average_last, "int", 0, 20),
+                ("ema_decay", ema_decay, "float", 0, 0.9999),
                 ("final_test_dataset", final_test, "str", None, None),
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)

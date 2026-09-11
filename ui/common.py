@@ -159,6 +159,9 @@ BUTTON_HUES: dict[str, tuple[str, str, str]] = {
     "bronze":  ("#5c3a21", "#8b5a2b", "#d4a373"),
     "slate":   ("#334155", "#475569", "#94a3b8"),
     "gray":    ("#3f3f46", "#52525b", "#a1a1aa"),
+    "olive":   ("#3f4f1f", "#6b8e23", "#b5cc4a"),
+    "coral":   ("#9a3b2e", "#e0573e", "#ffa08a"),
+    "mint":    ("#0f5132", "#2dbd8f", "#9ff3d3"),
 }
 BUTTON_COLORS = tuple(BUTTON_HUES)
 
@@ -351,6 +354,124 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
 .stat-box { padding: var(--size-2) 0 var(--size-1); border-top: 3px solid var(--ax-accent); }
 .stat-box span { font-size: var(--text-xs); color: var(--body-text-color-subdued); }
 .stat-box b { font-size: var(--text-lg); }
+
+/* Voice LoRA / DoRA panel: an identity strip and a row of equal-height cards (speaking
+   rate, line length, sentences, pauses, decoder and files).  Numbers stay on one line
+   while the label column and every note wrap, so nothing is ever clipped at a card
+   edge.  The rules are written at .adapter-card depth to outrank Gradio's .prose
+   table styling, which otherwise draws a box around every cell. */
+.adapter-panel { display: grid; gap: var(--size-3); font-size: var(--text-sm); line-height: 1.45; }
+.adapter-panel .adapter-head { display: flex; flex-wrap: wrap; gap: var(--size-2); align-items: center; }
+.adapter-panel .adapter-head b { margin-right: var(--size-2); font-size: var(--text-md); letter-spacing: .06em; }
+.adapter-panel .adapter-chip {
+  display: inline-block;
+  padding: 2px var(--size-3);
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-full);
+  background: var(--background-fill-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.adapter-panel .adapter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: var(--size-3);
+  align-items: stretch;
+}
+.adapter-panel .adapter-card {
+  --card-accent: var(--ax-accent);
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2);
+  min-width: 0;
+  padding: var(--size-3);
+  border: 1px solid var(--border-color-primary);
+  border-left: 4px solid var(--card-accent);
+  border-radius: var(--radius-md);
+  background: var(--background-fill-secondary);
+  overflow-wrap: anywhere;
+}
+.adapter-panel .adapter-card.rate { --card-accent: #0ea5e9; }
+.adapter-panel .adapter-card.lines { --card-accent: #22c55e; }
+.adapter-panel .adapter-card.sentences { --card-accent: #a855f7; }
+.adapter-panel .adapter-card.pauses { --card-accent: #ec4899; }
+.adapter-panel .adapter-card.notes { --card-accent: #f59e0b; }
+.adapter-panel .adapter-card h4 {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0 var(--size-3);
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--body-text-color);
+}
+/* A qualifier on the heading line, set as a caption so the title itself stays short. */
+.adapter-panel .adapter-card h4 .adapter-hint {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--body-text-color-subdued);
+}
+.adapter-panel .adapter-card > div, .adapter-panel .adapter-card > ul { margin: 0; }
+/* The table bleeds into the card padding by one cell padding, so its text lines up
+   with the heading and the highlighted row reads as a full-width band. */
+.adapter-panel .adapter-card table {
+  width: calc(100% + 2 * var(--size-2));
+  margin: 0 calc(-1 * var(--size-2));
+  border: none;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.adapter-panel .adapter-card th, .adapter-panel .adapter-card td {
+  padding: 4px var(--size-2);
+  border: none;
+  border-bottom: 1px solid var(--border-color-primary);
+  text-align: right;
+  vertical-align: top;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+.adapter-panel .adapter-card th {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--body-text-color-subdued);
+}
+.adapter-panel .adapter-card th:first-child, .adapter-panel .adapter-card td:first-child { width: 100%; text-align: left; white-space: normal; }
+.adapter-panel .adapter-card tr:last-child td { border-bottom: none; }
+.adapter-panel .adapter-card tr.target td { font-weight: 650; background: color-mix(in srgb, var(--card-accent) 14%, transparent); }
+.adapter-panel .adapter-card td .sub {
+  display: block;
+  margin-top: 1px;
+  font-size: calc(var(--text-sm) - 1px);
+  font-weight: 400;
+  line-height: 1.35;
+  color: var(--body-text-color-subdued);
+}
+.adapter-panel .adapter-card ul { display: grid; gap: var(--size-1); padding-left: var(--size-4); }
+.adapter-panel .adapter-card li { margin: 0; padding: 0; }
+.adapter-panel .adapter-card code { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.adapter-panel .adapter-card .adapter-path {
+  margin-top: auto;
+  padding-top: var(--size-2);
+  border-top: 1px dashed var(--border-color-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  color: var(--body-text-color-subdued);
+  word-break: break-all;
+}
+.timing-panel { padding: var(--size-2) var(--size-3); border: 1px solid var(--border-color-primary); border-radius: var(--radius-lg); background: var(--background-fill-secondary); }
+.timing-panel .form { border: none; background: transparent; box-shadow: none; }
+.timing-panel .block { padding-top: var(--size-1); padding-bottom: var(--size-1); }
+.timing-panel .section-note { margin: 0; }
 
 /* Let Vega axis labels extend into the block padding instead of being clipped on narrow layouts. */
 .gradio-plot .vega-embed, .gradio-plot .vega-embed svg, .gradio-plot .vega-embed .chart-wrapper { overflow: visible !important; }
@@ -880,6 +1001,69 @@ class LazyEngine:
 
 
 LAZY_ENGINE = LazyEngine()
+
+
+_BOUNDS_GUARD_INSTALLED = False
+_BOUNDS_NOTICES: set[tuple[int, str]] = set()
+
+
+def clamp_to_bounds(value: Any, minimum: Any, maximum: Any) -> Any:
+    """Return ``value`` limited to ``[minimum, maximum]`` (either bound may be None)."""
+
+    if value is None:
+        return None
+    result = value
+    if minimum is not None and result < minimum:
+        result = minimum
+    if maximum is not None and result > maximum:
+        result = maximum
+    return result
+
+
+def install_gradio_bounds_guard() -> None:
+    """Clamp out-of-range slider and number payloads instead of raising an error.
+
+    Typing into a slider's number box sends every intermediate keystroke to the
+    live listeners ("4" on the way to "45" for a slider whose minimum is 20).
+    Gradio's default is to raise ``Value 4 is less than minimum value 20`` for each
+    of them, which prints a traceback in the console and shows an error toast.
+    The guard limits the payload to the component's bounds, prints one short
+    notice per component, and lets the listener run with the clamped value.
+    """
+
+    global _BOUNDS_GUARD_INSTALLED
+    if _BOUNDS_GUARD_INSTALLED:
+        return
+    from gradio.components import Number, Slider
+
+    def guarded(original: Any):
+        def preprocess(self, payload: Any):
+            if isinstance(payload, (int, float)) and not isinstance(payload, bool):
+                minimum = getattr(self, "minimum", None)
+                maximum = getattr(self, "maximum", None)
+                clamped = clamp_to_bounds(payload, minimum, maximum)
+                if clamped != payload:
+                    bound = "minimum" if clamped == minimum else "maximum"
+                    key = (id(self), bound)
+                    if key not in _BOUNDS_NOTICES:
+                        _BOUNDS_NOTICES.add(key)
+                        label = getattr(self, "label", None) or type(self).__name__
+                        print(
+                            f">> {type(self).__name__} '{label}': value {payload} is outside "
+                            f"{minimum}..{maximum}; using the {bound} {clamped} (values typed while editing are clamped).",
+                            flush=True,
+                        )
+                    payload = clamped
+            return original(self, payload)
+
+        preprocess.__wrapped__ = original  # type: ignore[attr-defined]
+        return preprocess
+
+    for component in (Slider, Number):
+        current = component.preprocess
+        if getattr(current, "__wrapped__", None) is None:
+            component.preprocess = guarded(current)  # type: ignore[method-assign]
+    _BOUNDS_GUARD_INSTALLED = True
 
 
 def progress_panel_html(payload: Mapping[str, Any] | None, *, title: str = "Ready") -> str:

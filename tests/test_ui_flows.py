@@ -191,8 +191,9 @@ def test_lora_selection_auto_applies_and_resets_calibrated_speaking_rate(
     monkeypatch.setattr(
         generation_tab,
         "_lora_info",
-        lambda _path: ("adapter info", None),
+        lambda _path, **_panel: ("adapter info", None),
     )
+    monkeypatch.setattr(generation_tab, "_lora_reference", lambda _path: None)
     monkeypatch.setattr(
         generation_tab,
         "load_speaking_rate",
@@ -220,9 +221,9 @@ def test_saving_a_manual_speaking_rate_refreshes_the_adapter_summary(monkeypatch
         if rate > 1.5:
             raise ValueError("Speaking rate must be between 0.5 and 1.5")
         saved.append((path, rate))
-        return SimpleNamespace(recommended_speaking_rate=round(rate, 3))
+        return SimpleNamespace(recommended_speaking_rate=round(rate, 3), calibrated_speaking_rate=None)
 
-    monkeypatch.setattr(generation_tab, "_lora_info", lambda _path: ("adapter info", None))
+    monkeypatch.setattr(generation_tab, "_lora_info", lambda _path, **_panel: ("adapter info", None))
     monkeypatch.setattr(generation_tab, "save_manual_speaking_rate", fake_save)
 
     info, message, rate_update, field_value = generation_tab.save_lora_speaking_rate(str(checkpoint), 1.07, True)

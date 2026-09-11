@@ -389,3 +389,22 @@ def test_runner_records_failure_instead_of_a_successful_truncated_file(tmp_path)
     assert "Incomplete speech" in saved["error"]
     assert not (tmp_path / "final.wav").exists()
     assert not (tmp_path / "candidate_01.wav").exists()
+
+
+def test_text_plan_marks_sentence_gaps_and_pause_tags():
+    engine = make_engine()
+    segments, plan, _ = engine._build_text_plan(
+        "alpha delta. beta gamma. [pause:200ms] omega", "EN", 1000, False, 200, True, 1.0, "sentence", None, 500,
+    )
+    assert [segment.strip() for segment in segments] == ["alpha delta.", "beta gamma.", "omega"]
+    # Sentence ends inside a text chunk get the sentence gap; the pause tag keeps its own kind.
+    assert plan == [
+        ("segment", 0), ("sentence_gap", 11025), ("segment", 1), ("pause", 4410), ("segment", 2),
+    ]
+    # Without a sentence pause the section silence is used, and a cut inside a sentence never gets the gap.
+    _segments, plan, _ = engine._build_text_plan(
+        "alpha delta. beta gamma.", "EN", 1000, False, 200, True, 1.0, "sentence", None, 0,
+    )
+    assert plan == [("segment", 0), ("silence", 4410), ("segment", 1)]
+    segments, plan, _ = engine._build_text_plan("alpha delta", "EN", 5, False, 200, True, 1.0, "budget", None, 500)
+    assert segments == ["alpha", "delta"] and plan == [("segment", 0), ("silence", 4410), ("segment", 1)]

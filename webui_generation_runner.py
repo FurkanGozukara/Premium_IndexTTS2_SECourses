@@ -551,6 +551,9 @@ def run_generation_request(
         "reuse_spk_cond_for_emo": False,
         "enable_pause_tags": True,
         "trim_silence_ms_threshold": 0,
+        "segmentation_mode": "budget",
+        "segment_target_tokens": None,
+        "sentence_pause_ms": 0,
         "target_duration_s": None,
         "target_duration_mode": "off",
     }
@@ -559,6 +562,12 @@ def run_generation_request(
             infer_kwargs[key] = request[key]
         else:
             infer_kwargs.setdefault(key, default)
+    max_pause_ms = int(request.get("max_pause_ms", 0) or 0)
+    sentence_pause_ms = int(infer_kwargs.get("sentence_pause_ms", 0) or 0)
+    if max_pause_ms > 0 and sentence_pause_ms > max_pause_ms:
+        # The ceiling applies to every pause, so the join pause cannot exceed it.
+        print(f">> Sentence pause {sentence_pause_ms} ms limited to Maximum pause {max_pause_ms} ms")
+        infer_kwargs["sentence_pause_ms"] = max_pause_ms
     num_candidates = max(1, min(32, int(request.get("num_candidates", infer_kwargs.pop("num_candidates", 1)))))
     audio_tuning_preset = str(request.get("audio_tuning_preset", "bypass") or "bypass").strip().lower()
     audio_tuning_overrides = request.get("audio_tuning_overrides", {})
@@ -572,9 +581,10 @@ def run_generation_request(
     else:
         base_seed = int(requested_seed) % (2**32)
     if subtitle_mode:
-        # Subtitle timing already owns duration fitting cue by cue.
+        # Subtitle timing already owns duration fitting cue by cue, and the cue slots own the pauses.
         infer_kwargs["target_duration_s"] = None
         infer_kwargs["target_duration_mode"] = "off"
+        infer_kwargs["sentence_pause_ms"] = 0
     request_runtime = RuntimeConfig.from_dict(request.get("runtime"))
     infer_kwargs.setdefault("cfm_cache_length", request_runtime.cfm_cache_length)
     section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
@@ -668,6 +678,8 @@ def run_generation_request(
                             unit.text,
                             request["max_text_tokens"],
                             f'<|{language.lower()}|> ',
+                            mode=str(infer_kwargs.get("segmentation_mode") or "budget"),
+                            target_tokens=infer_kwargs.get("segment_target_tokens"),
                         )
                     )
                     for unit in non_empty_units
@@ -928,6 +940,19 @@ def run_generation_request(
                 print(f"Saved used reference audio to: {task_layout['speaker_reference_copy_path']}")
             except Exception as exc:
                 print(f"Error saving used audio: {exc}")
+
+        if max_pause_ms > 0 and not subtitle_mode:
+            from indextts.utils.pause_cap import shorten_long_pauses_file
+
+            # Explicit pause tags keep their exact length; the engine reports where they are.
+            protected = list((candidate_stats[0] if candidate_stats else {}).get("protected_pauses") or [])
+            pause_report = shorten_long_pauses_file(output, output, max_pause_ms, protected_s=protected)
+            metadata["pause_cap"] = pause_report
+            print(
+                f">> Maximum pause {max_pause_ms} ms: shortened {pause_report['shortened']} of "
+                f"{pause_report['pauses']} pauses, removed {pause_report['removed_ms']} ms"
+                + (f", {pause_report['protected']} pause tag(s) kept" if pause_report.get("protected") else "")
+            )
 
         tuning_active = audio_tuning_preset != "bypass" or bool(audio_tuning_overrides)
         if tuning_active:

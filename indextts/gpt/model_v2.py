@@ -10,7 +10,7 @@ from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
 install_native_enum_pytree_compatibility()
 
 import transformers
-from transformers import GPT2Config, GPT2Model, GPT2PreTrainedModel, LogitsProcessorList
+from transformers import GPT2Config, GPT2Model, GPT2PreTrainedModel, LogitsProcessor, LogitsProcessorList
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 try:
@@ -71,6 +71,39 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         return F.relu(self.net(x) + x)
+
+
+class WindowedRepetitionPenaltyLogitsProcessor(LogitsProcessor):
+    """Repetition penalty that looks only at the last ``window`` generated codes.
+
+    The Hugging Face penalty divides the score of every code that already occurred
+    anywhere in the sequence; with the sampling cut-offs this app uses it becomes a
+    hard ban above about 1.3, so a long segment loses one more code for every code
+    it speaks. Speech reuses codes constantly (the same vowel returns in every
+    word), while the failure the penalty guards against, a stuck loop, lives in the
+    last few dozen codes. Limiting the penalty to a window stops the loop and lets
+    earlier codes return. The prompt part of the sequence is never penalized.
+    """
+
+    def __init__(self, penalty: float, window: int, prompt_length: int):
+        penalty = float(penalty)
+        window = int(window)
+        if not penalty > 0:
+            raise ValueError(f"`penalty` has to be a strictly positive float, but is {penalty}")
+        if window <= 0:
+            raise ValueError(f"`window` has to be a positive integer, but is {window}")
+        self.penalty = penalty
+        self.window = window
+        self.prompt_length = max(0, int(prompt_length))
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        generated = input_ids[:, self.prompt_length:]
+        if generated.shape[1] == 0:
+            return scores
+        recent = generated[:, -self.window:]
+        score = torch.gather(scores, 1, recent)
+        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
+        return scores.scatter(1, recent, score)
 
 
 class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
@@ -884,6 +917,14 @@ class UnifiedVoice(nn.Module):
             attention_mask = F.pad(attention_mask, (0, input_tokens.shape[1]), value=1)
         trunc_index = inputs.shape[1]
         logits_processor = LogitsProcessorList()
+        repetition_window = int(hf_generate_kwargs.pop("repetition_window", 0) or 0)
+        repetition_penalty_value = float(hf_generate_kwargs.get("repetition_penalty", 1.0) or 1.0)
+        if repetition_window > 0 and repetition_penalty_value != 1.0:
+            # The windowed processor replaces the global penalty; the prompt codes are excluded.
+            logits_processor.append(
+                WindowedRepetitionPenaltyLogitsProcessor(repetition_penalty_value, repetition_window, trunc_index)
+            )
+            hf_generate_kwargs["repetition_penalty"] = 1.0
         if typical_sampling:
             # employ custom typical sampling
             if not (typical_mass > 0.0 and typical_mass < 1.0):
@@ -897,6 +938,7 @@ class UnifiedVoice(nn.Module):
             self.accel_engine is not None
             and num_return_sequences == 1
             and int(hf_generate_kwargs.get("num_beams", 1)) == 1
+            and len(logits_processor) == 0
         ):
             output = self.accel_engine.generate(
                 inputs,  # fake input_ids (all 1s + start_mel_token)

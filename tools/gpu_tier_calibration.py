@@ -255,7 +255,7 @@ def inference_stage(tiers: TierValues, tier: int, variant: str, args: argparse.N
         adapter = Path(args.lora).resolve()
         values["runtime.lora_path"] = str(adapter)
         values["runtime.decoder_adapter"] = "auto"
-        candidate = next(iter(sorted(adapter.parent.glob("*_reference.*"))), None)
+        candidate = next(iter(sorted(p for p in adapter.parent.glob("*_reference.*") if "_expressive_reference" not in p.name.lower())), None)
         if candidate is not None:
             reference = candidate.resolve()
     elif variant == "emotion_text":

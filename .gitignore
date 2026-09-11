@@ -48,6 +48,8 @@ Trellis_2_3D_Generator/
 /presets/user/*
 !/presets/user/.gitkeep
 /.ui_state/
+# The per-installation pronunciation dictionary (built-in readings are in code).
+/pronunciations/
 
 # Local, dataset-specific QA evidence and its one-off listening harness.
 # Public release notes belong in ui/changelog_tab.py, not personal run reports.

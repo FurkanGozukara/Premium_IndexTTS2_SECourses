@@ -7,6 +7,11 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.14 sentence-aware text splitting, speaker-derived pauses, and EMA weights:** the Text & Timing block is redesigned around a **Text splitting** selector with three modes. **Smart sentences** (the new default) packs whole sentences into each speech segment so every line lands near the trained voice's typical clip length and never cuts inside a sentence shorter than the token limit; **Every sentence** renders one sentence per segment; **Token budget** keeps the former greedy splitter. **Sentence pause (ms)** sets the pause between two sentences the splitter separated, measured from the last word to the next, and **Maximum pause (ms)** now sits beside it; with **Auto pauses from LoRA / DoRA dataset** both come from the speaker's own recordings (the median pause between sentences and the length only one in ten of them exceeds), measured once per dataset and shown in a new **Pauses of this speaker** card of the Voice LoRA / DoRA panel. Explicit `[pause:…]` tags are never shortened by the cap, the live preview shows words and seconds per section, **Repetition window (codes)** limits the repetition penalty to the last N generated codes, **Max consecutive silence tokens** is hidden for the IndexTTS 2.5 codec, and training gains **EMA of the adapter weights**, saved beside every epoch and final file and judged by the speech comparison.
+
+
+**V6.13 line-length guidance, automatic token budget, and pronunciation dictionary:** the Voice LoRA / DoRA panel now derives, from the adapter's own training clips, the target, acceptable and hard word counts per generated line and per sentence, shows the calibrated (original) speaking rate beside the saved value and the slider, and recomputes the seconds live as the slider moves. **Auto from LoRA / DoRA dataset** sets **Max tokens per segment** so each line lands on the clip length the voice was trained on. The new **Pronunciation check & dictionary** finds words the voice never spoke and the base model cannot read, proposes ARPAbet readings and inserts them as native `<word|PHONES>` annotations without touching words the voice learned from its recordings. Dataset preparation returns to a 16 second maximum, and typed slider values are clamped instead of raising console errors.
+
 **V6.12 GPU VRAM presets:** the read-only system presets are now one preset per card size, 6 GB GPU through 32 GB GPU. Each sets the inference runtime, the generation decoding settings and the training settings together, keeps the BF16 GPT and at least the former quality decoding on every card (the 24 and 32 GB presets refine with 50 diffusion steps), and pays for a smaller card with speed before beams. The preset matching the detected GPU is selected on first start (a card counts as a tier from 500 MB below its nominal size); a saved user preset or the preset loaded last is always restored instead. The LoRA / DoRA Training tab gains a **GPU VRAM preset** dropdown beside the dataset, epoch samples render with the tier that fits beside the training model, and `tools/gpu_tier_calibration.py` measures the whole-GPU peak of every stage against each tier's budget.
 
 **V6.11 selection score and clip-length mix:** the speech comparison selects checkpoints by one deployment score (identity gain over Base, minus four times any word-error increase, plus a pause term), dataset preparation aims a quarter of the clips at single sentences and a quarter at medium clips by default (cut only between clear pauses), and training gains checkpoint averaging and decoder training on the GPT's own codes as options, both off by default because they measured worse than the existing defaults. `tools/compare_checkpoint_benchmark.py` compares any checkpoint or decoder on a run's frozen benchmark.
@@ -123,7 +128,7 @@ Use a clean, single-speaker reference with little music, reverb, or room noise. 
 1. Drop an audio or video file into **Reference Voice**, expand **Record from microphone** and record a WAV in the browser, or enter an existing local path in **Reference media path** and press **Load path**. Stop the microphone recording before generating; the recorded WAV becomes the active Reference Voice.
 2. If only part of a long source is clean, enter ranges such as `1:4;7.5:12` or `01:02-01:08`, then press **Extract ranges**. Ranges are joined in the order written.
 3. Type the words to synthesize. Match **Language** to the script, not necessarily to the reference speaker.
-4. Keep **Max tokens per segment** on Auto or the language-aware default for the first run.
+4. Leave **Auto from LoRA / DoRA dataset** checked so **Max tokens per segment** follows the selected voice's training clips, or press **Language default** for a base-model run.
 5. Press **Generate voice** and do not close the terminal while the worker is active.
 
 The **Reference audio library** scans `reference_audios`. **Refresh** rescans it and **Load path** applies the selected entry. When no manual reference is present, an enabled LoRA/DoRA can supply its recommended reference automatically; otherwise the newest compatible library file is the final fallback. **Clear** removes uploads, recordings, previews, the path field, and the current manual selection.
@@ -133,6 +138,9 @@ For a local path outside the app's normal output, dataset, adapter, reference, o
 ### Understand automatic text segmentation
 
 Long input is split before synthesis so each section stays inside the model and VRAM budget. The live preview shows section number, type, text or pause, and details before you commit GPU time.
+
+**Text splitting** chooses how the text becomes segments. **Smart sentences** (default) packs whole sentences into each segment by dynamic programming: every segment aims at the selected voice's median training clip (the base model aims at 85 percent of the token limit), no segment exceeds **Max tokens per segment**, a sentence is cut at a comma or a word only when the sentence alone is longer than the limit, and a short tail is never left on its own. **Every sentence** renders one sentence per segment, which is the exact match for **Sentence pause**. **Token budget** is the former splitter: cut at any punctuation and fill greedily, which can end a segment at a comma and leave a few words as the last one. The live preview reports the mode, tokens, words and the seconds each section will take at the voice's pace. **Sentence pause (ms)** is the silence between two sentences the splitter separated, measured from the last spoken word to the next one (the model's own trailing and leading quiet counts towards it, extra quiet is trimmed); 0 uses **Section silence** at every join. **Maximum pause (ms)** shortens every longer pause in the finished audio, except tagged pauses and caption-timed output. With **Auto pauses from LoRA / DoRA dataset** checked, both values come from the selected voice's training recordings.
+
 
 ![Annotated 4K language-aware text segmentation preview](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/R7bzHNe69iMhSCjDS0Qht.png)
 
@@ -200,7 +208,7 @@ Use **Speaking rate** for the voice's pace, **Section silence** for joins, and *
 - Natural: regenerate timing toward the target instead of mechanically editing the finished waveform.
 - Pad: append silence only when output is shorter; it never speeds up or truncates longer speech.
 - Trim: cut a longer assembled result to the exact target.
-- Max consecutive silence tokens: 0 disables token trimming; use it only to suppress unusual model silences.
+- Max consecutive silence tokens: trims runs of the IndexTTS 2.0 codec's silence token; the control is hidden for the 2.5 codec, which never repeats a code, so use Maximum pause there.
 - Latent multiplier: the natural-duration factor passed to the engine; leave 1.72 unless running a controlled timing experiment.
 
 ### Formats, audio finishing, and execution mode
@@ -279,7 +287,7 @@ Press **Scan inputs** before processing. The discovered-media table and statisti
 
 ![Annotated 4K transcript, Whisper, and segmentation controls](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/d5-Whc2PWD4iOAGIhUNab.png)
 
-*Figure 15. Remove bracket notes such as `[music]`, deduplicate rolling captions, and drop repeated spoken sentences. The measured quality window is 4 to 20 seconds with a 14-second target; edge padding and silence snapping avoid clipped consonants.*
+*Figure 15. Remove bracket notes such as `[music]`, deduplicate rolling captions, and drop repeated spoken sentences. The default window is 4 to 16 seconds with a 14-second target, the line length Voice Generation later reproduces for the trained voice; edge padding and silence snapping avoid clipped consonants.*
 
 - Sentence boundaries require punctuation and are the cleanest option.
 - Sentence-or-pause recovers more material at aligned-word pauses, with a small risk of less natural cuts.
@@ -534,7 +542,20 @@ Press **Calibrate speaking rate from this grid** after generating representative
 
 *Figure 42. Voice Generation can automatically apply the stored value when that adapter is selected. The production calibration measured about 0.944, while a separate smoke calibration proved the full write-and-reload path.*
 
-Training saves a first estimate from the short epoch sample. Because that compares one ten-word sentence with long multi-sentence recordings, it tends to overstate how slow the voice is. When the automatic speech comparison completes, the trainer replaces it with a calibration from matched held-out sentences, the same text spoken by the person and by the adapter, and keeps the earlier estimate beside it as `speaking_rate_training_samples.json`. In Voice Generation, the **Saved speaking rate for this LoRA / DoRA** field under the adapter summary shows the stored value; edit it and press **Save speaking rate** to override any estimate for that adapter. Auto-apply then uses your value.
+Training saves a first estimate from the short epoch sample. Because that compares one ten-word sentence with long multi-sentence recordings, it tends to overstate how slow the voice is. When the automatic speech comparison completes, the trainer replaces it with a calibration from matched held-out sentences, the same text spoken by the person and by the adapter, and keeps the earlier estimate beside it as `speaking_rate_training_samples.json`. In Voice Generation, the **Saved speaking rate for this LoRA / DoRA** field under the adapter panel shows the stored value; edit it and press **Save speaking rate** to override any estimate for that adapter. Auto-apply then uses your value, and the calibrated (original) rate stays on record: the panel's **Speaking rate** card lists the calibrated rate and its method, the saved value, and the slider's current value, each with the words per second it produces next to the recordings' pace.
+
+### Line length, token budget and pronunciation for a trained voice
+
+A voice reproduces the clip lengths it was trained on, so the **Voice LoRA / DoRA** panel derives its **Words per generated line** table from the adapter's training clips (`analysis/dataset_profile.json`, written by training since v6.13 and measured on first selection for older adapters while their dataset folder exists): the target is the middle of the training clips (40th to 60th percentile of words), the acceptable range covers 80 percent of them, the hard limits 90 percent, and never exceed is the longest clip; the seconds column uses the pace of the voice at the current **Speaking rate** and updates as the slider moves. **Per sentence inside a line** names the smallest sentence that should stand alone and the longest sentence before the segmenter cuts it at a comma or a word. With **Auto from LoRA / DoRA dataset** checked, **Max tokens per segment** is set so sentences merge up to the training clips' typical length (the panel states the value and the words and seconds it holds); the **Language default** button restores the per-language value.
+
+Since v6.14 the profile also measures the speaker's pauses: every internal pause of the training clips (a quiet run of at least 120 ms between words), split into pauses at sentence boundaries (the longest `sentences - 1` pauses of a clip with several sentences) and pauses inside sentences. The **Pauses of this speaker** card shows the median sentence pause, the length only one in ten sentence pauses exceeds, the median pause inside a sentence and the share of clip time spent in pauses; with **Auto pauses from LoRA / DoRA dataset** checked they set **Sentence pause** and **Maximum pause** when the adapter is selected. **Smart sentences** uses the same profile for its target: the median training clip in text tokens, so a generated line holds about as many words as the recordings the voice learned from. The measurements are cached beside the dataset (`analysis/pause_cache.json`) and take a few seconds for a few thousand clips.
+
+
+The **Pronunciation check & dictionary** accordion under the live section preview lists the words in the text that the selected voice never spoke in training and the base model has no dictionary reading for, proposes an ARPAbet reading (CMU dictionary, CamelCase and acronym splitting, letter-to-sound rules as the last resort), and stores your dictionary in `pronunciations/dictionary.json`. **Add suggestions and save** takes only the dictionary-backed readings; letter-rule guesses are listed with low confidence for you to correct by hand, because a wrong reading measured worse than the plain spelling while dictionary-backed readings fixed words the base model mangles (SwarmUI, SageAttention, ComfyUI). Readings are inserted before synthesis as the engine's native `<word|PHONES>` annotations, for example `<Qwen|K W EH1 N>`; a plain respelling such as `Comfy U I` replaces the word as text. Entries with scope `unseen` never override a word the voice learned from its recordings, `always` applies everywhere, and the dictionary is used by Voice Generation, Batch Generation and the live preview while **Apply the pronunciation dictionary when generating** is checked.
+
+### Expressive emotion prompt and pause cap
+
+A voice trained with one prompt clip tends to speak with an averaged delivery. Training now also saves the liveliest clean training clip (the largest pitch and loudness variability among the best-quality clips of prompt length) as `<name>_expressive_reference.wav`; **Pick expressive clip** does the same for an adapter trained earlier while its dataset is present. With **Use the LoRA / DoRA expressive clip as the emotion prompt** checked (the default) and Emotion source on Same as speaker voice, that clip drives the delivery through the emotion pathway while the recommended reference keeps the identity; **Emotion weight** scales it. Against the real recordings this lowers word error and raises pitch movement at unchanged identity; blind listening rounds were split (a hand-picked lively clip was preferred over the plain prompt, the automatically chosen one slightly not), so the checkbox is a default to judge by ear, not a guarantee. **Maximum pause (ms)** in the Text & Timing block trims the drawn-out gaps such a voice adds at commas and sentence ends without touching the words.
 
 ## 10. Fit Runtime to the GPU
 
@@ -629,7 +650,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.12 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.14 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -724,7 +745,7 @@ All three active paths were generated. A 3-second Natural target produced about 
 
 ### Train and deploy a new voice
 
-1. Scan media and captions, prepare 4-20 second sentence-aligned 24 kHz clips, inspect them, and cache features.
+1. Scan media and captions, prepare 4-16 second sentence-aligned 24 kHz clips, inspect them, and cache features.
 2. Train the measured DoRA baseline with validation, samples, epoch checkpoints, train state, and automatic analysis.
 3. Evaluate base plus saved checkpoints with inference-like references, then generate a fixed-seed listening grid.
 4. Select the best audible checkpoint, calibrate speaking rate, and enable automatic reference/rate in Voice Generation.
@@ -787,19 +808,31 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 ## 17. Every Registered Setting
 
-The appendix below covers all 268 registered controls, including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs; the GPU VRAM presets change the runtime, decoding, and training values noted below and keep every other control at its default.
+The appendix below documents the registered controls (313 preset keys in this release), including current defaults, ranges, choices, and the help text shown by the UI. A preset stores these values across tabs; the GPU VRAM presets change the runtime, decoding, and training values noted below and keep every other control at its default.
 
-### Voice Generation - 70 settings
+### Voice Generation - 78 settings
 
 **Language** - `generation.language`. Language code used by text normalization and pronunciation. *(default "EN"; choices "ZH", "EN", "JA", "AR", "ES")*
 
-**Max tokens per segment** - `generation.max_text_tokens_per_segment`. Per-language defaults are recommended; shorter segments use less VRAM. *(default 60; minimum 20; maximum 300)*
+**Max tokens per segment** - `generation.max_text_tokens_per_segment`. Hard limit of text tokens per speech segment; longer segments need more VRAM. *(default 60; minimum 20; maximum 300)*
+
+**Auto from LoRA / DoRA dataset** - `generation.auto_lora_max_tokens`. Limit from the voice's training clip length. *(default true)*
+
+**Text splitting** - `generation.segmentation_mode`. Smart sentences: whole sentences packed to the voice's typical clip length (the token limit is never exceeded). Every sentence: one sentence per segment. Token budget: cut at any punctuation up to the limit. *(default "smart"; choices "budget", "sentence", "smart")*
+
+**Sentence pause (ms)** - `generation.sentence_pause_ms`. Pause between two sentences that the splitter separated, measured from the last word to the next; 0 falls back to Section silence. *(default 0; minimum 0; maximum 2000)*
+
+**Maximum pause (ms)** - `generation.max_pause_ms`. Every pause in the finished audio longer than this is shortened to it; 0 keeps the model's pauses. Tagged pauses and caption timing are never changed. *(default 0; minimum 0; maximum 2000)*
+
+**Auto pauses from LoRA / DoRA dataset** - `generation.auto_lora_pauses`. Sentence pause and Maximum pause from the speaker's own recordings. *(default true)*
 
 **Use caption cue timing** - `generation.use_caption_timing`. Retimes each caption unit to its cue slot and preserves cue start times. *(default false)*
 
 **Auto-load the LoRA / DoRA recommended reference audio** - `generation.auto_lora_reference`. Loads the LoRA / DoRA's saved reference whenever no manual Reference Voice is selected. *(default true)*
 
 **Auto-apply the LoRA / DoRA calibrated speaking rate** - `generation.auto_lora_speaking_rate`. Uses the selected voice's measured pace; selecting None resets speaking rate to 1.0. *(default true)*
+
+**Use the LoRA / DoRA expressive clip as the emotion prompt** - `generation.auto_lora_emotion_reference`. While Emotion source is Same as speaker voice, the liveliest clean training clip saved with the adapter (`<name>_expressive_reference.wav`, written by training or by **Pick expressive clip**) drives the delivery with the Emotion weight, and the speaker reference keeps the identity. *(default true)*
 
 **Emotion source** - `generation.emotion_mode`. Use the speaker tone, another reference, eight manual vectors, or emotion text analysis. *(default "Same as speaker voice"; choices "Same as speaker voice", "Emotion reference audio", "Emotion vector", "Emotion text")*
 
@@ -855,7 +888,9 @@ The appendix below covers all 268 registered controls, including current default
 
 **Beams** - `generation.num_beams`. More beams can improve stability but increase time and VRAM. *(default 3; minimum 1; maximum 10)*
 
-**Repetition penalty** - `generation.repetition_penalty`. 10 is the established model default. *(default 10; minimum 1; maximum 20)*
+**Repetition penalty** - `generation.repetition_penalty`. 10 is the established model default. Above about 1.3 it works as a ban on every code the segment has already used. *(default 10; minimum 1; maximum 20)*
+
+**Repetition window (codes)** - `generation.repetition_window`. 0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second. *(default 0; minimum 0; maximum 256)*
 
 **Length penalty** - `generation.length_penalty`. Only affects beam search; 0 is neutral. *(default 0; minimum -2; maximum 2)*
 
@@ -877,7 +912,7 @@ The appendix below covers all 268 registered controls, including current default
 
 **Section silence (ms)** - `generation.interval_silence`. Silence inserted between generated text sections; cue timing overrides this to zero. *(default 200; minimum 0; maximum 2000)*
 
-**Max consecutive silence tokens** - `generation.max_consecutive_silence`. 0 disables token trimming; use only to suppress unusually long model silences. *(default 0; minimum 0; maximum 200)*
+**Max consecutive silence tokens** - `generation.max_consecutive_silence`. Trims runs of the codec's silence token (IndexTTS 2.0 codec only; the 2.5 codec never repeats a code, so the control is hidden there). Use Maximum pause instead. *(default 0; minimum 0; maximum 200)*
 
 **Latent multiplier** - `generation.latent_multiplier`. 1.72 is natural duration; the runner converts this to the engine duration factor. *(default 1.72; minimum 0.5; maximum 3)*
 
@@ -890,6 +925,8 @@ The appendix below covers all 268 registered controls, including current default
 **Enable pause tags** - `generation.enable_pause_tags`. Parses inline pause tags before tokenization. *(default true)*
 
 **Text normalization** - `generation.text_normalization`. Recommended: expands and normalizes text before phonetic processing. *(default true)*
+
+**Apply the pronunciation dictionary when generating** - `generation.apply_pronunciation_dictionary`. Rewrites dictionary words before synthesis and in the live preview; also used by Batch Generation. *(default true)*
 
 **Maximum speaker audio length (s)** - `generation.max_speaker_audio_length`. 15 seconds preserves enough identity without wasting reference compute. *(default 15; minimum 3; maximum 90)*
 
@@ -975,11 +1012,11 @@ The appendix below covers all 268 registered controls, including current default
 
 **Drop duplicate sentences** - `dataset.drop_duplicate_sentences`. Keeps one copy (best aligned) of every sentence that is spoken more than once, e.g. repeated intros or outros; recommended for voice training. *(default true)*
 
-**Target seconds** - `dataset.target_s`. 14 seconds packs whole sentences into inference-length clips; measured best with a 20 second maximum. *(default 14; minimum 1; maximum 30)*
+**Target seconds** - `dataset.target_s`. 14 seconds packs whole sentences into the clip length the voice will later reproduce per generated line; pairs with the 16 second maximum. *(default 14; minimum 1; maximum 30)*
 
 **Minimum seconds** - `dataset.min_s`. 4 seconds keeps enough voice context while retaining the measured quality range. *(default 4; minimum 0.5; maximum 15)*
 
-**Maximum seconds** - `dataset.max_s`. 20 seconds covers 12-15-second inference segments and retains more source audio; 30 seconds measured worse. *(default 20; minimum 2; maximum 40)*
+**Maximum seconds** - `dataset.max_s`. 16 seconds keeps every clip inside the line length Voice Generation targets for the trained voice; 20 retains a little more source audio at the cost of longer lines, and 30 measured worse. *(default 16; minimum 2; maximum 40)*
 
 **Maximum cue gap (ms)** - `dataset.max_gap_ms`. Cues closer than this can merge into one sentence segment. *(default 700; minimum 0; maximum 3000)*
 
@@ -1211,6 +1248,8 @@ The appendix below covers all 268 registered controls, including current default
 **Allowed speaker-similarity drop from Base** - `training.speech_eval_max_speaker_drop`. Absolute screening margin for mean speaker similarity. *(default 0.03)*
 
 **Average the last saved checkpoints** - `training.average_last_checkpoints`. After training, this many of the last saved updates (epoch files and the final file) are averaged in parameter space into one more speech-comparison candidate, `<name>_avg_ep<first>_<last>.safetensors`, selected only when it scores best. 0 disables it. *(default 0; minimum 0; maximum 20)*
+
+**EMA of the adapter weights (decay)** - `training.ema_decay`. 0 is off. Otherwise a running average of the trainable weights is kept during training (0.999 averages roughly the last thousand updates) and saved beside every epoch and final file as `<name>_ema*.safetensors`; the final EMA file joins the speech comparison as one more candidate and is selected only when it measures best. *(default 0; minimum 0; maximum 0.9999)*
 
 **Decoder training codes** - `training.decoder_adapter_code_source`. Semantic codes the voice decoder adapter learns to render: `real` (quantized from the recordings, as the decoder was pretrained), `gpt` (the selected checkpoint's teacher-forced predictions for the same clips, predicted once before the decoder trains, greedy plus sampled variants), or `mixed` (half of each). *(default "real"; choices "real", "gpt", "mixed")*
 

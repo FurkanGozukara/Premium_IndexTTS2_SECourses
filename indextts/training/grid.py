@@ -34,7 +34,7 @@ _EPOCH_RE = re.compile(r"_epoch_(\d+)", re.IGNORECASE)
 _STEP_RE = re.compile(r"_step_(\d+)", re.IGNORECASE)
 _INFER_KEYS = {
     "do_sample", "top_p", "top_k", "temperature", "length_penalty", "num_beams",
-    "repetition_penalty", "max_mel_tokens", "emo_audio_prompt", "emo_alpha",
+    "repetition_penalty", "repetition_window", "max_mel_tokens", "emo_audio_prompt", "emo_alpha",
     "emo_vector", "use_emo_text", "emo_text", "use_random", "verbose",
     "max_text_tokens_per_segment", "interval_silence", "diffusion_steps",
     "inference_cfg_rate", "max_speaker_audio_length", "max_emotion_audio_length",
@@ -45,7 +45,8 @@ _INFER_KEYS = {
 }
 _RUNNER_EXTRA_KEYS = {
     "segment_budget_scale_non_cjk", "cfm_temperature", "seed",
-    "reuse_spk_cond_for_emo", "enable_pause_tags", "trim_silence_ms_threshold",
+    "reuse_spk_cond_for_emo", "enable_pause_tags", "trim_silence_ms_threshold", "max_pause_ms",
+    "segmentation_mode", "segment_target_tokens", "sentence_pause_ms",
     "target_duration_s", "target_duration_mode",
 }
 
@@ -352,6 +353,7 @@ def _default_infer_kwargs(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "length_penalty": 0.0,
         "num_beams": 1,
         "repetition_penalty": 10.0,
+        "repetition_window": 0,
         "max_mel_tokens": 1500,
         "emo_audio_prompt": None,
         "emo_alpha": 0.65,
@@ -455,6 +457,10 @@ def _request_for_cell(
         "reuse_spk_cond_for_emo": bool(runner_extras.get("reuse_spk_cond_for_emo", False)),
         "enable_pause_tags": bool(runner_extras.get("enable_pause_tags", True)),
         "trim_silence_ms_threshold": int(runner_extras.get("trim_silence_ms_threshold", 0)),
+        "max_pause_ms": int(runner_extras.get("max_pause_ms", 0) or 0),
+        "segmentation_mode": str(runner_extras.get("segmentation_mode", "budget") or "budget"),
+        "segment_target_tokens": runner_extras.get("segment_target_tokens"),
+        "sentence_pause_ms": int(runner_extras.get("sentence_pause_ms", 0) or 0),
         "target_duration_s": runner_extras.get("target_duration_s"),
         "target_duration_mode": str(runner_extras.get("target_duration_mode", "off")),
     }

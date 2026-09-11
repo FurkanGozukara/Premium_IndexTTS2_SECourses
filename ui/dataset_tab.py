@@ -494,9 +494,9 @@ def build_dataset_tab(
                     info="A fragment edge must have at least this much silence when punctuation does not provide the boundary.",
                 )
             with gr.Row():
-                target_s = gr.Slider(1, 30, value=DATASET_DEFAULTS["target_s"], step=0.25, label="Target seconds", info="14 seconds packs whole sentences into inference-length clips; measured best with a 20 second maximum.")
+                target_s = gr.Slider(1, 30, value=DATASET_DEFAULTS["target_s"], step=0.25, label="Target seconds", info="14 seconds packs whole sentences into the clip length the voice will later reproduce per generated line; pairs with the 16 second maximum.")
                 min_s = gr.Slider(0.5, 15, value=DATASET_DEFAULTS["min_s"], step=0.25, label="Minimum seconds", info="4 seconds keeps enough voice context while retaining the measured quality range.")
-                max_s = gr.Slider(2, 40, value=DATASET_DEFAULTS["max_s"], step=0.25, label="Maximum seconds", info="20 seconds covers 12-15-second inference segments and retains more source audio; 30 seconds measured worse.")
+                max_s = gr.Slider(2, 40, value=DATASET_DEFAULTS["max_s"], step=0.25, label="Maximum seconds", info="16 seconds keeps every clip inside the line length Voice Generation targets for the trained voice; 20 retains a little more source audio at the cost of longer lines, and 30 measured worse.")
                 max_gap = gr.Slider(0, 3000, value=700, step=25, label="Maximum cue gap (ms)", info="Cues closer than this can merge into one sentence segment.")
                 short_share = gr.Slider(
                     0, 0.8, value=DATASET_DEFAULTS["short_clip_fraction"], step=0.05,

@@ -104,7 +104,8 @@ def test_non_object_status_json_does_not_break_checkpoint_selection(tmp_path, va
 def test_uncalibrated_adapter_clears_previous_rate_only_when_auto_enabled(monkeypatch):
     import gradio as gr
     import ui.generation_tab as generation
-    monkeypatch.setattr(generation, "_lora_info", lambda _: ("info", None))
+    monkeypatch.setattr(generation, "_lora_info", lambda _path, **_panel: ("info", None))
+    monkeypatch.setattr(generation, "_lora_reference", lambda _path: None)
     monkeypatch.setattr(generation, "load_speaking_rate", lambda _: None)
     assert generation.lora_selection_updates("new.safetensors", None, False, True)[3] == 1.0
     assert generation.lora_selection_updates("new.safetensors", None, False, False)[3] == gr.skip()

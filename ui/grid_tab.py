@@ -315,7 +315,7 @@ def _adapter_context(adapter_dir: str | Path | None) -> dict[str, Any]:
                 candidate = root_candidate
         reference = str(candidate.resolve()) if candidate.is_file() else ""
     if not reference:
-        candidates = sorted(root.glob("*_reference.wav"))
+        candidates = sorted(p for p in root.glob("*_reference.wav") if "_expressive_reference" not in p.name.lower())
         reference = str(candidates[0].resolve()) if candidates else ""
     dataset_dir = str(config.get("dataset_dir") or "")
     dataset_name = Path(dataset_dir).name if dataset_dir else str(metadata.get("dataset") or "unknown")

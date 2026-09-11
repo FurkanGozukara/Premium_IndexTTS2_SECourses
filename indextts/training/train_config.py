@@ -125,6 +125,10 @@ class TrainConfig:
     # average of the last two and of the last three updates both lost to the final file (identity -0.004 to
     # -0.006, word error +0.6 to +1.1 points on the speech benchmark).
     average_last_checkpoints: int = 0
+    # Exponential moving average of the trainable weights, updated after every optimizer step and saved
+    # beside each epoch and final file as ``<name>_ema*.safetensors``. 0 disables it; 0.999 averages over
+    # roughly the last thousand updates. The final EMA file joins the speech comparison as a candidate.
+    ema_decay: float = 0.0
     final_test_dataset: str = ""
     decoder_adapter_enabled: bool = True
     decoder_adapter_rank: int = 128
@@ -245,6 +249,9 @@ class TrainConfig:
         if self.resume_mode not in {"weights_only", "continue"}:
             raise ValueError("resume_mode must be 'weights_only' or 'continue'")
         self.average_last_checkpoints = max(0, int(self.average_last_checkpoints))
+        self.ema_decay = _finite_float(self.ema_decay, "ema_decay")
+        if not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError("ema_decay must be 0 (off) or between 0 and 1")
         self.decoder_adapter_enabled = bool(self.decoder_adapter_enabled)
         self.decoder_adapter_rank = max(1, int(self.decoder_adapter_rank))
         self.decoder_adapter_alpha = _finite_float(self.decoder_adapter_alpha, "decoder_adapter_alpha")

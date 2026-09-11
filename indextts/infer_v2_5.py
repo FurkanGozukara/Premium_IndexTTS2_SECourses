@@ -32,6 +32,8 @@ from indextts.utils.text_segmentation import (
     DEFAULT_NON_CJK_BUDGET_SCALE,
     SpeechRecoveryConfig,
     default_segment_tokens,
+    ends_sentence,
+    normalize_segmentation_mode,
     split_atomic_pieces,
     split_text_by_tokens as shared_split_text_by_tokens,
     split_text_for_recovery,
@@ -81,6 +83,109 @@ def _seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(actual_seed)
     return actual_seed
+
+
+# Audio-plan items: ("segment", index) renders a text segment; the others insert silence:
+# "silence" is the section gap, "pause" an explicit pause tag (never shortened afterwards),
+# "sentence_gap" the pause between two sentences measured from the last word to the next.
+PLAN_SILENCE_KINDS = frozenset({"silence", "pause", "sentence_gap"})
+_EDGE_GATE_DBFS = -40.0
+
+
+def _edge_quiet_samples(wav, sampling_rate=SAMPLE_RATE):
+    """(leading, trailing) quiet samples of a segment: 10 ms frames below -40 dBFS at the edges."""
+
+    if wav is None or wav.numel() == 0:
+        return 0, 0
+    audio = wav.detach().float()
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+    peak_scale = 32767.0 if audio.abs().max().item() > 2.0 else 1.0
+    mono = audio.mean(dim=0) / peak_scale
+    frame = max(1, int(round(float(sampling_rate) * 0.01)))
+    count = mono.numel() // frame
+    if count == 0:
+        return 0, 0
+    rms = mono[: count * frame].view(count, frame).square().mean(dim=1).add(1e-12).sqrt()
+    loud = torch.nonzero(rms >= 10 ** (_EDGE_GATE_DBFS / 20.0), as_tuple=False).flatten()
+    if loud.numel() == 0:
+        return int(mono.numel()), 0
+    leading = int(loud[0].item()) * frame
+    trailing = int(mono.numel()) - (int(loud[-1].item()) + 1) * frame
+    return max(0, leading), max(0, trailing)
+
+
+def _stream_silence_samples(plan, index, segment_wavs, sampling_rate=SAMPLE_RATE):
+    """Silence to stream for plan item ``index``; a sentence gap is shortened by the previous segment's tail."""
+
+    kind, value = plan[index]
+    if kind != "sentence_gap":
+        return int(value)
+    previous = next((plan[position][1] for position in range(index - 1, -1, -1) if plan[position][0] == "segment"), None)
+    if previous is None or previous >= len(segment_wavs) or segment_wavs[previous] is None:
+        return int(value)
+    _leading, trailing = _edge_quiet_samples(segment_wavs[previous], sampling_rate)
+    return max(0, int(value) - trailing)
+
+
+def assemble_audio_plan(segment_wavs, plan, sampling_rate=SAMPLE_RATE):
+    """Concatenate rendered segments and planned silences.
+
+    Returns ``(wav, protected)`` where ``protected`` lists the sample ranges of explicit
+    pause tags, so a later pause cap can leave them untouched. A ``sentence_gap`` item
+    makes the pause from the last word of one segment to the first word of the next
+    equal to its value: the quiet tails the model generated count towards it, extra
+    tail is trimmed, and the rest is inserted as silence.
+    """
+
+    template = next((item for item in segment_wavs if item is not None), None)
+    channels = int(template.shape[0]) if template is not None else 1
+    dtype = template.dtype if template is not None else torch.float32
+    parts = []
+    protected = []
+    offset = 0
+    pending_gap = None
+    for kind, value in plan:
+        if kind == "segment":
+            wav = segment_wavs[value]
+            if pending_gap is not None and wav is not None:
+                target = int(pending_gap)
+                previous = parts[-1] if parts else None
+                _, trailing = _edge_quiet_samples(previous, sampling_rate) if previous is not None else (0, 0)
+                leading, _ = _edge_quiet_samples(wav, sampling_rate)
+                gap = target - trailing - leading
+                if gap >= 0:
+                    if gap:
+                        parts.append(torch.zeros(channels, gap, dtype=dtype))
+                        offset += gap
+                else:
+                    excess = -gap
+                    cut_previous = min(excess, trailing)
+                    if cut_previous > 0 and previous is not None:
+                        parts[-1] = previous[..., : previous.shape[-1] - cut_previous]
+                        offset -= cut_previous
+                        excess -= cut_previous
+                    cut_next = min(excess, leading)
+                    if cut_next > 0:
+                        wav = wav[..., cut_next:]
+            pending_gap = None
+            if wav is not None:
+                parts.append(wav)
+                offset += int(wav.shape[-1])
+            continue
+        if kind == "sentence_gap":
+            pending_gap = int(value)
+            continue
+        samples = int(value)
+        if samples <= 0:
+            continue
+        if kind == "pause":
+            protected.append((offset, offset + samples))
+        parts.append(torch.zeros(channels, samples, dtype=dtype))
+        offset += samples
+    if not parts:
+        return torch.zeros(channels, 0, dtype=dtype), protected
+    return torch.cat(parts, dim=1), protected
 
 
 def trim_segment_silence(wav, sampling_rate=SAMPLE_RATE, minimum_silence_ms=0):
@@ -985,6 +1090,8 @@ class IndexTTS2:
         max_tokens,
         lang_prefix="",
         segment_budget_scale_non_cjk=DEFAULT_NON_CJK_BUDGET_SCALE,
+        mode="budget",
+        target_tokens=None,
     ):
         capacity = self.gpt.text_pos_embedding.emb.num_embeddings
         return shared_split_text_by_tokens(
@@ -994,6 +1101,8 @@ class IndexTTS2:
             token_len=self._token_len,
             lang_prefix=lang_prefix,
             segment_budget_scale_non_cjk=segment_budget_scale_non_cjk,
+            mode=mode,
+            target_tokens=target_tokens,
         )
 
     @staticmethod
@@ -1048,17 +1157,23 @@ class IndexTTS2:
         interval_silence,
         enable_pause_tags,
         segment_budget_scale_non_cjk,
+        segmentation_mode="budget",
+        segment_target_tokens=None,
+        sentence_pause_ms=0,
     ):
         chunks = split_text_with_pauses(text) if enable_pause_tags else [TextChunk(str(text))]
         lang_prefix = f"<|{str(lang or 'EN').lower()}|> "
         segments = []
         plan = []
         interval_samples = max(0, int(round(SAMPLE_RATE * float(interval_silence) / 1000.0)))
+        sentence_gap_samples = max(0, int(round(SAMPLE_RATE * float(sentence_pause_ms or 0) / 1000.0)))
+        mode = "budget" if str(segmentation_mode or "budget") == "budget" else normalize_segmentation_mode(segmentation_mode)
+        target = int(segment_target_tokens) if segment_target_tokens else None
         for chunk in chunks:
             if isinstance(chunk, PauseChunk):
                 pause_samples = max(0, int(round(SAMPLE_RATE * chunk.duration_s)))
                 if pause_samples:
-                    plan.append(("silence", pause_samples))
+                    plan.append(("pause", pause_samples))
                 continue
             if not chunk.text.strip():
                 continue
@@ -1068,6 +1183,8 @@ class IndexTTS2:
                 max_tokens,
                 lang_prefix,
                 segment_budget_scale_non_cjk,
+                mode=mode,
+                target_tokens=target,
             )
             # The splitter preserves every character, including a whitespace
             # fragment between two words which each fill their token budget.
@@ -1077,25 +1194,17 @@ class IndexTTS2:
                 segment_index = len(segments)
                 segments.append(segment)
                 plan.append(("segment", segment_index))
-                if interval_samples and index < len(chunk_segments) - 1:
+                if index >= len(chunk_segments) - 1:
+                    continue
+                if sentence_gap_samples and ends_sentence(segment):
+                    plan.append(("sentence_gap", sentence_gap_samples))
+                elif interval_samples:
                     plan.append(("silence", interval_samples))
         return segments, plan, lang_prefix
 
     @staticmethod
     def _assemble_audio_plan(segment_wavs, plan, sampling_rate=SAMPLE_RATE):
-        del sampling_rate
-        template = next((item for item in segment_wavs if item is not None), None)
-        channels = int(template.shape[0]) if template is not None else 1
-        dtype = template.dtype if template is not None else torch.float32
-        parts = []
-        for kind, value in plan:
-            if kind == "segment":
-                parts.append(segment_wavs[value])
-            else:
-                parts.append(torch.zeros(channels, int(value), dtype=dtype))
-        if not parts:
-            return torch.zeros(channels, 0, dtype=dtype)
-        return torch.cat(parts, dim=1)
+        return assemble_audio_plan(segment_wavs, plan, sampling_rate)[0]
 
     @staticmethod
     def _fit_target_samples(wav, target_samples, mode):
@@ -1404,6 +1513,7 @@ class IndexTTS2:
               segment_budget_scale_non_cjk=DEFAULT_NON_CJK_BUDGET_SCALE,
               cfm_temperature=1.0, seed=None, reuse_spk_cond_for_emo=False,
               enable_pause_tags=True, trim_silence_ms_threshold=0,
+              segmentation_mode="budget", segment_target_tokens=None, sentence_pause_ms=0,
               target_duration_s=None, target_duration_mode="off",
               auto_retry_incomplete_speech=SpeechRecoveryConfig.enabled,
               max_speech_retries=SpeechRecoveryConfig.max_attempts,
@@ -1434,6 +1544,9 @@ class IndexTTS2:
                 reuse_spk_cond_for_emo=reuse_spk_cond_for_emo,
                 enable_pause_tags=enable_pause_tags,
                 trim_silence_ms_threshold=trim_silence_ms_threshold,
+                segmentation_mode=segmentation_mode,
+                segment_target_tokens=segment_target_tokens,
+                sentence_pause_ms=sentence_pause_ms,
                 target_duration_s=target_duration_s,
                 target_duration_mode=target_duration_mode,
                 auto_retry_incomplete_speech=auto_retry_incomplete_speech,
@@ -1464,6 +1577,9 @@ class IndexTTS2:
                 reuse_spk_cond_for_emo=reuse_spk_cond_for_emo,
                 enable_pause_tags=enable_pause_tags,
                 trim_silence_ms_threshold=trim_silence_ms_threshold,
+                segmentation_mode=segmentation_mode,
+                segment_target_tokens=segment_target_tokens,
+                sentence_pause_ms=sentence_pause_ms,
                 target_duration_s=target_duration_s,
                 target_duration_mode=target_duration_mode,
                 auto_retry_incomplete_speech=auto_retry_incomplete_speech,
@@ -1593,6 +1709,9 @@ class IndexTTS2:
         reuse_spk_cond_for_emo = bool(kwargs.pop("reuse_spk_cond_for_emo", False))
         enable_pause_tags = bool(kwargs.pop("enable_pause_tags", True))
         trim_silence_ms_threshold = float(kwargs.pop("trim_silence_ms_threshold", 0) or 0)
+        segmentation_mode = str(kwargs.pop("segmentation_mode", "budget") or "budget")
+        segment_target_tokens = kwargs.pop("segment_target_tokens", None)
+        sentence_pause_ms = int(kwargs.pop("sentence_pause_ms", 0) or 0)
         if not 0.0 < segment_budget_scale_non_cjk <= 1.0:
             raise ValueError("segment_budget_scale_non_cjk must be in the range (0, 1]")
         if not math.isfinite(cfm_temperature) or cfm_temperature < 0:
@@ -1732,6 +1851,9 @@ class IndexTTS2:
                 interval_silence,
                 enable_pause_tags,
                 segment_budget_scale_non_cjk,
+                segmentation_mode,
+                segment_target_tokens,
+                sentence_pause_ms,
             )
             text_plans.append(plan)
             expected_segments.append(len(segments))
@@ -1767,6 +1889,9 @@ class IndexTTS2:
                 "reuse_spk_cond_for_emo": reuse_spk_cond_for_emo,
                 "enable_pause_tags": enable_pause_tags,
                 "trim_silence_ms_threshold": trim_silence_ms_threshold,
+                "segmentation_mode": segmentation_mode,
+                "segment_target_tokens": segment_target_tokens,
+                "sentence_pause_ms": sentence_pause_ms,
             })
             return run_sequential()
 
@@ -1786,6 +1911,7 @@ class IndexTTS2:
 
         generated_parts = [[] for _ in texts]
         results = [None for _ in texts]
+        protected_by_text = {}
         emitted = set()
         sampling_rate = 22050
         total_batches = (len(jobs) + section_batch_size - 1) // section_batch_size
@@ -1815,7 +1941,11 @@ class IndexTTS2:
             if text_index in emitted or len(generated_parts[text_index]) != expected_segments[text_index]:
                 return
             ordered_parts = [part for _, part in sorted(generated_parts[text_index])]
-            combined = self._assemble_audio_plan(ordered_parts, text_plans[text_index]).to(torch.int16)
+            combined, protected = assemble_audio_plan(ordered_parts, text_plans[text_index], sampling_rate)
+            combined = combined.to(torch.int16)
+            protected_by_text[text_index] = [
+                (round(start / sampling_rate, 4), round(end / sampling_rate, 4)) for start, end in protected
+            ]
             result = (sampling_rate, combined.numpy().T)
             results[text_index] = result
             emitted.add(text_index)
@@ -2028,6 +2158,7 @@ class IndexTTS2:
             s2mel_time=s2mel_time,
             vocoder_time=vocoder_time,
             generated_tokens=generated_code_tokens,
+            protected_pauses=protected_by_text.get(0, []) if len(texts) == 1 else [],
         )
         if self.progress_reporter is not None:
             self.progress_reporter.finish()
@@ -2046,6 +2177,7 @@ class IndexTTS2:
               segment_budget_scale_non_cjk=DEFAULT_NON_CJK_BUDGET_SCALE,
               cfm_temperature=1.0, seed=None, reuse_spk_cond_for_emo=False,
               enable_pause_tags=True, trim_silence_ms_threshold=0,
+              segmentation_mode="budget", segment_target_tokens=None, sentence_pause_ms=0,
               target_duration_s=None, target_duration_mode="off",
               auto_retry_incomplete_speech=SpeechRecoveryConfig.enabled,
               max_speech_retries=SpeechRecoveryConfig.max_attempts,
@@ -2228,6 +2360,9 @@ class IndexTTS2:
             interval_silence,
             enable_pause_tags,
             segment_budget_scale_non_cjk,
+            segmentation_mode,
+            segment_target_tokens,
+            sentence_pause_ms,
         )
         segments_count = len(segments)
         if self.progress_reporter is not None:
@@ -2387,11 +2522,13 @@ class IndexTTS2:
                         if kind == "segment":
                             yield wavs[value].cpu()
                         else:
-                            yield torch.zeros(1, int(value), dtype=wav.dtype)
+                            yield torch.zeros(
+                                1, _stream_silence_samples(audio_plan, stream_plan_cursor, wavs, sampling_rate), dtype=wav.dtype
+                            )
                         stream_plan_cursor += 1
         natural_duration_factor = float(duration_factor)
         if target_duration_mode == "natural" and wavs:
-            fixed_samples = sum(value for kind, value in audio_plan if kind == "silence")
+            fixed_samples = sum(value for kind, value in audio_plan if kind in PLAN_SILENCE_KINDS)
             natural_speech_samples = sum(item.shape[-1] for item in wavs)
             desired_speech_samples = max(1, int(round(target_duration_s * sampling_rate)) - fixed_samples)
             ratio = desired_speech_samples / max(1, natural_speech_samples)
@@ -2421,7 +2558,7 @@ class IndexTTS2:
             natural_duration_factor = adjusted_factor
 
         self._set_gr_progress(0.9, "saving audio...")
-        wav = self._assemble_audio_plan(wavs, audio_plan, sampling_rate)
+        wav, protected_pauses = assemble_audio_plan(wavs, audio_plan, sampling_rate)
         if target_duration_mode in {"pad", "trim"}:
             wav = self._fit_target_samples(
                 wav,
@@ -2430,17 +2567,18 @@ class IndexTTS2:
             )
         if stream_return:
             if target_duration_mode == "off":
-                for kind, value in audio_plan[stream_plan_cursor:]:
+                for plan_index in range(stream_plan_cursor, len(audio_plan)):
+                    kind, value = audio_plan[plan_index]
                     if kind == "segment":
                         yield wavs[value].cpu()
                     else:
-                        yield torch.zeros(1, int(value), dtype=wav.dtype)
+                        yield torch.zeros(1, _stream_silence_samples(audio_plan, plan_index, wavs, sampling_rate), dtype=wav.dtype)
             elif target_duration_mode == "natural":
-                for kind, value in audio_plan:
+                for plan_index, (kind, value) in enumerate(audio_plan):
                     if kind == "segment":
                         yield wavs[value].cpu()
                     else:
-                        yield torch.zeros(1, int(value), dtype=wav.dtype)
+                        yield torch.zeros(1, _stream_silence_samples(audio_plan, plan_index, wavs, sampling_rate), dtype=wav.dtype)
             else:
                 yield wav.cpu()
         end_time = time.perf_counter()
@@ -2458,6 +2596,7 @@ class IndexTTS2:
             target_duration_mode=target_duration_mode,
             target_duration_s=target_duration_s,
             duration_factor_used=natural_duration_factor,
+            protected_pauses=[(round(start / sampling_rate, 4), round(end / sampling_rate, 4)) for start, end in protected_pauses],
         )
         if self.progress_reporter is not None:
             self.progress_reporter.finish()

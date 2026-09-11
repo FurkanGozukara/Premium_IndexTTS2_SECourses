@@ -142,7 +142,7 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
         assert preset_values["dataset.min_pause_boundary_ms"] == 400
         assert preset_values["dataset.target_s"] == 14.0
         assert preset_values["dataset.min_s"] == 4.0
-        assert preset_values["dataset.max_s"] == 20.0
+        assert preset_values["dataset.max_s"] == 16.0
     assert demo.preset_registry["dataset.target_s"].maximum == 30
     assert demo.preset_registry["dataset.min_s"].maximum == 15
     assert demo.preset_registry["dataset.max_s"].maximum == 40

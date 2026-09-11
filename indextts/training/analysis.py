@@ -45,6 +45,7 @@ _EPOCH_RE = re.compile(r"_epoch_(\d+)$", re.IGNORECASE)
 _STEP_RE = re.compile(r"_step_(\d+)$", re.IGNORECASE)
 # ``<name>_avg_ep<first>_<last>``: the parameter-space mean of the last saved updates of a training.
 _AVERAGED_RE = re.compile(r"_avg_ep(\d+)_(\d+)$", re.IGNORECASE)
+_EMA_RE = re.compile(r"_ema(?:_epoch_(\d+))?$", re.IGNORECASE)
 
 
 def _utc_now() -> str:
@@ -215,8 +216,11 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     epoch_match = _EPOCH_RE.search(stem)
     step_match = _STEP_RE.search(stem)
     averaged_match = _AVERAGED_RE.search(stem)
+    ema_match = _EMA_RE.search(stem)
     if source.parent.name.lower() == "best":
         kind = "best"
+    elif ema_match:
+        kind = "ema"
     elif averaged_match:
         kind = "averaged"
     elif epoch_match:
@@ -230,6 +234,8 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     epoch = _integer(info.get("epochs")) or (
         int(epoch_match.group(1)) if epoch_match else (int(averaged_match.group(2)) if averaged_match else 0)
     )
+    if kind == "ema" and ema_match.group(1):
+        epoch = int(ema_match.group(1))
     steps = _integer(info.get("steps")) or (
         int(step_match.group(1)) if step_match else 0
     )
@@ -249,6 +255,10 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
         first_epoch, last_epoch = int(averaged_match.group(1)), int(averaged_match.group(2))
         label = f"averaged (epochs {first_epoch} to {last_epoch} {checkpoint_type})"
         file_label = f"avg_ep{first_epoch}_{last_epoch}"
+    elif kind == "ema":
+        scope = f"epoch {epoch}" if ema_match.group(1) else "final"
+        label = f"EMA weights ({scope}, {checkpoint_type})"
+        file_label = f"ema_ep{epoch}" if ema_match.group(1) else "ema_final"
     elif kind == "epoch":
         label = f"epoch {epoch} ({checkpoint_type})"
         file_label = f"epoch_{epoch:03d}"
@@ -374,7 +384,7 @@ def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, 
                 descriptors.append(descriptor)
         except Exception:
             continue
-    order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4, "averaged": 5}
+    order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4, "averaged": 5, "ema": 6}
     descriptors.sort(
         key=lambda item: (
             order.get(str(item["kind"]), 9),

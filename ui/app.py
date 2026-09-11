@@ -25,6 +25,7 @@ from .batch_tab import bind_batch_events, build_batch_tab
 from .changelog_tab import build_changelog_tab
 from .common import (
     APP_CSS,
+    install_gradio_bounds_guard,
     APP_HEAD,
     APP_TITLE,
     APP_VERSION,
@@ -121,6 +122,9 @@ def _runner_request_keys_from_source() -> set[str]:
             "reuse_spk_cond_for_emo",
             "enable_pause_tags",
             "trim_silence_ms_threshold",
+            "segmentation_mode",
+            "segment_target_tokens",
+            "sentence_pause_ms",
             "target_duration_s",
             "target_duration_mode",
         }
@@ -163,12 +167,18 @@ def startup_request_self_check(registry: PresetRegistry, model_dir: str | Path) 
             "reuse_spk_cond_for_emo",
             "enable_pause_tags",
             "trim_silence_ms_threshold",
+            "segmentation_mode",
+            "segment_target_tokens",
+            "sentence_pause_ms",
             "target_duration_s",
             "target_duration_mode",
         }
     )
-    # Sampling options are accepted by **generation_kwargs and consumed by infer_generator.
-    sampling = {"do_sample", "top_p", "top_k", "temperature", "length_penalty", "num_beams", "repetition_penalty", "max_mel_tokens"}
+    # Sampling options are accepted by **generation_kwargs and consumed by infer_generator / inference_speech.
+    sampling = {
+        "do_sample", "top_p", "top_k", "temperature", "length_penalty", "num_beams", "repetition_penalty",
+        "repetition_window", "max_mel_tokens",
+    }
     expected_engine = infer_explicit | sampling
     missing_engine = expected_engine - effective
     # Explicit internal-only controls are intentionally fixed by the non-streaming runner.
@@ -271,6 +281,8 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
 
     global LAST_REGISTRY, LAST_STORE
     options = _args(args)
+    # Typed slider values must never surface as console tracebacks or error toasts.
+    install_gradio_bounds_guard()
     registry = PresetRegistry()
     store = PresetStore(registry, ROOT / "presets")
     # Retire the old system presets before reading the last-used bookmark, so an

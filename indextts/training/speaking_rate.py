@@ -45,9 +45,35 @@ class SpeakingRateReport:
     method: str
     generated_at: str
     summary: str
+    # The automatic estimate and how it was measured; kept when a manual value replaces it,
+    # so the original calibration stays visible beside the value in use.
+    calibrated_speaking_rate: float | None = None
+    calibration_method: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def is_manual(self) -> bool:
+        return self.method == "manual"
+
+    def original_rate(self) -> float | None:
+        """The automatic calibration: the report's own value unless a manual one replaced it."""
+
+        if self.calibrated_speaking_rate is not None:
+            return float(self.calibrated_speaking_rate)
+        return None if self.is_manual else float(self.recommended_speaking_rate)
+
+    def original_method(self) -> str:
+        if self.calibration_method:
+            return str(self.calibration_method)
+        return "" if self.is_manual else str(self.method)
+
+    def effective_words_per_second(self, speaking_rate: float | None = None) -> float:
+        """Generated words per second at a speaking-rate slider value (the rate scales the pace)."""
+
+        rate = float(self.recommended_speaking_rate if speaking_rate is None else speaking_rate)
+        return float(self.generated_words_per_second) * max(0.0, rate)
 
     @classmethod
     def from_dict(
@@ -75,6 +101,14 @@ class SpeakingRateReport:
             raise ValueError("recommended_speaking_rate must be in [0.5, 1.5]")
         if int(report.clips_used) < 1:
             raise ValueError("clips_used must be at least 1")
+        calibrated = report.calibrated_speaking_rate
+        if calibrated is not None:
+            calibrated = float(calibrated)
+            if not math.isfinite(calibrated) or not 0.5 <= calibrated <= 1.5:
+                raise ValueError("calibrated_speaking_rate must be in [0.5, 1.5]")
+        calibration_method = str(report.calibration_method or "")
+        if calibration_method and calibration_method not in _METHOD_LABELS:
+            raise ValueError("calibration_method must be a known speaking-rate method")
         return cls(
             recommended_speaking_rate=float(report.recommended_speaking_rate),
             dataset_words_per_second=float(report.dataset_words_per_second),
@@ -83,6 +117,8 @@ class SpeakingRateReport:
             method=str(report.method),
             generated_at=str(report.generated_at),
             summary=str(report.summary),
+            calibrated_speaking_rate=calibrated,
+            calibration_method=calibration_method,
         )
 
 
@@ -187,6 +223,8 @@ def _report(
         method=method,
         generated_at=datetime.now(timezone.utc).isoformat(),
         summary=summary,
+        calibrated_speaking_rate=rate,
+        calibration_method=method,
     )
 
 
@@ -227,6 +265,8 @@ def _matched_report(
         method=method,
         generated_at=datetime.now(timezone.utc).isoformat(),
         summary=summary,
+        calibrated_speaking_rate=rate,
+        calibration_method=method,
     )
 
 
@@ -445,6 +485,12 @@ def save_manual_speaking_rate(
             f"Replaced the automatic estimate {previous.recommended_speaking_rate:.3f} "
             f"({speaking_rate_method_label(previous.method)})."
         )
+    calibrated, calibration_method = original_calibration(adapter_or_checkpoint_path, previous)
+    if calibrated is not None:
+        note += (
+            f" The automatic estimate {calibrated:.3f} "
+            f"({speaking_rate_method_label(calibration_method)}) is kept for reference."
+        )
     report = SpeakingRateReport(
         recommended_speaking_rate=round(value, 3),
         dataset_words_per_second=previous.dataset_words_per_second if previous else 0.0,
@@ -453,9 +499,86 @@ def save_manual_speaking_rate(
         method="manual",
         generated_at=now.isoformat(),
         summary=f"Speaking rate {value:.3f} was set manually on {now:%Y-%m-%d}. {note}",
+        calibrated_speaking_rate=calibrated,
+        calibration_method=calibration_method if calibrated is not None else "",
     )
     write_speaking_rate(_adapter_dir(adapter_or_checkpoint_path), report)
     return report
+
+
+_SUMMARY_ESTIMATE_RE = re.compile(r"automatic estimate (?P<rate>\d+(?:\.\d+)?) \((?P<label>[^)]+)\)")
+_LABEL_TO_METHOD = {label: method for method, label in _METHOD_LABELS.items()}
+
+
+def original_calibration(
+    adapter_or_checkpoint_path: str | Path,
+    report: SpeakingRateReport | None = None,
+) -> tuple[float | None, str]:
+    """The automatic speaking-rate estimate of an adapter and its method, even after manual edits.
+
+    Order: the report's own calibration fields; an automatic report; the estimate
+    named in a manual report's summary; the matched-sentence speech comparison
+    saved by training; the training-sample estimate kept beside it.
+    """
+
+    if report is None:
+        report = load_speaking_rate(adapter_or_checkpoint_path)
+    if report is not None:
+        rate = report.original_rate()
+        if rate is not None:
+            return rate, report.original_method() or report.method
+        match = _SUMMARY_ESTIMATE_RE.search(report.summary or "")
+        if match:
+            method = _LABEL_TO_METHOD.get(match.group("label").strip(), "")
+            if method:
+                try:
+                    return float(match.group("rate")), method
+                except ValueError:
+                    pass
+    adapter_dir = _adapter_dir(adapter_or_checkpoint_path)
+    speech_report = read_json_retry(adapter_dir / "analysis" / "speech_evaluation" / "report.json", None)
+    if isinstance(speech_report, Mapping):
+        try:
+            matched = calibrate_from_speech_report(speech_report, None)
+        except Exception:
+            matched = None
+        if matched is not None:
+            return matched.recommended_speaking_rate, matched.method
+    sidecar = read_json_retry(adapter_dir / "analysis" / "speaking_rate_training_samples.json", None)
+    if isinstance(sidecar, Mapping):
+        try:
+            earlier = SpeakingRateReport.from_dict(sidecar)
+        except (KeyError, TypeError, ValueError):
+            earlier = None
+        if earlier is not None and not earlier.is_manual:
+            return earlier.recommended_speaking_rate, earlier.method
+    return None, ""
+
+
+def ensure_calibration_fields(
+    adapter_or_checkpoint_path: str | Path,
+    report: SpeakingRateReport | None = None,
+) -> SpeakingRateReport | None:
+    """Return the adapter's report with the original calibration filled in, persisting it once.
+
+    Manual reports written before v6.13 carry no ``calibrated_speaking_rate``;
+    recovering it means reading the saved speech comparison, so the recovered
+    value is stored back into ``speaking_rate.json`` the first time it is needed.
+    """
+
+    if report is None:
+        report = load_speaking_rate(adapter_or_checkpoint_path)
+    if report is None or report.original_rate() is not None:
+        return report
+    calibrated, method = original_calibration(adapter_or_checkpoint_path, report)
+    if calibrated is None:
+        return report
+    updated = SpeakingRateReport.from_dict({**report.to_dict(), "calibrated_speaking_rate": calibrated, "calibration_method": method})
+    try:
+        write_speaking_rate(_adapter_dir(adapter_or_checkpoint_path), updated)
+    except OSError:
+        pass
+    return updated
 
 
 def write_speaking_rate(
@@ -498,7 +621,9 @@ __all__ = [
     "calibrate_from_samples",
     "calibrate_from_speech_report",
     "dataset_words_per_second",
+    "ensure_calibration_fields",
     "load_speaking_rate",
+    "original_calibration",
     "save_manual_speaking_rate",
     "speaking_rate_method_label",
     "words_per_second",

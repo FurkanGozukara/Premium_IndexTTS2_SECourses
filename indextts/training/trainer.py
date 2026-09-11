@@ -17,7 +17,7 @@ import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -59,6 +59,7 @@ from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
 from .best_checkpoint import best_checkpoint_path, migrate_run_best_checkpoints
 from .dataset_manifest import atomic_write_json
 from .early_stopping import EarlyStopping
+from .ema import AdapterEMA, ema_checkpoint_name
 from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
 from .plan import training_plan, training_plan_line
 from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS
@@ -1200,6 +1201,44 @@ class LoraTrainer:
             )
             return None
 
+    def _write_dataset_profile(self) -> None:
+        """Save the training clips' length, pace and vocabulary profile beside the adapter.
+
+        Voice Generation reads ``analysis/dataset_profile.json`` to show the words and
+        seconds per line this voice reproduces best and to pick its text-token budget.
+        """
+
+        try:
+            from indextts.utils.tokenizer import get_tokenizer
+
+            from .dataset_profile import build_dataset_profile, describe_profile, write_dataset_profile
+
+            try:
+                tokenizer = get_tokenizer(multilingual=True, model_dir=str(self.config.model_dir))
+                token_len = lambda text: len(tokenizer.encode(text, allowed_special="all"))  # noqa: E731
+            except Exception:
+                token_len = None
+            profile = build_dataset_profile(self.dataset_dir, token_len=token_len, dataset_name=self.dataset_dir.name)
+            if profile is None:
+                self.log(">> dataset profile skipped: the manifest has no usable training rows")
+                return
+            try:
+                from .dataset_profile import expressive_profile_entry, save_expressive_reference
+                from .voice_profile import choose_expressive_reference, describe_expressive_choice
+
+                records = list(getattr(self, "training_records", []) or [])
+                choice = choose_expressive_reference(self.dataset_dir, records) if records else None
+                if choice is not None:
+                    saved = save_expressive_reference(self.adapter_dir, self.config.name, self.dataset_dir, choice)
+                    profile["expressive_reference"] = expressive_profile_entry(choice, saved)
+                    self.log(">> " + describe_expressive_choice(choice) + f"; saved as {saved.name}")
+            except Exception as exc:
+                self.log(f">> expressive clip selection failed but training is safe: {exc}")
+            write_dataset_profile(self.adapter_dir, profile)
+            self.log(">> dataset profile: " + describe_profile(profile))
+        except Exception as exc:
+            self.log(f">> dataset profile failed but training is safe: {exc}")
+
     def _write_speech_matched_speaking_rate(self, report: Mapping[str, Any], checkpoint: str) -> None:
         """Replace the short-sample pace estimate with matched held-out sentences."""
 
@@ -1303,6 +1342,7 @@ class LoraTrainer:
             self._metadata(step, epochs_completed, list(built.adapters)),
             dtype=_dtype(self.config.save_dtype),
         )
+        self._save_ema_sibling(destination, built, step=step, epochs_completed=epochs_completed)
         if self.config.save_train_state and (
             self.config.epoch_train_state or not periodic_checkpoint
         ):
@@ -1324,6 +1364,37 @@ class LoraTrainer:
             self._checkpoint_history.append(destination)
             self._prune_checkpoints()
         return destination
+
+    def _save_ema_sibling(
+        self, destination: Path, built: BuiltTrainingModel, *, step: int, epochs_completed: int
+    ) -> Path | None:
+        """Write the EMA weights next to an epoch or final checkpoint; never interrupts training."""
+
+        ema = getattr(self, "ema", None)
+        if ema is None or ema.updates == 0:
+            return None
+        stem = destination.stem
+        prefix = f"{self.config.name}_"
+        if destination.parent.name.lower() == "best" or stem.endswith("_interrupted") or "_step_" in stem:
+            return None
+        epoch: int | None = None
+        if stem.startswith(f"{prefix}epoch_") and stem.removeprefix(f"{prefix}epoch_").isdigit():
+            epoch = int(stem.removeprefix(f"{prefix}epoch_"))
+        elif stem != self.config.name:
+            return None
+        target = destination.with_name(ema_checkpoint_name(self.config.name, epoch) + destination.suffix)
+        try:
+            metadata = self._metadata(step, epochs_completed, list(built.adapters))
+            train_config = dict(metadata.train_config)
+            train_config.update({"ema_of": destination.name, "ema_decay": float(ema.decay), "ema_updates": int(ema.updates)})
+            metadata = replace(metadata, train_config=train_config)
+            with ema.averaged_weights():
+                save_lora(target, built.adapters, built.full_modules, metadata, dtype=_dtype(self.config.save_dtype))
+            self.log(f">> EMA weights (decay {ema.decay:g}, {ema.updates} updates) saved to {target.name}")
+            return target
+        except Exception as exc:
+            self.log(f">> EMA checkpoint could not be saved but training is safe: {exc}")
+            return None
 
     def _prune_checkpoints(self) -> None:
         keep = self.config.keep_last_n
@@ -1542,6 +1613,13 @@ class LoraTrainer:
 
         device = torch.device(config.device)
         optimizer = _optimizer(config, built.parameters)
+        self.ema = AdapterEMA(built.parameters, config.ema_decay) if config.ema_decay > 0.0 else None
+        if self.ema is not None:
+            shadow_mb = sum(shadow.numel() * 4 for shadow in self.ema.shadows) / (1024 ** 2)
+            self.log(
+                f">> EMA of the adapter weights enabled: decay {config.ema_decay:g}, "
+                f"{len(self.ema.shadows)} tensors, {shadow_mb:.0f} MB of shadows"
+            )
         try:
             scaler = torch.amp.GradScaler(
                 device.type, enabled=device.type == "cuda" and config.mixed_precision == "fp16"
@@ -1767,6 +1845,8 @@ class LoraTrainer:
                         continue
                     scheduler.step()
                     global_step += 1
+                    if self.ema is not None:
+                        self.ema.update()
 
                     step_loss = group_loss / micro_count
                     step_accuracy = group_accuracy / micro_count
@@ -2111,6 +2191,7 @@ class LoraTrainer:
         _analysis_path, recommended_checkpoint = self._write_automatic_analysis()
         self._write_averaged_checkpoint()
         self._write_speaking_rate_calibration()
+        self._write_dataset_profile()
         terminal_status = read_json_retry(self.status_path, {}) or {}
         terminal_message = str(
             terminal_status.get("message")

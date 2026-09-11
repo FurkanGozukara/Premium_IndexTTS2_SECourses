@@ -33,7 +33,7 @@ def test_summary_without_override_does_not_claim_no_sweep(summary_checkpoint, re
             json.dumps(report), encoding="utf-8",
         )
     text, reference = generation_tab._lora_info(str(summary_checkpoint))
-    assert "Decoding settings: **defaults** (no accepted sweep override for this training)." in text
+    assert "Decoding settings: <b>defaults</b> (no accepted sweep override for this training)." in text
     assert "no sweep result" not in text
     assert "inspection failed" not in text
     assert reference is None
@@ -46,5 +46,5 @@ def test_summary_still_reports_an_accepted_override(summary_checkpoint):
         }}), encoding="utf-8",
     )
     text, _ = generation_tab._lora_info(str(summary_checkpoint))
-    assert "Decoding settings from the sweep: temperature **0.6**, guidance **1**, beams **5**" in text
+    assert "Decoding settings from the sweep: temperature <b>0.6</b>, guidance <b>1</b>, beams <b>5</b>" in text
     assert "no accepted sweep override" not in text
