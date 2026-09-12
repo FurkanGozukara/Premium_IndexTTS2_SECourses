@@ -17,6 +17,8 @@ budget (``segment_token_budget``):
 
 Every mode preserves every character of the input: the segments concatenate
 back to the original text, and pronunciation annotations are never split.
+Sentence modes measure formatting whitespace as a single spoken space, matching
+inference; subtitle line/cue breaks do not create sentence or clause boundaries.
 """
 
 from __future__ import annotations
@@ -35,13 +37,14 @@ DEFAULT_SEGMENTATION_MODE = "smart"
 SMART_TARGET_FRACTION = 0.85
 _PROTECTED_PATTERN = re.compile(r"<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>")
 _PUNCTUATION_SPLIT = re.compile(r"(?<=[\u3001\u3002\uff01\uff0c\uff1a\uff1b\uff1f,.!?;:\n])")
+_CLAUSE_SPLIT = re.compile(r"(?<=[\u3001\u3002\uff01\uff0c\uff1a\uff1b\uff1f,.!?;:])")
 _LANG_PREFIX = re.compile(r"<\|([^|]+)\|>")
 _WORD_PIECES = re.compile(r"\s+|\S+")
 _CJK_CHARACTER = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]")
 # A sentence ends at . ! ? or an ellipsis (plus closing quotes or brackets) followed by whitespace, at a
-# CJK full stop, exclamation or question mark, or at a line break.
+# CJK full stop, exclamation or question mark. Line/cue breaks alone are formatting.
 _SENTENCE_BOUNDARY = re.compile(
-    r"(?<=[.!?\u2026])[\"\u201d\u2019')\]]*\s+|(?<=[\u3002\uff01\uff1f])[\"\u201d\u2019')\]\u3011\u300d\u300f\uff09]*\s*|\n+"
+    r"(?<=[.!?\u2026])[\"\u201d\u2019')\]]*\s+|(?<=[\u3002\uff01\uff1f])[\"\u201d\u2019')\]\u3011\u300d\u300f\uff09]*\s*"
 )
 _SENTENCE_END_CHARS = ".!?\u2026\u3002\uff01\uff1f"
 _CLOSERS = "\"\u201d\u2019')]\u3011\u300d\u300f\uff09"
@@ -152,14 +155,21 @@ def ends_sentence(piece: str) -> bool:
     """True when the piece ends with sentence-final punctuation (closing quotes and spaces allowed)."""
 
     stripped = str(piece).rstrip().rstrip(_CLOSERS)
-    return bool(stripped) and (stripped[-1] in _SENTENCE_END_CHARS or str(piece).endswith("\n"))
+    return bool(stripped) and stripped[-1] in _SENTENCE_END_CHARS
+
+
+def normalize_sentence_whitespace(text: str) -> str:
+    """One spoken space per whitespace run, retaining leading/trailing boundaries."""
+
+    return re.sub(r"\s+", " ", str(text))
 
 
 def split_sentences(text: str) -> list[str]:
     """Sentence pieces of the text; each keeps its trailing whitespace so they concatenate to the input.
 
     Boundaries inside pronunciation annotations and after common abbreviations
-    or single-letter initials are not used.
+    or single-letter initials are not used. A newline (even a blank subtitle cue
+    separator) is whitespace, not evidence that the sentence has ended.
     """
 
     source = str(text)
@@ -197,7 +207,7 @@ def _budget_chunks(text: str, budget: int, token_len: Callable[[str], int]) -> l
         if atomic:
             chunks.append((piece, "word"))
             continue
-        for part in _PUNCTUATION_SPLIT.split(piece):
+        for part in _CLAUSE_SPLIT.split(piece):
             if not part:
                 continue
             if token_len(part) <= budget:
@@ -328,12 +338,16 @@ def split_text_by_sentences(
     source = str(text)
     if not source.strip():
         return [source] if source else []
-    pieces = sentence_pieces(source, budget, token_len)
+
+    def spoken_token_len(value: str) -> int:
+        return token_len(normalize_sentence_whitespace(value))
+
+    pieces = sentence_pieces(source, budget, spoken_token_len)
     if normalize_segmentation_mode(mode) == "sentence":
         segments: list[str] = []
         current = ""
         for piece, boundary in pieces:
-            if current and token_len(current + piece) > budget:
+            if current and spoken_token_len(current + piece) > budget:
                 segments.append(current)
                 current = ""
             current += piece
@@ -343,7 +357,7 @@ def split_text_by_sentences(
         if current:
             segments.append(current)
         return segments or [source]
-    return pack_sentences(pieces, budget, token_len, target=target_tokens) or [source]
+    return pack_sentences(pieces, budget, spoken_token_len, target=target_tokens) or [source]
 
 
 def split_text_by_tokens(
@@ -474,6 +488,7 @@ __all__ = [
     "ends_sentence",
     "normalize_language",
     "normalize_segmentation_mode",
+    "normalize_sentence_whitespace",
     "pack_sentences",
     "segment_token_budget",
     "sentence_pieces",

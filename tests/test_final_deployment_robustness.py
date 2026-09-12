@@ -296,3 +296,33 @@ def test_final_report_update_preserves_frozen_evidence_and_repeat_history(deploy
     assert len(history) == 1 and history[0].read_bytes() == first_selection
     assert len(calls) == 4
     speech._validate_frozen_deployment(_read(selection_path))
+
+
+def test_freeze_keeps_each_candidate_deployment_settings_from_the_development_report(deployment):
+    accepted = _accepted_pipeline(deployment)
+    report = _read(deployment.root / "report.json")
+    base_infer = {**speech._benchmark_infer_kwargs(deployment.config), "emo_audio_prompt": None, "segment_target_tokens": None,
+                  "sentence_pause_ms": 0, "max_pause_ms": 0, "num_beams": 4, "diffusion_steps": 50, "segmentation_mode": "smart"}
+    fresh_infer = {**base_infer, "emo_audio_prompt": "expressive.wav", "segment_target_tokens": 40, "sentence_pause_ms": 310,
+                   "max_pause_ms": 440, "latent_multiplier": 1.7}
+    report["candidate_inference"] = {"Base": {"infer_kwargs": base_infer}, "fresh": {"infer_kwargs": fresh_infer}}
+    _json(deployment.root / "report.json", report)
+    # The decoder gate and the decoding settings were recorded against the report; refresh their provenance.
+    fingerprint = speech.development_fingerprint(deployment.run)
+    for path in (accepted.gate, accepted.sweep):
+        payload = _read(path)
+        payload["development_fingerprint"] = fingerprint
+        _json(path, payload)
+    settings = _read(accepted.settings)
+    settings.update(development_fingerprint=fingerprint, report_sha256=speech._file_sha256(accepted.sweep))
+    _json(accepted.settings, settings)
+    frozen = speech.freeze_deployment_selection(deployment.config, str(deployment.checkpoint.resolve()))
+    base, selected = frozen["candidates"]
+    assert base["infer_kwargs"]["emo_audio_prompt"] is None and base["infer_kwargs"]["segment_target_tokens"] is None
+    assert base["speaking_rate"] == pytest.approx(1.0)
+    assert selected["infer_kwargs"]["emo_audio_prompt"] == "expressive.wav" and selected["infer_kwargs"]["segment_target_tokens"] == 40
+    assert (selected["infer_kwargs"]["sentence_pause_ms"], selected["infer_kwargs"]["max_pause_ms"]) == (310, 440)
+    # The calibrated speaking rate still overrides the pace recorded at comparison time.
+    assert selected["speaking_rate"] == pytest.approx(0.8)
+    assert selected["infer_kwargs"]["latent_multiplier"] == pytest.approx(round(1.72 / 0.8, 4))
+    assert selected["runtime"]["decoder_adapter"] == str(accepted.decoder.resolve())

@@ -27,6 +27,8 @@ PRIVATE_RELEASE_PATTERNS = (
     r"\b\d+[- ]recording (?:English |narration )?dataset\b",
     r"\bmeasured on (?:the|a|one|this|that)\b",
     r"\bindependent listening rated\b|\bmeasured recovery\b",
+    r"\b(?:test voice|measured voice|on one voice|blind pairwise listening)\b",
+    r"\b(?:on a real run|on the same run|a first real probe)\b",
 )
 
 
@@ -56,7 +58,7 @@ def test_readme_release_summary_is_current_and_public() -> None:
 def test_release_version_is_shared_with_adapter_metadata() -> None:
     from indextts.version import APP_VERSION as metadata_version
 
-    assert APP_VERSION == metadata_version == "6.15"
+    assert APP_VERSION == metadata_version == "6.16"
 
 
 @pytest.mark.parametrize("text", [
@@ -76,6 +78,8 @@ def test_public_release_guard_allows_product_documentation(text: str) -> None:
     "See qa_v42_listening.md for personal results.",
     "See ADAPTER_COMPARISON_V41_V42.md for rankings.",
     "Measured on this recording collection.",
+    "On the measured voice this checkpoint was preferred.",
+    "A first real probe took three minutes.",
 ])
 def test_public_release_guard_rejects_local_run_evidence(text: str) -> None:
     with pytest.raises(AssertionError):

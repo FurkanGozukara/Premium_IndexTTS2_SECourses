@@ -349,8 +349,13 @@ def audit_stage(tiers: TierValues, tier: int, args: argparse.Namespace, poller: 
     sources = sorted({Path(str(row.get("source_media", ""))).stem for row in _read_manifest(dataset_dir)})
     if len(sources) < 2:
         raise ValueError("the audit needs at least two source recordings (one is held out for validation)")
+    # --final-test reserves a second recording so the training run also exercises the frozen final test,
+    # which renders Base and the deployed pipeline (adapter, decoder, adopted decoding settings) once more.
+    final_test = bool(getattr(args, "final_test", False))
+    if final_test and len(sources) < 3:
+        raise ValueError("--final-test needs at least three source recordings (training, validation and final test)")
     settings.update({"name": f"{dataset_dir.name}_audited", "references": str(references[0]),
-                     "validation_sources": sources[-1], "test_sources": ""})
+                     "validation_sources": sources[-1], "test_sources": sources[-2] if final_test else ""})
     command, output = curation_command(str(dataset_dir), settings, model_dir=str(args.model_dir))
     state = out_dir / f"audit_{dataset_dir.name}"
     state.mkdir(parents=True, exist_ok=True)
@@ -359,8 +364,10 @@ def audit_stage(tiers: TierValues, tier: int, args: argparse.Namespace, poller: 
     with poller.window(f"audit {dataset_dir.name}", phase_fn=lambda: _status_phase(state / "status.json")) as window:
         code = _run(command, log_path=state / "audit.log", env=_child_env(args.gpu, _emulated_cap(args, tier)))
     info = _read_json(output / "dataset_info.json")
+    test_dir = output.with_name(output.name + "_test")
     return {"tier": tier, "stage": "audit", "returncode": code, "wall_s": round(time.perf_counter() - started, 1),
             "dataset_dir": str(output), "segments": info.get("segment_count"),
+            "test_dataset_dir": str(test_dir) if final_test and (test_dir / "dataset_info.json").is_file() else "",
             "second_opinion": settings.get("second_opinion"),
             "error": None if code == 0 else _tail(state / "audit.log"), **window.to_dict()}
 
@@ -392,9 +399,12 @@ def train_stage(tiers: TierValues, tier: int, args: argparse.Namespace, poller: 
         "training.early_stop_enabled": False, "training.sample_every_epochs": 1, "training.sample_enabled": True,
         "training.speech_eval_prompts": 4, "training.speech_eval_seeds": 1, "training.speech_eval_candidates": 2,
         "training.decoder_adapter_epochs": 1, "training.decoding_sweep_enabled": bool(args.decoding_sweep),
-        "training.eval_train_subset": 8, "training.final_test_dataset": "",
+        "training.eval_train_subset": 8, "training.final_test_dataset": str(getattr(args, "final_test_dataset", "") or ""),
         "training.decoder_adapter_enabled": not args.skip_decoder,
     })
+    # --override values win over the stage defaults above, so a peak-only run can shrink every phase
+    # (for example training.speech_eval_prompts=2 training.probe_prompts=1 training.probe_seeds=1).
+    values.update({key: value for key, value in args.overrides.items() if key.startswith("training.")})
     config = train_config_from_values(values)
     adapter_dir = Path(config.output_dir) / config.name
     adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -536,6 +546,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--decoding-sweep", action="store_true", help="Keep the decoding sweep in the training run")
     parser.add_argument("--skip-decoder", action="store_true", help="Skip the voice decoder adaptation phase")
+    parser.add_argument("--final-test", action="store_true",
+                        help="Reserve a third source recording for the frozen final test so the training run renders every phase")
+    parser.add_argument("--final-test-dataset", default="",
+                        help="Final-test dataset for a train-only run (the audit stage sets it automatically with --final-test)")
     parser.add_argument("--emulate", action="store_true",
                         help="Cap every worker's allocator at the tier budget and report that size as the card, so "
                              "the run behaves like a card of that tier (out-of-memory errors then mean it does not fit)")
@@ -564,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.output) if args.output else ROOT / "outputs" / "gpu_tier_calibration" / _utc_stamp()
     out_dir.mkdir(parents=True, exist_ok=True)
     args.overrides = _parse_overrides(args.override)
+    args.final_test_dataset = str(Path(args.final_test_dataset).resolve()) if args.final_test_dataset else ""
     if args.overrides:
         print(f">> overrides: {args.overrides}", flush=True)
     if not args.lora:
@@ -609,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_report(out_dir, records, poller, args)
             if record["returncode"] == 0:
                 dataset_dir = Path(record["dataset_dir"])
+                args.final_test_dataset = record.get("test_dataset_dir") or ""
         if "cache" in stages and dataset_dir is not None:
             record = cache_stage(pipeline_tier, args, poller, out_dir, dataset_dir)
             records.append(record)

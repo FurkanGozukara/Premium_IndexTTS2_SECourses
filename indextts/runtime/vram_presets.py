@@ -422,7 +422,9 @@ def preset_notes(tier: str | int | float) -> str:
     return (
         f"{resolved} GB preset: {detail} Generation uses {generation['num_beams']} beams, section batch 1, "
         f"{generation['diffusion_steps']} diffusion steps. {training_detail} "
-        f"Peak use stays within {tier_budget_gb(resolved):.0f} GB, leaving about {config.vram_reserve_gb:.0f} GB free."
+        f"The target memory budget is {tier_budget_gb(resolved):.0f} GB, reserving about "
+        f"{config.vram_reserve_gb:.0f} GB for other use. Automatic checks run one helper process at a time; "
+        f"memory retained by the paused trainer and other applications also counts toward total GPU use."
     )
 
 

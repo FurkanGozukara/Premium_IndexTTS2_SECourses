@@ -61,7 +61,8 @@ def test_training_discovers_and_adopts_newest_running_state(tmp_path: Path) -> N
     assert Path(updates[0]) == live.resolve()
     assert "Attached to running run live_60_steps" in updates[2]
     assert "step 7/60" in updates[2]
-    assert updates[-1].value == 1.0
+    # Five-second Gradio ticks even while live: the browser's own poller carries the one-second status.
+    assert updates[-1].value == 5.0
 
     _write_json(live / "status.json", {"phase": "stopped", "step": 8, "total_steps": 60})
     idle = training_poll_updates(str(live), 0.9, state_root=tmp_path)

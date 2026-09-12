@@ -167,3 +167,22 @@ def test_cached_metrics_parse_only_appended_complete_lines(tmp_path: Path) -> No
 
     (run / "metrics.jsonl").unlink()
     assert training_tab._cached_metrics(run).empty
+
+
+def test_live_snapshot_serves_fragments_only_while_a_run_is_active(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(training_tab.PROCESS_MANAGER, "get", lambda kind: None)
+    assert training_tab.live_training_snapshot(root=tmp_path) == {"active": False}
+    run = tmp_path / "live"
+    _write_run(run, phase="training", step=15, rows=15)
+    snapshot = training_tab.live_training_snapshot(root=tmp_path)
+    assert snapshot["active"] and snapshot["run"] == "live"
+    assert "step 15/100" in snapshot["status"] and snapshot["status"].startswith("Attached to running run live")
+    assert "epoch 1/2" in snapshot["panel"] and "line 2" in snapshot["log"]
+    # The Gradio path and the live route describe the run identically, so the five-second tick
+    # never repaints what the one-second poller already showed.
+    gradio_values = training_tab.training_status_updates(str(run), 0.9)
+    assert gradio_values[0] == snapshot["panel"] and gradio_values[6] == snapshot["log"]
+    assert gradio_values[-1].value == 5.0
+    (run / "status.json").write_text(json.dumps(_status("complete", 100)), encoding="utf-8")
+    assert training_tab.live_training_snapshot(root=tmp_path) == {"active": False}
+    assert "training-live-panel" in training_tab.LIVE_TRAINING_JS and training_tab.LIVE_TRAINING_ROUTE in training_tab.LIVE_TRAINING_JS

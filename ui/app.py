@@ -56,7 +56,7 @@ from .models_tab import (
 from .gpu_tier_presets import tier_preset_name
 from .presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
 from .request_guard import configure_request_guard
-from .training_tab import bind_training_events, build_training_tab
+from .training_tab import LIVE_TRAINING_JS, bind_training_events, build_training_tab
 
 
 LAST_REGISTRY: PresetRegistry | None = None
@@ -534,6 +534,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             show_progress="hidden",
             api_name=False,
         )
+        demo.load(None, None, None, js=LIVE_TRAINING_JS)
         def refresh_preset_choices(requested: str | None):
             available = store.list_presets()
             selected_value = requested if requested in available else SYSTEM_PREFIX + store.default_preset_name()

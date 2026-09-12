@@ -91,6 +91,21 @@ def representative_records(records: Sequence[Mapping[str, Any]], count: int, see
     return chosen
 
 
+AUTO_PROMPTS_PER_SOURCE = 6
+AUTO_PROMPTS_MIN = 12
+AUTO_PROMPTS_MAX = 24
+
+
+def automatic_speech_prompt_count(sources: int) -> int:
+    """Six matched prompts per held-out recording, at least 12 and at most 24.
+
+    One recording with a few hard sentences then cannot decide a comparison by itself, and the paired
+    bootstrap over prompts has enough clusters to resolve differences of a point or two of word error.
+    """
+
+    return max(AUTO_PROMPTS_MIN, min(AUTO_PROMPTS_MAX, AUTO_PROMPTS_PER_SOURCE * max(1, int(sources))))
+
+
 def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
                       val_records: Sequence[Mapping[str, Any]], run_dir: str | Path, *,
                       evaluation_dataset: str | Path | None = None, final_test: bool = False) -> dict[str, Any]:
@@ -106,7 +121,10 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
         if previous.get("dataset_identity") != identity:
             raise ValueError("The saved speech evaluation plan belongs to a different dataset; use a new run name")
         return previous
-    selected = representative_records(val_records, config.speech_eval_prompts, config.seed)
+    val_sources = {str(row.get("source_media") or row["id"]) for row in val_records}
+    configured = int(getattr(config, "speech_eval_prompts", 0) or 0)
+    prompt_count = configured or automatic_speech_prompt_count(len(val_sources))
+    selected = representative_records(val_records, prompt_count, config.seed)
     grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in selected:
         grouped[(str(row.get("speaker", "")), str(row.get("language") or "EN").upper())].append(row)
@@ -141,14 +159,13 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
                        "reference_note": describe_training_reference(speaker_rows, config.dataset_dir) if typical else "",
                        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(), "prompts": prompts})
     train_sources = {str(row.get("source_media") or row["id"]) for row in train_records}
-    val_sources = {str(row.get("source_media") or row["id"]) for row in val_records}
     warnings = []
     if train_sources & val_sources:
         warnings.append("Training and validation share source recordings; scores measure held-out clips, not new recording sessions.")
     if len(val_sources) < 3:
         label = "final-test" if final_test else "validation"
         warnings.append(f"Only {len(val_sources)} {label} recording(s); more recording sessions would improve coverage.")
-    if len(selected) < config.speech_eval_prompts:
+    if len(selected) < prompt_count:
         warnings.append(f"The dataset supplies only {len(selected)} distinct validation prompts.")
     all_speakers = {str(row.get("speaker", "")) for row in train_records}
     evaluated_speakers = {group["speaker"] for group in groups}
@@ -161,8 +178,12 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
             "source_overlap": sorted(train_sources & val_sources), "groups": groups,
             "seeds": [(int(config.seed) + 104729 * i) % 2**32 for i in range(config.speech_eval_seeds)],
             "candidate_limit": config.speech_eval_candidates, "warnings": warnings,
+            "prompt_count": prompt_count, "prompt_count_mode": "configured" if configured else "automatic",
+            "deployment_settings": bool(getattr(config, "speech_eval_deployment_settings", True)),
             "policy": {"max_wer_increase": config.speech_eval_max_wer_increase,
-                       "max_speaker_drop": config.speech_eval_max_speaker_drop},
+                       "max_speaker_drop": config.speech_eval_max_speaker_drop,
+                       "guard_mode": str(getattr(config, "speech_eval_guard_mode", "interval") or "interval"),
+                       "score_wer_weight": float(getattr(config, "speech_eval_score_wer_weight", 4.0))},
             "scope": "final test; used only after checkpoint selection is frozen" if final_test else
                      "development; no previous training or final-test targets are consulted"}
     atomic_write_json(destination, plan)
@@ -195,4 +216,5 @@ def build_final_test_plan(config: Any, train_records: Sequence[Mapping[str, Any]
     return build_speech_plan(config, train_records, rows, run_dir, evaluation_dataset=dataset, final_test=True)
 
 
-__all__ = ["audio_path", "build_speech_plan", "build_final_test_plan", "choose_training_reference", "describe_training_reference", "record_identity", "representative_records"]
+__all__ = ["audio_path", "automatic_speech_prompt_count", "build_speech_plan", "build_final_test_plan", "choose_training_reference",
+           "describe_training_reference", "record_identity", "representative_records"]

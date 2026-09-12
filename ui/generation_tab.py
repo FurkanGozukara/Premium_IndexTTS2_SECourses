@@ -84,6 +84,7 @@ from indextts.utils.text_segmentation import (
     SpeechRecoveryConfig,
     default_segment_tokens,
     normalize_segmentation_mode,
+    normalize_sentence_whitespace,
     split_text_by_tokens,
 )
 from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
@@ -766,11 +767,15 @@ def preview_segments(
         return [], "0 sections"
     try:
         tokenizer = _preview_tokenizer(str(Path(model_dir).resolve()))
-        token_len = lambda value: len(tokenizer.encode(value, allowed_special="all"))
+        raw_token_len = lambda value: len(tokenizer.encode(value, allowed_special="all"))
     except Exception:
-        token_len = lambda value: max(1, len(str(value).split()) * 2)
+        raw_token_len = lambda value: max(1, len(str(value).split()) * 2)
     prefix = f"<|{str(language or 'EN').lower()}|> "
     mode = normalize_segmentation_mode(segmentation_mode) if str(segmentation_mode or "budget") != "budget" else "budget"
+
+    def token_len(value: str) -> int:
+        return raw_token_len(normalize_sentence_whitespace(value) if mode != "budget" else value)
+
     rows: list[list[Any]] = []
     section_index = 0
     row_index = 0
@@ -2781,7 +2786,7 @@ def build_generation_tab(
                         choices=list(SEGMENTATION_CHOICES),
                         value=GENERATION_DEFAULTS["generation.segmentation_mode"],
                         label="Text splitting",
-                        info="Smart sentences packs whole sentences to the voice's typical clip length without exceeding the token limit; Every sentence renders one sentence per segment; Token budget cuts at any punctuation up to the limit.",
+                        info="Smart sentences packs whole sentences to the voice's typical clip length; Every sentence renders each separately. Both ignore line wrapping and subtitle cue breaks unless cue timing is enabled. Token budget cuts at any punctuation up to the limit.",
                     )
                     with gr.Row(equal_height=False):
                         sentence_pause = gr.Slider(
@@ -3762,14 +3767,15 @@ def build_generation_tab(
     for component in (tab.text, max_tokens, budget_scale):
         component.input(update_preview, preview_inputs, [segment_preview, preview_count], queue=False, show_progress="hidden", trigger_mode="always_last")
 
-    def load_caption(path: str | None, current_text: str, use_timing: bool, lang: str, token_limit: int, pauses: bool, scale: float):
+    def load_caption(*items: Any):
+        path = resolve_path_value(items[4])
         if not path:
-            rows, count = preview_segments(current_text, lang, token_limit, False, None, pauses, scale, model_dir)
+            rows, count = update_preview(*items)
             return gr.skip(), "", rows, count
         try:
             cues = parse_subtitle_file(path)
             text_value = subtitle_cues_to_text(cues)
-            rows, count = preview_segments(text_value, lang, token_limit, use_timing, path, pauses, scale, model_dir)
+            rows, count = update_preview(text_value, *items[1:])
             status = f"Loaded {len(cues)} {get_subtitle_format_label(path)} cue(s); timeline ends at {format_srt_timestamp(cues[-1].end_ms) if cues else '00:00:00.000'}."
             return text_value, status, rows, count
         except Exception as exc:
@@ -3778,7 +3784,7 @@ def build_generation_tab(
 
     tab.subtitle_file.change(
         load_caption,
-        [tab.subtitle_file, tab.text, caption_timing, language, max_tokens, pause_tags, budget_scale],
+        preview_inputs,
         [tab.text, caption_load_status, segment_preview, preview_count],
         queue=False,
     )

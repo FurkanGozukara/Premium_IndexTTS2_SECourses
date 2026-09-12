@@ -74,6 +74,20 @@ def open_app_browser(url: str, browser: str) -> None:
     webbrowser.open_new_tab(url)
 
 
+def install_live_training_route(demo: Any) -> None:
+    """Serve the training dashboard's one-second status outside Gradio's event system."""
+    from fastapi.responses import JSONResponse
+    from ui.training_tab import LIVE_TRAINING_ROUTE, live_training_snapshot
+
+    def live_training_status() -> JSONResponse:
+        return JSONResponse(live_training_snapshot(), headers={"Cache-Control": "no-store"})
+
+    try:
+        demo.server_app.add_api_route(LIVE_TRAINING_ROUTE, live_training_status, methods=["GET"], include_in_schema=False)
+    except Exception as exc:  # the dashboard still works through the Gradio timer
+        print(f">> live training status route unavailable: {exc}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
     args = build_parser().parse_args(argv)
@@ -113,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         ],
         prevent_thread_lock=True,
     )
+    install_live_training_route(demo)
     # The port is chosen at launch when it was not requested, so repeat it on an
     # unbuffered line that survives redirected output.
     print(f">> IndexTTS 2.5 Premium SECourses is ready at {demo.local_url}", flush=True)

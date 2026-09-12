@@ -73,7 +73,9 @@ def test_running_gate_uses_its_live_file_not_completed_optimization(dashboard, g
     assert "31/39" in updates[0] and "10500/20340" not in updates[0]
     assert "optimizer early stopping" not in updates[0]
     assert "Generating speech at strength 1" in updates[1]
-    assert updates[-1].value == 1.0 and training_tab._state_running(dashboard.root)
+    # The Gradio timer stays at five seconds while a run is live; the browser's own one-second poller
+    # (LIVE_TRAINING_JS) carries the panel, status line and log in between.
+    assert updates[-1].value == 5.0 and training_tab._state_running(dashboard.root)
     assert dashboard.gate.read_bytes() == original
 
 

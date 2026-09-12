@@ -58,3 +58,16 @@ Trellis_2_3D_Generator/
 /tools/qa_v10_native_bundle.py
 /tests/test_qa_v10_native_bundle*.py
 /tests/fixtures/browser_v10/
+
+# Local working instructions, production policies, run evidence and runtime logs.
+/AGENTS.md
+/CODEX_CLAUDE_COORDINATION.md
+/NATURALNESS_RESEARCH_*.md
+/ADAPTER_COMPARISON_*.md
+/*_TRAINING_REPORT_*.md
+/TRAINING_QUALITY_REPORT_*.md
+/CHECKPOINT_GRID_REPORT.md
+/docs/PRODUCTION_VOICE.md
+/docs/local/
+/docs/naturalness_experiments/
+/webui_*.log

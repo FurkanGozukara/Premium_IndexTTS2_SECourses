@@ -20,6 +20,33 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def resolve_baseline(run_dir: Path, baseline_arg: str, recommended: str) -> tuple[dict, list[dict], str, dict, str]:
+    """Return (plan, baseline rows, label, inference, baseline path) for the comparison.
+
+    A run whose speech comparison recommended the Base model has no checkpoint file to
+    hash-verify, so ``--baseline-checkpoint`` left empty (or given as ``base``) compares with
+    the run's own Base measurement instead of failing.
+    """
+
+    raw = str(baseline_arg or recommended or "").strip()
+    if raw.lower() in {"", "base"}:
+        root = run_dir / "analysis" / "speech_evaluation"
+        plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
+        full = json.loads((root / "report.json").read_text(encoding="utf-8"))
+        base = next((row for row in full.get("candidates", []) if not row.get("path")), None)
+        if base is None:
+            raise SystemExit("the development speech benchmark has no Base measurement to compare with")
+        label = str(base["label"])
+        rows = [row for row in full.get("cells", []) if row.get("checkpoint") == label]
+        inference = full.get("inference") if isinstance(full.get("inference"), dict) else {}
+        return plan, rows, label, inference, ""
+    from indextts.training.speech_eval import development_baseline
+
+    baseline_checkpoint = str(Path(raw).expanduser().resolve())
+    plan, rows, label, _report_path, inference = development_baseline(run_dir, baseline_checkpoint)
+    return plan, rows, label, inference, baseline_checkpoint
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True, help="Training folder with analysis/speech_evaluation")
@@ -32,7 +59,7 @@ def main() -> int:
     args = parser.parse_args()
 
     from indextts.training.train_config import TrainConfig
-    from indextts.training.speech_eval import (_benchmark_infer_kwargs, _benchmark_runtime, _lenient_terms, development_baseline,
+    from indextts.training.speech_eval import (_benchmark_infer_kwargs, _benchmark_runtime, _lenient_terms,
                                                 load_speech_evaluation, render_benchmark_rows)
     from indextts.training.speech_metrics import deployment_score, paired_difference, summarize
     from indextts.utils.atomic_json import write_json_atomic
@@ -42,8 +69,9 @@ def main() -> int:
     report = load_speech_evaluation(run_dir)
     if report is None:
         raise SystemExit("the run has no completed speech evaluation")
-    baseline_checkpoint = str(Path(args.baseline_checkpoint or report["recommended_checkpoint"]).expanduser().resolve())
-    plan, baseline_rows, baseline_label, _report_path, inference = development_baseline(run_dir, baseline_checkpoint)
+    plan, baseline_rows, baseline_label, inference, baseline_checkpoint = resolve_baseline(
+        run_dir, args.baseline_checkpoint, str(report.get("recommended_checkpoint") or ""),
+    )
     candidate = str(Path(args.checkpoint).expanduser().resolve())
     label = args.label or Path(candidate).stem
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

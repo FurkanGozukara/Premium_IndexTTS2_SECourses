@@ -94,9 +94,11 @@ def test_only_presets_load_automatically_and_attachments_use_header_button(demo)
         for dependency in config["dependencies"]
         if any(target[1] == "load" for target in dependency.get("targets") or [])
     ]
-    assert [dependency.get("api_name") for dependency in load_dependencies] == [
-        "initial_load"
-    ]
+    # The only backend work on page load is the preset load; the other load event is browser-side JS
+    # (the training dashboard's live-status poller) with no server function.
+    backend_loads = [dependency for dependency in load_dependencies if dependency.get("backend_fn", True) is not False]
+    assert [dependency.get("api_name") for dependency in backend_loads] == ["initial_load"]
+    assert all(dependency.get("js") for dependency in load_dependencies if dependency not in backend_loads)
 
     last_values = [
         component

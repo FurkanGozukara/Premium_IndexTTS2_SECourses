@@ -486,6 +486,12 @@ def _training_generalization(state_dir: str | Path | None) -> tuple[str, pd.Data
     elif status.get("speech_evaluation_status"):
         summary = (f"**Speech evaluation: {status['speech_evaluation_status']}** — "
                    f"{status.get('speech_evaluation_message', '')}\n\n" + summary)
+    probe_summary = read_json(root / "analysis" / "probe" / "summary.json", {}) or {}
+    if probe_summary.get("history"):
+        from indextts.training.probe import probe_markdown
+        summary = summary + "\n\n" + probe_markdown(probe_summary)
+    elif status.get("probe_status") in {"running", "failed", "skipped"}:
+        summary = summary + f"\n\n**Epoch probe: {status['probe_status']}** — {status.get('probe_message', '')}"
     decoder_status = str(status.get("decoder_adapter_status") or "")
     if decoder_status:
         from indextts.training.speech_eval import load_decoder_test
@@ -545,6 +551,15 @@ def _training_status_text(status: Mapping[str, Any], metrics: pd.DataFrame) -> s
         parts.append(f"{max(0, step - int(tracking.get('last_meaningful_step', 0)))} updates since meaningful improvement")
         if tracking.get("lr_reductions"):
             parts.append(f"LR refinement used; grace until step {tracking.get('cooldown_until_step', 0)}")
+    probe = value.get("probe") or {}
+    if probe.get("best_score") is not None:
+        parts.append(f"probe best {float(probe['best_score']):+.4f} at epoch {int(probe.get('best_epoch', 0) or 0)}")
+        if probe.get("last_score") is not None and probe.get("last_epoch"):
+            parts.append(f"probe epoch {int(probe['last_epoch'])} {float(probe['last_score']):+.4f}")
+        if value.get("probe_status") == "complete" and probe.get("stalled_epochs") is not None:
+            parts.append(f"probe checks without gain {int(probe.get('stalled_epochs', 0) or 0)}")
+    elif value.get("probe_status") == "running" and value.get("probe_message"):
+        parts.append(str(value["probe_message"]))
     runtime_warning = str(value.get("runtime_warning") or "")
     if runtime_warning and runtime_warning != str(value.get("message") or ""):
         parts.append(runtime_warning)
@@ -588,31 +603,9 @@ def _decoder_gate_progress(root: Path, status: Mapping[str, Any]) -> dict[str, A
     return payload
 
 
-def training_status_updates(state_value: str, smoothing_value: float, *, heavy: bool = True) -> tuple[Any, ...]:
-    """Return the complete training dashboard update for polling and server push.
+def _dashboard_fragments(root: Path) -> dict[str, Any]:
+    """Everything the dashboard shows about a run that is cheap to compute every second."""
 
-    With ``heavy=False`` the charts, sample player, checkpoint table and generalization
-    summary are neither computed nor sent (``gr.skip()``); the panel, status line and log
-    are always returned.
-    """
-
-    if not state_value:
-        return (
-            progress_panel_html({}, title="Ready"),
-            "",
-            empty_series_frame(LOSS_SERIES),
-            empty_series_frame(LR_SERIES),
-            empty_series_frame(GRAD_SERIES),
-            empty_series_frame(SPEED_SERIES),
-            "",
-            None,
-            "",
-            [],
-            "",
-            analysis_epoch_frame(None),
-            gr.Timer(5.0, active=True),
-        )
-    root = Path(state_value)
     status = read_json(root / "status.json", {}) or {}
     metrics = _cached_metrics(root)
     step = int(status.get("step", 0) or 0)
@@ -692,7 +685,42 @@ def training_status_updates(state_value: str, smoothing_value: float, *, heavy: 
                                 else titles.get(phase, "Training in progress"))
     status_line = _training_status_text(status, metrics)
     log_text = tail_text(root / "log.txt", 60) or tail_text(root / "worker_console.log", 60)
-    timer_update = gr.Timer(5.0 if terminal else 1.0, active=True)
+    return {"status": status, "metrics": metrics, "terminal": terminal, "sample": sample,
+            "sample_text": sample_text_value, "panel": panel, "status_line": status_line, "log_text": log_text}
+
+
+def training_status_updates(state_value: str, smoothing_value: float, *, heavy: bool = True) -> tuple[Any, ...]:
+    """Return the complete training dashboard update for polling and server push.
+
+    With ``heavy=False`` the charts, sample player, checkpoint table and generalization
+    summary are neither computed nor sent (``gr.skip()``); the panel, status line and log
+    are always returned.
+    """
+
+    if not state_value:
+        return (
+            progress_panel_html({}, title="Ready"),
+            "",
+            empty_series_frame(LOSS_SERIES),
+            empty_series_frame(LR_SERIES),
+            empty_series_frame(GRAD_SERIES),
+            empty_series_frame(SPEED_SERIES),
+            "",
+            None,
+            "",
+            [],
+            "",
+            analysis_epoch_frame(None),
+            gr.Timer(5.0, active=True),
+        )
+    root = Path(state_value)
+    fragments = _dashboard_fragments(root)
+    status, metrics, terminal = fragments["status"], fragments["metrics"], fragments["terminal"]
+    sample, sample_text_value = fragments["sample"], fragments["sample_text"]
+    panel, status_line, log_text = fragments["panel"], fragments["status_line"], fragments["log_text"]
+    # One Gradio tick every five seconds whether the run is live or finished: the browser's own
+    # one-second poller (LIVE_TRAINING_JS) carries the panel, status line and log in between.
+    timer_update = gr.Timer(5.0, active=True)
     if not heavy:
         return (
             panel,
@@ -727,12 +755,77 @@ def training_status_updates(state_value: str, smoothing_value: float, *, heavy: 
     )
 
 
+LIVE_TRAINING_ROUTE = "/training/live"
+# Installed once per page. Every Gradio event makes the browser walk the whole app's component
+# tree for each output. To reduce repeated component updates, the live panel, status line and log
+# tail are fetched as three small fragments outside Gradio's event system instead and swapped
+# into the dashboard directly; the Gradio timer keeps charts, tables and the finished state at
+# five-second intervals.
+LIVE_TRAINING_JS = """
+() => {
+  if (window.__indexttsLiveTraining) { return; }
+  window.__indexttsLiveTraining = true;
+  const seen = {};
+  const root = (window.gradio_config && window.gradio_config.root) || "";
+  const swap = (id, key, data, apply) => {
+    const block = document.getElementById(id);
+    if (!block || seen[key] === data[key]) { return; }
+    seen[key] = data[key];
+    apply(block, data[key]);
+  };
+  const tick = async () => {
+    if (document.visibilityState !== "visible" || !document.getElementById("training-live-panel")) { return; }
+    try {
+      const response = await fetch(root + "%(route)s", {cache: "no-store"});
+      if (!response.ok) { return; }
+      const data = await response.json();
+      if (!data.active) { return; }
+      swap("training-live-panel", "panel", data, (block, html) => {
+        const host = block.querySelector(".html-container > div") || block.querySelector(".html-container") || block;
+        host.innerHTML = html;
+      });
+      swap("training-live-status", "status", data, (block, text) => {
+        const host = block.querySelector(".prose .md") || block.querySelector(".prose") || block;
+        host.textContent = text;
+      });
+      swap("training-live-log", "log", data, (block, text) => {
+        const area = block.querySelector("textarea");
+        if (area) { area.value = text; area.scrollTop = area.scrollHeight; }
+      });
+    } catch (error) { /* the server is busy or restarting; the next second tries again */ }
+  };
+  window.setInterval(tick, 1000);
+}
+""" % {"route": LIVE_TRAINING_ROUTE}
+
+
+def live_training_snapshot(root: str | Path = ROOT / "loras") -> dict[str, Any]:
+    """The live run's progress panel, status line and log tail for the browser's one-second poller.
+
+    Inactive (nothing to swap) when no run is in progress; the Gradio timer then owns the dashboard.
+    """
+    try:
+        job = PROCESS_MANAGER.get("training")
+        candidate = str(job.state_dir) if job is not None and job.running and getattr(job, "state_dir", None) else ""
+        if not candidate or not _state_running(candidate):
+            newest = latest_training_state(root)
+            candidate = newest if newest and _state_running(newest) else ""
+        if not candidate:
+            return {"active": False}
+        fragments = _dashboard_fragments(Path(candidate))
+        if fragments["terminal"]:
+            return {"active": False}
+        name = Path(candidate).name
+        return {"active": True, "run": name, "panel": fragments["panel"],
+                "status": f"Attached to running run {name} | {fragments['status_line']}", "log": fragments["log_text"]}
+    except Exception as exc:  # the poller must never surface an error into the page
+        return {"active": False, "error": str(exc)}
+
+
 def _finish_poll_updates(updates: list[Any], adopted_state: str, running: bool) -> None:
     if running and adopted_state:
         updates[1] = f"Attached to running run {Path(adopted_state).name} | {updates[1]}"
-        updates[-1] = gr.Timer(1.0, active=True)
-    else:
-        updates[-1] = gr.Timer(5.0, active=True)
+    updates[-1] = gr.Timer(5.0, active=True)
 
 
 def training_poll_updates(
@@ -780,7 +873,8 @@ def training_poll_updates(
         or entry is None
         or not running
         or phase != entry.get("phase")
-        or now - float(entry.get("heavy_at", 0.0)) >= HEAVY_REFRESH_SECONDS
+        # Timer ticks land a few milliseconds early; a small tolerance keeps one heavy refresh per interval.
+        or now - float(entry.get("heavy_at", 0.0)) >= HEAVY_REFRESH_SECONDS - 0.5
     )
     updates = list(training_status_updates(adopted_state, smoothing_value, heavy=heavy))
     _finish_poll_updates(updates, adopted_state, running)
@@ -1140,8 +1234,8 @@ def build_training_tab(
             gr.Markdown("Freeze held-out texts and training-only voice references before training. Compare Base and this run's checkpoints with repeated seeds after training. The recommendation uses automated proxies; listen to the saved comparison clips to judge naturalness.")
             with gr.Row():
                 speech_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["speech_eval_enabled"], label="Compare generated speech automatically")
-                speech_prompts = gr.Number(value=TRAIN_DEFAULTS["speech_eval_prompts"], minimum=1, maximum=100, precision=0, label="Held-out speech prompts",
-                    info="Balanced across available recordings, speakers and clip lengths. Adds a longer prompt per voice when enough texts are available.")
+                speech_prompts = gr.Number(value=TRAIN_DEFAULTS["speech_eval_prompts"], minimum=0, maximum=100, precision=0, label="Held-out speech prompts",
+                    info="0 = automatic: six per held-out recording, at least 12 and at most 24, so one recording cannot decide the comparison. Balanced across recordings, speakers and clip lengths; adds a longer prompt per voice when enough texts are available.")
                 speech_seeds = gr.Number(value=TRAIN_DEFAULTS["speech_eval_seeds"], minimum=1, maximum=10, precision=0, label="Generation seeds per prompt")
                 speech_candidates = gr.Number(value=TRAIN_DEFAULTS["speech_eval_candidates"], minimum=1, maximum=10, precision=0, label="Speech checkpoint candidates",
                     info="Lowest validation losses plus the latest distinct update, with Base always included.")
@@ -1157,6 +1251,14 @@ def build_training_tab(
                 ema_decay = gr.Number(value=TRAIN_DEFAULTS["ema_decay"], minimum=0, maximum=0.9999, step=0.0001,
                     label="EMA of the adapter weights (decay)",
                     info="0 is off. Otherwise a running average of the trainable weights is kept during training (0.999 averages roughly the last thousand updates) and saved beside every epoch and final file as <name>_ema*.safetensors; the final EMA file joins the speech comparison as one more candidate and is selected only when it measures best.")
+            with gr.Row():
+                speech_deployment = gr.Checkbox(value=TRAIN_DEFAULTS["speech_eval_deployment_settings"], label="Compare with the deployment settings",
+                    info="Render every candidate the way Voice Generation deploys it by default: the GPU tier's beams and diffusion steps, Smart sentences with the adapter's token target and dataset pauses, its expressive clip and speaking rate; Base with the language defaults. Off uses the fixed short-sample settings for every candidate.")
+                speech_guard = gr.Dropdown(choices=["interval", "mean"], value=TRAIN_DEFAULTS["speech_eval_guard_mode"], label="Regression guard",
+                    info="interval: a candidate is rejected for a word-error increase or identity drop beyond the margin only when its prompt-bootstrap 95% interval excludes zero or a majority of the held-out recordings show it; otherwise the increase costs deployment score. mean: the margin alone rejects.")
+                speech_wer_weight = gr.Number(value=TRAIN_DEFAULTS["speech_eval_score_wer_weight"], minimum=0, maximum=100,
+                    label="Word-error weight in the deployment score",
+                    info="One point of paired word-error increase costs this much divided by 100 of speaker similarity (4 = 0.04). Raise it to favor accuracy over likeness, lower it for the opposite.")
             reference_typical = gr.Checkbox(value=TRAIN_DEFAULTS["reference_typical"], label="Prefer a reference near the speaker's median pitch and pace",
                 info="Among the cleanest training clips near 15 seconds, the saved recommended reference, training conditioning, and the speech benchmark use the clip whose pitch and words per second are closest to the dataset's medians.")
             final_test = gr.Textbox(value=TRAIN_DEFAULTS["final_test_dataset"], label="Final-test dataset (optional)",
@@ -1164,7 +1266,10 @@ def build_training_tab(
             for name, component, kind, minimum, maximum in (
                 ("speech_eval_enabled", speech_enabled, "bool", None, None),
                 ("reference_typical", reference_typical, "bool", None, None),
-                ("speech_eval_prompts", speech_prompts, "int", 1, 100),
+                ("speech_eval_prompts", speech_prompts, "int", 0, 100),
+                ("speech_eval_deployment_settings", speech_deployment, "bool", None, None),
+                ("speech_eval_guard_mode", speech_guard, "str", None, None),
+                ("speech_eval_score_wer_weight", speech_wer_weight, "float", 0, 100),
                 ("speech_eval_seeds", speech_seeds, "int", 1, 10),
                 ("speech_eval_candidates", speech_candidates, "int", 1, 10),
                 ("speech_eval_timeout_s", speech_timeout, "float", 1, 100000),
@@ -1173,6 +1278,46 @@ def build_training_tab(
                 ("average_last_checkpoints", average_last, "int", 0, 20),
                 ("ema_decay", ema_decay, "float", 0, 0.9999),
                 ("final_test_dataset", final_test, "str", None, None),
+            ):
+                _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
+
+        with gr.Accordion("Epoch probe and two-signal early stopping", open=False):
+            gr.Markdown("After an epoch, a separate process renders a few held-out sentences with the checkpoint using the deployment settings and measures them against the real recordings "
+                        "(speaker similarity, word error, pauses), scored against Base with the deployment score. The best-scoring epoch is kept as `best/<name>_probe_best.safetensors` and always joins the speech comparison. "
+                        "Training then stops only when validation loss and the probe have both stalled, or when the probe shows the voice getting harder to understand while its score no longer improves. "
+                        "The probe follows the epoch sample's memory rules: it skips below the minimum free VRAM, fits its tier to the free memory, and prefers another GPU when the machine has one with room; the training process itself never grows.")
+            with gr.Row():
+                probe_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["probe_enabled"], label="Probe each checkpoint with the deployment settings")
+                probe_every = gr.Number(value=TRAIN_DEFAULTS["probe_every_epochs"], minimum=0, maximum=10000, precision=0, label="Probe every N epochs",
+                    info="0 = automatic: every epoch while a probe costs under a third of an epoch, otherwise spaced so probes stay under that share (small, fast datasets). Set 1 to probe every epoch regardless of cost.")
+                probe_prompts = gr.Number(value=TRAIN_DEFAULTS["probe_prompts"], minimum=0, maximum=50, precision=0, label="Probe sentences",
+                    info="0 = automatic: three per held-out recording, at least 6 and at most 12. More sentences measure more reliably and take longer.")
+                probe_seeds = gr.Number(value=TRAIN_DEFAULTS["probe_seeds"], minimum=1, maximum=5, precision=0, label="Probe seeds per sentence",
+                    info="Renders per sentence; two halve the swing one misread word gives a check.")
+                probe_device = gr.Dropdown(choices=["auto", "same", *[f"cuda:{index}" for index in range(8)]], value=TRAIN_DEFAULTS["probe_device"], label="Probe device",
+                    info="auto: another GPU with at least the minimum free VRAM when present, else the training GPU behind the same gate as the epoch sample. same: always the training GPU.")
+            with gr.Row():
+                probe_stop = gr.Checkbox(value=TRAIN_DEFAULTS["probe_stop_enabled"], label="Let the probe confirm or defer early stopping",
+                    info="On: a validation-loss stall stops training only when the probe's deployment score has also stalled; a probe whose word error degrades while its score stalls stops training as overfitting. Off: the probe only records and keeps its best checkpoint.")
+                probe_patience = gr.Number(value=TRAIN_DEFAULTS["probe_patience"], minimum=1, maximum=100, precision=0, label="Probe patience (checks)",
+                    info="Consecutive probe checks without a deployment-score gain above the minimum before the probe counts as stalled. With probing every N epochs each check spans N epochs.")
+                probe_delta = gr.Number(value=TRAIN_DEFAULTS["probe_min_delta"], minimum=0, maximum=1, label="Probe minimum improvement",
+                    info="Deployment-score gain over the best check that counts as progress. Smaller values count smaller improvements.")
+                probe_tolerance = gr.Number(value=TRAIN_DEFAULTS["probe_wer_tolerance"], minimum=0, maximum=1, label="Probe word-error tolerance",
+                    info="0 = automatic: the recognizer's own error on the real probe recordings, at least 0.01. A probe word error above the best check's by more than this, for the patience count while the score stalls, stops training.")
+                probe_timeout = gr.Number(value=TRAIN_DEFAULTS["probe_timeout_s"], minimum=60, label="Probe timeout (s)",
+                    info="A probe that runs longer is killed and skipped; training continues.")
+            for name, component, kind, minimum, maximum in (
+                ("probe_enabled", probe_enabled, "bool", None, None),
+                ("probe_every_epochs", probe_every, "int", 0, 10000),
+                ("probe_prompts", probe_prompts, "int", 0, 50),
+                ("probe_seeds", probe_seeds, "int", 1, 5),
+                ("probe_device", probe_device, "str", None, None),
+                ("probe_stop_enabled", probe_stop, "bool", None, None),
+                ("probe_patience", probe_patience, "int", 1, 100),
+                ("probe_min_delta", probe_delta, "float", 0, 1),
+                ("probe_wer_tolerance", probe_tolerance, "float", 0, 1),
+                ("probe_timeout_s", probe_timeout, "float", 60, 1000000),
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
 
@@ -1191,6 +1336,8 @@ def build_training_tab(
                 decoder_codes = gr.Dropdown(choices=["real", "gpt", "mixed"], value=TRAIN_DEFAULTS["decoder_adapter_code_source"],
                     label="Decoder training codes",
                     info="real: the semantic codes quantized from the recordings, as the decoder was pretrained. gpt: the selected checkpoint's own teacher-forced predictions for the same clips, which is what generation feeds the decoder. mixed: half of each.")
+            decoder_always_gate = gr.Checkbox(value=TRAIN_DEFAULTS["decoder_adapter_always_gate"], label="Judge the decoder with the best adapter even when Base leads",
+                info="When the speech comparison preferred Base, the decoder is still tested through the full pipeline with the best-scoring adapter checkpoint, and adapter + decoder is judged against Base and every plain adapter by the same guards and deployment score; it becomes the recommendation only when it wins. Off keeps the old behavior: no decoder gate after a Base recommendation.")
             with gr.Row():
                 decoding_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoding_sweep_enabled"], label="Sweep decoding settings after training",
                     info="Renders the speech benchmark with the selected checkpoint at other temperatures, guidance rates, and beam counts; a change is kept only when it scores better than the defaults, and Voice Generation applies the winner with the adapter.")
@@ -1203,6 +1350,7 @@ def build_training_tab(
                 ("decoder_adapter_learning_rate", decoder_lr, "float", 1e-6, 1e-2),
                 ("decoder_adapter_timeout_s", decoder_timeout, "float", 60, 1000000),
                 ("decoder_adapter_code_source", decoder_codes, "str", None, None),
+                ("decoder_adapter_always_gate", decoder_always_gate, "bool", None, None),
                 ("decoding_sweep_enabled", decoding_enabled, "bool", None, None),
                 ("decoding_sweep_timeout_s", decoding_timeout, "float", 60, 1000000),
             ):
@@ -1374,8 +1522,8 @@ def build_training_tab(
 
         state_dir = gr.State(current_state)
         timer = gr.Timer(5.0, active=True)
-        dashboard_progress = gr.HTML(progress_panel_html({}, title="Ready"))
-        status_text = gr.Markdown("")
+        dashboard_progress = gr.HTML(progress_panel_html({}, title="Ready"), elem_id="training-live-panel")
+        status_text = gr.Markdown("", elem_id="training-live-status")
         smoothing_slider = gr.Slider(0, 0.99, value=0.9, step=0.01, label="Loss chart smoothing", info="Exponential smoothing for the displayed train-loss line only; raw loss remains visible.")
         with gr.Row():
             loss_plot = gr.LinePlot(empty_series_frame(LOSS_SERIES), x="step", y="value", color="series", title="Training / validation loss", height=300, buttons=["fullscreen", "export"], x_title="step", x_axis_format="d", y_title="loss", colors_in_legend=["train raw", "train smoothed", "train EMA", "validation"], color_map={"train raw": "#6b7280", "train smoothed": "#e11d48", "train EMA": "#f59e0b", "validation": "#22d3ee"})
@@ -1383,7 +1531,8 @@ def build_training_tab(
         with gr.Row():
             grad_plot = gr.LinePlot(empty_series_frame(GRAD_SERIES), x="step", y="value", color="series", title="Gradient norm", height=280, buttons=["fullscreen", "export"], x_title="step", x_axis_format="d", y_title="grad norm", colors_in_legend=["grad norm"], color_map={"grad norm": "#f97316"})
             speed_plot_component = gr.LinePlot(empty_series_frame(SPEED_SERIES), x="step", y="value", color="series", title="Speed / VRAM", height=280, buttons=["fullscreen", "export"], x_title="step", x_axis_format="d", y_title="value", colors_in_legend=['VRAM GB', 'steps/s'], color_map={'VRAM GB': '#34d399', 'steps/s': '#60a5fa'})
-        log = gr.Textbox(label="Training log (last 60 lines)", lines=12, max_lines=18, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
+        log = gr.Textbox(label="Training log (last 60 lines)", lines=12, max_lines=18, interactive=False, buttons=["copy"], elem_classes=["log-tail"],
+                         elem_id="training-live-log")
         with gr.Row():
             latest_sample = gr.Audio(label="Latest training sample", type="filepath", buttons=["download"])
             sample_label = gr.Markdown("")
@@ -1481,7 +1630,7 @@ def build_training_tab(
             message = f"Training {config.name} started with {config.adapter_type.upper()} rank {config.rank}."
             print(">> " + message, flush=True)
             updates = list(training_poll_updates(str(adapter_dir), smoothing_value))
-            updates[-1] = gr.Timer(1.0, active=True)
+            updates[-1] = gr.Timer(5.0, active=True)
             emitted, fingerprints = dedupe_updates(updates)
             yield emitted
             # The dashboard timer is the only live poller. Streaming a second copy of every

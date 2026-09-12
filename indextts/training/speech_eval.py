@@ -103,14 +103,27 @@ def freeze_deployment_selection(config: Any, checkpoint_path: str) -> dict[str, 
     runtime = _benchmark_runtime(config).to_dict()
     runtime.update(lora_path="", decoder_adapter="none", decoder_adapter_strength=1.0)
     infer = _benchmark_infer_kwargs(config)
-    base.update(path="", runtime=dict(runtime), infer_kwargs=dict(infer), speaking_rate=float(config.sample_speaking_rate))
+    # With deployment settings the development report rendered Base and the adapters with their own
+    # settings (emotion prompt, pauses, token target, pace); the final test keeps each candidate's.
+    candidate_inference = report.get("candidate_inference") if isinstance(report.get("candidate_inference"), dict) else {}
+
+    def infer_for(label: str) -> dict[str, Any]:
+        entry = candidate_inference.get(label) if isinstance(candidate_inference, dict) else None
+        if isinstance(entry, dict) and isinstance(entry.get("infer_kwargs"), dict) and entry["infer_kwargs"]:
+            return dict(entry["infer_kwargs"])
+        return dict(infer)
+
+    base_infer = infer_for("Base")
+    base.update(path="", runtime=dict(runtime), infer_kwargs=base_infer,
+                speaking_rate=round(float(SAMPLE_FIXED_INFER_KWARGS["latent_multiplier"]) / float(base_infer.get("latent_multiplier") or SAMPLE_FIXED_INFER_KWARGS["latent_multiplier"]), 4))
     candidates = [base]
     artifacts = {str(root / "report.json"): _file_sha256(root / "report.json"),
                  str(root / "plan.json"): _file_sha256(root / "plan.json"),
                  str(root / "final_test" / "plan.json"): _file_sha256(root / "final_test" / "plan.json")}
     if checkpoint:
-        selected.update(path=checkpoint, runtime=dict(runtime), infer_kwargs=dict(infer),
-                        speaking_rate=float(config.sample_speaking_rate))
+        selected_infer = infer_for(str(selected.get("label") or ""))
+        selected.update(path=checkpoint, runtime=dict(runtime), infer_kwargs=selected_infer,
+                        speaking_rate=round(float(SAMPLE_FIXED_INFER_KWARGS["latent_multiplier"]) / float(selected_infer.get("latent_multiplier") or SAMPLE_FIXED_INFER_KWARGS["latent_multiplier"]), 4))
         artifacts[checkpoint] = _file_sha256(checkpoint)
         if selected.get("sha256") != artifacts[checkpoint]:
             raise ValueError("The selected checkpoint changed after development evaluation")
@@ -267,6 +280,15 @@ def shortlist_checkpoints(run_dir: str | Path, limit: int) -> list[dict[str, Any
     latest = max(members, key=lambda r: r["steps"])
     if limit > 1 and latest not in selected:
         selected[-1] = latest
+    # The update whose epoch probe scored best against Base during training is always judged too; it may be
+    # the same training update as an epoch file, in which case that file already represents it.
+    probe_steps = {item["steps"] for item in entries if item.get("kind") == "probe_best" and item["steps"]}
+    for item in members:
+        if item["steps"] in probe_steps and item not in selected:
+            selected.append(item)
+    for item in distinct:
+        if item.get("kind") == "probe_best" and not item["steps"] and item not in selected:
+            selected.append(item)
     # The averaged checkpoint and the EMA of the final update are always judged, in addition to the shortlist;
     # EMA epoch files stay available for the grid but are not rendered automatically.
     selected.extend(
@@ -298,7 +320,18 @@ def report_markdown(report: dict[str, Any]) -> str:
         if row["path"]:
             delta = row["error_delta_vs_base"]
             lines.append(f"- {row['label']}: paired error change {delta['mean']:+.1%}, prompt-bootstrap 95% interval "
-                         f"[{delta['ci95'][0]:+.1%}, {delta['ci95'][1]:+.1%}]. " + "; ".join(row["rejection_reasons"]))
+                         f"[{delta['ci95'][0]:+.1%}, {delta['ci95'][1]:+.1%}]. " + "; ".join(row["rejection_reasons"])
+                         + ("; ".join(row.get("notes") or []) if row.get("notes") else ""))
+    joint = report.get("joint_selection")
+    if joint:
+        lines.extend(["", f"**Deployment choice with the voice decoder adapter: {joint['recommended_label']}.** {joint['decision']}"])
+        if joint.get("candidates"):
+            lines.extend(["", "| Deployment | Deployment score vs Base | Speaker similarity vs real | Mean transcript error | Eligible |",
+                          "|---|---:|---:|---:|---|"])
+            for row in joint["candidates"]:
+                speaker_real = f"{row['speaker_similarity_real']:.3f}" if row.get("speaker_similarity_real") is not None else "unavailable"
+                lines.append(f"| {row['label']} | {row['deployment_score']['score']:+.4f} | {speaker_real} | {row['mean_error_rate']:.1%} | "
+                             f"{'yes' if row['eligible'] else 'no'} |")
     real = report.get("real_recordings")
     if real:
         lines.append(f"Real held-out recordings have {real['mean_error_rate']:.1%} mean ASR error on the same texts; ASR itself is imperfect.")
@@ -355,9 +388,24 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     # compares GPT checkpoints without it; deployment is assessed separately.
     runtime.decoder_adapter = "none"
     infer = _benchmark_infer_kwargs(config)
+    # Development renders every candidate the way Voice Generation deploys it by default: Base with the
+    # language defaults, the run's adapters with their profile's token target, pauses, expressive clip and
+    # calibrated pace, all at the GPU tier's beams and diffusion steps. Every checkpoint of one run shares
+    # those settings, so Base and the adapters form two batches.
+    deployment = bool(plan.get("deployment_settings", getattr(config, "speech_eval_deployment_settings", True))) and not final_test
+    deployment_infer: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def deployment_settings_for(candidate: Mapping[str, Any], language: str) -> dict[str, Any]:
+        # Every checkpoint of one run shares its profile, so Base and "an adapter" per language suffice.
+        from .deployment_settings import deployment_infer_kwargs
+        key = ("adapter" if candidate["path"] else "base", str(language).upper())
+        if key not in deployment_infer:
+            deployment_infer[key] = deployment_infer_kwargs(config, candidate["path"], language=key[1], tier=runtime.vram_tier)
+        return dict(deployment_infer[key])
     attempt = root / "grids" / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     clips, real_clips, grids = [], [], []
     candidate_inference = {}
+    report_inference: dict[str, Any] | None = None
     for group in plan["groups"]:
         update(f"Generating speech for {group['speaker']} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]) * len(candidates))
         if hashlib.sha256(Path(group["reference"]).read_bytes()).hexdigest() != group["reference_sha256"]:
@@ -367,20 +415,35 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                 raise ValueError("A frozen evaluation recording has changed")
         # Final deployment needs per-candidate settings: Base must never inherit
         # the selected adapter's decoder, speaking rate, or tuned decoding knobs.
-        batches = [[row] for row in candidates] if final_test else [candidates]
+        if final_test:
+            batches = [[row] for row in candidates]
+        elif deployment:
+            batches = [rows for rows in ([row for row in candidates if not row["path"]], [row for row in candidates if row["path"]]) if rows]
+        else:
+            batches = [candidates]
         for index, batch in enumerate(batches):
             if frozen_deployment is not None:
                 _validate_frozen_deployment(frozen_deployment)
             candidate = batch[0]
             selected_runtime = dict(candidate.get("runtime") or runtime.to_dict()) if final_test else runtime.to_dict()
-            selected_infer = dict(candidate.get("infer_kwargs") or infer) if final_test else dict(infer)
+            if final_test:
+                selected_infer = dict(candidate.get("infer_kwargs") or infer)
+            elif deployment:
+                selected_infer = deployment_settings_for(candidate, group["language"])
+            else:
+                selected_infer = dict(infer)
             if not candidate["path"]:
                 selected_runtime["decoder_adapter"] = "none"
+            if final_test:
+                grid_name = f"{group['id']}_candidate_{index}"
+            elif deployment:
+                grid_name = f"{group['id']}_{'adapters' if candidate['path'] else 'base'}"
+            else:
+                grid_name = group["id"]
             grid_config = GridConfig(adapter_dir=str(run_dir),
                 checkpoints=[GridCheckpoint(row["label"], row["path"]) for row in batch],
                 references=[group["reference"]], texts=[p["text"] for p in group["prompts"]], language=group["language"],
-                seeds=plan["seeds"], seed=plan["seeds"][0], output_root=str(attempt),
-                grid_name=f"{group['id']}_candidate_{index}" if final_test else group["id"],
+                seeds=plan["seeds"], seed=plan["seeds"][0], output_root=str(attempt), grid_name=grid_name,
                 runtime={"runtime": selected_runtime, "model_dir": config.model_dir, "cfg_path": config.model_config, "use_qwen_emo": False},
                 infer_kwargs=selected_infer, include_verdicts=False)
             result = run_grid(grid_config, reporter=ProgressReporter("speech clips", progress_file=state / "progress.json"), cancel_callback=cancelled)
@@ -389,6 +452,10 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
             grids.append(result.grid_dir)
             for row in batch:
                 candidate_inference[row["label"]] = grid_config.to_dict()
+            # The report's inference block describes how the adapters were rendered (the decoder gate and the
+            # decoding sweep render the selected adapter again with exactly these settings).
+            if report_inference is None or candidate["path"]:
+                report_inference = grid_config.to_dict()
             for cell in result.cells:
                 prompt = group["prompts"][cell.text_index - 1]
                 clips.append({"audio": cell.audio_path, "reference": group["reference"], "real_audio": prompt["audio"],
@@ -424,8 +491,9 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                       deployment_frozen=dict(frozen_deployment) if frozen_deployment else None)
     report.update(dataset_identity=plan["dataset_identity"], plan=str(root / "plan.json"), grids=grids,
                   cells=generated, real_cells=real, real_recordings=summarize(real) if real else None,
-                  warnings=plan["warnings"], seeds=plan["seeds"], inference=grid_config.to_dict(),
-                  candidate_inference=candidate_inference, evaluation_partition="final_test" if final_test else "validation",
+                  warnings=plan["warnings"], seeds=plan["seeds"], inference=report_inference or grid_config.to_dict(),
+                  candidate_inference=candidate_inference, deployment_settings=deployment,
+                  evaluation_partition="final_test" if final_test else "validation",
                   generated_at=datetime.now(timezone.utc).isoformat(), elapsed_s=time.perf_counter()-started)
     if not final_test:
         # Decoder and decoding selection still follow. Independent testing runs
@@ -597,7 +665,7 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
     do to the adapter; this can, and it decides whether the adapter stays installed and at which strength.
     """
     from indextts.lora.decoder import find_decoder_adapter
-    from .speech_metrics import MIN_REAL_SPEAKER_ROWS, paired_difference, summarize
+    from .speech_metrics import GUARD_MODE_INTERVAL, MIN_REAL_SPEAKER_ROWS, paired_difference, source_regression, summarize
     run_dir = Path(config.output_dir).resolve() / config.name
     root = run_dir / "analysis" / "speech_evaluation"
     out = root / "decoder_test"
@@ -637,6 +705,7 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
     baseline = [row for row in baseline_rows]
     without_summary = summarize(baseline)
     max_wer_increase = float((plan.get("policy") or {}).get("max_wer_increase", 0.02))
+    guard_mode = str((plan.get("policy") or {}).get("guard_mode") or "mean").strip().lower()
     real_rows = lambda rows: sum(row.get("speaker_similarity_real") is not None for row in rows)
     candidates = list(dict.fromkeys(max(0.05, min(4.0, float(item))) for item in strengths)) or [1.0]
     variants: list[dict[str, Any]] = []
@@ -657,13 +726,25 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
         elif float(gain["mean"]) < min_speaker_gain:
             reasons.append(f"speaker similarity to {target} changed by {float(gain['mean']):+.4f} through the full pipeline at "
                            f"strength {strength:g}, less than the required +{min_speaker_gain:g}")
+        notes: list[str] = []
+        error_delta = paired_difference(measured, baseline, "error_rate")
         if wer_increase > max_wer_increase:
-            reasons.append(f"the word error rate rose by {100 * wer_increase:.2f} points at strength {strength:g}, "
-                           f"more than the allowed {100 * max_wer_increase:.0f}")
+            resolved = True
+            if guard_mode == GUARD_MODE_INTERVAL:
+                sources = source_regression(measured, baseline, "error_rate", worse_when_higher=True)
+                ci = error_delta.get("ci95")
+                resolved = bool(ci and float(ci[0]) > 0) or bool(sources.get("majority"))
+                if not resolved:
+                    notes.append(f"the word error rate rose by {100 * wer_increase:.2f} points at strength {strength:g}, more than the "
+                                 f"allowed {100 * max_wer_increase:.0f}, but within the benchmark's noise (95% interval includes zero, "
+                                 f"higher on {sources['regressed']} of {sources['sources']} recordings); the increase costs score instead")
+            if resolved:
+                reasons.append(f"the word error rate rose by {100 * wer_increase:.2f} points at strength {strength:g}, "
+                               f"more than the allowed {100 * max_wer_increase:.0f}")
         score = (float(gain["mean"]) - wer_weight * max(0.0, wer_increase)) if gain.get("mean") is not None else float("-inf")
         variants.append({"strength": float(strength), "metric": metric, "speaker_gain": gain, "with": with_summary,
-                         "wer_increase": wer_increase, "reasons": reasons, "passes": not reasons, "score": score,
-                         "cells": measured, "grids": grids, "selected": False})
+                         "wer_increase": wer_increase, "error_delta": error_delta, "reasons": reasons, "notes": notes,
+                         "passes": not reasons, "score": score, "cells": measured, "grids": grids, "selected": False})
         print(f">> decoder adapter at strength {strength:g}: similarity {gain.get('mean') if gain.get('mean') is None else round(float(gain['mean']), 4):+} "
               f"| word error {100 * wer_increase:+.2f} points | {'passes' if not reasons else '; '.join(reasons)}", flush=True)
     passing = [item for item in variants if item["passes"]]
@@ -675,7 +756,8 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
             or development_fingerprint(run_dir) != measured_development):
         raise ValueError("The checkpoint or decoder adapter changed during its validation gate")
     report = {"status": "complete", "evaluation_partition": "validation",
-              "accepted": accepted, "reasons": reasons, "metric": chosen["metric"],
+              "accepted": accepted, "reasons": reasons, "notes": list(chosen.get("notes") or []), "metric": chosen["metric"],
+              "guard_mode": guard_mode,
               "speaker_gain": chosen["speaker_gain"], "without": without_summary, "with": chosen["with"],
               "wer_increase": chosen["wer_increase"], "max_wer_increase": max_wer_increase, "min_speaker_gain": min_speaker_gain,
               "strength": chosen["strength"], "wer_weight": wer_weight, "variants": variants, "clips": len(chosen["cells"]),
@@ -690,6 +772,111 @@ def run_decoder_test(config: Any, state_dir: str | Path, *, checkpoint_path: str
     (out / "report.md").write_text(report["summary_markdown"], encoding="utf-8")
     atomic_write_json(state / "status.json", {"phase": "complete", "message": "Decoder test complete", "elapsed_s": report["elapsed_s"]})
     return report
+
+
+DECODER_LABEL_SUFFIX = " + voice decoder"
+
+
+def best_adapter_candidate(report: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The adapter candidate of a development report that scored best against Base, eligible or not.
+
+    Used to gate the voice decoder adapter when the GPT comparison preferred Base: the decoder can only be
+    judged with an adapter, and the adapter closest to Base on the deployment score is the one whose
+    combination with the decoder has the best chance of beating Base.
+    """
+
+    adapters = [dict(row) for row in report.get("candidates") or []
+                if row.get("path") and Path(str(row["path"])).is_file() and isinstance(row.get("deployment_score"), Mapping)]
+    if not adapters:
+        return None
+    return max(adapters, key=lambda row: (bool(row.get("eligible")), float(row["deployment_score"].get("score", float("-inf"))),
+                                          -float(row.get("val_loss") if row.get("val_loss") is not None else float("inf"))))
+
+
+def joint_recommendation(report: Mapping[str, Any], decoder_report: Mapping[str, Any],
+                         plan_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Choose among Base, the measured GPT adapters, and the gated adapter with its voice decoder.
+
+    The decoder gate renders the gated checkpoint on the same sentences, seeds and reference as the
+    development benchmark, so its clips pair with Base's cells exactly like the GPT candidates' do. The
+    combination is judged by the same Base guards and deployment score; a decoder that only improves the
+    adapter relative to itself cannot win unless the whole deployment also beats Base and every plain
+    adapter. Nothing in the returned mapping changes the report's measured cells or candidates.
+    """
+
+    from .speech_metrics import select_recommendation
+    score_policy = dict(report.get("score_policy") or {})
+    policy = {"max_wer_increase": 0.02, "max_speaker_drop": 0.03, **dict(plan_policy or {})}
+    # The report's score policy is what selected the GPT candidates; the combination is judged the same way.
+    policy.update({"guard_mode": score_policy.get("guard_mode", policy.get("guard_mode", "mean")),
+                   "score_wer_weight": score_policy.get("wer_weight", policy.get("score_wer_weight", 4.0)),
+                   "score_pause_weight": score_policy.get("pause_weight", policy.get("score_pause_weight", 0.05)),
+                   "score_min_delta": score_policy.get("min_delta", policy.get("score_min_delta", 0.002))})
+    plan_policy = policy
+    candidates = [{key: value for key, value in row.items() if key in {"label", "path", "steps", "val_loss", "sha256"}}
+                  for row in report.get("candidates") or []]
+    cells = [dict(row) for row in report.get("cells") or []]
+    gated = next((row for row in candidates if row.get("path")
+                  and str(Path(str(row["path"])).resolve()) == str(Path(str(decoder_report.get("checkpoint", ""))).resolve())), None)
+    if gated is None:
+        raise ValueError("the decoder gate's checkpoint is not a candidate of the development report")
+    combo_label = f"{gated['label']}{DECODER_LABEL_SUFFIX}"
+    combo = {**gated, "label": combo_label, "decoder": str(decoder_report.get("adapter", "")),
+             "decoder_strength": float(decoder_report.get("strength", 1.0) or 1.0)}
+    combo_cells = [{**row, "checkpoint": combo_label} for row in decoder_report.get("cells") or []]
+    if not combo_cells:
+        raise ValueError("the decoder gate has no measured clips")
+    joint = select_recommendation([*candidates, combo], [*cells, *combo_cells], plan_policy)
+    chosen = next(row for row in joint["candidates"] if row["label"] == joint["recommended_label"])
+    with_decoder = chosen["label"] == combo_label
+    previous_label = str(report.get("recommended_label") or "")
+    decision = (f"Base, the measured GPT checkpoints and {gated['label']} with its voice decoder adapter (strength "
+                f"{combo['decoder_strength']:g}) were judged by the same Base guards and deployment score; "
+                f"{chosen['label']} scored best ({chosen['deployment_score']['score']:+.4f} against Base).")
+    return {"recommended_label": chosen["label"], "recommended_checkpoint": chosen["path"] if chosen["path"] else "",
+            "recommended_kind": "adapter" if chosen["path"] else "base", "with_decoder": with_decoder,
+            "decoder": combo["decoder"] if with_decoder else "", "decoder_strength": combo["decoder_strength"] if with_decoder else None,
+            "gpt_label": gated["label"] if with_decoder else chosen["label"], "previous_label": previous_label,
+            "changed": chosen["label"] != previous_label and not (with_decoder and previous_label == gated["label"]),
+            "candidates": [{key: row.get(key) for key in ("label", "path", "eligible", "rejection_reasons", "notes", "deployment_score",
+                                                          "mean_error_rate", "speaker_similarity_real", "speaker_similarity", "val_loss")}
+                           for row in joint["candidates"]],
+            "decision": decision, "speaker_metric": joint["speaker_metric"], "policy": plan_policy}
+
+
+def apply_joint_recommendation(run_dir: str | Path, decoder_report: Mapping[str, Any]) -> dict[str, Any]:
+    """Record the joint choice in the development report without touching its measured evidence.
+
+    Only the recommendation fields, the decision text and the summary change; ``candidates``, ``cells``,
+    ``inference`` and the other fingerprinted fields stay exactly as measured, so the decoder gate, the
+    decoding sweep and the final-test freeze keep matching the report.
+    """
+
+    root = Path(run_dir) / "analysis" / "speech_evaluation"
+    report_path = root / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("status") != "complete" or report.get("final_test"):
+        raise ValueError("a completed development speech report is required")
+    try:
+        plan_policy = dict(json.loads((root / "plan.json").read_text(encoding="utf-8")).get("policy") or {})
+    except (OSError, ValueError, TypeError):
+        plan_policy = {}
+    joint = joint_recommendation(report, decoder_report, plan_policy)
+    fingerprint_before = development_fingerprint(run_dir)
+    report["joint_selection"] = joint
+    if joint["with_decoder"] or joint["changed"]:
+        report["recommended_label"] = joint["recommended_label"] if not joint["with_decoder"] else joint["gpt_label"]
+        report["recommended_checkpoint"] = joint["recommended_checkpoint"]
+        report["recommended_kind"] = joint["recommended_kind"]
+        report["recommended_deployment"] = {"checkpoint": joint["recommended_checkpoint"], "label": joint["recommended_label"],
+                                            "decoder": joint["decoder"], "decoder_strength": joint["decoder_strength"]}
+        report["decision"] = str(report.get("decision") or "") + " " + joint["decision"]
+    report["summary_markdown"] = report_markdown(report)
+    if development_fingerprint(run_dir) != fingerprint_before:
+        raise ValueError("the joint recommendation must not change measured development evidence")
+    atomic_write_json(report_path, report)
+    (root / "report.md").write_text(report["summary_markdown"], encoding="utf-8")
+    return joint
 
 
 def main() -> int:

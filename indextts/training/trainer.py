@@ -51,6 +51,7 @@ from indextts.runtime import (
     gpu_total_gb,
     memory_stats,
 )
+from indextts.runtime.vram_presets import VRAM_TIERS
 from indextts.utils import model_downloads
 from indextts.utils.atomic_json import read_json_retry
 from indextts.version import APP_VERSION
@@ -62,6 +63,7 @@ from .early_stopping import EarlyStopping
 from .ema import AdapterEMA, ema_checkpoint_name
 from .model_forward import TokenMetrics, enable_gradient_checkpointing, gpt_train_step_loss
 from .plan import training_plan, training_plan_line
+from .probe import ProbeTracker, build_probe_plan, decide_stop, probe_best_path, probe_wer_tolerance, write_probe_summary
 from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS
 from .sampling import generate_training_sample
 from .speaking_rate import calibrate_from_samples, calibrate_from_speech_report, write_speaking_rate
@@ -362,10 +364,14 @@ class LoraTrainer:
         *,
         state_dir: str | Path | None = None,
         reporter: ProgressReporter | None = None,
+        continue_existing: bool = False,
     ) -> None:
         self.config = TrainConfig.from_dict(config)
-        from .run_guard import ensure_run_destination
-        ensure_run_destination(self.config, state_dir)
+        if not continue_existing:
+            # Post-training tools (tools/rerun_selection.py) attach to a finished run on purpose; fresh
+            # training must never overwrite one.
+            from .run_guard import ensure_run_destination
+            ensure_run_destination(self.config, state_dir)
         self.dataset_dir = Path(self.config.dataset_dir).expanduser().resolve()
         self.adapter_dir = (
             Path(self.config.output_dir).expanduser().resolve() / self.config.name
@@ -392,6 +398,10 @@ class LoraTrainer:
         self.last_validation_metrics: dict[str, Any] = {}
         self.training_records: list[dict[str, Any]] = []
         self.speech_plan_ready = False
+        self.probe_tracker = ProbeTracker()
+        self.probe_plan_ready = False
+        self.probe_best = probe_best_path(self.adapter_dir, self.config.name)
+        self.recommended_after_decoder: str | None = None
 
     def _adopt_best_checkpoint_name(self) -> None:
         """Rename a legacy ``best/<name>.safetensors`` of this training before resuming from it."""
@@ -823,7 +833,17 @@ class LoraTrainer:
         (job_dir / "stop.flag").unlink(missing_ok=True)
         decoder_report_path(output_path).unlink(missing_ok=True)  # a stale report must not describe this run
         code_source = str(getattr(config, "decoder_adapter_code_source", "real") or "real")
-        gpt_checkpoint = str(recommended_checkpoint or "")
+        self.recommended_after_decoder = str(recommended_checkpoint or "")
+        gate_checkpoint = str(recommended_checkpoint or "")
+        if not (gate_checkpoint and Path(gate_checkpoint).is_file()):
+            # The decoder can only be judged together with an adapter. When the GPT comparison preferred Base,
+            # the best-scoring adapter checkpoint carries the gate, and adapter + decoder is then judged against
+            # Base as a whole deployment (see _apply_joint_selection).
+            gate_checkpoint = self._decoder_gate_checkpoint() if getattr(config, "decoder_adapter_always_gate", True) else ""
+            if gate_checkpoint:
+                self.log(f">> the speech comparison preferred Base; the voice decoder adapter will be judged with "
+                         f"{Path(gate_checkpoint).name}, the best-scoring adapter checkpoint, and adapter + decoder against Base")
+        gpt_checkpoint = gate_checkpoint
         if code_source != "real" and not (gpt_checkpoint and Path(gpt_checkpoint).is_file()):
             # The GPT's own codes need a selected adapter; a Base recommendation trains on the recordings' codes.
             self.log(">> voice decoder adaptation uses the recordings' codes: no adapter checkpoint was recommended")
@@ -894,7 +914,7 @@ class LoraTrainer:
             verdict = None
             if not failure:
                 try:
-                    verdict = self._run_decoder_test(output_path, recommended_checkpoint)
+                    verdict = self._run_decoder_test(output_path, gate_checkpoint)
                 except Exception as exc:
                     self.write_status(decoder_test_status="failed", decoder_test_message=str(exc))
                     self.log(f">> full-pipeline decoder test failed: {exc}")
@@ -911,6 +931,7 @@ class LoraTrainer:
                 summary += (f"; full pipeline at strength {float(verdict.get('strength', 1.0)):g}: speaker similarity "
                             f"{float(gain):+.4f}, word error rate {100 * float(verdict['wer_increase']):+.2f} points"
                             if gain is not None else "")
+                summary += self._apply_joint_selection(verdict, str(recommended_checkpoint or ""))
                 self.write_status(decoder_adapter_status="complete", decoder_adapter_message=summary,
                                   decoder_adapter_path=str(output_path.resolve()))
                 self.log(f">> {summary}")
@@ -919,8 +940,43 @@ class LoraTrainer:
             failure = failure or str(child.get("message") or f"worker exited with code {process.returncode}")
             self._quarantine_decoder(output_path, failure)
             self.log(f">> voice decoder adaptation did not complete: {failure}; the GPT adapter remains usable without it")
-        self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
+        self.write_status(phase=terminal_phase, message=terminal_message,
+                          recommended_checkpoint=self.recommended_after_decoder or recommended_checkpoint)
         return str(output_path) if output_path.is_file() else ""
+
+    def _decoder_gate_checkpoint(self) -> str:
+        """The adapter checkpoint that carries the decoder gate when the GPT comparison preferred Base."""
+        from .speech_eval import best_adapter_candidate, load_speech_evaluation
+        try:
+            report = load_speech_evaluation(self.adapter_dir)
+            best = best_adapter_candidate(report) if report else None
+        except Exception as exc:
+            self.log(f">> no adapter checkpoint is available for the decoder gate: {exc}")
+            return ""
+        return str(best["path"]) if best else ""
+
+    def _apply_joint_selection(self, verdict: Mapping[str, Any], recommended_checkpoint: str) -> str:
+        """Judge adapter + accepted decoder against Base and every plain adapter; update the recommendation when it wins."""
+        from .speech_eval import apply_joint_recommendation, load_speech_evaluation
+        try:
+            joint = apply_joint_recommendation(self.adapter_dir, verdict)
+        except Exception as exc:
+            self.log(f">> the deployment choice with the voice decoder could not be recorded: {exc}")
+            return ""
+        note = f"; deployment choice: {joint['recommended_label']} ({joint['decision']})"
+        chosen = str(joint.get("recommended_checkpoint") or "")
+        if chosen != str(recommended_checkpoint or ""):
+            self.recommended_after_decoder = chosen
+            self.write_status(recommended_checkpoint=chosen, recommended_kind=joint["recommended_kind"],
+                              speech_recommended_checkpoint=chosen, recommended_deployment={
+                                  "checkpoint": chosen, "label": joint["recommended_label"], "decoder": joint.get("decoder", ""),
+                                  "decoder_strength": joint.get("decoder_strength")})
+            self.log(f">> speech recommendation updated to {joint['recommended_label']}: {joint['decision']}")
+            if chosen:
+                report = load_speech_evaluation(self.adapter_dir)
+                if report:
+                    self._write_speech_matched_speaking_rate(report, chosen)
+        return note
 
     def _quarantine_decoder(self, output_path: Path, reason: str, *, status: str = "failed") -> None:
         """Fail closed without deleting an unverified adapter or earlier evidence."""
@@ -950,7 +1006,8 @@ class LoraTrainer:
         self.log(">> " + message)
 
     def _run_guarded_decoder_adaptation(self, *, terminal_phase: str, terminal_message: str,
-                                        recommended_checkpoint: str) -> None:
+                                        recommended_checkpoint: str) -> str:
+        """Run the decoder phase; return the recommendation, which the joint deployment choice may have changed."""
         try:
             self._run_decoder_adaptation(terminal_phase=terminal_phase, terminal_message=terminal_message,
                                          recommended_checkpoint=recommended_checkpoint)
@@ -959,6 +1016,8 @@ class LoraTrainer:
             self.log(f">> voice decoder adaptation failed but training weights are safe: {exc}")
             self._quarantine_decoder(self.adapter_dir / f"{self.config.name}{DECODER_ADAPTER_SUFFIX}", str(exc))
             self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
+        updated = getattr(self, "recommended_after_decoder", None)
+        return str(updated) if updated is not None else str(recommended_checkpoint or "")
 
     def _run_decoder_test(self, adapter_path: Path, checkpoint: str) -> dict[str, Any] | None:
         """Judge the decoder adapter through the full pipeline against the speech benchmark.
@@ -1172,6 +1231,123 @@ class LoraTrainer:
             self.log(f">> independent final test did not complete: {message}")
         self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
 
+    def _probe_due(self, epoch: int) -> bool:
+        config = self.config
+        if not config.probe_enabled or not self.probe_plan_ready or self.stop_path.exists():
+            return False
+        return self.probe_tracker.due(epoch)
+
+    def _confirm_stop(self, loss_stop: bool) -> tuple[bool, str]:
+        """Two-signal stop: the token-loss verdict is confirmed or deferred by the epoch probe."""
+        config = self.config
+        enabled = bool(config.probe_enabled and config.probe_stop_enabled and self.probe_plan_ready)
+        return decide_stop(loss_stop, self.probe_tracker, enabled=enabled, patience=config.probe_patience)
+
+    def _run_epoch_probe(self, adapter_path: Path, epoch: int, *, step: int, epoch_elapsed_s: float | None) -> None:
+        """Render and measure the epoch probe in a bounded child process; never fails training."""
+        config = self.config
+        tracker = self.probe_tracker
+        # The same gate the epoch sample uses, decided here before a worker is started: beside the training
+        # model the smallest tier's budget must fit into the free memory, otherwise the probe is skipped.
+        from indextts.runtime.vram_presets import tier_budget_gb
+        from .probe_worker import resolve_probe_device
+        device, shares_gpu, _note = resolve_probe_device(config)
+        if shares_gpu and str(device).startswith("cuda"):
+            index = int(str(device).split(":", 1)[1]) if ":" in str(device) else 0
+            free = gpu_free_gb(index)
+            needed = max(float(config.sample_min_free_vram_gb), float(tier_budget_gb(min(VRAM_TIERS))))
+            if free < needed:
+                message = (f"probe skipped: {free:.1f} GB free VRAM beside the training model is below the "
+                           f"{needed:.1f} GB the smallest generation tier needs")
+                tracker.skipped += 1
+                tracker.plan_next(epoch=epoch, configured_interval=config.probe_every_epochs,
+                                  probe_elapsed_s=None, epoch_elapsed_s=epoch_elapsed_s)
+                self.write_status(probe_status="skipped", probe_message=message, probe=tracker.to_dict())
+                self.log(">> " + message)
+                return
+        job_dir = self.adapter_dir / "analysis" / "probe" / "probe_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        (job_dir / "result.json").unlink(missing_ok=True)
+        config_path = job_dir / "train_config.json"
+        atomic_write_json(config_path, config.to_dict())
+        started = time.perf_counter()
+        self.write_status(probe_status="running", probe_message=f"Rendering the epoch {epoch} probe with the deployment settings")
+        self.log(f">> epoch {epoch} probe: rendering the held-out probe sentences with the deployment settings in a subprocess")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.probe_worker", "--config", str(config_path),
+                                    "--state-dir", str(job_dir), "--adapter", str(adapter_path), "--epoch", str(int(epoch))],
+                                   cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="epoch-probe-log")
+        thread.start()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            if child.get("message"):
+                self.write_status(probe_message=str(child["message"]))
+            if self.stop_path.exists() or time.perf_counter() - started > config.probe_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else f"probe timeout after {config.probe_timeout_s:.0f}s"
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
+                break
+            time.sleep(0.5)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_evaluation_worker(process)
+            process.wait()
+        thread.join(timeout=2)
+        elapsed = time.perf_counter() - started
+        result = read_json_retry(job_dir / "result.json", {}) or {}
+        report = None
+        if process.returncode == 0 and not failure and result.get("status") == "complete" and result.get("report"):
+            report = read_json_retry(Path(str(result["report"])), {}) or None
+        if not report or not isinstance(report.get("deployment_score"), Mapping):
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            skipped = child.get("phase") == "skipped" and not failure
+            message = failure or str(child.get("message") or f"worker exited with code {process.returncode}")
+            tracker.skipped += 1
+            tracker.plan_next(epoch=epoch, configured_interval=config.probe_every_epochs,
+                              probe_elapsed_s=None if skipped else elapsed, epoch_elapsed_s=epoch_elapsed_s)
+            self.write_status(probe_status="skipped" if skipped else "failed", probe_message=message, probe=tracker.to_dict())
+            self.log(f">> epoch {epoch} probe {'skipped' if skipped else 'did not complete'}: {message}; training continues")
+            return
+        score = float(report["deployment_score"]["score"])
+        wer = float(report["summary"]["mean_error_rate"])
+        tolerance = probe_wer_tolerance(config.probe_wer_tolerance, report.get("real_error_rate"))
+        improved, _ = tracker.observe(epoch=epoch, score=score, wer=wer, tolerance=tolerance,
+                                      min_delta=config.probe_min_delta, patience=config.probe_patience)
+        pacing = report.get("pacing_elapsed_s")
+        interval = tracker.plan_next(epoch=epoch, configured_interval=config.probe_every_epochs,
+                                     probe_elapsed_s=float(pacing) if pacing is not None else elapsed,
+                                     epoch_elapsed_s=epoch_elapsed_s)
+        if improved:
+            self.probe_best.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(adapter_path, self.probe_best)
+            self.log(f">> epoch {epoch} probe is the best so far ({score:+.4f} against Base); saved to {self.probe_best}")
+        write_probe_summary(self.adapter_dir, tracker, best_checkpoint=str(self.probe_best) if self.probe_best.is_file() else "",
+                            name=config.name)
+        speaker = report["summary"].get("speaker_similarity_real")
+        self.metric({"event": "probe", "step": int(step), "epoch": int(epoch), "probe_score": score, "probe_wer": wer,
+                     "probe_speaker_similarity_real": speaker, "probe_base_wer": report["base"].get("mean_error_rate"),
+                     "probe_base_speaker_similarity_real": report["base"].get("speaker_similarity_real"),
+                     "probe_elapsed_s": elapsed})
+        message = (f"epoch {epoch}: deployment score {score:+.4f} vs Base (best {tracker.best_score:+.4f} at epoch {tracker.best_epoch}); "
+                   f"word error {100 * wer:.2f}% vs Base {100 * float(report['base']['mean_error_rate']):.2f}%; "
+                   f"{tracker.stalled_epochs}/{config.probe_patience} checks without gain")
+        if interval > 1:
+            message += f"; next probe in {interval} epochs ({elapsed:.0f}s per probe)"
+        self.write_status(probe_status="complete", probe_message=message, probe=tracker.to_dict(),
+                          probe_best_checkpoint=str(self.probe_best) if self.probe_best.is_file() else "")
+        self.log(">> epoch probe: " + message)
+
     def _write_speaking_rate_calibration(self) -> float | None:
         """Measure completed epoch samples without risking the training result."""
 
@@ -1303,6 +1479,7 @@ class LoraTrainer:
             "dataset_fingerprint": dataset_fingerprint,
             "best_val_loss": best_val_loss,
             "early_stopping": self.early_stopping.to_dict(),
+            "probe": self.probe_tracker.to_dict(),
             "ema_loss": ema_loss,
             "moving_losses": list(moving_losses),
             "rng": _rng_state(),
@@ -1468,6 +1645,7 @@ class LoraTrainer:
             )
             state["batch_in_epoch"] = 0
             state["early_stopping"] = {}
+            state["probe"] = {}
             state["best_val_loss"] = None
         return state
 
@@ -1609,6 +1787,24 @@ class LoraTrainer:
         # CLI runs need the same reproducible evaluation contract as UI jobs.
         atomic_write_json(self.adapter_dir / "train_config.json", config.to_dict())
         self._prepare_reference()
+        if config.probe_enabled and val_dataset is not None:
+            try:
+                probe_plan = build_probe_plan(config, val_dataset.records, self.adapter_dir, self.reference_copy)
+                self.probe_plan_ready = bool(probe_plan and probe_plan.get("prompts"))
+                if self.probe_plan_ready:
+                    self.log(f">> epoch probe: {len(probe_plan['prompts'])} held-out sentences from {len(probe_plan['sources'])} "
+                             f"recording(s), {len(probe_plan['seeds'])} seed(s), deployment settings; rendered in a subprocess after "
+                             + ("every epoch" if config.probe_every_epochs == 1 else
+                                f"every {config.probe_every_epochs} epochs" if config.probe_every_epochs else
+                                "an epoch, spaced automatically when a probe costs more than a third of an epoch"))
+                    # The deployment settings read the dataset profile (token target, pauses, expressive clip);
+                    # write it now so the probe renders exactly as Voice Generation will.
+                    self._write_dataset_profile()
+                else:
+                    self.log(">> epoch probe skipped: no held-out recordings with audio, or no reference clip")
+            except Exception as exc:
+                self.probe_plan_ready = False
+                self.log(f">> epoch probe disabled for this run: {exc}")
         self.reporter.set_stage("training")
 
         device = torch.device(config.device)
@@ -1674,6 +1870,7 @@ class LoraTrainer:
         best_val_loss = state.get("best_val_loss")
         best_val_loss = float(best_val_loss) if best_val_loss is not None else None
         self.early_stopping = EarlyStopping.from_state(state.get("early_stopping"))
+        self.probe_tracker = ProbeTracker.from_state(state.get("probe"))
         if self.early_stopping.best_loss is None and best_val_loss is not None:
             self.early_stopping.best_loss = best_val_loss
             self.early_stopping.meaningful_best = best_val_loss
@@ -1692,6 +1889,7 @@ class LoraTrainer:
         stopped = False
         early_stopped = False
         early_stop_reason = ""
+        last_stop_note = ""
         starting_step = global_step
         amp_dtype = _dtype(config.mixed_precision)
         amp_enabled = device.type == "cuda" and amp_dtype != torch.float32
@@ -1765,6 +1963,7 @@ class LoraTrainer:
             for epoch_index in range(start_epoch, effective_epochs):
                 if global_step >= total_steps:
                     break
+                epoch_started = time.perf_counter()
                 train_dataset.set_epoch(epoch_index)
                 sampler = LengthBucketBatchSampler(
                     train_dataset.lengths,
@@ -1973,8 +2172,14 @@ class LoraTrainer:
                             )
 
                         if should_stop:
-                            early_stopped = True
-                            break
+                            confirmed, note = self._confirm_stop(should_stop)
+                            if note and note != last_stop_note:
+                                self.log(">> " + note)
+                                last_stop_note = note
+                            if confirmed:
+                                early_stopped = True
+                                early_stop_reason = note or early_stop_reason
+                                break
 
                     # Save after validation so same-step resumable checkpoints
                     # include the latest best score and patience counter.
@@ -2006,6 +2211,7 @@ class LoraTrainer:
                 if stopped or early_stopped:
                     break
 
+                loss_stop = False
                 if val_loader is not None and last_validation_step != global_step:
                     last_val_loss, val_accuracy = self.validate(built, val_loader, device)
                     last_validation_step = global_step
@@ -2048,10 +2254,7 @@ class LoraTrainer:
                         )
 
                     if should_stop:
-                        early_stopped = True
-
-                if early_stopped:
-                    break
+                        loss_stop = True
 
                 if config.save_every_epochs and (epoch_index + 1) % config.save_every_epochs == 0:
                     epoch_path = self.adapter_dir / f"{config.name}_epoch_{epoch_index + 1:03d}.safetensors"
@@ -2071,10 +2274,9 @@ class LoraTrainer:
                         moving_losses=moving_losses,
                     )
 
-                if (
-                    config.sample_enabled
-                    and (epoch_index + 1) % config.sample_every_epochs == 0
-                ):
+                sample_due = bool(config.sample_enabled and (epoch_index + 1) % config.sample_every_epochs == 0)
+                probe_due = self._probe_due(epoch_index + 1)
+                if sample_due or probe_due:
                     temp_adapter = self.adapter_dir / f".{config.name}_sample_epoch_{epoch_index + 1:03d}.safetensors"
                     save_lora(
                         temp_adapter,
@@ -2083,26 +2285,43 @@ class LoraTrainer:
                         self._metadata(global_step, epoch_index + 1, list(built.adapters)),
                         dtype=_dtype(config.save_dtype),
                     )
-                    configured_reference = Path(config.sample_reference).expanduser() if config.sample_reference else None
-                    sample_reference = (
-                        configured_reference
-                        if configured_reference is not None and configured_reference.is_file()
-                        else self.reference_copy
-                    )
-                    sample_path = self.adapter_dir / "samples" / f"epoch_{epoch_index + 1:03d}.wav"
-                    result = generate_training_sample(
-                        config,
-                        adapter_path=temp_adapter,
-                        reference_path=sample_reference,
-                        output_path=sample_path,
-                        epoch=epoch_index + 1,
-                        seed=self.resolved_sample_seed,
-                        log=self.log,
-                    )
+                    if sample_due:
+                        configured_reference = Path(config.sample_reference).expanduser() if config.sample_reference else None
+                        sample_reference = (
+                            configured_reference
+                            if configured_reference is not None and configured_reference.is_file()
+                            else self.reference_copy
+                        )
+                        sample_path = self.adapter_dir / "samples" / f"epoch_{epoch_index + 1:03d}.wav"
+                        result = generate_training_sample(
+                            config,
+                            adapter_path=temp_adapter,
+                            reference_path=sample_reference,
+                            output_path=sample_path,
+                            epoch=epoch_index + 1,
+                            seed=self.resolved_sample_seed,
+                            log=self.log,
+                        )
+                        if result.generated:
+                            self.last_sample = result.path
+                            self.write_status(last_sample=self.last_sample)
+                    if probe_due:
+                        try:
+                            self._run_epoch_probe(temp_adapter, epoch_index + 1, step=global_step,
+                                                  epoch_elapsed_s=time.perf_counter() - epoch_started)
+                        except Exception as exc:
+                            self.log(f">> epoch {epoch_index + 1} probe failed but training is safe: {exc}")
+                            self.write_status(probe_status="failed", probe_message=str(exc))
                     temp_adapter.unlink(missing_ok=True)
-                    if result.generated:
-                        self.last_sample = result.path
-                        self.write_status(last_sample=self.last_sample)
+
+                confirmed, note = self._confirm_stop(loss_stop)
+                if note and note != last_stop_note:
+                    self.log(">> " + note)
+                    last_stop_note = note
+                if confirmed:
+                    early_stopped = True
+                    early_stop_reason = note or early_stop_reason
+                    break
 
             trained_steps = global_step - starting_step
             if trained_steps <= 0:
@@ -2258,8 +2477,8 @@ class LoraTrainer:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            self._run_guarded_decoder_adaptation(terminal_phase=post_phase, terminal_message=post_message,
-                                                 recommended_checkpoint=recommended_checkpoint)
+            recommended_checkpoint = self._run_guarded_decoder_adaptation(
+                terminal_phase=post_phase, terminal_message=post_message, recommended_checkpoint=recommended_checkpoint)
         if config.decoding_sweep_enabled and not self.stop_path.exists():
             try:
                 self._run_decoding_sweep(terminal_phase=post_phase, terminal_message=post_message,

@@ -34,6 +34,7 @@ from indextts.utils.text_segmentation import (
     default_segment_tokens,
     ends_sentence,
     normalize_segmentation_mode,
+    normalize_sentence_whitespace,
     split_atomic_pieces,
     split_text_by_tokens as shared_split_text_by_tokens,
     split_text_for_recovery,
@@ -1177,7 +1178,10 @@ class IndexTTS2:
                 continue
             if not chunk.text.strip():
                 continue
-            processed = self._process_text_chunk(chunk.text, lang, text_normalization)
+            # Caption wraps must reach normalization/tokenization exactly like spaces,
+            # including CRLF and blank cue separators when normalization is disabled.
+            source = normalize_sentence_whitespace(chunk.text) if mode != "budget" else chunk.text
+            processed = self._process_text_chunk(source, lang, text_normalization)
             chunk_segments = self.split_text_by_tokens(
                 processed,
                 max_tokens,

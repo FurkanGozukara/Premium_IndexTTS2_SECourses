@@ -52,7 +52,7 @@ def test_split_sentences_preserves_text_and_skips_abbreviations_annotations_and_
         "Say <|SPECIAL_TOKEN_1|>K W EH1 N . AH0<|SPECIAL_TOKEN_1|> twice. ", "Then stop."
     ]
     assert split_sentences("第一句。第二句！第三句？") == ["第一句。", "第二句！", "第三句？"]
-    assert split_sentences("line one\nline two") == ["line one\n", "line two"]
+    assert split_sentences("line one\nline two") == ["line one\nline two"]
     assert split_sentences('He said "Go." Then left.') == ['He said "Go." ', "Then left."]
     assert split_sentences("Version 2.2 is out. Yes.") == ["Version 2.2 is out. ", "Yes."]
     assert ends_sentence("Done. ") and ends_sentence('Done."') and not ends_sentence("Done, ")

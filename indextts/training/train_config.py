@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -114,16 +115,57 @@ class TrainConfig:
     # Automatic references (the saved recommended reference, training conditioning, the speech benchmark)
     # prefer, among the best-quality clips, the one nearest the speaker's median pitch and pace.
     reference_typical: bool = True
-    speech_eval_prompts: int = 12
+    # 0 = automatic: six prompts per held-out recording, at least 12 and at most 24, spread evenly over
+    # the held-out recordings so one recording cannot decide the comparison on its own.
+    speech_eval_prompts: int = 0
     speech_eval_seeds: int = 3
     speech_eval_candidates: int = 3
     speech_eval_timeout_s: float = 7200.0
     speech_eval_max_wer_increase: float = 0.02
     speech_eval_max_speaker_drop: float = 0.03
+    # Render the benchmark with the settings Voice Generation applies by default for each candidate (the
+    # GPU tier's beams and diffusion steps, Smart sentences with the adapter's token target and dataset
+    # pauses, its expressive clip and speaking rate) instead of the fixed short-sample settings, so the
+    # comparison measures what a user hears.
+    speech_eval_deployment_settings: bool = True
+    # "interval": a candidate is rejected for a word-error increase or an identity drop only when the paired
+    # difference is positive beyond its prompt-bootstrap 95% interval, or holds on a majority of the held-out
+    # recordings. "mean": the earlier hard threshold on the mean.
+    speech_eval_guard_mode: str = "interval"
+    # Weight of a paired word-error increase in the deployment score (one point of word error costs
+    # weight/100 of speaker similarity): raise it to favor accuracy, lower it to favor likeness.
+    speech_eval_score_wer_weight: float = 4.0
+    # Judge the voice decoder adapter through the full pipeline against the best adapter checkpoint even
+    # when the GPT comparison preferred Base, and recommend adapter + decoder when that deployment wins.
+    decoder_adapter_always_gate: bool = True
+    # Epoch probe: after an epoch the checkpoint renders a few held-out sentences with the deployment settings
+    # in its own process (the same free-VRAM gate and tier fitting as the epoch sample, or another GPU when one
+    # is free) and is measured against the real recordings; Base is rendered once for the comparison.
+    probe_enabled: bool = True
+    # 0 = automatic: every epoch while a probe costs less than a third of an epoch, otherwise spaced so the
+    # probes stay under that share; N probes every N epochs.
+    probe_every_epochs: int = 0
+    probe_prompts: int = 0  # 0 = automatic: three per held-out recording, at least 6 and at most 12
+    # Two seeds per sentence halve the swing a single misread word or an unlucky render gives a probe.
+    probe_seeds: int = 2
+    # Consecutive probe checks without a deployment-score improvement greater than probe_min_delta before the
+    # probe counts as stalled; with probe_every_epochs above 1 each check spans that many epochs.
+    probe_patience: int = 2
+    probe_min_delta: float = 0.002
+    # 0 = automatic: the recognizer's own error on the real probe recordings, at least one point. A probe word
+    # error above the best check's by more than this for probe_patience checks, while the score also stalls,
+    # stops training as overfitting.
+    probe_wer_tolerance: float = 0.0
+    probe_timeout_s: float = 900.0
+    # With the probe enabled, a validation-loss stall alone does not stop training while the probe's
+    # deployment score is still improving; both signals must stall.
+    probe_stop_enabled: bool = True
+    # "auto": another CUDA device with enough free memory when the machine has one, else the training GPU
+    # behind the sample free-VRAM gate; "same": always the training GPU; or an explicit device such as cuda:1.
+    probe_device: str = "auto"
     # After training, the last N saved updates (epoch files and the final file) can be averaged in parameter
-    # space into one more candidate for the speech comparison. Off by default: on the measured voice the
-    # average of the last two and of the last three updates both lost to the final file (identity -0.004 to
-    # -0.006, word error +0.6 to +1.1 points on the speech benchmark).
+    # space into one more candidate for the speech comparison. Off by default; an averaged checkpoint
+    # must pass the same speech comparison as the saved checkpoints before it can be recommended.
     average_last_checkpoints: int = 0
     # Exponential moving average of the trainable weights, updated after every optimizer step and saved
     # beside each epoch and final file as ``<name>_ema*.safetensors``. 0 disables it; 0.999 averages over
@@ -337,13 +379,35 @@ class TrainConfig:
         self.decoding_sweep_enabled = bool(self.decoding_sweep_enabled)
         self.decoding_sweep_timeout_s = max(60.0, _finite_float(self.decoding_sweep_timeout_s, "decoding_sweep_timeout_s"))
         self.final_test_dataset = str(self.final_test_dataset or "").strip()
-        for key, lower, upper in (("speech_eval_prompts", 1, 100),
+        for key, lower, upper in (("speech_eval_prompts", 0, 100),
                                   ("speech_eval_seeds", 1, 10),
-                                  ("speech_eval_candidates", 1, 10)):
+                                  ("speech_eval_candidates", 1, 10),
+                                  ("probe_every_epochs", 0, 10000),
+                                  ("probe_prompts", 0, 50),
+                                  ("probe_seeds", 1, 5),
+                                  ("probe_patience", 1, 100)):
             value = int(getattr(self, key))
             if not lower <= value <= upper:
                 raise ValueError(f"{key} must be between {lower} and {upper}")
             setattr(self, key, value)
+        self.speech_eval_deployment_settings = bool(self.speech_eval_deployment_settings)
+        self.speech_eval_guard_mode = str(self.speech_eval_guard_mode or "interval").strip().lower()
+        if self.speech_eval_guard_mode not in {"interval", "mean"}:
+            raise ValueError("speech_eval_guard_mode must be 'interval' or 'mean'")
+        self.speech_eval_score_wer_weight = _finite_float(self.speech_eval_score_wer_weight, "speech_eval_score_wer_weight")
+        if self.speech_eval_score_wer_weight < 0.0:
+            raise ValueError("speech_eval_score_wer_weight must be 0 or greater")
+        self.decoder_adapter_always_gate = bool(self.decoder_adapter_always_gate)
+        self.probe_enabled = bool(self.probe_enabled)
+        self.probe_stop_enabled = bool(self.probe_stop_enabled)
+        self.probe_min_delta = max(0.0, _finite_float(self.probe_min_delta, "probe_min_delta"))
+        self.probe_wer_tolerance = _finite_float(self.probe_wer_tolerance, "probe_wer_tolerance")
+        if not 0.0 <= self.probe_wer_tolerance <= 1.0:
+            raise ValueError("probe_wer_tolerance must be between 0 (automatic) and 1")
+        self.probe_device = str(self.probe_device or "auto").strip().lower()
+        if self.probe_device not in {"auto", "same"} and not re.fullmatch(r"cuda:\d+", self.probe_device):
+            raise ValueError("probe_device must be 'auto', 'same', or a CUDA device such as cuda:1")
+        self.probe_timeout_s = max(60.0, _finite_float(self.probe_timeout_s, "probe_timeout_s"))
         self.speech_eval_timeout_s = max(1.0, _finite_float(self.speech_eval_timeout_s, "speech_eval_timeout_s"))
         for key in ("speech_eval_max_wer_increase", "speech_eval_max_speaker_drop"):
             value = _finite_float(getattr(self, key), key)

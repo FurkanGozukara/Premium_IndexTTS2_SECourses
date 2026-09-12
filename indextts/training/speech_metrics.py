@@ -296,6 +296,12 @@ def paired_difference(rows: list[dict[str, Any]], baseline: list[dict[str, Any]]
 SCORE_WER_WEIGHT = 4.0
 SCORE_PAUSE_WEIGHT = 0.05
 SCORE_MIN_DELTA = 0.002
+# Guard modes. "mean" rejects a candidate whose mean paired regression exceeds the margin. "interval" also
+# needs the regression to be resolved by the benchmark: its prompt-bootstrap 95% interval must exclude zero,
+# or a majority of the held-out recordings must show it. A margin crossed by a few sentences of one recording
+# then costs deployment score instead of disqualifying the candidate outright.
+GUARD_MODE_MEAN = "mean"
+GUARD_MODE_INTERVAL = "interval"
 
 
 def deployment_score(summary: dict[str, Any], base: dict[str, Any], speaker_gain: float | None,
@@ -309,6 +315,78 @@ def deployment_score(summary: dict[str, Any], base: dict[str, Any], speaker_gain
     if candidate_ratio and base_ratio and float(candidate_ratio) > 0 and float(base_ratio) > 0:
         pause_term = float(pause_weight) * (abs(math.log(float(base_ratio))) - abs(math.log(float(candidate_ratio))))
     return {"score": gain - penalty + pause_term, "speaker_gain": gain, "wer_penalty": penalty, "pause_term": pause_term}
+
+
+def source_regression(rows: list[dict[str, Any]], baseline: list[dict[str, Any]], key: str, *,
+                      worse_when_higher: bool) -> dict[str, Any]:
+    """How many held-out recordings show the regression: per-source mean paired difference in the bad direction."""
+    base = {(r["prompt_id"], r["seed"]): r for r in baseline}
+    per_source: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        pair = (row["prompt_id"], row["seed"])
+        other = base.get(pair)
+        if other is None or row.get(key) is None or other.get(key) is None:
+            continue
+        per_source[str(row.get("source") or row["prompt_id"])].append(float(row[key]) - float(other[key]))
+    means = {source: float(np.mean(values)) for source, values in per_source.items() if values}
+    regressed = [source for source, value in means.items() if (value > 0 if worse_when_higher else value < 0)]
+    return {"sources": len(means), "regressed": len(regressed), "regressed_sources": sorted(regressed),
+            "majority": bool(means) and len(regressed) * 2 > len(means), "per_source": means}
+
+
+def _resolved_regression(delta: dict[str, Any], sources: dict[str, Any], *, worse_when_higher: bool) -> bool:
+    ci = delta.get("ci95")
+    if ci:
+        if worse_when_higher and float(ci[0]) > 0:
+            return True
+        if not worse_when_higher and float(ci[1]) < 0:
+            return True
+    return bool(sources.get("majority"))
+
+
+def regression_guards(measured: list[dict[str, Any]], base_rows: list[dict[str, Any]], *, policy: dict[str, Any],
+                      speaker_metric: str, summary: dict[str, Any] | None = None,
+                      base: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Base-regression guards for one candidate: reasons that reject it, notes about margins crossed by noise."""
+    summary = summary or summarize(measured)
+    base = base or summarize(base_rows)
+    mode = str(policy.get("guard_mode") or GUARD_MODE_MEAN).strip().lower()
+    max_wer = float(policy["max_wer_increase"])
+    max_drop = float(policy["max_speaker_drop"])
+    delta = paired_difference(measured, base_rows, "error_rate")
+    speaker = paired_difference(measured, base_rows, speaker_metric)
+    wer_sources = source_regression(measured, base_rows, "error_rate", worse_when_higher=True)
+    speaker_sources = source_regression(measured, base_rows, speaker_metric, worse_when_higher=False)
+    reasons: list[str] = []
+    notes: list[str] = []
+    if delta["mean"] is not None and delta["mean"] > max_wer:
+        if mode != GUARD_MODE_INTERVAL or _resolved_regression(delta, wer_sources, worse_when_higher=True):
+            detail = ""
+            if mode == GUARD_MODE_INTERVAL:
+                detail = (" (the 95% interval excludes zero)" if delta.get("ci95") and float(delta["ci95"][0]) > 0
+                          else f" (higher on {wer_sources['regressed']} of {wer_sources['sources']} recordings)")
+            reasons.append("transcript error exceeds the allowed increase over Base" + detail)
+        else:
+            notes.append(f"mean transcript error rose {100 * delta['mean']:+.2f} points, more than the {100 * max_wer:.0f}-point "
+                         f"margin, but the 95% interval includes zero and only {wer_sources['regressed']} of "
+                         f"{wer_sources['sources']} recordings got worse; the increase costs deployment score instead")
+    if speaker["mean"] is None:
+        reasons.append("speaker similarity could not be compared with Base")
+    elif speaker["mean"] < -max_drop:
+        if mode != GUARD_MODE_INTERVAL or _resolved_regression(speaker, speaker_sources, worse_when_higher=False):
+            detail = ""
+            if mode == GUARD_MODE_INTERVAL:
+                detail = (" (the 95% interval excludes zero)" if speaker.get("ci95") and float(speaker["ci95"][1]) < 0
+                          else f" (lower on {speaker_sources['regressed']} of {speaker_sources['sources']} recordings)")
+            reasons.append("speaker similarity falls below the allowed Base margin" + detail)
+        else:
+            notes.append(f"mean speaker similarity fell {speaker['mean']:+.4f}, more than the {max_drop:g} margin, but the 95% "
+                         f"interval includes zero and only {speaker_sources['regressed']} of {speaker_sources['sources']} "
+                         "recordings got worse")
+    if summary["failure_count"] > base["failure_count"]:
+        reasons.append("more invalid, possibly truncated, or repetitive clips than Base")
+    return {"reasons": reasons, "notes": notes, "error_delta": delta, "speaker_delta": speaker,
+            "error_sources": wer_sources, "speaker_sources": speaker_sources, "guard_mode": mode}
 
 
 def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str, Any]],
@@ -333,24 +411,20 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
     wer_weight = float(policy.get("score_wer_weight", SCORE_WER_WEIGHT))
     pause_weight = float(policy.get("score_pause_weight", SCORE_PAUSE_WEIGHT))
     score_min_delta = float(policy.get("score_min_delta", SCORE_MIN_DELTA))
+    guard_mode = str(policy.get("guard_mode") or GUARD_MODE_MEAN).strip().lower()
     results = []
     for candidate in candidates:
         measured = grouped[candidate["label"]]
         summary = summarize(measured)
-        delta = paired_difference(measured, base_rows, "error_rate")
-        speaker = paired_difference(measured, base_rows, speaker_metric)
-        reasons = []
-        if candidate["path"]:
-            if delta["mean"] > float(policy["max_wer_increase"]):
-                reasons.append("transcript error exceeds the allowed increase over Base")
-            if speaker["mean"] is None or speaker["mean"] < -float(policy["max_speaker_drop"]):
-                reasons.append("speaker similarity falls below the allowed Base margin")
-            if summary["failure_count"] > base["failure_count"]:
-                reasons.append("more invalid, possibly truncated, or repetitive clips than Base")
+        guards = regression_guards(measured, base_rows, policy=policy, speaker_metric=speaker_metric, summary=summary, base=base)
+        delta, speaker = guards["error_delta"], guards["speaker_delta"]
+        reasons = list(guards["reasons"]) if candidate["path"] else []
+        notes = list(guards["notes"]) if candidate["path"] else []
         score = deployment_score(summary, base, speaker["mean"], delta["mean"], wer_weight=wer_weight, pause_weight=pause_weight)
         results.append({**candidate, **summary, "error_delta_vs_base": delta, "speaker_metric": speaker_metric,
                         "speaker_delta_vs_base": speaker, "deployment_score": score, "eligible": not reasons,
-                        "rejection_reasons": reasons})
+                        "rejection_reasons": reasons, "notes": notes,
+                        "error_sources": guards["error_sources"], "speaker_sources": guards["speaker_sources"]})
     eligible = [r for r in results if r["eligible"]]
     top = max(r["deployment_score"]["score"] for r in eligible)
     # Candidates the score cannot separate are tied; the lower validation loss decides among them.
@@ -359,13 +433,16 @@ def select_recommendation(candidates: list[dict[str, Any]], rows: list[dict[str,
                                     r["mean_error_rate"], r["label"]))
     speaker_note = ("speaker similarity is measured against the real recording of each sentence"
                     if speaker_metric == "speaker_similarity_real" else "speaker similarity is measured against the reference clip")
+    guard_note = (" A margin crossed only within the benchmark's noise (95% interval including zero, a minority of recordings) "
+                  "costs score instead of disqualifying." if guard_mode == GUARD_MODE_INTERVAL else "")
     return {"status": "complete", "recommended_kind": "adapter" if best["path"] else "base",
             "recommended_checkpoint": best["path"], "recommended_label": best["label"],
             "candidates": results, "listening_status": "not_rated", "speaker_metric": speaker_metric,
-            "score_policy": {"wer_weight": wer_weight, "pause_weight": pause_weight, "min_delta": score_min_delta},
+            "score_policy": {"wer_weight": wer_weight, "pause_weight": pause_weight, "min_delta": score_min_delta,
+                             "guard_mode": guard_mode},
             "decision": (f"Observed Base regression guards ({speaker_note}), then the deployment score: paired speaker-similarity "
                          f"gain over Base minus {wer_weight:g} times any paired word-error increase, plus a pause-time term "
-                         f"(weight {pause_weight:g}); validation loss breaks ties within {score_min_delta:g}."),
+                         f"(weight {pause_weight:g}); validation loss breaks ties within {score_min_delta:g}.{guard_note}"),
             "scope": "Provisional automatic recommendation for this development suite; human listening is still needed to judge naturalness."}
 
 

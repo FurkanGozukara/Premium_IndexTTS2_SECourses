@@ -217,7 +217,9 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     step_match = _STEP_RE.search(stem)
     averaged_match = _AVERAGED_RE.search(stem)
     ema_match = _EMA_RE.search(stem)
-    if source.parent.name.lower() == "best":
+    if source.parent.name.lower() == "best" and stem.lower().endswith("_probe_best"):
+        kind = "probe_best"
+    elif source.parent.name.lower() == "best":
         kind = "best"
     elif ema_match:
         kind = "ema"
@@ -251,6 +253,14 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
             else f"best ({checkpoint_type})"
         )
         file_label = f"best_ep{epoch}" if epoch else "best"
+    elif kind == "probe_best":
+        # The epoch whose deployment-settings probe scored best against Base during training.
+        label = (
+            f"probe-best (epoch {epoch} {checkpoint_type})"
+            if epoch
+            else f"probe-best ({checkpoint_type})"
+        )
+        file_label = f"probe_best_ep{epoch}" if epoch else "probe_best"
     elif kind == "averaged":
         first_epoch, last_epoch = int(averaged_match.group(1)), int(averaged_match.group(2))
         label = f"averaged (epochs {first_epoch} to {last_epoch} {checkpoint_type})"
@@ -384,7 +394,7 @@ def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, 
                 descriptors.append(descriptor)
         except Exception:
             continue
-    order = {"best": 0, "epoch": 1, "step": 2, "interrupted": 3, "final": 4, "averaged": 5, "ema": 6}
+    order = {"best": 0, "probe_best": 1, "epoch": 2, "step": 3, "interrupted": 4, "final": 5, "averaged": 6, "ema": 7}
     descriptors.sort(
         key=lambda item: (
             order.get(str(item["kind"]), 9),
