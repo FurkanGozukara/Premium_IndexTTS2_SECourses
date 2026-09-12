@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.17",
+        "2026-09-12",
+        """
+### Restore the latest preset on startup and page reload
+
+- **Remember the latest preset:** selecting a preset, pressing Load, or saving a user preset records it as the last used preset.
+- **Restore every registered setting:** restarting the app, reloading the page, or opening another tab selects and loads that preset across all tabs. A page no longer restores the server's original selection over a newer choice.
+- **Fresh installations and missing presets:** when no valid last-used preset remains, the app loads the preset matching the detected GPU tier.
+
+Restart after updating. Existing presets remain compatible.
+""".strip(),
+    ),
+    (
         "v6.16",
         "2026-09-12",
         """

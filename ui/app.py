@@ -514,8 +514,11 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             api_name="reset_preset",
         )
 
-        def initial_load(browser_value: str | None):
-            requested = (browser_value or store.get_last_used()).removeprefix(SYSTEM_PREFIX)
+        def initial_load():
+            # Read the durable bookmark for every new page/session. A State
+            # initialized at build time keeps the server's original selection
+            # and can overwrite a more recently selected, loaded or saved preset.
+            requested = store.get_last_used().removeprefix(SYSTEM_PREFIX)
             if _display_name(store, requested) not in store.list_presets():
                 requested = store.default_preset_name()
             overlay = persisted_runtime if store.is_system(requested) else None
@@ -523,7 +526,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
 
         initial_load_event = demo.load(
             initial_load,
-            browser_preset,
+            None,
             [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
             queue=False,
         )

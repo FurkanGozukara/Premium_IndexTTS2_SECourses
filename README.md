@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.17 last-used preset restoration:** selecting, loading, or saving a preset remembers it immediately. App restarts, page reloads, and new browser tabs select and load the latest preset with all registered settings. A page no longer replaces a newer choice with the preset selected when the server started. When no valid saved selection remains, the app loads the detected GPU tier preset.
+
 **V6.16 reliable subtitle sentences and deployment-based checkpoint selection:** Smart sentences now ignores line wrapping and subtitle cue separators, and caption uploads use all current preview settings. Speech comparison uses the generation settings associated with each candidate, with automatic prompt counts and configurable regression guards. Epoch probes retain a separate best checkpoint and contribute to early stopping; joint adapter/decoder evaluation can recommend a complete deployment even when Base led the initial comparison. Training status uses lightweight updates, and the selection and GPU calibration tools support rerunning evaluation and independent final testing.
 
 **V6.15 broader media and caption format support:** dataset preparation, Voice Generation and Batch Generation accept every caption format in common use (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, and the JSON/TSV transcripts speech recognizers write), recognize the format from the file's content so a mislabeled extension still loads, and skip stray text, missing milliseconds and cue-end mistakes instead of failing the whole file. Media discovery covers the full set of containers and audio formats ffmpeg decodes (WebM, MKV, MOV, MXF, VOB, 3GP, OGV, MKA, Opus, AC3, AMR and more), an explicitly listed file with an unfamiliar extension is kept when it contains audio, damaged downloads are decoded with corrupt packets dropped, and download metadata such as `video.info.json` is never mistaken for captions. The training dashboard now stays responsive for the whole run: each browser tab receives a component only when it changed, charts and tables refresh every few seconds instead of every second, the metrics file is parsed incrementally, and opening the training tab shows the newest run with its charts drawn. A count followed by a plus sign, such as `30+`, no longer breaks English text normalization and is read as "30 plus".
@@ -102,7 +104,7 @@ If startup reports missing model files, run `Windows_Model_Download_and_Fix.bat`
 
 ## 2. Know the Workspace Before Generating
 
-The header controls reusable settings; the tab row separates generation, batch work, dataset preparation, training, checkpoint comparison, performance, help, and release history. The read-only system presets are the GPU VRAM tiers, **6 GB GPU** through **32 GB GPU**. A fresh install selects the preset of the detected card automatically (a card counts as a tier from 500 MB below its nominal size); an updated installation restores its last-used preset, and a saved user preset always wins. Start in **Voice Generation** and keep the detected GPU preset for the first successful output.
+The header controls reusable settings; the tab row separates generation, batch work, dataset preparation, training, checkpoint comparison, performance, help, and release history. The read-only system presets are the GPU VRAM tiers, **6 GB GPU** through **32 GB GPU**. A fresh install selects the preset of the detected card automatically (a card counts as a tier from 500 MB below its nominal size). Selecting, loading, or saving a preset remembers it; restarting the app, reloading a page, or opening another tab restores that latest selection and its registered settings. Start in **Voice Generation** and keep the detected GPU preset for the first successful output.
 
 ![Annotated 4K overview of the IndexTTS 2.5 Premium workspace](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/97GX_9lELPBHRPwdwMxVg.png)
 
@@ -660,7 +662,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.16 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.17 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
