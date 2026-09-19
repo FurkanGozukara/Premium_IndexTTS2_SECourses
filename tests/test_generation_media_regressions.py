@@ -60,6 +60,20 @@ def test_unsupported_mp3_bitrate_does_not_silently_quantize_or_remove_source(tmp
     assert "Unsupported MP3 bitrate: 200k" in capsys.readouterr().out
 
 
+def test_rf64_can_be_tuned_and_exported_to_mp3(tmp_path, ffmpeg_tools):
+    import soundfile as sf
+    from webui_generation_runner import convert_wav_to_mp3
+
+    source, tuned, mp3 = tmp_path / "source.wav", tmp_path / "tuned.wav", tmp_path / "export.mp3"
+    audio = np.arange(22050, dtype=np.int16)
+    sf.write(source, audio, 22050, subtype="PCM_16", format="RF64")
+    apply_audio_tuning(source, tuned, "bypass", gain_db=-1)
+    assert sf.info(tuned).frames == len(audio)
+    assert convert_wav_to_mp3(str(source), str(mp3), remove_source=False) == str(mp3)
+    assert abs(float(_probe(mp3)["format"]["duration"]) - 1.0) < 0.1
+    assert source.is_file()
+
+
 @pytest.mark.parametrize("duration", [0.013, 1.013, 11.0])
 def test_mp4_container_and_streams_end_at_audio_boundary(tmp_path, ffmpeg_tools, duration):
     from PIL import Image

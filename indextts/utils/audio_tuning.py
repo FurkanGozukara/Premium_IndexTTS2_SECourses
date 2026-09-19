@@ -165,6 +165,8 @@ def apply_audio_tuning(
         "pcm_s16le",
         "-ar",
         str(sample_rate),
+        "-rf64",
+        "auto",
         str(destination),
     ]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)

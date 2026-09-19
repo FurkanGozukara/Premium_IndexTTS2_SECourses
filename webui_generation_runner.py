@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
+import soundfile as sf
 
 from indextts.utils.subtitle_utils import (
     assemble_subtitle_audio,
@@ -26,15 +27,6 @@ from indextts.utils.subtitle_utils import (
 )
 from indextts.utils.task_output_utils import build_segment_output_path, write_metadata_file
 from indextts.utils.text_segmentation import SpeechRecoveryConfig
-
-try:
-    from pydub import AudioSegment
-
-    MP3_AVAILABLE = True
-except ImportError:
-    AudioSegment = None
-    MP3_AVAILABLE = False
-
 
 SUBTITLE_TIMING_INTERVAL_SILENCE_MS = 0
 
@@ -54,6 +46,7 @@ def check_ffmpeg() -> bool:
 
 
 FFMPEG_AVAILABLE = check_ffmpeg()
+MP3_AVAILABLE = FFMPEG_AVAILABLE
 
 
 def _ensure_selected_int8(
@@ -177,28 +170,32 @@ def convert_wav_to_mp3(
     bitrate: str = "256k",
     remove_source: bool = True,
 ) -> str:
-    if not MP3_AVAILABLE or AudioSegment is None:
+    if not MP3_AVAILABLE:
         return wav_path
 
     try:
-        audio = AudioSegment.from_wav(wav_path)
+        sample_rate = sf.info(wav_path).samplerate
         bitrate_text = str(bitrate).strip().lower()
         bitrate_bps = int(bitrate_text[:-1]) * 1000 if bitrate_text.endswith("k") else int(bitrate_text)
         supported_kbps = {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 320}
         if bitrate_bps not in {value * 1000 for value in supported_kbps}:
             raise ValueError(f"Unsupported MP3 bitrate: {bitrate}")
         export_parameters = []
-        if bitrate_bps > 160000 and audio.frame_rate < 32000:
+        if bitrate_bps > 160000 and sample_rate < 32000:
             # MPEG-2/2.5 (including our 22050 Hz WAVs) tops out at 160 kbps.
             # Let FFmpeg resample for MPEG-1 instead of silently lowering the bitrate.
             export_parameters = ["-ar", "44100"]
-            print(f">> MP3 export: resampling {audio.frame_rate} Hz to 44100 Hz for {bitrate_bps // 1000} kbps.")
-        elif (bitrate_bps < 32000 or bitrate_bps == 144000) and audio.frame_rate >= 32000:
+            print(f">> MP3 export: resampling {sample_rate} Hz to 44100 Hz for {bitrate_bps // 1000} kbps.")
+        elif (bitrate_bps < 32000 or bitrate_bps == 144000) and sample_rate >= 32000:
             export_parameters = ["-ar", "22050"]
-        audio.export(
-            mp3_path, format="mp3", codec="libmp3lame", bitrate=str(bitrate_bps),
-            parameters=export_parameters,
+        # Read the source directly: Pydub stages another 32-bit WAV and fails on RF64-sized audio.
+        completed = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", wav_path,
+             "-vn", "-c:a", "libmp3lame", "-b:a", str(bitrate_bps), *export_parameters, mp3_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
         )
+        if completed.returncode != 0:
+            raise RuntimeError(f"FFmpeg MP3 conversion failed: {(completed.stderr or '').strip()[-2000:]}")
         if remove_source:
             os.remove(wav_path)
         return mp3_path
@@ -214,8 +211,6 @@ def create_mp4_from_image_audio(image_path: str, audio_path: str, mp4_path: str)
         raise FileNotFoundError(f"Image file not found: {image_path}")
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    import soundfile as sf
-
     audio_info = sf.info(audio_path)
     duration_seconds = audio_info.frames / float(audio_info.samplerate) if audio_info.samplerate else 0.0
     if not math.isfinite(duration_seconds) or duration_seconds <= 0:
@@ -976,8 +971,8 @@ def run_generation_request(
             output = output_path
             print(f">> Audio tuning applied ({audio_tuning_preset}); untouched WAV: {raw_output}")
 
-        final_rate, final_audio = read_pcm16_wav(output_path)
-        final_wav_audio_seconds = final_audio.shape[0] / float(final_rate) if final_rate else 0.0
+        final_info = sf.info(output_path)
+        final_wav_audio_seconds = final_info.frames / float(final_info.samplerate) if final_info.samplerate else 0.0
 
         check_cancellation()
         if image_path:

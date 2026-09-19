@@ -141,6 +141,36 @@ def test_tuning_correction_is_retained_in_result_metadata_and_progress(tmp_path)
     assert metadata["status"] == "completed"
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_rf64_generation_completes_with_duration_and_candidate_metadata(tmp_path, monkeypatch, batch_size):
+    import soundfile as sf
+    from indextts.utils import subtitle_utils
+    from indextts.utils.common import save_pcm_wav
+    from webui_generation_runner import run_generation_request
+
+    monkeypatch.setattr(subtitle_utils, "_WAV_MAX_DATA_BYTES", 0)
+    audio = np.arange(2205, dtype=np.int16)
+
+    class Engine(_RequestEngine):
+        def infer(self, spk_audio_prompt, text, output_path, **kwargs):
+            save_pcm_wav(output_path, torch.from_numpy(audio), 22050)
+            return output_path
+
+        def infer_texts(self, **kwargs):
+            return [(22050, audio)]
+
+    request = _request(tmp_path, "rf64", infer_kwargs={"section_batch_size": batch_size})
+    result = run_generation_request(request, Engine())
+    metadata = json.loads(Path(request["metadata_path"]).read_text(encoding="utf-8"))
+    assert metadata["status"] == "completed"
+    assert metadata["generation"]["audio_seconds"] == pytest.approx(0.1)
+    paths = [metadata["outputs"]["final_audio_path"], *result["candidate_paths"]]
+    for path in paths:
+        with sf.SoundFile(path) as handle:
+            assert handle.format == "RF64" and handle.frames == len(audio)
+            np.testing.assert_array_equal(handle.read(dtype="int16"), audio)
+
+
 class _Projection(nn.Module):
     def __init__(self):
         super().__init__()

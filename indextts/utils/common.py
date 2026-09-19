@@ -1,7 +1,6 @@
 import os
 import random
 import re
-import wave
 
 import torch
 import torchaudio
@@ -18,8 +17,8 @@ def save_pcm_wav(path, wav, sampling_rate):
 
     ``wav`` holds values in ``[-32767, 32767]`` and may be either an integer tensor
     or the float tensor produced by ``torch.clamp(PCM16_MAX * wav, ...)``. The
-    standard-library WAV writer avoids Torchaudio's optional TorchCodec dependency
-    and keeps output behavior stable across Torchaudio releases.
+    shared WAV writer supports oversized RF64 output without Torchaudio's optional
+    TorchCodec dependency.
     """
     pcm = wav.detach().to(device="cpu", dtype=torch.float32)
     pcm = pcm.clamp_(-PCM16_MAX, PCM16_MAX).round().to(torch.int16)
@@ -29,11 +28,9 @@ def save_pcm_wav(path, wav, sampling_rate):
         raise ValueError(f"Expected [channels, samples] audio, received shape {tuple(pcm.shape)}")
 
     interleaved = pcm.transpose(0, 1).contiguous().numpy().astype("<i2", copy=False)
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(pcm.shape[0])
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(int(sampling_rate))
-        wav_file.writeframes(interleaved.tobytes())
+    from indextts.utils.subtitle_utils import write_pcm16_wav
+
+    write_pcm16_wav(interleaved, sampling_rate, str(path))
 
 
 def load_audio(audiopath, sampling_rate):

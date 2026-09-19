@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.18",
+        "2026-09-19",
+        """
+### Reliable exports for long audio beyond the WAV size limit
+
+- **Large WAV exports:** generation automatically uses RF64 when PCM16 audio exceeds the standard RIFF size limit, preventing a save failure after successful synthesis. The file keeps its `.wav` extension and lossless samples; smaller outputs remain standard WAV. Oversized files require an RF64-capable player or editor.
+- **Consistent output paths:** sequential, micro-batch and subtitle generation share the same bounded-block WAV writer. Final duration is read from the header without loading the complete audio again.
+- **Follow-on processing:** pause rewriting preserves RF64, audio tuning and retiming can write oversized WAVs, and MP3 export reads the source directly through FFmpeg without a size-limited intermediate WAV.
+
+Restart after updating. Existing presets, models and ordinary WAV outputs remain compatible.
+""".strip(),
+    ),
+    (
         "v6.17",
         "2026-09-12",
         """

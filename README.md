@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.18 long-audio export fix:** generation automatically saves oversized PCM16 audio as RF64 instead of failing at standard WAV's approximately 4 GiB size limit. Smaller outputs remain standard WAV. Sequential, micro-batch and subtitle output use bounded writes; duration lookup, audio finishing and MP3 conversion handle large files. Oversized WAVs require an RF64-capable player or editor.
+
 **V6.17 last-used preset restoration:** selecting, loading, or saving a preset remembers it immediately. App restarts, page reloads, and new browser tabs select and load the latest preset with all registered settings. A page no longer replaces a newer choice with the preset selected when the server started. When no valid saved selection remains, the app loads the detected GPU tier preset.
 
 **V6.16 reliable subtitle sentences and deployment-based checkpoint selection:** Smart sentences now ignores line wrapping and subtitle cue separators, and caption uploads use all current preview settings. Speech comparison uses the generation settings associated with each candidate, with automatic prompt counts and configurable regression guards. Epoch probes retain a separate best checkpoint and contribute to early stopping; joint adapter/decoder evaluation can recommend a complete deployment even when Base led the initial comparison. Training status uses lightweight updates, and the selection and GPU calibration tools support rerunning evaluation and independent final testing.
@@ -222,6 +224,8 @@ Use **Speaking rate** for the voice's pace, **Section silence** for joins, and *
 ### Formats, audio finishing, and execution mode
 
 Give the task an optional safe filename, keep the used reference for reproducibility, and choose WAV, MP3, or still-image MP4 behavior. **Bypass** preserves model audio; the other tuning presets use FFmpeg post-processing with optional explicit overrides.
+
+Generation exports automatically use **RF64** (with the same `.wav` extension and lossless PCM16 samples) when the audio exceeds standard WAV's approximately 4 GiB RIFF limit. Smaller exports remain standard WAV. Oversized files need an RF64-capable player or editor; for software that requires standard WAV, use Batch Generation with smaller scripts. Audio tuning and MP3 export also support RF64 input.
 
 ![Annotated 4K output, audio tuning, and execution settings](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/ethlsqm7ApVAs2Z-kO4pF.png)
 
@@ -662,7 +666,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.17 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.18 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 

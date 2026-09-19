@@ -19,10 +19,10 @@ import re
 import shutil
 import subprocess
 from typing import Callable, Iterable, List, Sequence, Tuple
-import wave
 
 import librosa
 import numpy as np
+import soundfile as sf
 from scipy.signal import resample
 
 from indextts.utils.text_encoding import read_text_resilient
@@ -861,40 +861,37 @@ def ensure_audio_matrix(audio: np.ndarray) -> np.ndarray:
     return matrix
 
 
+# RIFF's 32-bit size includes the 36 bytes preceding PCM data (excluding RIFF/size).
+_WAV_MAX_DATA_BYTES = 0xFFFFFFFF - 36
+_WAV_WRITE_CHUNK_FRAMES = 1024 * 1024
+
+
 def write_pcm16_wav(audio: np.ndarray, sampling_rate: int, output_path: str) -> str:
+    """Write PCM16, using RF64 automatically when a classic WAV cannot hold it."""
     matrix = ensure_audio_matrix(audio)
     directory = os.path.dirname(output_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
 
-    with wave.open(output_path, "wb") as wav_file:
-        wav_file.setnchannels(matrix.shape[1])
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(int(sampling_rate))
-        wav_file.writeframes(matrix.tobytes())
+    wav_format = "RF64" if matrix.nbytes > _WAV_MAX_DATA_BYTES else "WAV"
+    if wav_format == "RF64":
+        print(f">> WAV exceeds the RIFF size limit; saving RF64: {output_path}", flush=True)
+    with sf.SoundFile(
+        output_path, "w", samplerate=int(sampling_rate), channels=matrix.shape[1],
+        subtype="PCM_16", format=wav_format,
+    ) as wav_file:
+        # Bound temporary copies, including when the input is a strided array.
+        for start in range(0, len(matrix), _WAV_WRITE_CHUNK_FRAMES):
+            wav_file.write(matrix[start:start + _WAV_WRITE_CHUNK_FRAMES])
 
     return output_path
 
 
 def read_pcm16_wav(path: str) -> Tuple[int, np.ndarray]:
-    with wave.open(path, "rb") as wav_file:
-        channels = wav_file.getnchannels()
-        sample_width = wav_file.getsampwidth()
-        sampling_rate = wav_file.getframerate()
-        frame_count = wav_file.getnframes()
-        frames = wav_file.readframes(frame_count)
-
-    if sample_width != 2:
-        raise ValueError(f"Expected 16-bit PCM WAV, got sample width {sample_width} bytes: {path}")
-
-    audio = np.frombuffer(frames, dtype=np.int16)
-    if audio.size == 0:
-        return sampling_rate, np.zeros((0, channels), dtype=np.int16)
-
-    if audio.size % channels != 0:
-        raise ValueError(f"PCM frame data is not divisible by channel count for {path}")
-
-    return sampling_rate, audio.reshape(-1, channels).copy()
+    with sf.SoundFile(path) as wav_file:
+        if wav_file.format not in {"WAV", "WAVEX", "RF64"} or wav_file.subtype != "PCM_16":
+            raise ValueError(f"Expected 16-bit PCM WAV, got {wav_file.format}/{wav_file.subtype}: {path}")
+        return wav_file.samplerate, wav_file.read(dtype="int16", always_2d=True)
 
 
 def pad_or_trim_audio_to_samples(audio: np.ndarray, target_samples: int) -> np.ndarray:
@@ -1010,6 +1007,8 @@ def retime_audio_file_with_ffmpeg(
         "pcm_s16le",
         "-f",
         "wav",
+        "-rf64",
+        "auto",
         output_path,
         "-loglevel",
         "error",

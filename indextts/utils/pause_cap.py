@@ -139,15 +139,16 @@ def shorten_long_pauses_file(
     import soundfile as sf
 
     with sf.SoundFile(str(source)) as handle:
+        file_format = handle.format
         subtype = handle.subtype
         sample_rate = handle.samplerate
         dtype = "int16" if subtype == "PCM_16" else "float32"
         audio = handle.read(dtype=dtype, always_2d=False)
     result, report = shorten_long_pauses(audio, sample_rate, max_pause_ms, protected_s=protected_s)
     if report["shortened"]:
-        sf.write(str(destination), result, sample_rate, subtype=subtype)
+        sf.write(str(destination), result, sample_rate, subtype=subtype, format=file_format)
     elif str(Path(source).resolve()) != str(Path(destination).resolve()):
-        sf.write(str(destination), audio, sample_rate, subtype=subtype)
+        sf.write(str(destination), audio, sample_rate, subtype=subtype, format=file_format)
     report["duration_before_s"] = round(len(audio) / sample_rate, 3)
     report["duration_after_s"] = round(len(result) / sample_rate, 3)
     return report
