@@ -8,8 +8,14 @@ import gradio as gr
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
         "v6.19",
-        "2026-09-23",
+        "2026-09-25",
         """
+### Wider decoding ranges in Voice Generation
+
+- **Length penalty up to 10:** the slider now runs from -2 to 10 (previously -2 to 2). With beam search, 0 ranks the finished candidates by their total probability, which always favors the shortest one, so a take that drops or rushes a word can win over a complete one. Positive values let complete, longer candidates win; larger values push further in that direction. The default stays 0.
+- **Diffusion steps up to 200:** the slider now reaches 200 (previously 100) for experiments with slower, more refined acoustic rendering. The default is unchanged and generation time grows with the step count.
+- **Presets and API calls:** saved presets accept the wider ranges. Values sent through the API outside a slider's range are clamped to its limits, so a request above the old maximum previously ran at the maximum without an error.
+
 ### Fluency filters for training data
 
 - **Train on fluent clips:** the new **Training data fluency** section of LoRA / DoRA Training chooses which clips teach the voice: **All curated clips (current system)**, **No long hesitations**, **Fluent: at most one short hesitation**, or **Strictly fluent: no hesitations or filler words**. A clip's pauses are compared with its transcript: a pause where the text has no sentence end, comma, semicolon, colon or dash is a hesitation, and a trained voice copies the hesitations of its clips.

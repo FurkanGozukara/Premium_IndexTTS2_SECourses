@@ -3071,7 +3071,10 @@ def build_generation_tab(
                     0, 256, value=GENERATION_DEFAULTS["generation.repetition_window"], step=1, label="Repetition window (codes)",
                     info="0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second.",
                 )
-                length = gr.Slider(-2, 2, value=0, step=0.05, label="Length penalty", info="Only affects beam search; 0 is neutral.")
+                length = gr.Slider(
+                    -2, 10, value=0, step=0.05, label="Length penalty",
+                    info="Only affects beam search. 0 ranks finished beams by total probability, which favors the shortest one; positive values let complete, longer candidates win.",
+                )
                 max_mel = gr.Slider(50, 1815, value=1500, step=5, label="Max mel tokens", info="Upper limit on generated semantic tokens per section.")
             with gr.Row():
                 seed = gr.Number(value=-1, precision=0, label="Seed", info="-1 chooses a fresh random seed; reuse a shown seed for repeatability.")
@@ -3084,7 +3087,7 @@ def build_generation_tab(
                 ("generation.num_beams", beams, "int", 1, 10),
                 ("generation.repetition_penalty", repetition, "float", 1, 20),
                 ("generation.repetition_window", repetition_window, "int", 0, 256),
-                ("generation.length_penalty", length, "float", -2, 2),
+                ("generation.length_penalty", length, "float", -2, 10),
                 ("generation.max_mel_tokens", max_mel, "int", 50, 1815),
                 ("generation.seed", seed, "int", -1, 4294967295),
                 ("generation.num_candidates", candidates, "int", 1, 8),
@@ -3093,11 +3096,11 @@ def build_generation_tab(
 
         with gr.Accordion("Diffusion / CFM", open=False):
             with gr.Row():
-                steps = gr.Slider(2, 100, value=25, step=1, label="Diffusion steps", info="25 is the quality default; 12-16 is faster and 35-50 can refine difficult audio.")
+                steps = gr.Slider(2, 200, value=25, step=1, label="Diffusion steps", info="25 is the quality default; 12-16 is faster and 35-50 can refine difficult audio. Time grows with the step count.")
                 cfg = gr.Slider(0, 2, value=0.7, step=0.05, label="CFG rate", info="0.7 is recommended; high values follow conditioning more aggressively.")
                 cfm_temp = gr.Slider(0, 2, value=1.0, step=0.05, label="CFM temperature", info="1.0 is the best-quality default; lower values reduce diffusion variation.")
                 cfm_cache = gr.Slider(1024, 32768, value=8192, step=256, label="CFM cache length", info="8192 fits typical sections; lower values reduce reserved VRAM.")
-            _register(registry, "generation.diffusion_steps", steps, kind="int", minimum=2, maximum=100)
+            _register(registry, "generation.diffusion_steps", steps, kind="int", minimum=2, maximum=200)
             _register(registry, "generation.inference_cfg_rate", cfg, kind="float", minimum=0, maximum=2)
             _register(registry, "generation.cfm_temperature", cfm_temp, kind="float", minimum=0, maximum=2)
             _register(registry, "generation.cfm_cache_length", cfm_cache, kind="int", minimum=1024, maximum=32768)

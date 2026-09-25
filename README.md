@@ -7,7 +7,7 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
-**V6.19 fluency filters for training data:** LoRA / DoRA Training can train only on clips whose pauses fit their transcript, with four presets from **All curated clips (current system)** to **Strictly fluent**, editable limits, and an **Analyze dataset** table of the training time each filter keeps. Validation clips are never filtered, and the filtered dataset links the original files instead of copying them. Everything is measured locally.
+**V6.19 fluency filters for training data and wider decoding ranges:** LoRA / DoRA Training can train only on clips whose pauses fit their transcript, with four presets from **All curated clips (current system)** to **Strictly fluent**, editable limits, and an **Analyze dataset** table of the training time each filter keeps. Validation clips are never filtered, and the filtered dataset links the original files instead of copying them. Everything is measured locally. Voice Generation's **Length penalty** now reaches 10 (was 2), so beam search can favor complete candidates over shorter ones that drop a word, and **Diffusion steps** reaches 200 (was 100).
 
 **V6.18 long-audio export fix:** generation automatically saves oversized PCM16 audio as RF64 instead of failing at standard WAV's approximately 4 GiB size limit. Smaller outputs remain standard WAV. Sequential, micro-batch and subtitle output use bounded writes; duration lookup, audio finishing and MP3 conversion handle large files. Oversized WAVs require an RF64-capable player or editor.
 
@@ -927,7 +927,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Repetition window (codes)** - `generation.repetition_window`. 0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second. *(default 0; minimum 0; maximum 256)*
 
-**Length penalty** - `generation.length_penalty`. Only affects beam search; 0 is neutral. *(default 0; minimum -2; maximum 2)*
+**Length penalty** - `generation.length_penalty`. Only affects beam search. 0 ranks finished beams by total probability, which favors the shortest one; positive values let complete, longer candidates win. *(default 0; minimum -2; maximum 10)*
 
 **Max mel tokens** - `generation.max_mel_tokens`. Upper limit on generated semantic tokens per section. *(default 1500; minimum 50; maximum 1815)*
 
@@ -935,7 +935,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Candidates** - `generation.num_candidates`. Generates consecutive seeded alternatives; each adds generation time. *(default 1; minimum 1; maximum 8)*
 
-**Diffusion steps** - `generation.diffusion_steps`. 25 is the quality default; 12-16 is faster and 35-50 can refine difficult audio. *(default 25; minimum 2; maximum 100)*
+**Diffusion steps** - `generation.diffusion_steps`. 25 is the quality default; 12-16 is faster and 35-50 can refine difficult audio. Time grows with the step count. *(default 25; minimum 2; maximum 200)*
 
 **CFG rate** - `generation.inference_cfg_rate`. 0.7 is recommended; high values follow conditioning more aggressively. *(default 0.7; minimum 0; maximum 2)*
 
