@@ -176,6 +176,33 @@ def test_recorded_approval_does_not_cover_another_candidate(voice):
     assert decoder.find_decoder_adapter(voice.best) == ""  # parent and gate disagree
 
 
+@pytest.mark.parametrize("recorded", [
+    "Z:\\models\\loras\\voice\\voice.s2mel.safetensors",  # a Windows training read on Linux
+    "/mnt/other/machine/loras/voice/voice.s2mel.safetensors",  # a Linux training read on Windows
+    "Z:\\old/mixed\\voice/voice.s2mel.safetensors",
+])
+def test_approval_recorded_on_another_machine_enables_auto(voice, recorded):
+    # A training copied to another machine or drive keeps the absolute paths it recorded.
+    _accepted(voice)
+    status = json.loads(voice.status.read_text(encoding="utf-8"))
+    status["decoder_adapter_path"] = recorded
+    _write(voice.status, status)
+    _write(voice.gate, {"status": "complete", "accepted": True, "adapter": recorded})
+    for checkpoint in (voice.gpt, voice.epoch, voice.best):
+        assert Path(decoder.find_decoder_adapter(checkpoint)) == voice.adapter.resolve()
+
+
+def test_foreign_approval_of_another_file_does_not_cover_the_root_adapter(voice):
+    # Same file name in a different place inside the training folder: still a different candidate.
+    recorded = "Z:\\models\\voice\\best\\voice.s2mel.safetensors"
+    _accepted(voice)
+    status = json.loads(voice.status.read_text(encoding="utf-8"))
+    status["decoder_adapter_path"] = recorded
+    _write(voice.status, status)
+    _write(voice.gate, {"status": "complete", "accepted": True, "adapter": recorded})
+    assert decoder.find_decoder_adapter(voice.gpt) == ""
+
+
 @pytest.mark.parametrize("value", [None, "", 12, []])
 def test_recorded_but_invalid_accepted_path_does_not_enable_auto(voice, value):
     _accepted(voice)

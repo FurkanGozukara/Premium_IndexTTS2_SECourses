@@ -2657,6 +2657,9 @@ class GenerationTab:
     task_timer: Any = None
     request_keys: list[str] = field(default_factory=list)
     request_components: list[Any] = field(default_factory=list)
+    # (handler, inputs, outputs) that applies a chosen adapter's automatic settings; other tabs chain it
+    # after they set the LoRA / DoRA dropdown, because a programmatic change keeps the saved values.
+    apply_lora_selection: tuple[Any, list[Any], list[Any]] | None = None
 
 
 def build_generation_tab(
@@ -2943,6 +2946,8 @@ def build_generation_tab(
                 value="auto",
                 label="Voice decoder adapter",
                 info="Selecting a LoRA / DoRA picks the decoder adapter saved with it. Choose None to hear the GPT adapter alone, or any other decoder adapter file.",
+                # A saved explicit decoder file stays valid when a later adapter change rebuilds the choice list.
+                allow_custom_value=True,
                 scale=6,
             )
             refresh_lora = gr.Button("↻  Refresh", elem_classes=btn("violet"), scale=1)
@@ -3611,7 +3616,26 @@ def build_generation_tab(
         auto_lora_pauses, segmentation_mode,
     ]
 
-    def on_lora_selection(*items: Any):
+    def _reference_updates(items: tuple[Any, ...], *, auto_rate_on: bool, panel: dict[str, Any]):
+        """Adapter panel, automatic reference and (when auto_rate_on) the calibrated rate for the selected adapter."""
+        info, audio_update, message, rate_update, source_update = lora_selection_updates(
+            items[0], items[1], items[2], auto_rate_on, items[4], panel=panel,
+        )
+        media_update: Any = gr.skip()
+        video_update: Any = gr.skip()
+        if source_update == "lora_auto":
+            recommended = _recommended_lora_reference(str(items[0] or ""))
+            if recommended:
+                audio_update = gr.update(value=recommended, visible=True)
+            media_update = gr.update(value=recommended) if recommended else gr.skip()
+            video_update = gr.update(value=None, visible=False)
+        elif source_update == "empty":
+            audio_update = gr.update(value=None, visible=False)
+            media_update = gr.update(value=None)
+            video_update = gr.update(value=None, visible=False)
+        return info, audio_update, media_update, video_update, message, rate_update, source_update
+
+    def _selection_updates(items: tuple[Any, ...], *, adapter_changed: bool):
         path = str(items[0] or "")
         auto_tokens_on, scale, lang, current_rate, current_tokens = items[5:10]
         auto_pauses_on, split_mode = items[10:12]
@@ -3627,19 +3651,18 @@ def build_generation_tab(
             "auto_pauses": bool(auto_pauses_on),
             "segmentation_mode": str(split_mode or ""),
         }
-        info, audio_update, message, rate_update, source_update = lora_selection_updates(*items[:5], panel=panel)
-        media_update: Any = gr.skip()
-        video_update: Any = gr.skip()
-        if source_update == "lora_auto":
-            recommended = _recommended_lora_reference(str(items[0] or ""))
-            if recommended:
-                audio_update = gr.update(value=recommended, visible=True)
-            media_update = gr.update(value=recommended) if recommended else gr.skip()
-            video_update = gr.update(value=None, visible=False)
-        elif source_update == "empty":
-            audio_update = gr.update(value=None, visible=False)
-            media_update = gr.update(value=None)
-            video_update = gr.update(value=None, visible=False)
+        info, audio_update, media_update, video_update, message, rate_update, source_update = _reference_updates(
+            items, auto_rate_on=bool(items[3]), panel=panel,
+        )
+        if adapter_changed:
+            # Choosing a LoRA / DoRA selects its own decoder adapter again; None stays one click away.
+            decoder_update = gr.update(choices=decoder_adapter_choices(path, ROOT / "loras"), value="auto")
+            # The strength its full-pipeline test chose, or the trained strength when nothing was measured.
+            strength_update = gr.update(value=recommended_decoder_strength(path) or 1.0)
+        else:
+            # Toggling an automation switch keeps the chosen decoder adapter and its strength.
+            decoder_update = gr.skip()
+            strength_update = gr.skip()
         return (
             info,
             audio_update,
@@ -3648,15 +3671,65 @@ def build_generation_tab(
             message,
             rate_update,
             source_update,
-            gr.update(value=saved_lora_speaking_rate(str(items[0] or ""))),
-            # Loading a LoRA / DoRA selects its own decoder adapter again; None stays one click away.
-            gr.update(choices=decoder_adapter_choices(str(items[0] or ""), ROOT / "loras"), value="auto"),
-            # The strength its full-pipeline test chose, or the trained strength when nothing was measured.
-            gr.update(value=recommended_decoder_strength(str(items[0] or "")) or 1.0),
-            *decoding_updates(str(items[0] or ""), bool(items[3])),
+            gr.update(value=saved_lora_speaking_rate(path)),
+            decoder_update,
+            strength_update,
+            *decoding_updates(path, bool(items[3])),
             tokens_update,
             sentence_pause_update,
             max_pause_update,
+        )
+
+    def on_lora_selection(*items: Any):
+        """The user chose an adapter: apply its reference, calibrated rate, decoding, decoder and pauses."""
+        return _selection_updates(items, adapter_changed=True)
+
+    def on_lora_automation(*items: Any):
+        """An automation switch was toggled: apply what it enables without replacing the decoder choice."""
+        return _selection_updates(items, adapter_changed=False)
+
+    def on_lora_restored(*items: Any):
+        """The adapter changed with a preset load or page restore: every saved value stays exactly as saved.
+
+        Only what a preset does not store follows the adapter: its panel, its automatic reference audio,
+        its saved-rate field and the list of decoder adapters to choose from."""
+        path = str(items[0] or "")
+        panel = {
+            "speaking_rate": items[8],
+            "max_tokens": items[9],
+            "budget_scale": items[6],
+            "language": items[7],
+            "auto_tokens": bool(items[5]),
+            "auto_pauses": bool(items[10]),
+            "segmentation_mode": str(items[11] or ""),
+        }
+        info, audio_update, media_update, video_update, message, _rate, source_update = _reference_updates(
+            items, auto_rate_on=False, panel=panel,
+        )
+        choices = decoder_adapter_choices(path, ROOT / "loras")
+        current = str(items[12] or "") if len(items) > 12 else ""
+        decoder_update = gr.update(choices=choices)
+        if current and current not in {value for _, value in choices}:
+            explicit = Path(current).expanduser()
+            if explicit.is_file():
+                # The list for this adapter shows its own file as Automatic; keep the saved file selectable as saved.
+                try:
+                    label = str(explicit.resolve().relative_to((ROOT / "loras").resolve()))
+                except ValueError:
+                    label = explicit.name
+                decoder_update = gr.update(choices=[*choices, (label, current)])
+            else:
+                decoder_update = gr.update(choices=choices, value="auto")
+                message = f"{message} The saved voice decoder adapter {explicit.name} was not found; Automatic is selected."
+        return (
+            info,
+            audio_update,
+            media_update,
+            video_update,
+            message,
+            source_update,
+            gr.update(value=saved_lora_speaking_rate(path)),
+            decoder_update,
         )
 
     lora_selection_outputs = [
@@ -3726,24 +3799,33 @@ def build_generation_tab(
     add_suggestions.click(add_suggestions_and_save, [unknown_words, dictionary_table], [dictionary_table, pronunciation_status], queue=False)
     # Every edit in the table is saved; only the status is returned so the table does not re-trigger itself.
     dictionary_table.change(lambda rows: save_dictionary_rows(rows)[1], dictionary_table, pronunciation_status, queue=False, show_progress="hidden")
+    # A user's choice applies the adapter's automatic settings (.input fires only for user interaction).
+    # A preset load or page restore changes the dropdown programmatically (.change): the saved values,
+    # including the voice decoder adapter and speaking rate, must stay exactly as saved.
+    lora.input(
+        on_lora_selection,
+        lora_selection_inputs,
+        lora_selection_outputs,
+        queue=False,
+        api_name="apply_lora_selection",
+    )
     lora.change(
-        on_lora_selection,
-        lora_selection_inputs,
-        lora_selection_outputs,
+        on_lora_restored,
+        [*lora_selection_inputs, use_decoder],
+        [lora_info, tab.prompt_audio, tab.reference_media, tab.reference_video, reference_status,
+         tab.reference_source, lora_saved_rate, use_decoder],
         queue=False,
+        api_name="refresh_lora_panel",
     )
-    auto_rate.change(
-        on_lora_selection,
-        lora_selection_inputs,
-        lora_selection_outputs,
-        queue=False,
-    )
-    auto_ref.change(
-        on_lora_selection,
-        lora_selection_inputs,
-        lora_selection_outputs,
-        queue=False,
-    )
+    for switch in (auto_rate, auto_ref):
+        switch.input(
+            on_lora_automation,
+            lora_selection_inputs,
+            lora_selection_outputs,
+            queue=False,
+        )
+    # Other tabs that hand an adapter to Voice Generation chain this after setting the dropdown.
+    tab.apply_lora_selection = (on_lora_selection, lora_selection_inputs, lora_selection_outputs)
     auto_tokens.click(lambda lang: default_segment_tokens(lang), language, max_tokens, queue=False)
 
     preview_inputs = [

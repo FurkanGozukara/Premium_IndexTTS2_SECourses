@@ -1644,12 +1644,16 @@ def bind_grid_events(
                 gr.Tabs(selected="voice-generation"),
             )
 
-        tab.use_generation.click(
+        use_event = tab.use_generation.click(
             use_recommended,
             tab.adapter,
             [lora_component, main_tabs],
             queue=False,
         )
+        if getattr(generation, "apply_lora_selection", None) is not None:
+            # Handing an adapter over is a choice, so its automatic settings apply as for a manual pick.
+            apply_fn, apply_inputs, apply_outputs = generation.apply_lora_selection
+            use_event.success(apply_fn, apply_inputs, apply_outputs, queue=False)
 
     compare_button = getattr(training, "compare_grid", None)
     if compare_button is not None:

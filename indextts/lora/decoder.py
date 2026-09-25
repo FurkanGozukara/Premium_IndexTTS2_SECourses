@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,28 @@ def decoder_adapter_candidates(gpt_adapter_path: str | os.PathLike[str]) -> list
         if candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def _recorded_path(value: str, root: Path) -> Path:
+    """A decoder path recorded in lifecycle metadata, as a path on this machine.
+
+    Metadata written on another system (a Windows drive path read on Linux, or a moved models folder)
+    keeps its position inside the adapter's training folder: the part after the last folder with the
+    training folder's name is re-anchored on ``root``. The match stays exact, so an approval recorded
+    for one file never covers another file of the same name elsewhere in the folder.
+    """
+    path = Path(value).expanduser()
+    if path.exists():
+        return path.resolve()
+    parts = [part for part in re.split(r"[\\/]+", value.strip()) if part]
+    names = [part.lower() for part in parts]
+    folder = root.name.lower()
+    if folder in names:
+        index = len(names) - 1 - names[::-1].index(folder)
+        relative = parts[index + 1:]
+        if relative:
+            return root.joinpath(*relative).resolve()
+    return path.resolve()
 
 
 def _decoder_metadata(path: Path) -> dict[str, Any] | None:
@@ -110,7 +133,7 @@ def _decoder_auto_policy(root: Path) -> tuple[bool, Path | None]:
             value = record[key]
             if not isinstance(value, str) or not value.strip():
                 return False, None
-            path = Path(value).expanduser().resolve()
+            path = _recorded_path(value, root)
             if approved is not None and approved != path:
                 return False, None
             approved = path

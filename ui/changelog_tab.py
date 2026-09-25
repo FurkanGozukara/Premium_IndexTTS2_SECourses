@@ -7,6 +7,21 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.20",
+        "2026-09-25",
+        """
+### Presets keep the chosen voice decoder adapter
+
+- **Decoder choice restored:** saving a preset with an explicit **Voice decoder adapter** file and loading it back, or reopening the page, now restores that file. Previously the LoRA / DoRA change caused by loading a preset reset the decoder to Automatic and its strength to the recommended value.
+- **Saved values win on load:** loading a preset no longer re-applies the adapter's calibrated speaking rate, its sweep decoding (temperature, guidance, beams), the token budget or the pauses over the saved values, even when the automatic switches are on. Choosing a LoRA / DoRA by hand, or sending one from LoRA / DoRA Training or the Checkpoint Grid, still applies them as before.
+- **Switches keep the decoder:** turning **Auto-load the LoRA / DoRA recommended reference audio** or **Auto-apply the LoRA / DoRA calibrated speaking rate and decoding settings** on or off no longer resets the decoder choice.
+- **Automatic finds the decoder of a moved training:** a training copied to another machine or drive (for example from Windows to a Linux server) keeps the absolute paths it recorded when its decoder was approved. Automatic now recognizes the same file inside the training folder and loads it instead of no decoder; an approval still never covers a different file.
+- **Saved files stay selectable:** the decoder list keeps a saved decoder file available when a new adapter rebuilds it. A saved file that no longer exists falls back to Automatic with a notice.
+
+Restart after updating. Existing presets remain compatible; a preset saved while the decoder was being reset keeps the value it stored.
+""".strip(),
+    ),
+    (
         "v6.19",
         "2026-09-25",
         """

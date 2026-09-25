@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.20 presets keep the chosen voice decoder adapter:** loading a preset or reopening the page restores the saved **Voice decoder adapter** file, speaking rate and decoding settings instead of re-applying the adapter's automatic values; choosing an adapter by hand still applies them, and the automatic switches no longer reset the decoder. Automatic also finds the approved decoder of a training copied to another machine or drive.
+
 **V6.19 fluency filters for training data and wider decoding ranges:** LoRA / DoRA Training can train only on clips whose pauses fit their transcript, with four presets from **All curated clips (current system)** to **Strictly fluent**, editable limits, and an **Analyze dataset** table of the training time each filter keeps. Validation clips are never filtered, and the filtered dataset links the original files instead of copying them. Everything is measured locally. Voice Generation's **Length penalty** now reaches 10 (was 2), so beam search can favor complete candidates over shorter ones that drop a word, and **Diffusion steps** reaches 200 (was 100).
 
 **V6.18 long-audio export fix:** generation automatically saves oversized PCM16 audio as RF64 instead of failing at standard WAV's approximately 4 GiB size limit. Smaller outputs remain standard WAV. Sequential, micro-batch and subtitle output use bounded writes; duration lookup, audio finishing and MP3 conversion handle large files. Oversized WAVs require an RF64-capable player or editor.
@@ -685,7 +687,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.19 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.20 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -865,7 +867,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Auto-load the LoRA / DoRA recommended reference audio** - `generation.auto_lora_reference`. Loads the LoRA / DoRA's saved reference whenever no manual Reference Voice is selected. *(default true)*
 
-**Auto-apply the LoRA / DoRA calibrated speaking rate** - `generation.auto_lora_speaking_rate`. Uses the selected voice's measured pace; selecting None resets speaking rate to 1.0. *(default true)*
+**Auto-apply the LoRA / DoRA calibrated speaking rate** - `generation.auto_lora_speaking_rate`. Uses the selected voice's measured pace; selecting None resets speaking rate to 1.0. It applies when you choose an adapter or turn the switch on; loading a preset keeps the preset's saved rate and decoding settings. *(default true)*
 
 **Use the LoRA / DoRA expressive clip as the emotion prompt** - `generation.auto_lora_emotion_reference`. While Emotion source is Same as speaker voice, the liveliest clean training clip saved with the adapter (`<name>_expressive_reference.wav`, written by training or by **Pick expressive clip**) drives the delivery with the Emotion weight, and the speaker reference keeps the identity. *(default true)*
 

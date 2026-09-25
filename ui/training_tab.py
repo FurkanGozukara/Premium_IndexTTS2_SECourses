@@ -2120,12 +2120,16 @@ def bind_training_events(
                 gr.Tabs(selected="voice-generation"),
             )
 
-        tab.use_in_generation.click(
+        use_event = tab.use_in_generation.click(
             use_adapter,
             tab.state_dir,
             [lora_component, main_tabs],
             queue=False,
         )
+        if generation.apply_lora_selection is not None:
+            # Handing an adapter over is a choice, so its automatic settings apply as for a manual pick.
+            apply_fn, apply_inputs, apply_outputs = generation.apply_lora_selection
+            use_event.success(apply_fn, apply_inputs, apply_outputs, queue=False)
 
 
 __all__ = [
