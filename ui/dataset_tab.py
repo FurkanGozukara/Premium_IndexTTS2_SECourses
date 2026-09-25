@@ -17,6 +17,7 @@ import pandas as pd
 from indextts.runtime.progress import format_duration
 from indextts.training.dataset_manifest import load_manifest, summarize_manifest
 from indextts.training.dataset_prep import DatasetPrepConfig
+from indextts.training.fluency_filter import VIEW_MARKER
 from indextts.training.media import (
     find_media_files,
     find_sidecar_subtitles,
@@ -59,6 +60,8 @@ def scan_datasets(root: str | Path = ROOT / "datasets") -> list[tuple[str, str]]
     if not base.is_dir():
         return entries
     for info_path in base.glob("*/dataset_info.json"):
+        if (info_path.parent / VIEW_MARKER).is_file():
+            continue  # a training run's fluency-filtered view of another dataset, not a dataset to pick
         info = read_json(info_path, {}) or {}
         label = (
             f"{info_path.parent.name} | {int(info.get('segment_count', 0) or 0)} segments | "

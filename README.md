@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.19 fluency filters for training data:** LoRA / DoRA Training can train only on clips whose pauses fit their transcript, with four presets from **All curated clips (current system)** to **Strictly fluent**, editable limits, and an **Analyze dataset** table of the training time each filter keeps. Validation clips are never filtered, and the filtered dataset links the original files instead of copying them. Everything is measured locally.
+
 **V6.18 long-audio export fix:** generation automatically saves oversized PCM16 audio as RF64 instead of failing at standard WAV's approximately 4 GiB size limit. Smaller outputs remain standard WAV. Sequential, micro-batch and subtitle output use bounded writes; duration lookup, audio finishing and MP3 conversion handle large files. Oversized WAVs require an RF64-capable player or editor.
 
 **V6.17 last-used preset restoration:** selecting, loading, or saving a preset remembers it immediately. App restarts, page reloads, and new browser tabs select and load the latest preset with all registered settings. A page no longer replaces a newer choice with the preset selected when the server started. When no valid saved selection remains, the app loads the detected GPU tier preset.
@@ -374,6 +376,23 @@ Select a prepared cached dataset, enter a new safe adapter name, and choose LoRA
 
 Start with the default trainable modules. Increasing rank or enabling extra modules does not guarantee better speech; it increases file size, compute, and overfitting risk. The app inspects type, rank, and alpha when resuming so incompatible weights are rejected early.
 
+### Training data fluency
+
+A trained voice copies how its clips are spoken, including hesitations: recordings made while clicking through a screen demonstration teach the voice to pause mid-sentence. The **Training data fluency** section below the dataset chooses which training clips teach the voice.
+
+Each training clip's pauses (runs of at least 120 ms below -40 dBFS, the same measurement as the dataset pause profile) are compared with its transcript. The transcript allows a pause at every sentence end after the first sentence and at every comma, semicolon, colon or dash; the longest pauses fill those places. Every pause left over is a **hesitation**, and one at least the **long hesitation** length (250 ms by default) is a long hesitation. The pause share is the total pause time divided by the speaking time, and filler words are counted in the transcript.
+
+| Filter | Keeps a training clip when |
+|---|---|
+| **All curated clips (current system)** | always; the behaviour of every earlier release |
+| **No long hesitations** | it has no long hesitation |
+| **Fluent: at most one short hesitation** | no long hesitation, at most one shorter one, and a pause share of at most 12% |
+| **Strictly fluent: no hesitations or filler words** | no hesitation at all and none of the filler words |
+
+Selecting a filter fills in its limits; edit any of them to train on your own limits (a saved preset keeps them). Press **Analyze dataset** to measure the selected dataset's training split: the table lists the clips and hours every filter keeps, plus a row for edited limits, and the first line states what the selected filter will train on. Keep enough speech for the voice to stay stable; the strict filter can remove most of a dataset recorded as spontaneous talk.
+
+Validation clips are never filtered, so runs with different filters are validated on the same held-out recordings. When training starts with a filter, the app writes a filtered sibling dataset named `<dataset>__fluency_<filter>` (edited limits add `custom_<id>`): its manifest keeps the chosen training clips and every validation clip, and its audio and cached features are hard links to the original files, so nothing is duplicated and deleting the folder never changes the original. The same unchanged request reuses it. These folders do not appear in the dataset lists. The training log and the run's saved configuration name the filter and the kept clips. The measurement is fully local: no recognizer, model or online service runs for it.
+
 ### Optimizer, schedule, and effective updates
 
 The defaults use AdamW, cosine decay, learning rate `4e-5`, 200 warmup steps, a maximum of 10 epochs, batch size 1, and accumulation 1. With that setup, every training clip produces one optimizer update per epoch. Validation controls the optional lower-rate trial and early stopping within this maximum budget.
@@ -666,7 +685,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.18 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.19 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -1116,6 +1135,20 @@ The appendix below documents the registered controls (313 preset keys in this re
 **Dataset** - `training.dataset_dir`. Prepared manifest dataset used for cached-feature training. *(default "datasets/voice_dataset")*
 
 **GPU VRAM preset** - `training.vram_tier`. Fits training to the card: base precision, block swap, and the sample tier. The universal preset selects the detected tier; choose another to prepare a run for a smaller GPU. Selecting a value fills the VRAM controls; loading a preset restores it together with them. *(default "auto"; choices "auto", "6", "8", "10", "12", "16", "24", "32")*
+
+**Fluency filter** - `training.fluency_filter`. Which training clips teach the voice; see [Training data fluency](#training-data-fluency). Validation clips are never filtered. *(default "all"; choices "all" = All curated clips (current system), "no_long_hesitation", "fluent", "strict")*
+
+**Long hesitation (ms)** - `training.fluency_long_hesitation_ms`. A hesitation this long or longer counts as long. *(default 250; minimum 120; maximum 5000)*
+
+**Max long hesitations per clip** - `training.fluency_max_long_hesitations`. -1 means no limit. *(default -1; No long hesitations and Fluent use 0)*
+
+**Max hesitations per clip** - `training.fluency_max_hesitations`. Hesitations of any length; -1 means no limit. *(default -1; Fluent uses 1, Strictly fluent 0)*
+
+**Max pause share (%)** - `training.fluency_max_pause_percent`. Total pause time as a share of the speaking time; 100 means no limit. *(default 100; Fluent uses 12)*
+
+**Max filler words per clip** - `training.fluency_max_fillers`. Counted in the transcript; -1 means no limit. *(default -1; Strictly fluent uses 0)*
+
+**Filler words** - `training.fluency_filler_words`. Comma-separated words and phrases counted as fillers, matched as whole words in any capitalization. *(default "okay, ok, so, like, you know, you see, um, umm, uh, uhh, actually, basically, i mean, let's see, anyway")*
 
 **LoRA / DoRA name** - `training.name`. Safe output folder and final safetensors basename. *(default "voice_adapter")*
 

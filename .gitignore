@@ -19,9 +19,11 @@ conda_env*/
 *.egg-info/
 nul
 .pypirc
+projects
 .claude
 checkpoints
 # Operating System Junk.
+tests
 *.DS_Store
 Thumbs.db
 desktop.ini

@@ -7,6 +7,20 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.19",
+        "2026-09-23",
+        """
+### Fluency filters for training data
+
+- **Train on fluent clips:** the new **Training data fluency** section of LoRA / DoRA Training chooses which clips teach the voice: **All curated clips (current system)**, **No long hesitations**, **Fluent: at most one short hesitation**, or **Strictly fluent: no hesitations or filler words**. A clip's pauses are compared with its transcript: a pause where the text has no sentence end, comma, semicolon, colon or dash is a hesitation, and a trained voice copies the hesitations of its clips.
+- **Analyze dataset:** before training, a table shows the training clips and hours every filter keeps next to the complete training split. All limits are editable: long-hesitation length, long hesitations, hesitations of any length, pause share, filler words and the filler list. Edited limits get their own row and are saved in presets.
+- **Comparable runs:** validation clips are never filtered, so runs with different filters are validated on the same held-out recordings. Training uses a filtered sibling of the dataset whose audio and cached features are hard links (copies only on a drive that cannot link), so nothing is duplicated and deleting it never changes the original dataset. These filtered datasets stay out of the dataset lists.
+- **Fully local:** the measurements use each clip's pause profile and transcript. Nothing is uploaded, and no speech recognizer or model runs for the filter.
+
+Restart after updating. Existing presets, datasets and adapters remain compatible; **All curated clips** keeps the previous behaviour.
+""".strip(),
+    ),
+    (
         "v6.18",
         "2026-09-19",
         """

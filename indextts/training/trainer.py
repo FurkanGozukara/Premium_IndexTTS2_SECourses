@@ -388,6 +388,7 @@ class LoraTrainer:
         self.stop_path = self.state_dir / "stop.flag"
         self.reporter = reporter
         self.started_perf = time.perf_counter()
+        self.fluency_summary = self._prepare_fluency_dataset()
         self.reference_copy = self.adapter_dir / f"{self.config.name}_reference.wav"
         self.best_path = best_checkpoint_path(self.adapter_dir, self.config.name)
         self.last_sample = ""
@@ -402,6 +403,32 @@ class LoraTrainer:
         self.probe_plan_ready = False
         self.probe_best = probe_best_path(self.adapter_dir, self.config.name)
         self.recommended_after_decoder: str | None = None
+
+    def _prepare_fluency_dataset(self) -> dict[str, Any] | None:
+        """Train on the fluency-filtered view of the dataset when a filter is selected.
+
+        Every later stage (profile, references, evaluation, decoder adapter) reads ``config.dataset_dir``,
+        so pointing it at the view keeps the whole run on the filtered clips; the validation clips are the
+        original dataset's, and the view records which dataset it came from. A run whose dataset already is
+        a view (a resumed or attached run) is left as is.
+        """
+        from .fluency_filter import build_fluency_view, is_fluency_view, limits_from_values
+
+        config = self.config
+        if config.fluency_filter == "all" or is_fluency_view(config.dataset_dir):
+            return None
+        view, summary = build_fluency_view(
+            config.dataset_dir,
+            config.fluency_filter,
+            limits_from_values(config.to_dict()),
+            val_fraction=config.val_fraction,
+            seed=config.seed,
+            val_split_mode=config.val_split_mode,
+            log=self.log,
+        )
+        config.dataset_dir = str(view)
+        self.dataset_dir = view
+        return summary
 
     def _adopt_best_checkpoint_name(self) -> None:
         """Rename a legacy ``best/<name>.safetensors`` of this training before resuming from it."""

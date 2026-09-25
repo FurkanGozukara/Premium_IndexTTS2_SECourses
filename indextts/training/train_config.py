@@ -9,6 +9,14 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
 
+from .fluency_filter import (
+    DEFAULT_FILLER_WORDS,
+    DEFAULT_LONG_HESITATION_MS,
+    FLUENCY_FILTER_KEYS,
+    NO_LIMIT,
+    limits_from_values,
+)
+
 
 @dataclass
 class TrainConfig:
@@ -59,6 +67,17 @@ class TrainConfig:
     emo_ref_mode: str = "follow_speaker"
     max_codes: int = 1500
     max_text_tokens: int = 600
+
+    # Training-data fluency filter (fluency_filter.py): "all" trains on every curated clip as before; the
+    # other presets train on a filtered sibling dataset that keeps every validation clip. The limits hold the
+    # selected preset's values unless edited; -1 (counts) or 100 (percent) means no limit.
+    fluency_filter: str = "all"
+    fluency_long_hesitation_ms: int = DEFAULT_LONG_HESITATION_MS
+    fluency_max_long_hesitations: int = NO_LIMIT
+    fluency_max_hesitations: int = NO_LIMIT
+    fluency_max_pause_percent: float = 100.0
+    fluency_max_fillers: int = NO_LIMIT
+    fluency_filler_words: str = DEFAULT_FILLER_WORDS
 
     val_fraction: float = 0.05
     val_split_mode: str = "source"
@@ -264,6 +283,16 @@ class TrainConfig:
             )
         self.max_codes = max(1, int(self.max_codes))
         self.max_text_tokens = max(1, int(self.max_text_tokens))
+        self.fluency_filter = str(self.fluency_filter or "all").strip().lower()
+        if self.fluency_filter not in FLUENCY_FILTER_KEYS:
+            raise ValueError("fluency_filter must be one of " + ", ".join(FLUENCY_FILTER_KEYS))
+        limits = limits_from_values(asdict(self))
+        self.fluency_long_hesitation_ms = limits.long_hesitation_ms
+        self.fluency_max_long_hesitations = limits.max_long_hesitations
+        self.fluency_max_hesitations = limits.max_hesitations
+        self.fluency_max_pause_percent = limits.max_pause_percent
+        self.fluency_max_fillers = limits.max_fillers
+        self.fluency_filler_words = limits.filler_words
         self.val_fraction = min(0.5, max(0.0, float(self.val_fraction)))
         self.val_split_mode = str(self.val_split_mode).strip().lower()
         if self.val_split_mode not in {"record", "source"}:

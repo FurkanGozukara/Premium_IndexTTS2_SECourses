@@ -43,6 +43,15 @@ from indextts.training.analysis import (
 from indextts.training.best_checkpoint import TRAINING_TERMINAL_PHASES as _TRAINING_TERMINAL_PHASES
 from indextts.training.checkpoint_eval import load_checkpoint_eval
 from indextts.training.dataset_manifest import load_manifest
+from indextts.training.fluency_filter import (
+    FLUENCY_FILTER_KEYS,
+    FLUENCY_PRESETS,
+    FluencyLimits,
+    analysis_markdown,
+    analyze_dataset,
+    limits_from_values,
+    preset as fluency_preset,
+)
 from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line, validation_record_ids
 from indextts.training.train_config import TrainConfig
 
@@ -335,6 +344,109 @@ def _dataset_summary(path: str | None) -> str:
     )
 
 
+FLUENCY_INTRO = (
+    "A voice copies the hesitations of the clips it learns from. Every training clip's pauses are compared with "
+    "its transcript: a pause where the text has no sentence end, comma, semicolon, colon or dash is a "
+    "**hesitation**, and one at least the long-hesitation length is a **long hesitation**. A filter trains on the "
+    "clips within its limits; validation clips are never filtered, so runs with different filters stay "
+    "comparable. **Analyze dataset** shows how much training time each filter keeps. Everything is measured "
+    "locally from the clips' audio pauses and transcripts."
+)
+FLUENCY_LIMIT_FIELDS = (
+    "fluency_long_hesitation_ms",
+    "fluency_max_long_hesitations",
+    "fluency_max_hesitations",
+    "fluency_max_pause_percent",
+    "fluency_max_fillers",
+    "fluency_filler_words",
+)
+
+
+def _fluency_description(filter_key: str | None) -> str:
+    chosen = fluency_preset(filter_key or "all")
+    note = (
+        " The limits below are not used while this option is selected."
+        if chosen.limits is None
+        else " The limits below start at this filter's values; edit them to train on your own limits."
+    )
+    return f"**{chosen.label}:** {chosen.description}{note}"
+
+
+def _fluency_preset_values(filter_key: str | None) -> tuple[Any, ...]:
+    """The description plus the selected filter's limits for the six limit controls."""
+
+    limits = fluency_preset(filter_key or "all").limits or FluencyLimits()
+    return (
+        _fluency_description(filter_key),
+        limits.long_hesitation_ms,
+        limits.max_long_hesitations,
+        limits.max_hesitations,
+        limits.max_pause_percent,
+        limits.max_fillers,
+        limits.filler_words,
+    )
+
+
+def _fluency_limits_from_controls(*values: Any) -> FluencyLimits:
+    return limits_from_values(dict(zip(FLUENCY_LIMIT_FIELDS, values)))
+
+
+def _fluency_analysis_markdown(
+    dataset_path: str | None,
+    filter_key: str | None,
+    long_ms: Any,
+    max_long: Any,
+    max_hesitations: Any,
+    max_pause: Any,
+    max_fillers: Any,
+    filler_words: Any,
+    val_fraction: Any,
+    seed: Any,
+    val_split_mode: Any,
+    progress: gr.Progress = gr.Progress(),
+) -> str:
+    """Measure the training split and tabulate the time every fluency filter keeps."""
+
+    if not dataset_path:
+        return "Select a dataset to analyze."
+    root = Path(str(dataset_path)).expanduser()
+    if not root.is_absolute():
+        root = ROOT / root
+    if not (root / "manifest.jsonl").is_file():
+        return f"No manifest.jsonl in {root}; prepare the dataset first."
+    try:
+        key = str(filter_key or "all")
+        chosen = fluency_preset(key)
+        limits = _fluency_limits_from_controls(long_ms, max_long, max_hesitations, max_pause, max_fillers, filler_words)
+        custom = limits if chosen.limits is not None and limits != chosen.limits.normalized() else None
+
+        def report_progress(done: int, total: int) -> None:
+            progress(done / max(1, total), desc=f"Measuring pauses {done}/{total}")
+
+        report = analyze_dataset(
+            root,
+            val_fraction=float(val_fraction or 0.0),
+            seed=int(seed or 0),
+            val_split_mode=str(val_split_mode or "source"),
+            custom=custom,
+            progress=report_progress,
+        )
+    except Exception as exc:
+        message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        return f"Fluency analysis failed: {message[:200]}"
+    selected = next(
+        (item for item in report["filters"] if item["key"] == ("custom" if custom is not None else key)), None
+    )
+    heading = f"### Fluency analysis of {root.name}\n\n"
+    if selected is not None:
+        heading += (
+            f"**Selected for training:** {chosen.label}{' with your limits' if custom is not None else ''}: "
+            f"{selected['clips']} of {report['training']['clips']} training clips, {selected['hours']:.2f} of "
+            f"{report['training']['hours']:.2f} h ({selected['percent_of_time']:.1f}%).\n\n"
+        )
+    return heading + analysis_markdown(report)
+
+
 def _refresh_dataset_updates(path: str | None) -> tuple[Any, str]:
     """Refresh dataset choices and recompute mutable cache status."""
 
@@ -350,10 +462,17 @@ def _training_plan_markdown(
     val_fraction: float,
     seed: int = 42,
     val_split_mode: str = "record",
+    fluency_filter: str | None = "all",
 ) -> str:
     try:
         if not dataset_path:
             return "Select a dataset to see the training plan."
+        fluency_note = ""
+        if str(fluency_filter or "all") != "all":
+            fluency_note = (
+                f"\n\nFluency filter **{fluency_preset(str(fluency_filter)).label}**: this plan counts every clip; "
+                "training uses only the clips the filter keeps. **Analyze dataset** shows that count."
+            )
         root = Path(dataset_path).expanduser()
         if not root.is_absolute():
             root = ROOT / root
@@ -376,7 +495,7 @@ def _training_plan_markdown(
             validation_count=len(validation_record_ids(rows, val_fraction, seed, val_split_mode)),
         )
         advisory = training_plan_advisory(plan, batch_size, grad_accumulation)
-        return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}"
+        return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}{fluency_note}"
     except Exception as exc:
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         return f"Training plan unavailable: {message[:160]}"
@@ -981,6 +1100,62 @@ def build_training_tab(
         tier_note = gr.Markdown(_training_tier_note(TRAIN_DEFAULTS["vram_tier"], device_default), elem_classes=["section-note"])
         _reg(registry, controls, "dataset_dir", dataset, kind="str")
         _reg(registry, controls, "vram_tier", vram_tier, kind="choice", choices=["auto", *[str(tier) for tier in VRAM_TIERS]])
+
+        with gr.Accordion("Training data fluency", open=True):
+            gr.Markdown(FLUENCY_INTRO, elem_classes=["section-note"])
+            with gr.Row(equal_height=True):
+                fluency_filter = gr.Dropdown(
+                    choices=[(item.label, item.key) for item in FLUENCY_PRESETS],
+                    value=TRAIN_DEFAULTS["fluency_filter"],
+                    label="Fluency filter",
+                    info="Which training clips teach the voice. All curated clips is the behaviour of every earlier release.",
+                    scale=4,
+                )
+                analyze_fluency = gr.Button("🔍  Analyze dataset", elem_classes=btn("lime"), scale=1)
+            fluency_description = gr.Markdown(_fluency_description(TRAIN_DEFAULTS["fluency_filter"]))
+            with gr.Row():
+                fluency_long_ms = gr.Number(
+                    value=TRAIN_DEFAULTS["fluency_long_hesitation_ms"], minimum=120, maximum=5000, precision=0,
+                    label="Long hesitation (ms)",
+                    info="A hesitation this long or longer counts as long. Pauses are measured from 120 ms.",
+                )
+                fluency_max_long = gr.Number(
+                    value=TRAIN_DEFAULTS["fluency_max_long_hesitations"], minimum=-1, maximum=1000, precision=0,
+                    label="Max long hesitations per clip", info="-1 = no limit.",
+                )
+                fluency_max_hesitations = gr.Number(
+                    value=TRAIN_DEFAULTS["fluency_max_hesitations"], minimum=-1, maximum=1000, precision=0,
+                    label="Max hesitations per clip", info="Any length. -1 = no limit.",
+                )
+                fluency_max_pause = gr.Number(
+                    value=TRAIN_DEFAULTS["fluency_max_pause_percent"], minimum=0, maximum=100,
+                    label="Max pause share (%)",
+                    info="Silence inside the speech, as a share of the speaking time. 100 = no limit.",
+                )
+                fluency_max_fillers = gr.Number(
+                    value=TRAIN_DEFAULTS["fluency_max_fillers"], minimum=-1, maximum=1000, precision=0,
+                    label="Max filler words per clip", info="Counted in the transcript. -1 = no limit.",
+                )
+            fluency_fillers = gr.Textbox(
+                value=TRAIN_DEFAULTS["fluency_filler_words"],
+                label="Filler words",
+                info="Comma-separated words and phrases counted as fillers (whole words, any capitalization).",
+            )
+            fluency_report = gr.Markdown(
+                "Press **Analyze dataset** to see the training time each filter keeps for the selected dataset."
+            )
+        _reg(registry, controls, "fluency_filter", fluency_filter, kind="choice", choices=list(FLUENCY_FILTER_KEYS))
+        for field_name, component, kind, minimum, maximum in (
+            ("fluency_long_hesitation_ms", fluency_long_ms, "int", 120, 5000),
+            ("fluency_max_long_hesitations", fluency_max_long, "int", -1, 1000),
+            ("fluency_max_hesitations", fluency_max_hesitations, "int", -1, 1000),
+            ("fluency_max_pause_percent", fluency_max_pause, "float", 0, 100),
+            ("fluency_max_fillers", fluency_max_fillers, "int", -1, 1000),
+            ("fluency_filler_words", fluency_fillers, "str", None, None),
+        ):
+            _reg(registry, controls, field_name, component, kind=kind, minimum=minimum, maximum=maximum)
+        fluency_limit_controls = [fluency_long_ms, fluency_max_long, fluency_max_hesitations, fluency_max_pause,
+                                  fluency_max_fillers, fluency_fillers]
 
         with gr.Accordion("LoRA / DoRA", open=True):
             with gr.Row():
@@ -1760,7 +1935,22 @@ def build_training_tab(
         queue=False,
     )
     dataset.change(_dataset_summary, dataset, dataset_info, queue=False)
-    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode]
+    # Choosing a filter fills in its limits; loading a saved preset (a programmatic change) keeps the saved limits.
+    fluency_filter.input(
+        _fluency_preset_values,
+        fluency_filter,
+        [fluency_description, *fluency_limit_controls],
+        queue=False,
+        show_progress="hidden",
+    )
+    fluency_filter.change(_fluency_description, fluency_filter, fluency_description, queue=False, show_progress="hidden")
+    analyze_fluency.click(
+        _fluency_analysis_markdown,
+        [dataset, fluency_filter, *fluency_limit_controls, val_fraction, seed, val_split_mode],
+        fluency_report,
+        api_name="analyze_training_fluency",
+    )
+    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode, fluency_filter]
     for plan_input in plan_inputs:
         plan_input.change(
             _training_plan_markdown,
