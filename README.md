@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.21 output numbering past task 9999:** generation no longer stops once the `outputs` folder reaches task 10000. Every digit of a task number is read, so numbering continues with 10001, and apps that share one `outputs` folder each claim a free number atomically instead of failing.
+
 **V6.20 presets keep the chosen voice decoder adapter:** loading a preset or reopening the page restores the saved **Voice decoder adapter** file, speaking rate and decoding settings instead of re-applying the adapter's automatic values; choosing an adapter by hand still applies them, and the automatic switches no longer reset the decoder. Automatic also finds the approved decoder of a training copied to another machine or drive.
 
 **V6.19 fluency filters for training data and wider decoding ranges:** LoRA / DoRA Training can train only on clips whose pauses fit their transcript, with four presets from **All curated clips (current system)** to **Strictly fluent**, editable limits, and an **Analyze dataset** table of the training time each filter keeps. Validation clips are never filtered, and the filtered dataset links the original files instead of copying them. Everything is measured locally. Voice Generation's **Length penalty** now reaches 10 (was 2), so beam search can favor complete candidates over shorter ones that drop a word, and **Diffusion steps** reaches 200 (was 100).
@@ -687,7 +689,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.20 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.21 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 

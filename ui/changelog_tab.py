@@ -7,6 +7,18 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.21",
+        "2026-09-26",
+        """
+### Output numbering continues past task 9999
+
+- **Generation no longer stops at task 10000:** task folders in `outputs` are numbered 0001, 0002 and so on. Only the first four digits of a folder name were read, so once the folder reached 10000 the next number was computed as 10000 again, which already existed, and every generation waited in that loop without an error. All digits are now read, so numbering continues with 10001.
+- **Apps sharing one outputs folder:** each task folder is now claimed atomically. When another app using the same `outputs` folder takes a number first, generation moves on to the next free number instead of failing.
+
+Restart after updating. Existing output folders are kept. On an older version that stopped generating once `outputs` reached 10000, renaming or moving that folder also restores generation.
+""".strip(),
+    ),
+    (
         "v6.20",
         "2026-09-25",
         """

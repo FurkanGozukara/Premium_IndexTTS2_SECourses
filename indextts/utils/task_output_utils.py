@@ -7,7 +7,8 @@ from typing import Dict
 from .atomic_json import write_json_atomic
 
 
-TASK_ID_RE = re.compile(r"^(\d{4})")
+# Every leading digit: task 10000 must read as 10000, not 1000 (a 4-digit match looped forever at 10000).
+TASK_ID_RE = re.compile(r"^(\d{4,})")
 INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 
@@ -54,13 +55,17 @@ def create_task_output_layout(
     subtitle_extension: str | None = None,
     image_extension: str | None = None,
 ) -> Dict[str, str | None]:
+    # Claim the folder atomically and move forward on a collision, so apps sharing one outputs
+    # folder never take the same number and the search always ends.
+    index = get_next_output_index(output_root)
     while True:
-        task_id = f"{get_next_output_index(output_root):04d}"
+        task_id = f"{index:04d}"
         task_folder = os.path.join(output_root, task_id)
-        if not os.path.exists(task_folder):
+        try:
+            os.makedirs(task_folder, exist_ok=False)
             break
-
-    os.makedirs(task_folder, exist_ok=False)
+        except FileExistsError:
+            index += 1
 
     final_basename = sanitize_output_basename(filename, fallback=task_id)
     normalized_subtitle_extension = (subtitle_extension or ".srt").strip().lower()
