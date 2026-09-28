@@ -140,6 +140,7 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
         preset_values = json.loads(preset_path.read_text(encoding="utf-8"))["values"]
         assert preset_values["dataset.boundary_mode"] == "sentence"
         assert preset_values["dataset.min_pause_boundary_ms"] == 400
+        assert preset_values["generation.length_penalty"] == 2.0
         assert preset_values["dataset.target_s"] == 14.0
         assert preset_values["dataset.min_s"] == 4.0
         assert preset_values["dataset.max_s"] == 16.0
@@ -177,6 +178,14 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
     assert registry_defaults["generation.speaking_rate"] == 1.0
     assert registry_defaults["generation.auto_lora_speaking_rate"] is True
     assert registry_defaults["grid.speaking_rate"] == 1.0
+    # A slider's build-time value is also the API default for requests that leave it out.
+    generation_sliders = {
+        spec.key: spec.component.value
+        for spec in demo.preset_registry.component_specs
+        if spec.key.startswith("generation.") and spec.component.get_block_name() == "slider"
+    }
+    assert generation_sliders["generation.length_penalty"] == registry_defaults["generation.length_penalty"] == 2.0
+    assert generation_sliders == {key: registry_defaults[key] for key in generation_sliders}
 
     checkpoint_group = demo.ui_tabs["Checkpoint Grid"].checkpoint_group
     assert checkpoint_group.get_block_name() == "checkboxgroup"

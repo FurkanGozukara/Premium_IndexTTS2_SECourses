@@ -7,6 +7,8 @@
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
 
+**V6.22 length penalty 2.0 by default:** the built-in settings, every GPU tier preset and API generation requests that leave it out now use Length penalty 2.0 instead of 0, so beam search no longer prefers the shortest finished candidate, which could drop a word; user presets keep their stored value.
+
 **V6.21 output numbering past task 9999:** generation no longer stops once the `outputs` folder reaches task 10000. Every digit of a task number is read, so numbering continues with 10001, and apps that share one `outputs` folder each claim a free number atomically instead of failing.
 
 **V6.20 presets keep the chosen voice decoder adapter:** loading a preset or reopening the page restores the saved **Voice decoder adapter** file, speaking rate and decoding settings instead of re-applying the adapter's automatic values; choosing an adapter by hand still applies them, and the automatic switches no longer reset the decoder. Automatic also finds the approved decoder of a training copied to another machine or drive.
@@ -205,7 +207,7 @@ The autoregressive stage decides semantic tokens; the diffusion stage turns thos
 - Top-p and top-k: restrict the token candidate pool. Top-k 0 disables that filter.
 - Beams: can improve stability, but multiplies time and VRAM. Optional acceleration expects beams 1.
 - Repetition penalty: prevents semantic-token loops; keep the established default unless diagnosing repeats.
-- Length penalty: affects beam search only; 0 is neutral.
+- Length penalty: affects beam search only; the default 2 lets complete candidates win, while 0 favors the shortest one, which can drop a word.
 - Max mel tokens: a safety ceiling, not a requested duration.
 - Candidates: consecutive seeded alternatives from one request; each costs another generation.
 - Diffusion steps: 12-16 is a faster draft range, 25 is the registered/system-default value, and the quality preset uses 40; 35-50 can refine difficult material.
@@ -689,7 +691,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.21 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.22 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -931,7 +933,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Repetition window (codes)** - `generation.repetition_window`. 0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second. *(default 0; minimum 0; maximum 256)*
 
-**Length penalty** - `generation.length_penalty`. Only affects beam search. 0 ranks finished beams by total probability, which favors the shortest one; positive values let complete, longer candidates win. *(default 0; minimum -2; maximum 10)*
+**Length penalty** - `generation.length_penalty`. Only affects beam search. 0 ranks finished beams by total probability, which favors the shortest one; positive values let complete, longer candidates win. *(default 2; minimum -2; maximum 10)*
 
 **Max mel tokens** - `generation.max_mel_tokens`. Upper limit on generated semantic tokens per section. *(default 1500; minimum 50; maximum 1815)*
 

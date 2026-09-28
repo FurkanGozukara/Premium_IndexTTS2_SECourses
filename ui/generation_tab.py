@@ -198,7 +198,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.num_beams": 3,
     "generation.repetition_penalty": 10.0,
     "generation.repetition_window": 0,
-    "generation.length_penalty": 0.0,
+    "generation.length_penalty": 2.0,
     "generation.max_mel_tokens": 1500,
     "generation.seed": -1,
     "generation.num_candidates": 1,
@@ -3077,7 +3077,7 @@ def build_generation_tab(
                     info="0 applies the penalty to the whole segment (the model default). Otherwise only the last N generated codes are penalized, so a stuck loop is still stopped while sounds from earlier in the segment may return; 25 codes are about one second.",
                 )
                 length = gr.Slider(
-                    -2, 10, value=0, step=0.05, label="Length penalty",
+                    -2, 10, value=GENERATION_DEFAULTS["generation.length_penalty"], step=0.05, label="Length penalty",
                     info="Only affects beam search. 0 ranks finished beams by total probability, which favors the shortest one; positive values let complete, longer candidates win.",
                 )
                 max_mel = gr.Slider(50, 1815, value=1500, step=5, label="Max mel tokens", info="Upper limit on generated semantic tokens per section.")

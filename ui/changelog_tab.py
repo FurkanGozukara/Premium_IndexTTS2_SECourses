@@ -7,6 +7,18 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v6.22",
+        "2026-09-26",
+        """
+### Length penalty 2.0 by default
+
+- **Fewer dropped words:** Length penalty now defaults to 2.0 (previously 0) in the built-in settings, in every GPU tier preset and for API generation requests that leave it out. With beam search, 0 ranks the finished candidates by their total probability, which favors the shortest one, so a candidate that skips a word can win over a complete one; at 2.0 complete candidates win. In a word-error comparison on English narration transcribed by Whisper, 2.0 lowered the frequency-weighted word error rate by about 7 to 11 percent with a trained voice adapter, at the same speaking pace and generation time. Without an adapter the change pointed the same way but stayed within the run-to-run variation. Higher values matched 2.0 in most takes and were slightly worse in the rest.
+- **Your presets keep their value:** user presets store their own Length penalty and load it unchanged; set 2.0 there to adopt the new default. Training sample renders keep their own setting, so new trainings stay comparable with earlier ones.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v6.21",
         "2026-09-26",
         """

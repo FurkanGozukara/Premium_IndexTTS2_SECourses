@@ -114,7 +114,7 @@
     "generation.interval_silence": 200,
     "generation.language": "EN",
     "generation.latent_multiplier": 1.72,
-    "generation.length_penalty": 0.0,
+    "generation.length_penalty": 2.0,
     "generation.low_memory_mode": true,
     "generation.max_consecutive_silence": 0,
     "generation.max_emotion_audio_length": 15.0,
