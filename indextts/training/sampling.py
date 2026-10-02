@@ -76,6 +76,9 @@ def resolve_sample_runtime(
     if getattr(config, "tts_model", "indextts") == "omnivoice":
         from indextts.runtime.omnivoice_presets import resolve_preset as resolve_omni
         runtime = resolve_omni(str(resolved), total, free)
+    elif getattr(config, "tts_model", "indextts") == "auk":
+        from indextts.runtime.auk_presets import resolve_preset as resolve_auk
+        runtime = resolve_auk(str(resolved), total, free)
     else:
         runtime = resolve_preset(str(resolved), total, free)
     runtime.device = config.device
@@ -95,6 +98,17 @@ def _sample_language(config: TrainConfig) -> str:
         if rows:
             language = str(rows[0].get("language") or "").strip().upper()
     return language if language in _SAMPLE_LANGUAGES else "EN"
+
+
+def auk_request_settings(config, reference=None) -> dict:
+    """AuK generation settings for training samples and the speech comparison: a voice trained without
+    reference prompts speaks in Auto voice mode, otherwise it clones the training reference."""
+    settings = {"mode": "auto" if config.auk_prompt_fraction <= 0 else "clone", "num_step": config.auk_num_step,
+                "guidance_scale": config.auk_guidance_scale}
+    transcript = Path(reference).with_suffix(".txt") if reference else None
+    if transcript is not None and transcript.is_file():
+        settings["reference_text"] = transcript.read_text(encoding="utf-8-sig")
+    return settings
 
 
 def generate_training_sample(
@@ -227,6 +241,8 @@ def generate_training_sample(
         request["omnivoice"] = {"mode":"clone", "num_step":config.omni_num_step,
             "guidance_scale":config.omni_guidance_scale,
             "reference_text": reference.with_suffix(".txt").read_text(encoding="utf-8-sig") if reference.with_suffix(".txt").is_file() else ""}
+    if config.tts_model == "auk":
+        request["auk"] = auk_request_settings(config, reference)
     write_json_atomic(request_path, request, indent=2, ensure_ascii=False)
     worker = Path(__file__).resolve().parents[2] / "webui_subprocess_worker.py"
     command = [

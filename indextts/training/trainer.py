@@ -2594,6 +2594,9 @@ def run_training(
     if config.tts_model == "omnivoice":
         from .omnivoice_trainer import OmniVoiceTrainer
         return OmniVoiceTrainer(config, state_dir=state_dir, reporter=reporter).run()
+    if config.tts_model == "auk":
+        from .auk_trainer import AukTrainer
+        return AukTrainer(config, state_dir=state_dir, reporter=reporter).run()
     return LoraTrainer(config, state_dir=state_dir, reporter=reporter).run()
 
 

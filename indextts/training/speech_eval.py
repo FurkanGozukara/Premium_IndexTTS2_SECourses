@@ -519,6 +519,11 @@ def _benchmark_runtime(config: Any) -> Any:
 
 
 def _benchmark_infer_kwargs(config: Any) -> dict[str, Any]:
+    if getattr(config, "tts_model", "indextts") == "auk":
+        from .sampling import auk_request_settings
+        return {"auk": auk_request_settings(config), "max_text_tokens_per_segment": config.sample_max_text_tokens,
+                "section_batch_size": 1, "latent_multiplier": round(1.72 / config.sample_speaking_rate, 4),
+                "enable_pause_tags": True}
     if getattr(config, "tts_model", "indextts") == "omnivoice":
         return {"omnivoice": {"mode":"clone", "num_step":config.omni_num_step,"guidance_scale":config.omni_guidance_scale},
                 "max_text_tokens_per_segment":config.sample_max_text_tokens, "section_batch_size":1,

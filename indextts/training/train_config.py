@@ -35,6 +35,18 @@ class TrainConfig:
     omni_batch_tokens: int = 0
     # Train on transcripts normalized exactly as generation normalizes text.
     omni_normalize_text: bool = True
+    # AuK: share of training clips paired with a reference prompt of another clip (0 teaches the voice to
+    # speak from its description alone, Auto voice); the description it learns; the longest reference
+    # prompt; adapters on the adaLN modulation projections too; latent frames per micro-batch (0 keeps a
+    # fixed clip count); sampling of training samples and the speech comparison.
+    auk_prompt_fraction: float = 0.0
+    auk_voice_description: str = ""
+    auk_reference_seconds: float = 10.0
+    auk_target_adaln: bool = True
+    auk_batch_frames: int = 0
+    auk_num_step: int = 32
+    auk_guidance_scale: float = 2.0
+    auk_normalize_text: bool = True
 
     adapter_type: str = "dora"
     rank: int = 128
@@ -244,8 +256,16 @@ class TrainConfig:
         self.omni_guidance_scale = max(0.0, _finite_float(self.omni_guidance_scale, "omni_guidance_scale"))
         self.omni_batch_tokens = max(0, int(self.omni_batch_tokens))
         self.omni_normalize_text = bool(self.omni_normalize_text)
+        self.auk_prompt_fraction = min(1.0, max(0.0, _finite_float(self.auk_prompt_fraction, "auk_prompt_fraction")))
+        self.auk_voice_description = str(self.auk_voice_description or "").strip()
+        self.auk_reference_seconds = min(30.0, max(3.0, _finite_float(self.auk_reference_seconds, "auk_reference_seconds")))
+        self.auk_target_adaln = bool(self.auk_target_adaln)
+        self.auk_batch_frames = max(0, int(self.auk_batch_frames))
+        self.auk_num_step = max(4, int(self.auk_num_step))
+        self.auk_guidance_scale = max(0.0, _finite_float(self.auk_guidance_scale, "auk_guidance_scale"))
+        self.auk_normalize_text = bool(self.auk_normalize_text)
         self.adapter_type = str(self.adapter_type).lower()
-        if self.adapter_type not in ({"lora", "dora", "full"} if self.tts_model == "omnivoice" else {"lora", "dora"}):
+        if self.adapter_type not in ({"lora", "dora", "full"} if self.tts_model in {"omnivoice", "auk"} else {"lora", "dora"}):
             raise ValueError("LoRA / DoRA type must be 'lora' or 'dora'")
         self.rank = max(1, int(self.rank))
         self.alpha = float(self.alpha)
@@ -289,8 +309,8 @@ class TrainConfig:
         if self.optimizer not in {"adamw", "adamw_fused", "prodigy"}:
             raise ValueError("unsupported optimizer")
 
-        # OmniVoice resolves 0 from the training audio (training.plan.automatic_epochs).
-        self.epochs = max(0 if self.tts_model == "omnivoice" else 1, int(self.epochs))
+        # OmniVoice and AuK resolve 0 from the training audio (training.plan.automatic_epochs).
+        self.epochs = max(0 if self.tts_model in {"omnivoice", "auk"} else 1, int(self.epochs))
         self.max_steps = max(0, int(self.max_steps))
         self.batch_size = max(1, int(self.batch_size))
         self.grad_accumulation = max(1, int(self.grad_accumulation))
