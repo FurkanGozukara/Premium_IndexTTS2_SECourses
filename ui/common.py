@@ -552,6 +552,29 @@ APPLY_VALUES_JS = """
 """
 
 
+def front_hidden_plumbing(demo: Any) -> int:
+    """Put the page-level hidden helpers (payload boxes, API triggers, State) before the page.
+
+    Gradio 6.29's browser finds a component by walking the layout depth-first, for every
+    state read and update, and each event refreshes the loading status of every component
+    an earlier event used as an input or output, payload boxes included. Placed after the
+    page, each of those lookups walks every component; placed first, a few. They render
+    nothing, so the page looks the same. Returns how many moved.
+    """
+
+    from gradio.blocks import BlockContext
+
+    def hidden(block: Any) -> bool:
+        return isinstance(block, gr.State) or (not isinstance(block, BlockContext)
+                                               and getattr(block, "visible", True) is False)
+
+    children = demo.children
+    moved = [child for child in children if hidden(child)]
+    if moved:
+        children[:] = [*moved, *(child for child in children if not hidden(child))]
+    return len(moved)
+
+
 def untrack_hidden_progress(demo: Any) -> int:
     """Give hidden-progress events no progress targets.
 

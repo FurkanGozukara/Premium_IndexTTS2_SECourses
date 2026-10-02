@@ -39,6 +39,7 @@ from .common import (
     app_theme,
     apply_values,
     btn,
+    front_hidden_plumbing,
     gather_values,
     payload_values,
     runtime_config_from_values,
@@ -629,8 +630,10 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                     preset_dropdown,
                     queue=False,
                 )
-        # Last, once every event exists: hidden-progress events track no output status.
+        # Last, once every event exists: hidden-progress events track no output status,
+        # and the hidden helpers move before the page, where Gradio finds them quickly.
         untrack_hidden_progress(demo)
+        front_hidden_plumbing(demo)
 
     coverage = startup_request_self_check(registry, options.model_dir)
     startup_values = store.load(initial_last)
