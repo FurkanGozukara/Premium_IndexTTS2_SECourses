@@ -147,6 +147,9 @@ def create_tts(
     if model_id == "omnivoice":
         from indextts.backends.omnivoice import OmniVoiceEngine
         return OmniVoiceEngine(model_dir, runtime, progress_callback)
+    if model_id == "auk":
+        from indextts.backends.auk import AukEngine
+        return AukEngine(model_dir, runtime, progress_callback)
     from indextts.infer_v2_5 import IndexTTS2
     if runtime.gpt_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         print(">> BF16 is unavailable on this GPU; using full precision.")
@@ -534,6 +537,8 @@ def run_generation_request(
     infer_kwargs = dict(request["infer_kwargs"])
     if request.get("omnivoice") is not None:
         infer_kwargs["omnivoice"] = request["omnivoice"]
+    if request.get("auk") is not None:
+        infer_kwargs["auk"] = request["auk"]
     # Normal generation, batch items and subtitle units share these exact
     # Gradio request values, including disabled recovery and zero budgets.
     recovery = SpeechRecoveryConfig(

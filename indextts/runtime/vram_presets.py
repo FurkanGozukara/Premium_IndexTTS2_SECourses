@@ -90,6 +90,10 @@ class RuntimeConfig:
     # Strength of the voice decoder adapter, independent of the GPT adapter's strength.
     decoder_adapter_strength: float = 1.0
     max_section_batch_size_hint: int = 8
+    # AuK's Qwen2.5-Omni text/audio encoder: precision, and whether it stays on the GPU
+    # ("gpu") or waits in pinned CPU memory between encodes ("on_demand").
+    auk_text_encoder_variant: str = "bf16"
+    auk_text_encoder_residency: str = "gpu"
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -194,6 +198,10 @@ class RuntimeConfig:
         self.decoder_adapter = self.decoder_adapter or "auto"
         self.decoder_adapter_strength = _clamp_float(self.decoder_adapter_strength, 0.0, 4.0, 1.0)
         self.max_section_batch_size_hint = _clamp_int(self.max_section_batch_size_hint, 1, 64, 8)
+        text_variant = str(self.auk_text_encoder_variant or "bf16").strip().lower()
+        self.auk_text_encoder_variant = text_variant if text_variant in {"bf16", "int8_convrot"} else "bf16"
+        residency = str(self.auk_text_encoder_residency or "gpu").strip().lower()
+        self.auk_text_encoder_residency = residency if residency in {"gpu", "on_demand"} else "gpu"
         return self
 
 

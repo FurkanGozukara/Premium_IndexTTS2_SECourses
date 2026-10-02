@@ -1,0 +1,697 @@
+"""Tencent AuK behind the application's shared generation/adapter contract.
+
+AuK is a flow-matching transformer conditioned on a natural-language instruction
+(encoded with the Qwen2.5-Omni Thinker) and, optionally, a reference recording
+(prepended as VAE latents). Speech length is not predicted by the model: every
+section is generated at a duration estimated here from the text, the reference
+speaker's measured pace, or a trained voice's calibrated pace.
+"""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import math
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import torch
+
+from indextts.auk import AUK_REPO, LATENT_RATE, MAX_CONTEXT_SECONDS, QWEN_OMNI_REPO, SAMPLE_RATE
+from indextts.runtime.vram_presets import RuntimeConfig
+from indextts.utils.audio_plan import assemble_audio_plan, fit_target_samples, trim_segment_silence
+from indextts.utils.pause_tags import PauseChunk, TextChunk, split_text_with_pauses
+from indextts.utils.text_segmentation import ends_sentence, normalize_sentence_whitespace, split_text_by_tokens
+
+MODEL_REPO = AUK_REPO
+TEXT_ENCODER_REPO = QWEN_OMNI_REPO
+QUANT_REPO = "MonsterMMORPG/Wan_GGUF"
+QUANT_FILES = {
+    "dit": "AuK/auk_dit_convrot_int8.safetensors",
+    "text": "AuK/qwen_omni_thinker_convrot_int8.safetensors",
+}
+ROOT = Path(__file__).resolve().parents[2]
+REFERENCE_CACHE_DIR = ROOT / ".ui_state" / "auk_references"
+REFERENCE_CACHE_VERSION = 1
+HOP = SAMPLE_RATE // LATENT_RATE  # 480 samples per latent frame
+
+# Upstream's zero-shot TTS and instruct TTS templates (docs/COOKBOOK.md), verbatim:
+# changing their wording makes the model read the instruction aloud or repeat the
+# reference. Zero-shot TTS uses the English template for every language.
+CLONE_TEMPLATE = 'Say the following with the same voice: "{text}"'
+DESIGN_TEMPLATE = 'Generate speech based on the following description: "{description}". The content to speak is: "{text}".'
+DESIGN_TEMPLATE_ZH = '请基于下面的描述: "{description}",生成语音内容"{text}".'
+# A trained voice speaks without a reference; its training used this description.
+TRAINED_VOICE_DESCRIPTION = "The trained speaker's natural voice, clear studio recording"
+
+GENERATION_DEFAULTS = {
+    "mode": "clone", "reference_text": "", "voice_description": "",
+    "num_step": 32, "guidance_scale": 2.0, "sway_coef": -1.0, "solver": "euler",
+    "max_reference_seconds": 12.0, "trim_reference_silence": True,
+    "speech_rate": 0.0, "edge_seconds": 0.25, "match_loudness": True,
+}
+# Characters (UTF-8 bytes, as upstream measures text) per second of ordinary speech
+# when neither a reference nor a trained voice gives the pace. One CJK character is
+# three bytes, so Mandarin at about 4.5 characters per second lands near English's
+# 14 characters per second.
+DEFAULT_BYTES_PER_SECOND = 14.0
+SEGMENT_SECONDS_LIMIT = MAX_CONTEXT_SECONDS
+
+
+_NORMALIZER = None
+_NORMALIZER_LOCK = threading.Lock()
+
+
+def detect_language(text: str) -> str:
+    return "zh" if re.search(r"[一-鿿]", str(text)) else "en"
+
+
+def normalize_auk_text(text: str, language: str = "auto") -> str:
+    """The app's WeText normalization (numbers, versions and units spelled out) for English and Chinese.
+
+    Other languages pass through unchanged; training normalizes transcripts the same way.
+    """
+    global _NORMALIZER
+    language = str(language or "auto").lower()
+    if language == "auto":
+        language = detect_language(text)
+    if language not in {"en", "zh"} or not str(text).strip():
+        return str(text)
+    with _NORMALIZER_LOCK:
+        if _NORMALIZER is None:
+            from indextts.utils.front import TextNormalizer
+
+            normalizer = TextNormalizer()
+            normalizer.load()
+            _NORMALIZER = normalizer
+    stripped = text.strip()
+    normalized = _NORMALIZER.normalize(stripped, lang=language) or stripped
+    return text[:len(text) - len(text.lstrip())] + normalized + text[len(text.rstrip()):]
+
+
+def text_units(text: str) -> int:
+    """Upstream's duration measure: the UTF-8 byte length of the spoken text."""
+    return len(str(text).strip().encode("utf-8"))
+
+
+def quote_text(text: str) -> str:
+    """Text placed inside the template's double quotes; inner quotes become typographic."""
+    return re.sub(r'"([^"]*)"', "“\\1”", str(text).strip()).replace('"', "”")
+
+
+def build_instruction(text: str, mode: str, description: str = "", language: str = "en") -> str:
+    if mode == "clone":
+        return CLONE_TEMPLATE.format(text=quote_text(text))
+    description = str(description or "").strip() or TRAINED_VOICE_DESCRIPTION
+    template = DESIGN_TEMPLATE_ZH if str(language).lower() == "zh" else DESIGN_TEMPLATE
+    return template.format(description=quote_text(description), text=quote_text(text))
+
+
+def trained_voice(adapter_path) -> dict:
+    """The training run's saved voice record (pace and the description it was trained with)."""
+    if not adapter_path:
+        return {}
+    source = Path(adapter_path)
+    run_dir = source.parent.parent if source.parent.name.lower() == "best" else source.parent
+    try:
+        record = json.loads((run_dir / "auk_voice.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def validate_voice_settings(settings):
+    mode = settings.get("mode", "clone")
+    if mode not in {"auto", "clone", "design"}:
+        raise ValueError("Unknown AuK voice mode")
+    if mode == "design" and not str(settings.get("voice_description") or "").strip():
+        raise ValueError("Describe the voice for Voice design, for example: a calm middle-aged man with a deep, warm voice.")
+
+
+def ensure_model(model_dir, *, dit_variant="bf16", text_variant="bf16", progress=None):
+    """Download public weights on demand, retaining Hugging Face's resume cache."""
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    root = Path(model_dir)
+    folder, qwen = root / "auk", root / "qwen2_5_omni_3b"
+    if not all((folder / name).is_file() for name in ("config.yaml", "auk_base.safetensors", "vae.safetensors")):
+        print(f">> Downloading public AuK model to {folder}", flush=True)
+        if progress:
+            progress(0, desc="Downloading AuK weights")
+        snapshot_download(MODEL_REPO, local_dir=str(folder), allow_patterns=["*.safetensors", "config.yaml", "LICENSE"])
+    if not all((qwen / name).is_file() for name in ("config.json", "preprocessor_config.json", "tokenizer.json")) \
+            or not any(qwen.glob("*.safetensors")):
+        print(f">> Downloading the Qwen2.5-Omni-3B text and audio encoder to {qwen}", flush=True)
+        if progress:
+            progress(0, desc="Downloading the Qwen2.5-Omni-3B encoder")
+        snapshot_download(TEXT_ENCODER_REPO, local_dir=str(qwen))
+    quantized = {}
+    for part, wanted in (("dit", dit_variant), ("text", text_variant)):
+        if wanted != "int8_convrot":
+            continue
+        path = root / "quantized" / QUANT_FILES[part]
+        if not path.is_file():
+            print(f">> Downloading AuK ConvRot INT8 weights ({part})", flush=True)
+            path = Path(hf_hub_download(QUANT_REPO, QUANT_FILES[part], local_dir=str(root / "quantized")))
+        quantized[part] = path
+    return folder, qwen, quantized
+
+
+def _quiet_frames(audio: np.ndarray, frame: int) -> np.ndarray:
+    count = len(audio) // frame
+    if count == 0:
+        return np.zeros(0, dtype=np.float32)
+    frames = audio[: count * frame].reshape(count, frame)
+    return np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+
+
+def trim_silence(audio: np.ndarray, sample_rate: int, *, gate_db: float = -40.0, margin_s: float = 0.1) -> np.ndarray:
+    """Trim leading and trailing audio quieter than ``gate_db`` below the peak, keeping a margin."""
+    frame = max(1, int(sample_rate * 0.01))
+    rms = _quiet_frames(audio, frame)
+    if not len(rms):
+        return audio
+    peak = float(rms.max())
+    if peak <= 0:
+        return audio
+    loud = np.nonzero(rms >= peak * 10 ** (gate_db / 20.0))[0]
+    if not len(loud):
+        return audio
+    margin = int(margin_s * sample_rate)
+    start = max(0, int(loud[0]) * frame - margin)
+    end = min(len(audio), (int(loud[-1]) + 1) * frame + margin)
+    return audio[start:end]
+
+
+def cut_at_pause(audio: np.ndarray, sample_rate: int, max_seconds: float) -> np.ndarray:
+    """Shorten audio to at most ``max_seconds``, cutting at the quietest point of the last 3 seconds."""
+    limit = int(max_seconds * sample_rate)
+    if len(audio) <= limit:
+        return audio
+    frame = max(1, int(sample_rate * 0.05))
+    window_start = max(0, limit - 3 * sample_rate)
+    rms = _quiet_frames(audio[window_start:limit], frame)
+    if not len(rms):
+        return audio[:limit]
+    cut = window_start + int(np.argmin(rms)) * frame + frame // 2
+    return audio[: max(frame, cut)]
+
+
+def read_audio(path) -> tuple[np.ndarray, int]:
+    """Mono float32 audio at its native rate; non-WAV containers go through librosa/FFmpeg."""
+    try:
+        audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+    except Exception:
+        import librosa
+
+        audio, sample_rate = librosa.load(str(path), sr=None, mono=True)
+    audio = np.asarray(audio, dtype=np.float32)
+    if not len(audio) or not np.isfinite(audio).all():
+        raise ValueError(f"The audio file is empty or damaged: {Path(path).name}")
+    return audio, int(sample_rate)
+
+
+def resample(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    """Upstream resamples the VAE input with torchaudio's windowed sinc; this is the same filter."""
+    if int(source_rate) == int(target_rate):
+        return np.asarray(audio, dtype=np.float32)
+    try:
+        import torchaudio.functional as AF
+
+        tensor = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
+        return AF.resample(tensor, int(source_rate), int(target_rate)).squeeze(0).numpy()
+    except Exception:
+        import librosa
+
+        return librosa.resample(audio, orig_sr=int(source_rate), target_sr=int(target_rate), res_type="soxr_hq")
+
+
+def _rms(audio) -> float:
+    array = audio.detach().float().cpu().numpy() if isinstance(audio, torch.Tensor) else np.asarray(audio, dtype=np.float32)
+    array = array.reshape(-1)
+    return float(np.sqrt(np.mean(array * array) + 1e-12)) if array.size else 0.0
+
+
+class OffloadedModule:
+    """Keep a frozen module in pinned CPU memory and lend it to the GPU while it runs.
+
+    Weights never change, so offloading only rebinds every tensor to its pinned
+    CPU copy (no device-to-host copy); loading is one asynchronous host-to-device
+    copy per tensor.
+    """
+
+    def __init__(self, module: torch.nn.Module, device):
+        self.module, self.device = module, torch.device(device)
+        self.cpu = {}
+        for owner in module.modules():
+            for collection in (owner._parameters, owner._buffers):
+                for name, tensor in collection.items():
+                    if tensor is not None and tensor.device.type == "cpu":
+                        pinned = tensor.detach().pin_memory() if torch.cuda.is_available() else tensor.detach()
+                        self.cpu[(id(owner), name)] = pinned
+                        collection[name] = torch.nn.Parameter(pinned, requires_grad=False) \
+                            if isinstance(tensor, torch.nn.Parameter) else pinned
+        self.active = False
+
+    def activate(self, active: bool):
+        if bool(active) == self.active:
+            return
+        started = time.perf_counter()
+        for owner in self.module.modules():
+            for collection in (owner._parameters, owner._buffers):
+                for name, tensor in list(collection.items()):
+                    pinned = self.cpu.get((id(owner), name))
+                    if pinned is None or tensor is None:
+                        continue
+                    value = pinned.to(self.device, non_blocking=True) if active else pinned
+                    collection[name] = torch.nn.Parameter(value, requires_grad=False) \
+                        if isinstance(tensor, torch.nn.Parameter) else value
+        if active:
+            torch.cuda.synchronize(self.device)
+        else:
+            torch.cuda.empty_cache()
+        self.active = bool(active)
+        print(f">> AuK text encoder {'on GPU' if active else 'offloaded'} in {time.perf_counter() - started:.2f}s", flush=True)
+
+
+class PreparedReference:
+    """A reference cut for the model: 24 kHz for the VAE, 16 kHz for the Qwen audio encoder."""
+
+    def __init__(self, audio24: np.ndarray, audio16: np.ndarray, transcript: str, speech_seconds: float,
+                 bytes_per_second: float | None, source: str):
+        self.audio24, self.audio16 = audio24, audio16
+        self.transcript, self.speech_seconds = transcript, speech_seconds
+        self.bytes_per_second, self.source = bytes_per_second, source
+        self.seconds = len(audio24) / SAMPLE_RATE
+        self.rms = _rms(audio24)
+        self.latent = None
+
+
+class AukEngine:
+    sampling_rate = SAMPLE_RATE
+    model_id = "auk"
+
+    def __init__(self, model_dir="models", runtime=None, progress_callback=None):
+        from indextts.auk.conditioning import QwenConditioner
+        from indextts.auk.loader import build_model, build_vae, read_config, read_state
+
+        self.runtime = RuntimeConfig.from_dict(runtime)
+        self.device = self.runtime.device
+        if self.device == "auto":
+            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        cuda = str(self.device).startswith("cuda")
+        if cuda:
+            torch.set_num_threads(min(torch.get_num_threads(), 8))
+        self.dtype = torch.bfloat16 if cuda and self.runtime.gpt_dtype != "fp32" else torch.float32
+        self.low_vram = self._runtime_low_vram = False
+        self.progress_reporter = self.gr_progress = None
+        self.last_generation_stats = {}
+        self._lora_path, self._lora_strength, self._lora_merged = "", 1.0, False
+        self._reference_key, self._reference = None, None
+        self._voice = {}
+        self.text_residency = self.runtime.auk_text_encoder_residency if cuda else "gpu"
+        folder, qwen_dir, quantized = ensure_model(
+            model_dir, dit_variant=self.runtime.model_variant, text_variant=self.runtime.auk_text_encoder_variant,
+            progress=progress_callback)
+        self.model_dir, self.folder = Path(model_dir), folder
+        started = time.perf_counter()
+        print(f">> Loading AuK | {self.device} | {self.dtype} | transformer {self.runtime.model_variant} | "
+              f"text encoder {self.runtime.auk_text_encoder_variant} ({self.text_residency})", flush=True)
+        self.config = read_config(folder)
+        text_device = self.device if self.text_residency == "gpu" else "cpu"
+        self.conditioner = QwenConditioner(qwen_dir, device=text_device, dtype=torch.bfloat16 if cuda else torch.float32,
+                                           attn_implementation=self.runtime.attention_backend)
+        if "text" in quantized:
+            from indextts.quant.convrot_int8 import load_gpt_checkpoint
+
+            load_gpt_checkpoint(self.conditioner.model.model, str(quantized["text"]), device=text_device,
+                                dtype=torch.bfloat16, strict=True)
+        self._text_offload = OffloadedModule(self.conditioner.model, self.device) if self.text_residency != "gpu" else None
+        num_layers = self.conditioner.num_layers
+        if "dit" in quantized:
+            from indextts.auk.loader import build_int8_model
+
+            self.model = build_int8_model(self.config, quantized["dit"], device=self.device, num_text_layers=num_layers)
+        else:
+            state = read_state(folder / "auk_base.safetensors")
+            self.model = build_model(self.config, state, device=self.device, dtype=self.dtype, num_text_layers=num_layers)
+            del state
+        self.vae = build_vae(self.config, folder / "vae.safetensors", device=self.device)
+        gc.collect()
+        if cuda:
+            torch.cuda.empty_cache()
+        print(f">> AuK ready in {time.perf_counter() - started:.1f}s", flush=True)
+        self.set_lora(self.runtime.lora_path, self.runtime.lora_strength, merge_into_base=self.runtime.lora_merge_into_base)
+
+    # ------------------------------------------------------------------ residency
+
+    def _text_encoder_on(self, active: bool):
+        if self._text_offload is not None:
+            self._text_offload.activate(active)
+            self.conditioner.device = torch.device(self.device if active else "cpu")
+
+    # ------------------------------------------------------------------ adapters
+
+    def set_lora(self, path, strength=1.0, *, merge_into_base=False, **_kwargs):
+        from indextts.lora import apply_lora, inspect_lora, merge_lora_for_inference, remove_lora
+
+        path = os.path.abspath(str(path)) if path else ""
+        metadata = {}
+        if path:
+            metadata = inspect_lora(path)
+            base = str(metadata.get("base_model", "")).lower()
+            if "auk" not in base:
+                owner = "OmniVoice" if "omnivoice" in base else "IndexTTS"
+                raise ValueError(f"This adapter belongs to {owner}. Select an AuK adapter or clear the adapter selection.")
+            if metadata.get("adapter_type") == "full" and self.runtime.model_variant != "bf16":
+                raise ValueError("Select BF16 before loading a full fine-tuning checkpoint.")
+        remove_lora(self.model)
+        if path:
+            apply_lora(self.model, path, strength=float(strength))
+            if merge_into_base:
+                merge_lora_for_inference(self.model)
+        self._lora_path, self._lora_strength, self._lora_merged = path, float(strength), bool(merge_into_base)
+        self.model.eval().requires_grad_(False)
+        self._voice = trained_voice(path)
+
+    # ------------------------------------------------------------------ text
+
+    def split_text_by_tokens(self, text, max_tokens, lang_prefix="", *, mode="budget", target_tokens=None):
+        tokenizer = self.conditioner.processor.tokenizer
+        return split_text_by_tokens(text, max_tokens, capacity=4096,
+            token_len=lambda value: len(tokenizer.encode(value, add_special_tokens=False)),
+            mode=mode, target_tokens=target_tokens, segment_budget_scale_non_cjk=1.0)
+
+    # ------------------------------------------------------------------ reference
+
+    def prepare_reference(self, path, settings, language="auto") -> PreparedReference:
+        """Load, trim and transcribe a reference once; later calls reuse it until the file changes."""
+        stat = Path(path).stat()
+        transcript_file = Path(path).with_suffix(".txt")
+        transcript = str(settings.get("reference_text") or "").strip()
+        if not transcript and transcript_file.is_file():
+            transcript = transcript_file.read_text(encoding="utf-8-sig").strip()
+        key = (str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size, transcript,
+               float(settings["max_reference_seconds"]), bool(settings["trim_reference_silence"]))
+        if key == self._reference_key and self._reference is not None:
+            return self._reference
+        audio, rate = read_audio(path)
+        if settings["trim_reference_silence"]:
+            audio = trim_silence(audio, rate)
+        full_seconds = len(audio) / rate
+        if not transcript:
+            transcript = self._cached_transcript(path, audio, rate, language)
+        units = text_units(transcript)
+        bytes_per_second = units / full_seconds if units and full_seconds > 0.5 else None
+        audio = cut_at_pause(audio, rate, float(settings["max_reference_seconds"]))
+        audio24 = resample(audio, rate, SAMPLE_RATE)
+        audio24 = audio24[: len(audio24) // HOP * HOP]
+        from indextts.auk.conditioning import to_encoder_rate
+
+        audio16 = to_encoder_rate(audio, rate)
+        reference = PreparedReference(audio24, audio16, transcript, full_seconds, bytes_per_second, str(path))
+        self._reference_key, self._reference = key, reference
+        return reference
+
+    def _cached_transcript(self, path, audio, rate, language) -> str:
+        """Transcribe a reference with the app's Whisper model once, cached by audio content."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        digest.update(json.dumps([REFERENCE_CACHE_VERSION]).encode("utf-8"))
+        cached = REFERENCE_CACHE_DIR / f"{digest.hexdigest()[:32]}.json"
+        try:
+            return str(json.loads(cached.read_text(encoding="utf-8"))["transcript"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        from indextts.training.whisper_asr import transcribe
+
+        lang = str(language or "auto").lower()
+        lang = lang if lang in {"en", "zh"} else "en"
+        print(f">> Transcribing reference {Path(path).name} once with Whisper (pace estimate)", flush=True)
+        transcript = transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
+                                device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
+        try:
+            REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            temporary = cached.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(json.dumps({"transcript": transcript, "source": Path(path).name}), encoding="utf-8")
+            os.replace(temporary, cached)
+        except OSError as exc:
+            print(f">> AuK reference transcript cache not written ({exc})", flush=True)
+        print(f">> Reference transcript: {transcript}", flush=True)
+        return transcript
+
+    def _reference_latent(self, reference: PreparedReference):
+        if reference.latent is None:
+            audio = torch.from_numpy(reference.audio24).to(self.device).view(1, 1, -1)
+            with torch.inference_mode():
+                latent, _ = self.vae.encode(audio)
+            reference.latent = latent[0]
+        return reference.latent
+
+    # ------------------------------------------------------------------ duration
+
+    def speech_rate(self, settings, reference: PreparedReference | None) -> float:
+        """Bytes of text per second of speech for the active voice."""
+        explicit = float(settings.get("speech_rate") or 0.0)
+        if explicit > 0:
+            return explicit
+        if reference is not None and reference.bytes_per_second:
+            return float(reference.bytes_per_second)
+        voice_rate = self._voice.get("bytes_per_second")
+        if voice_rate:
+            return float(voice_rate)
+        return DEFAULT_BYTES_PER_SECOND
+
+    def estimate_seconds(self, text, rate, *, edge_seconds=0.25, duration_factor=1.0, max_seconds=None) -> float:
+        seconds = text_units(text) / max(1.0, rate) * float(duration_factor) + float(edge_seconds)
+        limit = float(max_seconds or SEGMENT_SECONDS_LIMIT)
+        return float(min(max(0.6, seconds), limit))
+
+    # ------------------------------------------------------------------ synthesis core
+
+    def _encode(self, instructions, audios16):
+        with torch.inference_mode():
+            inputs = self.conditioner.inputs(instructions, audios16)
+            hidden, mask = self.conditioner.hidden_states(inputs)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=str(self.device).startswith("cuda")):
+                fused = self.model.fuse([item.to(self.device) for item in hidden])
+        return fused.float(), mask.to(self.device)
+
+    def _sample(self, text, mask, ref_latents, ref_lens, target_lens, settings, seeds, step_callback=None):
+        batch = text.shape[0]
+        max_target = int(max(target_lens))
+        noise = torch.zeros(batch, max_target, self.model.num_channels, device=self.device)
+        for index, seed in enumerate(seeds):
+            generator = torch.Generator(device=self.device).manual_seed(int(seed))
+            noise[index, : target_lens[index]] = torch.randn(int(target_lens[index]), self.model.num_channels,
+                                                             device=self.device, generator=generator)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=self.dtype, enabled=str(self.device).startswith("cuda")):
+            return self.model.sample(
+                text, mask, ref_latents, ref_lens.to(self.device), torch.tensor(target_lens, device=self.device),
+                steps=int(settings["num_step"]), cfg_strength=float(settings["guidance_scale"]),
+                sway_sampling_coef=float(settings["sway_coef"]), noise=noise,
+                method=str(settings.get("solver") or "euler"), step_callback=step_callback)
+
+    def _decode(self, latent, frames):
+        with torch.inference_mode():
+            audio = self.vae.decode(self.vae.denormalize(latent[None, :frames]).permute(0, 2, 1))
+        audio = audio.reshape(1, -1).float().cpu()
+        if not audio.numel() or not torch.isfinite(audio).all():
+            raise RuntimeError("AuK returned empty or non-finite audio.")
+        return audio
+
+    def generate_batch(self, instructions, references, seconds, settings, seeds, progress=None):
+        """Render one batch: instructions[i] with optional references[i] at seconds[i]."""
+        audios16 = [reference.audio16 if reference is not None else None for reference in references]
+        self._text_encoder_on(True)
+        try:
+            text, mask = self._encode(instructions, audios16)
+        finally:
+            self._text_encoder_on(False)
+        latents = [self._reference_latent(reference) if reference is not None else None for reference in references]
+        ref_frames = [int(item.shape[0]) if item is not None else 0 for item in latents]
+        ref_latents = torch.zeros(len(references), max(ref_frames), self.model.num_channels, device=self.device)
+        for index, item in enumerate(latents):
+            if item is not None:
+                ref_latents[index, : ref_frames[index]] = item
+        target_lens = [max(1, int(math.ceil(value * LATENT_RATE))) for value in seconds]
+        generated = self._sample(text, mask, ref_latents, torch.tensor(ref_frames), target_lens, settings, seeds, progress)
+        return [self._decode(generated[index], target_lens[index]) for index in range(len(instructions))]
+
+    # ------------------------------------------------------------------ public API
+
+    def infer(self, spk_audio_prompt, text, output_path=None, lang="EN", **kwargs):
+        result = self.infer_texts(spk_audio_prompt, [text], lang=lang, **kwargs)[0]
+        if output_path:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            sf.write(output_path, result[1], result[0], subtype="PCM_16")
+            return str(output_path)
+        return result
+
+    def infer_texts(self, spk_audio_prompt, texts, lang="EN", *, auk=None,
+              max_text_tokens_per_segment=80, interval_silence=200, sentence_pause_ms=0,
+              segmentation_mode="budget", segment_target_tokens=None, enable_pause_tags=True,
+              text_normalization=True, duration_factor=1.0, seed=None, target_duration_s=None,
+              target_duration_mode="off", section_batch_size=1, on_text_complete=None,
+              trim_silence_ms_threshold=0, **_kwargs):
+        started = time.perf_counter()
+        cuda = str(self.device).startswith("cuda")
+        if cuda:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        settings = {**GENERATION_DEFAULTS, **(auk or {})}
+        validate_voice_settings(settings)
+        if target_duration_mode not in {"off", "natural", "pad", "trim"}:
+            raise ValueError("Unknown target duration mode")
+        mode = settings["mode"]
+        language = str(lang or "auto").lower()
+        if language not in {"en", "zh"}:
+            language = detect_language(" ".join(texts))
+        reference = None
+        if mode == "clone":
+            if not spk_audio_prompt or not Path(spk_audio_prompt).is_file():
+                raise ValueError("Voice cloning requires reference audio. Choose Auto voice or Voice design to generate without it.")
+            reference = self.prepare_reference(spk_audio_prompt, settings, language)
+        rate = self.speech_rate(settings, reference)
+        description = settings["voice_description"] if mode == "design" else self._voice.get("description", "")
+        budget = SEGMENT_SECONDS_LIMIT - (reference.seconds if reference is not None else 0.0)
+
+        plans, speech, owners, natural = [], [], [], []
+        for text_index, text in enumerate(texts):
+            plan, first = [], len(speech)
+            chunks = split_text_with_pauses(text) if enable_pause_tags else [TextChunk(text)]
+            for chunk in chunks:
+                if isinstance(chunk, PauseChunk):
+                    plan.append(("pause", round(chunk.duration_s * self.sampling_rate)))
+                    continue
+                source = chunk.text.strip()
+                if segmentation_mode != "budget":
+                    source = normalize_sentence_whitespace(source)
+                if text_normalization:
+                    source = normalize_auk_text(source, language)
+                segments = [part for part in self.split_text_by_tokens(source, max_text_tokens_per_segment,
+                    mode=segmentation_mode, target_tokens=segment_target_tokens) if part.strip()]
+                for index, segment in enumerate(segments):
+                    plan.append(("segment", len(speech)))
+                    speech.append(segment.strip())
+                    owners.append(text_index)
+                    if index < len(segments) - 1:
+                        gap = sentence_pause_ms if sentence_pause_ms and ends_sentence(segment) else interval_silence
+                        kind = "sentence_gap" if sentence_pause_ms and ends_sentence(segment) else "silence"
+                        plan.append((kind, round(max(0, gap) * self.sampling_rate / 1000)))
+            if len(speech) == first:
+                raise ValueError("Enter some text to generate speech.")
+            plans.append(plan)
+            factor = float(duration_factor)
+            estimated = [self.estimate_seconds(part, rate, edge_seconds=settings["edge_seconds"],
+                                               duration_factor=factor, max_seconds=budget) for part in speech[first:]]
+            if target_duration_s and target_duration_mode == "natural":
+                fixed = sum(value for kind, value in plan if kind != "segment") / self.sampling_rate
+                scale = max(0.1, float(target_duration_s) - fixed) / max(1e-6, sum(estimated))
+                estimated = [min(budget, max(0.6, value * scale)) for value in estimated]
+            natural.extend(estimated)
+
+        instructions = [build_instruction(part, mode, description, language) for part in speech]
+        base_seed = int(seed) if seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
+        batch_size = 1 if getattr(self, "low_vram", False) else max(1, int(section_batch_size))
+        total = math.ceil(len(speech) / batch_size)
+        rendered, durations = [None] * len(speech), []
+        results, protected_by_text = [None] * len(texts), {}
+
+        def complete(text_index):
+            plan = plans[text_index]
+            if results[text_index] is not None or any(rendered[value] is None for kind, value in plan if kind == "segment"):
+                return
+            audio, protected = assemble_audio_plan(rendered, plan, self.sampling_rate)
+            if target_duration_s and target_duration_mode in {"pad", "trim"}:
+                audio = fit_target_samples(audio, round(float(target_duration_s) * self.sampling_rate), target_duration_mode)
+            pcm = (audio.flatten().clamp(-1, 1) * 32767).round().to(torch.int16).numpy()
+            results[text_index] = (self.sampling_rate, pcm)
+            protected_by_text[text_index] = [(start / self.sampling_rate, end / self.sampling_rate) for start, end in protected]
+            if on_text_complete:
+                on_text_complete(text_index, results[text_index])
+
+        devices = [torch.device(self.device).index or 0] if cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(base_seed)
+            for start in range(0, len(speech), batch_size):
+                batch_index = start // batch_size
+                stop = min(len(speech), start + batch_size)
+
+                def on_step(step, steps, batch_index=batch_index):
+                    if self.progress_reporter:
+                        self.progress_reporter.update(batch_index * steps + step, total=total * steps,
+                            desc=f"AuK section batch {batch_index + 1}/{total}, step {step}/{steps}")
+
+                if self.progress_reporter:
+                    self.progress_reporter.update(batch_index * max(1, int(settings["num_step"])),
+                        total=total * max(1, int(settings["num_step"])), desc=f"AuK encoding batch {batch_index + 1}/{total}")
+                seeds = [(base_seed + 7919 * index) % (2**31 - 1) for index in range(start, stop)]
+                audios = self.generate_batch(instructions[start:stop], [reference] * (stop - start), natural[start:stop],
+                                             settings, seeds, progress=on_step)
+                for offset, audio in enumerate(audios):
+                    if settings.get("match_loudness") and reference is not None and reference.rms > 1e-4:
+                        gain = min(4.0, reference.rms / max(1e-4, _rms(audio)))
+                        audio = (audio * gain).clamp(-1, 1)
+                    rendered[start + offset] = trim_segment_silence(audio, self.sampling_rate, trim_silence_ms_threshold)
+                    durations.append(rendered[start + offset].shape[-1] / self.sampling_rate)
+                    complete(owners[start + offset])
+        self.last_generation_stats = {
+            "segment_count": len(speech), "segments_count": len(speech),
+            "total_duration_s": sum(len(result[1]) for result in results) / self.sampling_rate,
+            "mean_duration_s": float(np.mean(durations)), "min_duration_s": min(durations),
+            "max_duration_s": max(durations), "generation_time_s": time.perf_counter() - started,
+            "model": self.model_id, "section_batch_size": batch_size,
+            "bytes_per_second": rate, "voice_mode": mode,
+            "peak_vram_gb": torch.cuda.max_memory_allocated(self.device) / 1024**3 if cuda else 0.0,
+            "protected_pauses": protected_by_text.get(0, []) if len(texts) == 1 else [],
+        }
+        return results
+
+    def edit(self, source_path, instruction, *, gen_seconds=None, settings=None, seed=None):
+        """Run one AuK editing, enhancement or separation instruction on a source recording.
+
+        ``gen_seconds`` None keeps the source length (upstream's default for same-length tasks).
+        """
+        settings = {**GENERATION_DEFAULTS, **(settings or {}), "trim_reference_silence": False}
+        audio, rate = read_audio(source_path)
+        audio24 = resample(audio, rate, SAMPLE_RATE)
+        audio24 = audio24[: max(HOP, len(audio24) // HOP * HOP)]
+        from indextts.auk.conditioning import to_encoder_rate
+
+        reference = PreparedReference(audio24, to_encoder_rate(audio, rate), "", len(audio24) / SAMPLE_RATE, None, str(source_path))
+        seconds = float(gen_seconds) if gen_seconds else reference.seconds
+        seconds = min(max(0.3, seconds), 2 * MAX_CONTEXT_SECONDS)
+        base_seed = int(seed) if seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
+        started = time.perf_counter()
+        devices = [torch.device(self.device).index or 0] if str(self.device).startswith("cuda") else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(base_seed)
+            steps = max(1, int(settings["num_step"]))
+
+            def on_step(step, total):
+                if self.progress_reporter:
+                    self.progress_reporter.update(step, total=total, desc=f"AuK edit step {step}/{total}")
+
+            audio_out = self.generate_batch([instruction], [reference], [seconds], settings, [base_seed], on_step)[0]
+        self.last_generation_stats = {"model": self.model_id, "generation_time_s": time.perf_counter() - started,
+                                      "total_duration_s": audio_out.shape[-1] / SAMPLE_RATE, "steps": steps}
+        return SAMPLE_RATE, (audio_out.flatten().clamp(-1, 1) * 32767).round().to(torch.int16).numpy()
+
+    def unload(self):
+        self._reference = self._reference_key = None
+        self.progress_reporter = self.gr_progress = None
+        if getattr(self, "conditioner", None) is not None:
+            self.conditioner.unload()
+        self.model = self.vae = self.conditioner = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
