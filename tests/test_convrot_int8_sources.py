@@ -146,6 +146,28 @@ def test_sharded_conversion_loads_and_matches_the_float_model(tmp_path: Path) ->
     assert report.quantized_layers == 2
     assert isinstance(loaded.proj, ConvRotInt8Linear) and isinstance(loaded.out, ConvRotInt8Linear)
     x = torch.randn(4, 64, generator=torch.Generator().manual_seed(3))
-    expected, actual = reference(x), loaded(x)
+    with torch.no_grad():
+        expected, actual = reference(x), loaded(x)
     relative = float((actual - expected).norm() / expected.norm())
+    assert relative < 0.03
+
+
+def test_meta_initialized_model_loads_and_moves(tmp_path: Path) -> None:
+    # AuK builds its INT8 transformer on the meta device and lets the checkpoint
+    # supply every tensor; the never-filled W8A8 cache must not block .to().
+    state = _source_state()
+    destination = tmp_path / "int8.safetensors"
+    save_file(state, str(tmp_path / "model.safetensors"))
+    _convert(tmp_path / "model.safetensors", destination, keep_float32=("layer_scale", "norm.weight"))
+    with torch.device("meta"):
+        loaded = _Tiny()
+    load_gpt_checkpoint(loaded, str(destination), device="cpu", dtype=torch.bfloat16, strict=True)
+    assert not any(tensor.is_meta for tensor in [*loaded.parameters(), *loaded.buffers()])
+    assert loaded.proj.weight_int8_rhs.device.type == "cpu" and loaded.proj.weight_int8.dtype == torch.int8
+    loaded.to(torch.float32)
+    reference = _Tiny()
+    reference.load_state_dict(state)
+    x = torch.randn(4, 64, generator=torch.Generator().manual_seed(4))
+    with torch.no_grad():
+        relative = float((loaded(x) - reference(x)).norm() / reference(x).norm())
     assert relative < 0.03

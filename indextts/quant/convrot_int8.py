@@ -812,9 +812,20 @@ class ConvRotInt8Linear(nn.Module):
             super()._apply(fn, recurse=recurse)
         finally:
             for name, value in protected.items():
+                if name == "weight_int8_rhs" and value.is_meta:
+                    # The empty cache of a layer built on the meta device (a
+                    # meta-initialized model loaded from a checkpoint): it holds no
+                    # data and is recreated beside the moved weights below.
+                    self._buffers[name] = value
+                    continue
                 probe = torch.empty(0, device=value.device, dtype=value.dtype)
                 destination = fn(probe).device
                 self._buffers[name] = value.to(device=destination)
+            rhs = self._buffers.get("weight_int8_rhs")
+            if rhs is not None and rhs.is_meta and not self.weight_int8.is_meta:
+                self._buffers["weight_int8_rhs"] = torch.empty(
+                    (0, 0), device=self.weight_int8.device, dtype=torch.int8
+                )
         self._hadamards.clear()
         if rhs_was_current:
             self._remember_rhs_source()
