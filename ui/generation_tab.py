@@ -2493,6 +2493,18 @@ class _Tee:
             if threading.current_thread() is self.owner_thread and not self.handle.closed:
                 self.handle.flush()
 
+    def isatty(self) -> bool:
+        # Libraries probe the console (Transformers' loading report styles its text
+        # for terminals); the captured log is a file, so report no terminal.
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        # Any other attribute of a text stream (encoding, errors, fileno, ...) is the console's.
+        stream = self.__dict__.get("stream")
+        if stream is None:
+            raise AttributeError(name)
+        return getattr(stream, name)
+
     def close(self) -> None:
         with self.lock:
             if not self.handle.closed:

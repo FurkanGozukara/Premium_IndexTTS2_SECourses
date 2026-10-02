@@ -60,11 +60,20 @@ class QwenConditioner:
                  attn_implementation: str = "sdpa"):
         from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
+        from transformers.utils import logging as hf_logging
+
         path = str(model_path)
         self.device = torch.device(device)
-        self.processor = Qwen2_5OmniProcessor.from_pretrained(path)
-        thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            path, dtype=dtype, attn_implementation=attn_implementation, low_cpu_mem_usage=True)
+        # The full Qwen2.5-Omni snapshot also holds the talker and speech decoder, which AuK
+        # does not use: their skipped weights and config checks are expected, not worth a report.
+        verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        try:
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(path)
+            thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                path, dtype=dtype, attn_implementation=attn_implementation, low_cpu_mem_usage=True)
+        finally:
+            hf_logging.set_verbosity(verbosity)
         if getattr(thinker, "visual", None) is not None:
             del thinker.visual
             thinker.visual = None
