@@ -11,6 +11,7 @@
     "app.profiles": {
       "_active": "indextts",
       "indextts": {
+        "generation.apply_pronunciation_dictionary": true,
         "generation.auto_lora_max_tokens": true,
         "generation.auto_lora_reference": true,
         "generation.auto_lora_speaking_rate": true,
@@ -63,6 +64,7 @@
         "training.eval_strengths": "1.0",
         "training.eval_timeout_s": 900.0,
         "training.eval_train_subset": 48,
+        "training.export_int8": true,
         "training.final_test_dataset": "",
         "training.fluency_filler_words": "okay, ok, so, like, you know, you see, um, umm, uh, uhh, actually, basically, i mean, let's see, anyway",
         "training.fluency_filter": "all",
@@ -136,6 +138,7 @@
         "training.weight_decay": 0.01
       },
       "omnivoice": {
+        "generation.apply_pronunciation_dictionary": true,
         "generation.auto_lora_max_tokens": false,
         "generation.auto_lora_reference": true,
         "generation.auto_lora_speaking_rate": false,
@@ -188,6 +191,7 @@
         "training.eval_strengths": "1.0",
         "training.eval_timeout_s": 900.0,
         "training.eval_train_subset": 48,
+        "training.export_int8": true,
         "training.final_test_dataset": "",
         "training.fluency_filler_words": "okay, ok, so, like, you know, you see, um, umm, uh, uhh, actually, basically, i mean, let's see, anyway",
         "training.fluency_filter": "all",
@@ -383,6 +387,7 @@
     "generation.num_beams": 2,
     "generation.num_candidates": 1,
     "generation.output_filename": "",
+    "generation.pick_best_candidate": false,
     "generation.prevent_vram_accumulation": false,
     "generation.repetition_penalty": 10.0,
     "generation.repetition_window": 0,
@@ -411,6 +416,7 @@
     "generation.use_caption_timing": false,
     "generation.use_subprocess": false,
     "generation.verbose": false,
+    "generation.word_timestamps": false,
     "grid.diffusion_steps": 40,
     "grid.emotion_weight": 0.65,
     "grid.eval_include_base": true,
@@ -513,6 +519,7 @@
     "training.eval_strengths": "1.0",
     "training.eval_timeout_s": 900.0,
     "training.eval_train_subset": 48,
+    "training.export_int8": true,
     "training.final_test_dataset": "",
     "training.fluency_filler_words": "okay, ok, so, like, you know, you see, um, umm, uh, uhh, actually, basically, i mean, let's see, anyway",
     "training.fluency_filter": "all",

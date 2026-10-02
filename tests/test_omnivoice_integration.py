@@ -147,8 +147,10 @@ def test_training_model_contract_and_preset_dispatch():
     assert config.tts_model == "omnivoice" and config.adapter_type == "full"
     with pytest.raises(ValueError,match="BF16"):
         TrainConfig.from_dict({**config.to_dict(),"base_variant":"int8_convrot"})
-    with pytest.raises(ValueError,match="type"):
-        TrainConfig.from_dict({**config.to_dict(),"tts_model":"indextts"})
+    # Both speech models support full fine-tuning; an unknown method is rejected.
+    assert TrainConfig.from_dict({**config.to_dict(),"tts_model":"indextts"}).adapter_type == "full"
+    with pytest.raises(ValueError,match="Training method"):
+        TrainConfig.from_dict({**config.to_dict(),"adapter_type":"qlora"})
     assert training_tier_values("6","cuda:0","omnivoice")["blocks_to_swap"] == 0
 
 

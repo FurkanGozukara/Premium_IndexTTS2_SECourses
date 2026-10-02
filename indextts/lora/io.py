@@ -157,6 +157,8 @@ class _LoraStructure:
     target_modules: list[str]
     module_paths: list[str]
     has_full: bool
+    # "int8_convrot" for the INT8 version of a full fine-tune (indextts.quant.finetune_int8): a model, not an adapter.
+    quantized: str = ""
 
 
 def _coerce_metadata(metadata: LoraMetadata | Mapping[str, Any]) -> LoraMetadata:
@@ -296,6 +298,9 @@ def _analyze_lora_structure(
         if metadata.adapter_type == "full" and shapes and all(key.startswith("full.") for key in shapes):
             metadata = replace(metadata, rank=0, alpha=0.0, target_modules=[])
             return _LoraStructure(metadata, "full", 0, 0.0, [], [], True)
+        if metadata.adapter_type == "full" and header.get("indextts_int8_finetune"):
+            metadata = replace(metadata, rank=0, alpha=0.0, target_modules=[])
+            return _LoraStructure(metadata, "full", 0, 0.0, [], [], True, "int8_convrot")
         raise ValueError(f"{source} does not contain LoRA / DoRA tensors")
 
     inferred_ranks: set[int] = set()
@@ -462,13 +467,17 @@ def _inspected_lora(path: str, modified_ns: int, size: int) -> dict[str, Any] | 
         "size_mb": round(size / (1024 * 1024), 3),
         "base_variant": metadata.base_variant,
         "base_model": metadata.base_model,
+        "quantized": structure.quantized,
         "train_config": dict(metadata.train_config),
         "recommended_reference": reference,
     }
 
 
 def _metadata_summary(info: Mapping[str, Any]) -> str:
-    parts = [str(info["adapter_type"]).upper(), f"r{info['rank']}"]
+    if info["adapter_type"] == "full":
+        parts = ["Full fine-tune" + (" INT8 ConvRot" if info.get("quantized") else "")]
+    else:
+        parts = [str(info["adapter_type"]).upper(), f"r{info['rank']}"]
     if info.get("steps"):
         parts.append(f"{info['steps']} steps")
     if info.get("dataset"):

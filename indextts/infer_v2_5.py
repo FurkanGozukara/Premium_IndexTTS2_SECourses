@@ -210,8 +210,15 @@ class IndexTTS2:
         self.stop_text_token = self.cfg.gpt.stop_text_token
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         print(">> Runtime:", describe(self.runtime))
+        from indextts.quant.finetune_int8 import is_int8_finetune
 
-        if self.runtime.model_variant == "int8_convrot":
+        # The INT8 version of a full fine-tune is the model itself: it replaces the public INT8 GPT.
+        self._int8_finetune_path = os.path.abspath(self.runtime.lora_path) if is_int8_finetune(self.runtime.lora_path) else ""
+        if self._int8_finetune_path:
+            self.runtime.model_variant = "int8_convrot"
+            print(f">> INT8 ConvRot fine-tuned model: {self._int8_finetune_path}", flush=True)
+
+        if self.runtime.model_variant == "int8_convrot" and not self._int8_finetune_path:
             from indextts.utils import model_downloads
 
             int8_path = model_downloads.int8_gpt_path(self.model_dir)
@@ -269,7 +276,7 @@ class IndexTTS2:
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         loaded_gpt_path = self.gpt_path
         if self.runtime.model_variant == "int8_convrot":
-            int8_path = os.path.join(self.model_dir, "gpt_int8_convrot.safetensors")
+            int8_path = self._int8_finetune_path or os.path.join(self.model_dir, "gpt_int8_convrot.safetensors")
             if not os.path.isfile(int8_path):
                 raise FileNotFoundError(f"INT8 ConvRot checkpoint not found after download: {int8_path}")
             try:
@@ -613,8 +620,22 @@ class IndexTTS2:
         resolved = os.path.abspath(requested) if requested else ""
         if resolved and os.path.isfile(resolved):
             from indextts.lora import inspect_lora
-            if "omnivoice" in str(inspect_lora(resolved).get("base_model", "")).lower():
+            info = inspect_lora(resolved)
+            if "omnivoice" in str(info.get("base_model", "")).lower():
                 raise ValueError("This checkpoint belongs to OmniVoice. Select OmniVoice or choose an IndexTTS adapter.")
+            if info.get("adapter_type") == "full" and not info.get("quantized") and self.runtime.model_variant != "bf16":
+                raise ValueError("Select BF16 before loading a full fine-tuning checkpoint, or choose its INT8 ConvRot version.")
+        finetuned = getattr(self, "_int8_finetune_path", "")
+        if finetuned or (resolved and resolved.lower().endswith(".int8_convrot.safetensors")):
+            from indextts.quant.finetune_int8 import is_int8_finetune
+
+            if resolved != finetuned and (finetuned or is_int8_finetune(resolved)):
+                raise ValueError("An INT8 fine-tuned model is the speech model itself; reload the model to change to or from it.")
+            if resolved == finetuned:
+                self._lora_path, self._lora_handle = resolved, None
+                self.runtime.lora_path, self.runtime.lora_strength = requested, strength
+                self._sync_decoder_adapter(requested, strength)
+                return None
         if resolved and resolved == self._lora_path and self._lora_handle is not None:
             if self._lora_merged:
                 unmerge_lora_from_model(self.gpt)

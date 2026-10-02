@@ -466,7 +466,7 @@ def whisper_device_for_free_vram(
 def transcribe(
     audio_path_or_array: str | Path | np.ndarray,
     sr: int = 24000,
-    language: str = "EN",
+    language: str | None = "EN",
     model_name: str = DEFAULT_WHISPER_MODEL,
     device: str = "cuda:0",
     progress_cb: Callable[..., Any] | Any | None = None,
@@ -520,7 +520,8 @@ def transcribe(
             result = pipe(
                 {"array": waveform[start_i:end_i], "sampling_rate": sample_rate},
                 return_timestamps="word",
-                generate_kwargs={"language": str(language).lower(), "task": "transcribe"},
+                # No language (OmniVoice's AUTO) lets Whisper detect it.
+                generate_kwargs={"task": "transcribe", **({"language": str(language).lower()} if language else {})},
             )
             chunk_words = _result_words(result, start_s)
             accept_from = start_s if index == 0 else start_s + overlap_s / 2.0

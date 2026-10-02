@@ -1206,11 +1206,12 @@ def _load_safetensors_checkpoint(
     device: str | torch.device,
     dtype: torch.dtype,
     strict: bool,
+    skip_prefixes: Sequence[str] = (),
 ) -> LoadReport:
     started = time.perf_counter()
     target_device = torch.device(device)
     with safe_open(path, framework="pt", device="cpu") as handle:
-        names = list(handle.keys())
+        names = [name for name in handle.keys() if not any(name.startswith(prefix) for prefix in skip_prefixes)]
         plan = _detect_safetensors_plan(handle)
         quantized = bool(plan)
         replaced = patch_model_with_convrot(model, plan) if quantized else []
@@ -1302,8 +1303,12 @@ def load_gpt_checkpoint(
     device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
     strict: bool = False,
+    skip_prefixes: Sequence[str] = (),
 ) -> LoadReport:
-    """Load an official or INT8 ConvRot GPT checkpoint into ``model``."""
+    """Load an official or INT8 ConvRot GPT checkpoint into ``model``.
+
+    Tensors whose names start with one of ``skip_prefixes`` are left to the caller.
+    """
 
     checkpoint_path = str(Path(path).expanduser().resolve())
     if checkpoint_path.lower().endswith(".safetensors"):
@@ -1313,6 +1318,7 @@ def load_gpt_checkpoint(
             device=device,
             dtype=dtype,
             strict=strict,
+            skip_prefixes=tuple(skip_prefixes),
         )
 
     started = time.perf_counter()
@@ -1607,6 +1613,49 @@ def convert_gpt_checkpoint(
         state = OrderedDict((key[len(state_prefix):], value) for key, value in state.items() if key.startswith(state_prefix))
         if not state:
             raise ValueError(f"No tensors matched prefix {state_prefix!r}")
+    return convert_state_dict(
+        state, str(destination), group_sizes=resolved_groups, mse_clip=mse_clip, device=target_device,
+        report_path=str(report_destination), progress=progress, quantize_emo_encoder=quantize_emo_encoder,
+        linear_targets=linear_targets, model_id=model_id, source_name=source.name, source_path=str(source),
+        source_bytes=source.stat().st_size, state_prefix=state_prefix, started=started,
+    )
+
+
+def convert_state_dict(
+    state: Mapping[str, torch.Tensor],
+    dst_safetensors: str,
+    *,
+    group_sizes: Sequence[int] = DEFAULT_GROUP_SIZES,
+    mse_clip: bool = True,
+    device: str | torch.device = "cuda",
+    report_path: str | None = None,
+    progress: Callable[[str], Any] | None = print,
+    quantize_emo_encoder: bool = False,
+    linear_targets: Sequence[str] | None = None,
+    model_id: str = "IndexTeam/IndexTTS-2.5",
+    source_name: str = "state_dict",
+    source_path: str = "",
+    source_bytes: int | None = None,
+    state_prefix: str = "",
+    extra_metadata: Mapping[str, str] | None = None,
+    started: float | None = None,
+) -> dict[str, Any]:
+    """Convert an in-memory state dict (see ``convert_gpt_checkpoint``); ``extra_metadata`` joins the header."""
+
+    started = time.perf_counter() if started is None else started
+    state = OrderedDict(state)
+    destination = Path(dst_safetensors).expanduser().resolve()
+    report_destination = (
+        Path(report_path).expanduser().resolve() if report_path is not None else destination.with_suffix(".report.json")
+    )
+    if destination.suffix.lower() != ".safetensors":
+        raise ValueError("Destination must end with .safetensors")
+    resolved_groups = tuple(int(size) for size in group_sizes)
+    if not resolved_groups or any(not _is_power_of_four(size) for size in resolved_groups):
+        raise ValueError(f"All group sizes must be powers of four: {resolved_groups}")
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA conversion was requested, but CUDA is unavailable")
     if linear_targets is None:
         targets = _select_conversion_targets(state, quantize_emo_encoder=quantize_emo_encoder)
     else:
@@ -1658,20 +1707,22 @@ def convert_gpt_checkpoint(
         )
 
     groups = {base: value[2] for base, value in quantized.items()}
-    metadata = _json_metadata(groups, source.name)
+    metadata = _json_metadata(groups, source_name)
     metadata["indextts_model"] = model_id
+    metadata.update({str(key): str(value) for key, value in (extra_metadata or {}).items()})
     output_plan = _make_output_plan(state, targets, quantized)
     _emit(progress, f"Writing {len(output_plan)} tensors atomically to {destination}")
     _write_streaming_safetensors(destination, state, output_plan, metadata)
 
     errors = [item["relative_weight_error_pct"] for item in layer_reports]
-    source_bytes = source.stat().st_size
+    if source_bytes is None:
+        source_bytes = sum(value.numel() * value.element_size() for value in state.values())
     output_bytes = destination.stat().st_size
     elapsed = time.perf_counter() - started
     report: dict[str, Any] = {
         "format": COMFY_FORMAT,
         "format_version": "1.0",
-        "source": str(source),
+        "source": source_path or source_name,
         "state_prefix": state_prefix,
         "model_id": model_id,
         "selected_source_bytes": sum(value.numel() * value.element_size() for value in state.values()),
@@ -1723,6 +1774,7 @@ __all__ = [
     "clear_hadamard_cache",
     "comfy_quant_tensor",
     "convert_gpt_checkpoint",
+    "convert_state_dict",
     "describe_checkpoint",
     "detect_convrot_layers",
     "is_int8_convrot_checkpoint",

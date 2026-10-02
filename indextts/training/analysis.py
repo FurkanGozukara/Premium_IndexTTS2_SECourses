@@ -38,7 +38,7 @@ BASE_PHASE_LABEL = "Reference-only baseline (no LoRA / DoRA)"
 BASE_GRID_HEADER_DETAIL = "Plain voice clone: only the reference audio shapes the voice"
 _LEGACY_BASE_LABELS = frozenset({"base model", "base model (no adapter)"})
 GENERALIZATION_LEGEND = (
-    "Validation loss measures how well the LoRA / DoRA predicts sentences it never saw during "
+    "Validation loss measures how well the trained voice (LoRA / DoRA or full fine-tune) predicts sentences it never saw during "
     "training (lower is better). Training loss measures the clips it trains on. When training "
     "loss keeps falling but validation loss rises, that can indicate overfitting. Loss alone does not "
     "establish memorization or generated-speech quality; audio-token accuracy is not word accuracy."
@@ -397,7 +397,8 @@ def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, 
         candidates.extend(best_dir.glob("*.safetensors"))
     descriptors: list[dict[str, Any]] = []
     for path in candidates:
-        if path.name.startswith("."):
+        # Hidden files and the INT8 copies of fine-tuned checkpoints (inference only) are not candidates.
+        if path.name.startswith(".") or path.name.lower().endswith(".int8_convrot.safetensors"):
             continue
         try:
             descriptor = checkpoint_descriptor(path)

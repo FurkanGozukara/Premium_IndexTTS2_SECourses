@@ -552,6 +552,31 @@ def apply_dictionary(
     return re.sub(r"\x00(\d+)\x00", lambda match: protected[int(match.group(1))], value)
 
 
+_CJK_RE = re.compile(r"[㐀-鿿]")
+_KANA_RE = re.compile(r"^[぀-ヿ\s]+$")
+
+
+def omnivoice_readings(text: str) -> str:
+    """Write ``<word|reading>`` annotations in OmniVoice's inline syntax.
+
+    The dictionary and hand-written text mark readings the IndexTTS way. OmniVoice
+    reads CMU phones in brackets (``<DoRA|D AO1 . R AH0>`` becomes ``[D AO1 R AH0]``;
+    syllable dots dropped) and Chinese pinyin with tone digits in place of the
+    characters (``<行|XING2>`` becomes ``XING2``). Kana readings and respellings
+    replace the word as text. Text without annotations is returned unchanged.
+    """
+
+    def replace(match: re.Match) -> str:
+        word, reading = match.group(1), " ".join(match.group(2).split())
+        if is_phoneme_string(reading):
+            return "[" + " ".join(token for token in reading.upper().split() if token != ".") + "]"
+        if _CJK_RE.search(word) and not _KANA_RE.match(reading):
+            return "".join(reading.upper().split())
+        return reading
+
+    return _ANNOTATION_RE.sub(replace, str(text or ""))
+
+
 def default_dictionary_path(root: str | os.PathLike[str]) -> Path:
     return Path(root).expanduser() / "pronunciations" / "dictionary.json"
 
@@ -631,6 +656,7 @@ __all__ = [
     "merge_entries",
     "normalize_entry",
     "normalize_scope",
+    "omnivoice_readings",
     "save_dictionary",
     "suggest_pronunciation",
     "syllabify",

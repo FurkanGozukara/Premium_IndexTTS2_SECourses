@@ -23,6 +23,7 @@ from indextts.utils.subtitle_utils import (
     parse_subtitle_file,
     read_pcm16_wav,
     retime_audio_file_with_ffmpeg,
+    subtitle_cues_to_text,
     write_pcm16_wav,
 )
 from indextts.utils.task_output_utils import build_segment_output_path, write_metadata_file
@@ -58,6 +59,10 @@ def _ensure_selected_int8(
 ) -> str:
     if runtime.model_variant != "int8_convrot":
         return ""
+    from indextts.quant.finetune_int8 import is_int8_finetune
+
+    if is_int8_finetune(runtime.lora_path):
+        return ""  # the fine-tuned model's own INT8 file replaces the public INT8 GPT
 
     from indextts.runtime.progress import ProgressReporter
     from indextts.utils import model_downloads
@@ -485,6 +490,52 @@ def _emit_progress(progress_callback, value: float, desc: str) -> None:
     if progress_callback is None:
         return
     progress_callback(value, desc=desc)
+
+
+def _choose_best_candidate(request: Dict[str, Any], tts: Any, paths: list, text: str, language: str,
+                           metadata: Dict[str, Any]) -> int:
+    """Index of the candidate Whisper hears with the fewest word errors (0 keeps the first on any failure)."""
+
+    from indextts.utils.take_selection import best_take, candidate_word_errors
+
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        rows = candidate_word_errors(paths, text, language, device=device)
+    except Exception as exc:
+        print(f">> Best-take selection failed; keeping candidate 1: {exc}", flush=True)
+        return 0
+    chosen = best_take(rows)
+    print(">> Candidate word errors: " + ", ".join(
+        f"{os.path.basename(row['path'])} {100 * row['error_rate']:.1f}%" for row in rows)
+          + f" -> keeping {os.path.basename(rows[chosen]['path'])}", flush=True)
+    metadata["candidate_selection"] = {"rule": "fewest Whisper word errors", "chosen": os.path.basename(rows[chosen]["path"]),
+                                       "candidates": rows}
+    return chosen
+
+
+def _write_word_timestamps(request: Dict[str, Any], tts: Any, audio_path: str, cues: Any) -> Dict[str, Any]:
+    """Word timings and subtitles of the finished audio; a failure is reported, never fatal to the take."""
+
+    from indextts.utils.speech_timestamps import write_speech_timestamps
+
+    text = subtitle_cues_to_text(cues) if cues else str(request.get("text") or "")
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        result = write_speech_timestamps(audio_path, text, language=request.get("language"), device=device)
+    except Exception as exc:  # the audio is complete; timestamps are an extra
+        print(f">> Word timestamps failed: {exc}", flush=True)
+        return {"error": f"Word timestamps failed: {exc}"}
+    print(f">> Word timestamps: {result['words']} words ({result['coverage']:.0%} matched by Whisper), "
+          f"{result['cues']} subtitle cues -> {result['paths']['srt']}", flush=True)
+    return result
 
 
 def run_generation_request(
@@ -928,9 +979,17 @@ def run_generation_request(
                 candidate_paths.append(candidate_path)
                 candidate_stats.append(dict(getattr(tts, "last_generation_stats", {})))
 
+            if request.get("pick_best_candidate") and len(candidate_paths) > 1:
+                check_cancellation()
+                _emit_progress(progress_callback, 0.95, "choosing the best take...")
+                chosen = _choose_best_candidate(request, tts, candidate_paths, text, language, metadata)
+                if chosen:
+                    # The chosen take becomes the output and the first candidate; the files keep their names.
+                    candidate_paths.insert(0, candidate_paths.pop(chosen))
+                    candidate_stats.insert(0, candidate_stats.pop(chosen))
             shutil.copy2(candidate_paths[0], output_path)
             output = output_path
-            print(">> Primary output uses candidate 1:", output)
+            print(f">> Primary output uses {os.path.basename(candidate_paths[0])}:", output)
 
         check_cancellation()
         if save_used_audio and prompt:
@@ -990,6 +1049,14 @@ def run_generation_request(
                 task_layout["final_mp4_path"],
             )
 
+        timestamps = None
+        if request.get("word_timestamps"):
+            check_cancellation()
+            _emit_progress(progress_callback, 0.97, "word timestamps...")
+            timestamps = _write_word_timestamps(request, tts, output_path, subtitle_cues)
+            if timestamps.get("error"):
+                runtime_warning = " ".join(filter(None, [runtime_warning, timestamps["error"]]))
+
         check_cancellation()
         if save_as_mp3 and MP3_AVAILABLE:
             output = convert_wav_to_mp3(
@@ -1037,6 +1104,8 @@ def run_generation_request(
         metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
         metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
         metadata["generation"] = primary_stats
+        if timestamps is not None:
+            metadata["outputs"]["word_timestamps"] = timestamps
         if runtime_warning:
             metadata["runtime_warning"] = runtime_warning
         write_metadata_file(metadata_path, metadata)
@@ -1078,6 +1147,7 @@ def run_generation_request(
             "candidate_seeds": primary_stats["candidate_seeds"],
             "raw_wav_path": abs_path_or_none(raw_output),
             "runtime_warning": runtime_warning,
+            "timestamps": timestamps,
         }
     except Exception as exc:
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from typing import Any, Mapping, Sequence
 
 import gradio as gr
@@ -63,6 +64,7 @@ from indextts.utils.pronunciation import (
     load_dictionary,
     merge_entries,
     normalize_entry,
+    omnivoice_readings,
     save_dictionary,
 )
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
@@ -212,6 +214,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.max_mel_tokens": 1500,
     "generation.seed": -1,
     "generation.num_candidates": 1,
+    "generation.pick_best_candidate": False,
     "generation.diffusion_steps": 25,
     "generation.inference_cfg_rate": 0.7,
     "generation.cfm_temperature": 1.0,
@@ -237,6 +240,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.save_used_audio": False,
     "generation.output_filename": "",
     "generation.save_as_mp3": False,
+    "generation.word_timestamps": False,
     "generation.mp3_bitrate": "256k",
     "generation.audio_tuning_preset": "bypass",
     "generation.tuning_low_cut_hz": None,
@@ -305,6 +309,7 @@ RUNNER_REQUEST_KEYS = frozenset(
         "language",
         "save_used_audio",
         "save_as_mp3",
+        "word_timestamps",
         "mp3_bitrate",
         "image_path",
         "infer_kwargs",
@@ -320,6 +325,7 @@ RUNNER_REQUEST_KEYS = frozenset(
         "decoder_adapter",
         "decoder_adapter_strength",
         "num_candidates",
+        "pick_best_candidate",
         "audio_tuning_preset",
         "audio_tuning_overrides",
         "segment_budget_scale_non_cjk",
@@ -490,6 +496,7 @@ def build_generation_request(
         "language": str(language or ("AUTO" if omnivoice else "EN")).upper(),
         "save_used_audio": bool(_value(merged, "generation.save_used_audio")),
         "save_as_mp3": bool(_value(merged, "generation.save_as_mp3")),
+        "word_timestamps": bool(_value(merged, "generation.word_timestamps")),
         "mp3_bitrate": str(_value(merged, "generation.mp3_bitrate")),
         "image_path": image_path,
         "infer_kwargs": infer_kwargs,
@@ -505,6 +512,7 @@ def build_generation_request(
         "decoder_adapter": decoder_adapter,
         "decoder_adapter_strength": decoder_adapter_strength,
         "num_candidates": int(_value(merged, "generation.num_candidates")),
+        "pick_best_candidate": bool(_value(merged, "generation.pick_best_candidate")),
         "audio_tuning_preset": str(_value(merged, "generation.audio_tuning_preset") or "bypass"),
         "audio_tuning_overrides": overrides,
         "segment_budget_scale_non_cjk": float(_value(merged, "generation.segment_budget_scale_non_cjk")),
@@ -791,6 +799,9 @@ def preview_segments(
             return [[0, "Caption error", str(exc), ""]], f"Caption error: {exc}"
     if not str(text or "").strip():
         return [], "0 sections"
+    if model_id == "omnivoice":
+        # The sections as OmniVoice receives them: dictionary readings in its syntax ([D AO1 R AH0]).
+        text = omnivoice_readings(str(text))
     try:
         if model_id == "omnivoice":
             tokenizer = _omnivoice_preview_tokenizer(str(Path(model_dir).resolve()))
@@ -1412,11 +1423,12 @@ def _build_lora_choices(model_id: str = "indextts") -> list[tuple[str, str]]:
         if not checkpoint_matches_model(info, model_id):
             continue
         parent = source.parent.parent.name if source.parent.name.lower() == "best" else source.parent.name
-        adapter_type = {"dora": "DoRA", "full": "Full"}.get(str(info.get("adapter_type", "")).lower(), "LoRA")
-        label = (
-            f"{parent}/{source.stem}  ·  {adapter_type} r{int(info.get('rank', 0) or 0)}"
-            f"  ·  {int(info.get('steps', 0) or 0)} steps"
-        )
+        kind = str(info.get("adapter_type", "")).lower()
+        if kind == "full":
+            method = "Full fine-tune INT8 ConvRot" if info.get("quantized") else "Full fine-tune"
+        else:
+            method = f"{'DoRA' if kind == 'dora' else 'LoRA'} r{int(info.get('rank', 0) or 0)}"
+        label = f"{parent}/{source.stem}  ·  {method}  ·  {int(info.get('steps', 0) or 0)} steps"
         if source.parent.name.lower() == "best":
             label += "  [best - lowest validation loss]"
         choices.append((label, str(source)))
@@ -2276,10 +2288,25 @@ def _candidate_paths_from_state(value: Any) -> list[str]:
     return [str(path) for path in decoded if path]
 
 
+def _timestamp_note(timestamps: Mapping[str, Any] | None) -> str:
+    """Links to the word timestamps and subtitles written beside the audio."""
+
+    paths = dict((timestamps or {}).get("paths") or {})
+    if not paths:
+        return ""
+    labels = {"srt": "SRT subtitles", "vtt": "WebVTT subtitles", "json": "word timings (JSON)"}
+    links = " · ".join(
+        f"[{labels[kind]}](/gradio_api/file={urllib.parse.quote(Path(path).as_posix(), safe='/:')})"
+        for kind, path in paths.items() if kind in labels and Path(path).is_file()
+    )
+    return (f"**Word timestamps:** {int(timestamps.get('words') or 0)} words, "
+            f"{float(timestamps.get('coverage') or 0.0):.0%} matched by Whisper, {int(timestamps.get('cues') or 0)} cues. {links}")
+
+
 def _result_updates(result: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[Any, ...]:
     output = result.get("output_path")
     video = result.get("video_path")
-    caption = result.get("subtitle_status") or ""
+    caption = "\n\n".join(filter(None, [result.get("subtitle_status") or "", _timestamp_note(result.get("timestamps"))]))
     runtime_warning = str(result.get("runtime_warning") or "")
     status = "Generation complete."
     if runtime_warning:
@@ -2348,6 +2375,7 @@ def _generation_result_from_disk(task_folder: Path, metadata: Mapping[str, Any])
         **generation,
         "output_path": output,
         "video_path": outputs.get("final_video_path"),
+        "timestamps": outputs.get("word_timestamps"),
         "candidate_paths": candidates or ([output] if output else []),
         "runtime_warning": metadata.get("runtime_warning", ""),
     }
@@ -2927,8 +2955,9 @@ def build_generation_tab(
                 )
                 with gr.Accordion("🔤 Pronunciation check & dictionary", open=False) as pronunciation_panel:
                     gr.Markdown(
-                        "The engine reads `<word|PHONES>` annotations natively: ARPAbet phones with stress digits and dots between "
-                        "syllables, for example `<Qwen|K W EH1 N>`. **Check unknown words** lists the words in the text that the "
+                        "Both engines read `<word|PHONES>` annotations: ARPAbet phones with stress digits and dots between "
+                        "syllables, for example `<Qwen|K W EH1 N>`. IndexTTS reads them natively; for OmniVoice they become its "
+                        "CMU phone syntax (`[K W EH1 N]`), and Chinese pinyin readings (`<行|XING2>`) its tone markers. **Check unknown words** lists the words in the text that the "
                         "selected voice never spoke in training and the base model has no dictionary reading for, with a proposed "
                         "reading. **Add suggestions and save** stores the ones listed; edits in the dictionary table are saved as you "
                         "make them. Entries with scope `unseen` never override a word the voice learned from its recordings; `always` "
@@ -2967,7 +2996,6 @@ def build_generation_tab(
                         label="Pronunciation dictionary (pronunciations/dictionary.json)",
                         buttons=["fullscreen"],
                     )
-                tab.index_panels.append(pronunciation_panel)
                 _register(registry, "generation.apply_pronunciation_dictionary", apply_pronunciation, kind="bool")
 
             with gr.Column(scale=1, min_width=320):
@@ -3162,6 +3190,10 @@ def build_generation_tab(
             with gr.Row():
                 seed = gr.Number(value=-1, precision=0, label="Seed", info="-1 chooses a fresh random seed; reuse a shown seed for repeatability.")
                 candidates = gr.Slider(1, 8, value=1, step=1, label="Candidates", info="Generates consecutive seeded alternatives; each adds generation time.")
+                pick_best = gr.Checkbox(value=False, label="Keep the take Whisper hears best",
+                                        info="With 2 or more candidates, Whisper transcribes every take and the one with the fewest "
+                                             "word errors becomes the output (the others stay as candidates). Both speech models; "
+                                             "steadier pronunciation at the cost of the extra takes.")
             for key, component, kind, minimum, maximum in (
                 ("generation.do_sample", do_sample, "bool", None, None),
                 ("generation.temperature", temperature, "float", 0.1, 2),
@@ -3174,6 +3206,7 @@ def build_generation_tab(
                 ("generation.max_mel_tokens", max_mel, "int", 50, 1815),
                 ("generation.seed", seed, "int", -1, 4294967295),
                 ("generation.num_candidates", candidates, "int", 1, 8),
+                ("generation.pick_best_candidate", pick_best, "bool", None, None),
             ):
                 _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
 
@@ -3267,6 +3300,11 @@ def build_generation_tab(
                 save_mp3 = gr.Checkbox(value=False, label="Save MP3", info="Converts the final output to MP3; WAV candidates remain available.")
                 bitrate = gr.Dropdown(choices=["128k", "192k", "256k", "320k"], value="256k", label="MP3 bitrate", info="256k is a strong quality/size balance for voice.")
             with gr.Row():
+                stamps = gr.Checkbox(value=False, label="Word timestamps and subtitles",
+                                     info="Saves <name>.srt, <name>.vtt and <name>.words.json beside the audio: Whisper's word timings "
+                                          "aligned to your text, for both speech models. Neither model reports timings itself; this adds "
+                                          "a few seconds per minute of speech.")
+            with gr.Row():
                 tuning = gr.Dropdown(choices=["bypass", "voice_clarity", "clear_narration", "deharsh", "warm", "normalize"], value="bypass", label="Audio tuning preset", info="Bypass preserves model audio exactly; other presets use FFmpeg post-processing.")
                 trim_ms = gr.Slider(0, 3000, value=0, step=10, label="Trim edge silence threshold (ms)", info="0 disables trimming; only edge silence at least this long is removed.")
             with gr.Accordion("Audio tuning overrides", open=False):
@@ -3280,6 +3318,7 @@ def build_generation_tab(
                 ("generation.output_filename", filename, "str", None, None, None, False),
                 ("generation.save_used_audio", save_ref, "bool", None, None, None, False),
                 ("generation.save_as_mp3", save_mp3, "bool", None, None, None, False),
+                ("generation.word_timestamps", stamps, "bool", None, None, None, False),
                 ("generation.mp3_bitrate", bitrate, "choice", ["128k", "192k", "256k", "320k"], None, None, False),
                 ("generation.audio_tuning_preset", tuning, "choice", ["bypass", "voice_clarity", "clear_narration", "deharsh", "warm", "normalize"], None, None, False),
                 ("generation.trim_silence_ms_threshold", trim_ms, "int", None, 0, 3000, False),

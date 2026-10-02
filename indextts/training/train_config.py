@@ -46,6 +46,8 @@ class TrainConfig:
     train_emo_layers: bool = False
     train_mel_embed_head: bool = False
     train_full_modules_fp32: bool = True
+    # After a full fine-tune, save the INT8 ConvRot version of its best (and recommended) checkpoint for generation.
+    export_int8: bool = True
 
     # GPU VRAM tier the training settings were chosen for: "auto" (the detected
     # card) or a nominal size such as "8". It records the choice and resolves the
@@ -245,8 +247,8 @@ class TrainConfig:
         self.omni_batch_tokens = max(0, int(self.omni_batch_tokens))
         self.omni_normalize_text = bool(self.omni_normalize_text)
         self.adapter_type = str(self.adapter_type).lower()
-        if self.adapter_type not in ({"lora", "dora", "full"} if self.tts_model == "omnivoice" else {"lora", "dora"}):
-            raise ValueError("LoRA / DoRA type must be 'lora' or 'dora'")
+        if self.adapter_type not in {"lora", "dora", "full"}:
+            raise ValueError("Training method must be 'lora', 'dora' or 'full'")
         self.rank = max(1, int(self.rank))
         self.alpha = float(self.alpha)
         self.dropout = float(self.dropout)
@@ -255,6 +257,7 @@ class TrainConfig:
         if not (self.target_attention or self.target_mlp):
             raise ValueError("at least one LoRA / DoRA target group must be enabled")
         self.train_full_modules_fp32 = bool(self.train_full_modules_fp32)
+        self.export_int8 = bool(self.export_int8)
 
         from indextts.runtime.vram_presets import VRAM_TIERS
 
