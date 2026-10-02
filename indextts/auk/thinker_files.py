@@ -4,15 +4,16 @@ AuK conditions on the Qwen2.5-Omni-3B Thinker: its text model and audio tower.
 The public snapshot (``models/qwen2_5_omni_3b``, 12 GB) also carries the vision
 tower, the Thinker's vocabulary head and the speech Talker and Token2Wav, which
 AuK never runs. The slim folder (``models/quantized/AuK/qwen2_5_omni_thinker``,
-7.4 GB) holds only the Thinker weights AuK runs, a Thinker config and the
+7.5 GB) holds only the Thinker weights AuK runs, a Thinker config and the
 tokenizer, processor and chat-template files; ``Qwen2_5OmniThinkerForConditionalGeneration``
 and ``Qwen2_5OmniProcessor`` load it with ``from_pretrained`` exactly like the
 snapshot and give bitwise-identical hidden states.
 
-The slim config declares the vision tower with no transformer blocks and ties
-the vocabulary head to the token embeddings, so loading neither reads nor
-randomly initialises the 1.3 GB of weights AuK discards (AuK deletes the vision
-tower and replaces the head with a hidden-states stub right after loading).
+The slim config declares the vision tower with no transformer blocks (its small
+patch embedding and merger, 76 MB, are kept) and ties the vocabulary head to the
+token embeddings, so loading reports no missing or unexpected weights and never
+randomly initialises the 1.9 GB AuK discards (AuK deletes the vision tower and
+replaces the head with a hidden-states stub right after loading).
 """
 
 from __future__ import annotations
@@ -33,8 +34,9 @@ SLIM_FOLDER = Path("quantized") / "AuK" / "qwen2_5_omni_thinker"
 PROCESSOR_FILES = ("added_tokens.json", "chat_template.json", "merges.txt", "preprocessor_config.json",
                    "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.json")
 NOTICE_FILES = ("LICENSE",)
-# Thinker weights AuK runs, as stored in the public snapshot.
-KEPT_PREFIXES = ("thinker.model.", "thinker.audio_tower.")
+# Thinker weights AuK runs, as stored in the public snapshot, plus the vision tower's
+# block-free remainder, which the Thinker class always builds.
+KEPT_PREFIXES = ("thinker.model.", "thinker.audio_tower.", "thinker.visual.patch_embed.", "thinker.visual.merger.")
 WEIGHTS_INDEX = "model.safetensors.index.json"
 SLIM_MARKER = "auk_thinker_slim"
 SLIM_VERSION = 1
@@ -113,7 +115,7 @@ def slim_config(full_config: dict) -> dict:
     thinker["transformers_version"] = full_config.get("transformers_version", thinker.get("transformers_version"))
     thinker[SLIM_MARKER] = {"version": SLIM_VERSION, "source": "Qwen/Qwen2.5-Omni-3B",
                             "kept": list(KEPT_PREFIXES),
-                            "dropped": ["thinker.visual", "thinker.lm_head", "talker", "token2wav"]}
+                            "dropped": ["thinker.visual.blocks", "thinker.lm_head", "talker", "token2wav"]}
     return thinker
 
 
@@ -193,10 +195,10 @@ def build_slim_folder(source: str | os.PathLike, destination: str | os.PathLike,
     readme.write_text(
         "# Qwen2.5-Omni-3B Thinker (AuK slim)\n\n"
         "The Thinker text model and audio tower of [Qwen/Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B), "
-        "unchanged BF16 weights, as Tencent AuK's text and audio encoder uses them. The vision tower, the Thinker's "
-        "vocabulary head and the Talker/Token2Wav speech decoder are not included (the config declares no vision "
-        "blocks and ties the head to the embeddings), so the folder is for hidden-state conditioning only, not for "
-        "text, image or speech generation.\n\n"
+        "unchanged BF16 weights, as Tencent AuK's text and audio encoder uses them. The vision tower's transformer "
+        "blocks, the Thinker's vocabulary head and the Talker/Token2Wav speech decoder are not included (the config "
+        "declares no vision blocks and ties the head to the embeddings), so the folder is for hidden-state "
+        "conditioning only, not for text, image or speech generation.\n\n"
         "Load with `Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(folder)` and "
         "`Qwen2_5OmniProcessor.from_pretrained(folder)`. Licensed under the Qwen Research License (LICENSE).\n",
         encoding="utf-8")
