@@ -43,14 +43,33 @@ def default_training_method(tier):
     return "full" if int(tier) >= FULL_MIN_TIER else "dora"
 
 
+# Latent frames per micro-batch by training tier (50 frames per second of target audio).
+_TRAINING_FRAMES = {6: 600, 8: 800, 10: 1000, 12: 1200, 16: 1600, 24: 2400, 32: 2700}
+UPDATE_FRAMES = 5400  # two upstream micro-batches per optimizer update (about 108 s of audio)
+
+
 def resolve_training_preset(tier, method="dora"):
-    selected = int(tier)
+    """Memory and learning settings of one GPU tier and training method (provisional; see docs/AUK.md)."""
+    selected = max(key for key in _TRAINING_FRAMES if key <= max(6, int(tier)))
     full = method == "full"
+    frames = _TRAINING_FRAMES[selected]
     return {"base_variant": "bf16" if full or selected >= 16 else "int8_convrot", "base_dtype": "bf16",
-            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": full or selected < 32,
-            "swap_ring_size": 2, "pin_swap_memory": False, "batch_size": 1,
+            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": True,
+            "swap_ring_size": 2, "pin_swap_memory": False, "batch_size": 4, "auk_batch_frames": frames,
+            "grad_accumulation": max(1, round(UPDATE_FRAMES / frames)),
             "learning_rate": LEARNING_RATE["full" if full else "adapter"], "keep_last_n": 2 if full else 0,
-            "train_mel_embed_head": False, "sample_runtime_tier": str(selected), "sample_min_free_vram_gb": 6.0}
+            "train_mel_embed_head": not full, "sample_runtime_tier": str(selected), "sample_min_free_vram_gb": 6.0}
+
+
+def training_note(tier, method="dora"):
+    values = resolve_training_preset(tier, method)
+    precision = "ConvRot INT8" if values["base_variant"] == "int8_convrot" else "BF16"
+    frames = int(values["auk_batch_frames"])
+    return (f"**AuK {str(method).upper()}: {tier} GB tier profile.** {precision} transformer base, {frames:,} latent "
+            f"frames per micro-batch x accumulation {values['grad_accumulation']} (about "
+            f"{frames * values['grad_accumulation'] / 50:.0f} s of audio per update), gradient checkpointing, learning "
+            f"rate {values['learning_rate']:g}. Without reference prompts the Qwen2.5-Omni encoder is not loaded "
+            "(its conditioning is cached); with them it is resident in BF16.")
 
 
 def preset_notes(tier):

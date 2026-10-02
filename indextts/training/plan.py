@@ -202,6 +202,16 @@ def token_budget_micro_batches(rows: Sequence[Mapping[str, Any]], max_tokens: in
     return len(TokenBudgetBatchSampler(lengths, int(max_tokens), seed=int(seed))) if lengths else 0
 
 
+def frame_budget_micro_batches(rows: Sequence[Mapping[str, Any]], max_frames: int, seed: int = 42) -> int:
+    """Micro-batches per epoch of AuK's frame-budget sampler (50 latent frames per second plus text)."""
+
+    from .dataset import TokenBudgetBatchSampler
+
+    lengths = [round(float(row.get("duration_s") or 0.0) * 50) + 2 * len(str(row.get("text") or "").split()) + 40
+               for row in rows]
+    return len(TokenBudgetBatchSampler(lengths, int(max_frames), seed=int(seed))) if lengths else 0
+
+
 def training_plan_line(plan: dict[str, int]) -> str:
     """Format the shared one-line plan used by the UI and training log."""
 

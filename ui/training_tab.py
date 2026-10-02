@@ -171,7 +171,8 @@ TRAINING_TIER_FIELDS = (
     "sample_runtime_tier",
     "sample_min_free_vram_gb",
 )
-OMNI_CAPACITY_FIELDS = ("batch_size", "grad_accumulation", "train_mel_embed_head", "omni_batch_tokens", "learning_rate", "keep_last_n")
+OMNI_CAPACITY_FIELDS = ("batch_size", "grad_accumulation", "train_mel_embed_head", "omni_batch_tokens", "learning_rate", "keep_last_n",
+                        "auk_batch_frames")
 _TRAINING_PATH_FIELDS = ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset")
 
 
@@ -243,6 +244,9 @@ def training_tier_values(tier_value: str | None, device_value: str | None, model
     if model == "omnivoice":
         from indextts.runtime.omnivoice_presets import resolve_training_preset as omni_training_preset
         return omni_training_preset(tier, method)
+    if model == "auk":
+        from indextts.runtime.auk_presets import resolve_training_preset as auk_training_preset
+        return auk_training_preset(tier, method)
     preset = resolve_training_preset(tier)
     return {key: preset[key] for key in TRAINING_TIER_FIELDS}
 
@@ -264,6 +268,12 @@ def _training_tier_note(tier_value: str | None, device_value: str | None, model=
                 f"gradient checkpointing {checkpointing}; learning rate {values['learning_rate']:g}. "
                 "Adapters keep audio embeddings and heads frozen. Full fine-tuning updates all model weights and requires 16 GB or more. "
                 "Measured with clips up to 16 seconds; longer clips or custom trainable modules need more memory.")
+    if model == "auk":
+        from indextts.runtime.auk_presets import FULL_MIN_TIER, training_note
+        if method == "full" and int(tier) < FULL_MIN_TIER:
+            return (f"**AuK: {tier} GB tier.** Full fine-tuning of the 1.5B transformer needs at least the "
+                    f"{FULL_MIN_TIER} GB tier. Select LoRA / DoRA for this card.")
+        return training_note(tier, method)
     prefix = "Detected GPU tier" if str(tier_value or "auto").strip().lower() in {"auto", "custom", ""} else "Selected GPU tier"
     return f"**{prefix}: {tier} GB.** {preset_notes(tier)}"
 
@@ -514,6 +524,7 @@ def _training_plan_markdown(
     fluency_filter: str | None = "all",
     model: str | None = "indextts",
     batch_tokens: int | None = 0,
+    batch_frames: int | None = 0,
 ) -> str:
     try:
         if not dataset_path:
@@ -540,7 +551,10 @@ def _training_plan_markdown(
         if model == "omnivoice" and int(batch_tokens or 0) > 0:
             # OmniVoice groups clips into batches of a token budget instead of a clip count.
             token_batches = token_budget_micro_batches(training_rows, int(batch_tokens), seed)
-        automatic = model == "omnivoice" and not int(epochs or 0)
+        if model == "auk" and int(batch_frames or 0) > 0:
+            from indextts.training.plan import frame_budget_micro_batches
+            token_batches = frame_budget_micro_batches(training_rows, int(batch_frames), seed)
+        automatic = model in {"omnivoice", "auk"} and not int(epochs or 0)
         if automatic:
             epochs = automatic_epochs(sum(float(row.get("duration_s") or 0.0) for row in training_rows))
         plan = training_plan(
@@ -959,7 +973,8 @@ LIVE_TRAINING_JS = """
     if (document.visibilityState !== "visible" || !document.getElementById("training-live-panel")) { return; }
     try {
       const selected = document.querySelector("#speech-model-selector input");
-      const model = selected && selected.value.toLowerCase().includes("omnivoice") ? "omnivoice" : "indextts";
+      const label = selected ? selected.value.toLowerCase() : "";
+      const model = label.includes("omnivoice") ? "omnivoice" : label.includes("auk") ? "auk" : "indextts";
       const response = await fetch(root + "%(route)s?model=" + model, {cache: "no-store"});
       if (!response.ok) { return; }
       const data = await response.json();
@@ -1108,6 +1123,7 @@ class TrainingTab:
     tier_note: Any = None
     device: Any = None
     omnivoice_panel: Any = None
+    auk_panel: Any = None
     index_panels: tuple = ()
     model_selector: Any = None
     manager_outputs: tuple = ()
@@ -1202,6 +1218,44 @@ def build_training_tab(
                 _reg(registry, controls, "omni_normalize_text", gr.Checkbox(
                     value=TRAIN_DEFAULTS["omni_normalize_text"], label="Train on normalized transcripts",
                     info="Spells out numbers, versions and units exactly as generation does, so the voice learns the text it will be given."), kind="bool")
+
+        with gr.Accordion("AuK training objective", open=True) as auk_panel:
+            gr.Markdown("Full fine-tuning updates the whole 1.5B transformer (32 GB or larger cards). LoRA / DoRA adapt its "
+                        "attention, feed-forward and (optionally) adaLN projections. The Qwen2.5-Omni encoder, its layer fusion "
+                        "and the VAE stay frozen, as in AuK's own recipe; latents and the no-reference conditioning are cached "
+                        "automatically beside the dataset.")
+            with gr.Row():
+                _reg(registry, controls, "auk_prompt_fraction", gr.Slider(
+                    0, 1, value=TRAIN_DEFAULTS["auk_prompt_fraction"], step=.01, label="Reference prompt fraction",
+                    info="0 teaches the voice to speak from its description alone (Auto voice; best for one personal voice). "
+                         "Higher values also train cloning from another clip as a reference."),
+                     kind="float", minimum=0, maximum=1)
+                _reg(registry, controls, "auk_reference_seconds", gr.Slider(
+                    3, 30, value=TRAIN_DEFAULTS["auk_reference_seconds"], step=.5, label="Longest reference prompt (s)"),
+                     kind="float", minimum=3, maximum=30)
+            _reg(registry, controls, "auk_voice_description", gr.Textbox(
+                value=TRAIN_DEFAULTS["auk_voice_description"], label="Trained voice description", lines=2,
+                placeholder="The trained speaker's natural voice, clear studio recording",
+                info="The description the voice is trained to answer; Auto voice sends it back. Blank uses the default."),
+                 kind="str")
+            with gr.Row():
+                _reg(registry, controls, "auk_batch_frames", gr.Number(
+                    value=TRAIN_DEFAULTS["auk_batch_frames"], minimum=0, maximum=20000, precision=0,
+                    label="Latent frames per micro-batch",
+                    info="Clips of similar length are grouped up to this many 50 Hz frames (2,700 is upstream's per-GPU "
+                         "budget, about 54 s of audio). 0 uses the fixed Batch size."), kind="int", minimum=0, maximum=20000)
+                _reg(registry, controls, "auk_target_adaln", gr.Checkbox(
+                    value=TRAIN_DEFAULTS["auk_target_adaln"], label="Adapt adaLN modulation too",
+                    info="LoRA / DoRA also on the time-conditioning projections (about 37% of the transformer)."),
+                     kind="bool")
+                _reg(registry, controls, "auk_normalize_text", gr.Checkbox(
+                    value=TRAIN_DEFAULTS["auk_normalize_text"], label="Train on normalized transcripts",
+                    info="Spells out numbers, versions and units exactly as generation does."), kind="bool")
+            with gr.Row():
+                _reg(registry, controls, "auk_num_step", gr.Slider(4, 128, value=32, step=1, label="Sample flow steps"),
+                     kind="int", minimum=4, maximum=128)
+                _reg(registry, controls, "auk_guidance_scale", gr.Slider(0, 6, value=2, step=.1, label="Sample guidance"),
+                     kind="float", minimum=0, maximum=6)
 
         with gr.Accordion("Training data fluency", open=True):
             gr.Markdown(FLUENCY_INTRO, elem_classes=["section-note"])
@@ -2073,7 +2127,7 @@ def build_training_tab(
         api_name="analyze_training_fluency",
     )
     plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode, fluency_filter,
-                   model_selector, controls["training.omni_batch_tokens"]]
+                   model_selector, controls["training.omni_batch_tokens"], controls["training.auk_batch_frames"]]
     on_gathered(
         # Model switches change the batch controls they restore, which already triggers the plan.
         [plan_input.change for plan_input in plan_inputs if plan_input is not model_selector],
@@ -2127,7 +2181,7 @@ def build_training_tab(
     vram_tier.select(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
     apply_tier.click(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
     def apply_omni_method(tier_value, device_value, model_value, method_value):
-        return apply_training_tier(tier_value, device_value, model_value, method_value) if model_value == "omnivoice" else [gr.skip()] * (len(tier_outputs) + 1)
+        return apply_training_tier(tier_value, device_value, model_value, method_value) if model_value in {"omnivoice", "auk"} else [gr.skip()] * (len(tier_outputs) + 1)
     adapter_type.select(apply_omni_method, tier_inputs, [*tier_outputs, tier_note], queue=False, api_name=False)
     gr.on(
         [component.change for component in (vram_tier, device, adapter_type)],
@@ -2219,6 +2273,7 @@ def build_training_tab(
         tier_note=tier_note,
         device=device,
         omnivoice_panel=omnivoice_panel,
+        auk_panel=auk_panel,
         index_panels=(probe_panel, decoder_panel),
         model_selector=model_selector,
         manager_outputs=(manager_table, manager_paths_state, selected_adapter),
