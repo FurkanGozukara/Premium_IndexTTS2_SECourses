@@ -314,3 +314,13 @@ def test_sections_longer_than_the_context_are_split_again():
     assert len(parts) > 1 and sum(len(part.split()) for part in parts) == 200
     assert all(AukEngine.estimate_seconds(part, "en", 1.0, max_seconds=1000) <= 30.0 for part in parts)
     assert engine._fit_context(["A short sentence."], 60, 30.0, "en", 1.0, False, 0.0, 1.0) == ["A short sentence."]
+
+
+def test_pronunciation_markup_becomes_plain_text_for_auk():
+    from indextts.utils.pronunciation import plain_readings
+    from ui import generation_tab
+
+    assert plain_readings("A <DoRA|D AO1 . R AH0> run with <Qwen|chwen>.") == "A DoRA run with chwen."
+    assert plain_readings("<行|XING2>人") == "行人"
+    rows, _note = generation_tab.preview_segments("A <DoRA|D AO1 . R AH0> run.", "EN", 60, model_id="auk")
+    assert rows[0][2] == "A DoRA run." and "reads" not in rows[0][3]

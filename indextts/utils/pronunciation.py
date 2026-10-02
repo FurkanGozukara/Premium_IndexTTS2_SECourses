@@ -577,6 +577,21 @@ def omnivoice_readings(text: str) -> str:
     return _ANNOTATION_RE.sub(replace, str(text or ""))
 
 
+def plain_readings(text: str) -> str:
+    """Write ``<word|reading>`` annotations for a model that reads plain text only (AuK).
+
+    AuK has no phoneme input, so a phoneme reading keeps the written word (and Chinese
+    keeps its characters), while a respelling replaces the word. Text without
+    annotations is returned unchanged.
+    """
+
+    def replace(match: re.Match) -> str:
+        word, reading = match.group(1), " ".join(match.group(2).split())
+        return word if is_phoneme_string(reading) or _CJK_RE.search(word) else reading
+
+    return _ANNOTATION_RE.sub(replace, str(text or ""))
+
+
 def default_dictionary_path(root: str | os.PathLike[str]) -> Path:
     return Path(root).expanduser() / "pronunciations" / "dictionary.json"
 
@@ -657,6 +672,7 @@ __all__ = [
     "normalize_entry",
     "normalize_scope",
     "omnivoice_readings",
+    "plain_readings",
     "save_dictionary",
     "suggest_pronunciation",
     "syllabify",

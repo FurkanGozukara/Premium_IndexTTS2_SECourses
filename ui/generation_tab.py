@@ -67,6 +67,7 @@ from indextts.utils.pronunciation import (
     merge_entries,
     normalize_entry,
     omnivoice_readings,
+    plain_readings,
     save_dictionary,
 )
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
@@ -826,10 +827,15 @@ def preview_segments(
     # Token counts use the text the model receives (OmniVoice: readings in its syntax, [D AO1 R AH0]).
     readings = {}
     for match in re.finditer(r"<([^|>\n]+)\|([^>\n]+)>", str(text)):
-        model_form = omnivoice_readings(match.group(0)) if model_id == "omnivoice" else match.group(0)
+        model_form = (omnivoice_readings(match.group(0)) if model_id == "omnivoice" else
+                      plain_readings(match.group(0)) if model_id == "auk" else match.group(0))
+        if model_id == "auk" and model_form == match.group(1):
+            continue  # AuK has no phoneme input: the written word stays as it is
         readings[model_form] = (match.group(1), " ".join(token for token in match.group(2).split() if token != "."))
     if model_id == "omnivoice":
         text = omnivoice_readings(str(text))
+    elif model_id == "auk":
+        text = plain_readings(str(text))
 
     def shown(segment: str) -> tuple[str, list[str]]:
         used = []

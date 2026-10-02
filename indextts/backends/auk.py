@@ -25,6 +25,7 @@ from indextts.auk import AUK_REPO, LATENT_RATE, MAX_CONTEXT_SECONDS, QWEN_OMNI_R
 from indextts.runtime.vram_presets import RuntimeConfig
 from indextts.utils.audio_plan import assemble_audio_plan, fit_target_samples, trim_segment_silence
 from indextts.utils.pause_tags import PauseChunk, TextChunk, split_text_with_pauses
+from indextts.utils.pronunciation import plain_readings
 from indextts.utils.text_segmentation import ends_sentence, normalize_sentence_whitespace, split_text_by_tokens
 
 MODEL_REPO = AUK_REPO
@@ -587,7 +588,8 @@ class AukEngine:
                 if isinstance(chunk, PauseChunk):
                     plan.append(("pause", round(chunk.duration_s * self.sampling_rate)))
                     continue
-                source = chunk.text.strip()
+                # Pronunciation markup: AuK reads plain text, so respellings replace words and phonemes are dropped.
+                source = plain_readings(chunk.text).strip()
                 if segmentation_mode != "budget":
                     source = normalize_sentence_whitespace(source)
                 if text_normalization:
