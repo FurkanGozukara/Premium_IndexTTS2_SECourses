@@ -198,8 +198,8 @@ class OffloadedModule:
     copy per tensor.
     """
 
-    def __init__(self, module: torch.nn.Module, device):
-        self.module, self.device = module, torch.device(device)
+    def __init__(self, module: torch.nn.Module, device, label="text encoder"):
+        self.module, self.device, self.label = module, torch.device(device), label
         self.cpu = {}
         for owner in module.modules():
             for collection in (owner._parameters, owner._buffers):
@@ -229,7 +229,7 @@ class OffloadedModule:
         else:
             torch.cuda.empty_cache()
         self.active = bool(active)
-        print(f">> AuK text encoder {'on GPU' if active else 'offloaded'} in {time.perf_counter() - started:.2f}s", flush=True)
+        print(f">> AuK {self.label} {'on GPU' if active else 'offloaded'} in {time.perf_counter() - started:.2f}s", flush=True)
 
 
 class PreparedReference:
@@ -290,17 +290,24 @@ class AukEngine:
             self.conditioner.to(text_device)
         self._text_offload = OffloadedModule(self.conditioner.model, self.device) if self.text_residency != "gpu" else None
         num_layers = self.conditioner.num_layers
+        # On demand, the GPU holds one model at a time: the text encoder while encoding and the
+        # transformer while sampling, so the peak is the larger of the two instead of their sum.
+        dit_device = self.device if self._text_offload is None else "cpu"
         if "dit" in quantized:
             from indextts.auk.loader import build_int8_model
             from indextts.quant.convrot_int8 import set_kernel_mode
 
-            self.model = build_int8_model(self.config, quantized["dit"], device=self.device, num_text_layers=num_layers)
+            self.model = build_int8_model(self.config, quantized["dit"], device=dit_device, num_text_layers=num_layers)
             # W8A16 is faster than W8A8 for AuK's shapes (and never calls cuBLASLt's int8 GEMM).
             set_kernel_mode(self.model, "w8a16")
         else:
             state = read_state(folder / "auk_base.safetensors")
-            self.model = build_model(self.config, state, device=self.device, dtype=self.dtype, num_text_layers=num_layers)
+            self.model = build_model(self.config, state, device=dit_device, dtype=self.dtype, num_text_layers=num_layers)
             del state
+        # The layer fusion runs right after encoding; its two small tensors stay on the GPU.
+        for name in ("layer_weights", "layer_scale"):
+            getattr(self.model, name).data = getattr(self.model, name).data.to(self.device)
+        self._dit_offload = None
         self.vae = build_vae(self.config, folder / "vae.safetensors", device=self.device)
         gc.collect()
         if cuda:
@@ -310,10 +317,18 @@ class AukEngine:
 
     # ------------------------------------------------------------------ residency
 
-    def _text_encoder_on(self, active: bool):
-        if self._text_offload is not None:
-            self._text_offload.activate(active)
-            self.conditioner.device = torch.device(self.device if active else "cpu")
+    def _residency(self, phase: str):
+        """Lend the GPU to the text encoder ("text"), the transformer ("dit") or neither ("idle", for
+        Whisper); a no-op when both stay resident."""
+        if self._text_offload is None:
+            return
+        lent = {"text": self._text_offload, "dit": self._dit_offload}.get(phase)
+        for offload in (self._text_offload, self._dit_offload):
+            if offload is not None and offload is not lent:
+                offload.activate(False)
+        if lent is not None:
+            lent.activate(True)
+        self.conditioner.device = torch.device(self.device if phase == "text" else "cpu")
 
     # ------------------------------------------------------------------ adapters
 
@@ -330,6 +345,9 @@ class AukEngine:
                 raise ValueError(f"This adapter belongs to {owner}. Select an AuK adapter or clear the adapter selection.")
             if metadata.get("adapter_type") == "full" and self.runtime.model_variant != "bf16":
                 raise ValueError("Select BF16 before loading a full fine-tuning checkpoint.")
+        if self._dit_offload is not None:
+            # Adapters change the pinned weights themselves, which are re-pinned afterwards.
+            self._dit_offload.activate(False)
         remove_lora(self.model)
         if path:
             apply_lora(self.model, path, strength=float(strength))
@@ -337,6 +355,8 @@ class AukEngine:
                 merge_lora_for_inference(self.model)
         self._lora_path, self._lora_strength, self._lora_merged = path, float(strength), bool(merge_into_base)
         self.model.eval().requires_grad_(False)
+        if self._text_offload is not None:
+            self._dit_offload = OffloadedModule(self.model, self.device, label="transformer")
         self._voice = trained_voice(path)
 
     # ------------------------------------------------------------------ text
@@ -398,6 +418,7 @@ class AukEngine:
         lang = str(language or "auto").lower()
         lang = lang if lang in {"en", "zh"} else "en"
         print(f">> Transcribing reference {Path(path).name} once with Whisper (pace estimate)", flush=True)
+        self._residency("idle")
         transcript = transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
                                 device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
         try:
@@ -475,14 +496,23 @@ class AukEngine:
             raise RuntimeError("AuK returned empty or non-finite audio.")
         return audio
 
-    def generate_batch(self, instructions, references, seconds, settings, seeds, progress=None):
+    def encode_batches(self, batches):
+        """Qwen conditioning of each (instructions, references) batch, kept on the CPU when lent on demand.
+
+        With on-demand residency the text encoder is lent once for every batch, then the transformer.
+        """
+        self._residency("text")
+        encoded = []
+        for instructions, references in batches:
+            text, mask = self._encode(instructions, [item.audio16 if item is not None else None for item in references])
+            encoded.append((text.cpu(), mask.cpu()) if self._text_offload is not None else (text, mask))
+        self._residency("dit")
+        return encoded
+
+    def generate_batch(self, instructions, references, seconds, settings, seeds, progress=None, conditioning=None):
         """Render one batch: instructions[i] with optional references[i] at seconds[i]."""
-        audios16 = [reference.audio16 if reference is not None else None for reference in references]
-        self._text_encoder_on(True)
-        try:
-            text, mask = self._encode(instructions, audios16)
-        finally:
-            self._text_encoder_on(False)
+        text, mask = conditioning if conditioning is not None else self.encode_batches([(instructions, references)])[0]
+        text, mask = text.to(self.device), mask.to(self.device)
         latents = [self._reference_latent(reference) if reference is not None else None for reference in references]
         ref_frames = [int(item.shape[0]) if item is not None else 0 for item in latents]
         ref_latents = torch.zeros(len(references), max(ref_frames), self.model.num_channels, device=self.device)
@@ -586,6 +616,15 @@ class AukEngine:
             if on_text_complete:
                 on_text_complete(text_index, results[text_index])
 
+        prefetched = {}
+        if self._text_offload is not None:
+            # One loan of the text encoder for every batch, then one of the transformer.
+            if self.progress_reporter:
+                self.progress_reporter.update(0, total=total * max(1, int(settings["num_step"])), desc="AuK encoding the text")
+            starts = list(range(0, len(speech), batch_size))
+            encoded = self.encode_batches([(instructions[start:start + batch_size],
+                                            [reference] * len(instructions[start:start + batch_size])) for start in starts])
+            prefetched = dict(zip(starts, encoded))
         devices = [torch.device(self.device).index or 0] if cuda else []
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(base_seed)
@@ -603,7 +642,7 @@ class AukEngine:
                         total=total * max(1, int(settings["num_step"])), desc=f"AuK encoding batch {batch_index + 1}/{total}")
                 seeds = [(base_seed + 7919 * index) % (2**31 - 1) for index in range(start, stop)]
                 audios = self.generate_batch(instructions[start:stop], [reference] * (stop - start), natural[start:stop],
-                                             settings, seeds, progress=on_step)
+                                             settings, seeds, progress=on_step, conditioning=prefetched.get(start))
                 for offset, audio in enumerate(audios):
                     if settings.get("match_loudness") and reference is not None and reference.rms > 1e-4:
                         gain = min(4.0, reference.rms / max(1e-4, _rms(audio)))
@@ -676,13 +715,17 @@ class AukEngine:
         scale = target / max(1e-6, len(audio) / rate)
         outputs = []
         devices = [torch.device(self.device).index or 0] if str(self.device).startswith("cuda") else []
+        references = []
+        for piece in pieces:
+            audio24 = resample(piece, rate, SAMPLE_RATE)
+            audio24 = audio24[: max(HOP, len(audio24) // HOP * HOP)]
+            references.append(PreparedReference(audio24, to_encoder_rate(piece, rate), "", len(audio24) / SAMPLE_RATE,
+                                                None, "edit source"))
+        encoded = (self.encode_batches([([instruction], [reference]) for reference in references])
+                   if self._text_offload is not None else [None] * len(pieces))
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(seed)
-            for index, piece in enumerate(pieces):
-                audio24 = resample(piece, rate, SAMPLE_RATE)
-                audio24 = audio24[: max(HOP, len(audio24) // HOP * HOP)]
-                reference = PreparedReference(audio24, to_encoder_rate(piece, rate), "", len(audio24) / SAMPLE_RATE,
-                                              None, "edit source")
+            for index, (piece, reference) in enumerate(zip(pieces, references)):
                 piece_seconds = target if len(pieces) == 1 else len(piece) / rate * scale
 
                 def on_step(step, total, index=index):
@@ -691,7 +734,8 @@ class AukEngine:
                                                       desc=f"AuK edit, piece {index + 1}/{len(pieces)}, step {step}/{total}")
 
                 outputs.append(self.generate_batch([instruction], [reference], [min(2 * MAX_CONTEXT_SECONDS,
-                                                   max(0.3, piece_seconds))], settings, [seed + index], on_step)[0])
+                                                   max(0.3, piece_seconds))], settings, [seed + index], on_step,
+                                                   conditioning=encoded[index])[0])
         result = torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0]
         self.last_generation_stats = {
             "model": self.model_id, "task": task_key, "instruction": instruction, "pieces": len(pieces),
@@ -705,6 +749,7 @@ class AukEngine:
 
         lang = str(language or "en").lower()
         lang = lang if lang in {"en", "zh"} else "en"
+        self._residency("idle")
         return transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
                           device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
 
@@ -713,7 +758,7 @@ class AukEngine:
         self.progress_reporter = self.gr_progress = None
         if getattr(self, "conditioner", None) is not None:
             self.conditioner.unload()
-        self.model = self.vae = self.conditioner = None
+        self.model = self.vae = self.conditioner = self._text_offload = self._dit_offload = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

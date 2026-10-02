@@ -220,8 +220,10 @@ class AukTrainer(LoraTrainer):
         else:
             sampler = LengthBucketBatchSampler(train_data.lengths, config.batch_size, seed=config.seed)
             val_sampler = None
+        # Workers read the cached latents and reference audio ahead of the GPU (about 75 ms per micro-batch
+        # in the main process). They are recreated every epoch, so each copy sees the dataset's current epoch.
+        train_loader = DataLoader(train_data, batch_sampler=sampler, collate_fn=collate, num_workers=config.num_workers)
         loader_args = {"collate_fn": collate, "num_workers": 0}
-        train_loader = DataLoader(train_data, batch_sampler=sampler, **loader_args)
         val_loader = (DataLoader(val_data, batch_sampler=val_sampler, **loader_args) if val_sampler is not None
                       else DataLoader(val_data, batch_size=config.batch_size, shuffle=False, **loader_args))
         if not config.epochs:

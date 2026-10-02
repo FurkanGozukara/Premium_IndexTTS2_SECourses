@@ -54,7 +54,8 @@ def resolve_training_preset(tier, method="dora"):
     full = method == "full"
     frames = _TRAINING_FRAMES[selected]
     return {"base_variant": "bf16" if full or selected >= 16 else "int8_convrot", "base_dtype": "bf16",
-            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": True,
+            # Full fine-tuning peaks in the optimizer step, so checkpointing would only cost speed (65 %).
+            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": not full,
             "swap_ring_size": 2, "pin_swap_memory": False, "batch_size": 4, "auk_batch_frames": frames,
             "grad_accumulation": max(1, round(UPDATE_FRAMES / frames)),
             "learning_rate": LEARNING_RATE["full" if full else "adapter"], "keep_last_n": 2 if full else 0,
@@ -67,8 +68,9 @@ def training_note(tier, method="dora"):
     frames = int(values["auk_batch_frames"])
     return (f"**AuK {str(method).upper()}: {tier} GB tier profile.** {precision} transformer base, {frames:,} latent "
             f"frames per micro-batch x accumulation {values['grad_accumulation']} (about "
-            f"{frames * values['grad_accumulation'] / 50:.0f} s of audio per update), gradient checkpointing, learning "
-            f"rate {values['learning_rate']:g}. Without reference prompts the Qwen2.5-Omni encoder is not loaded "
+            f"{frames * values['grad_accumulation'] / 50:.0f} s of audio per update), gradient checkpointing "
+            f"{'on' if values['gradient_checkpointing'] else 'off'}, learning rate {values['learning_rate']:g}. "
+            "Without reference prompts the Qwen2.5-Omni encoder is not loaded "
             "(its conditioning is cached); with them it is resident in BF16.")
 
 
@@ -76,7 +78,8 @@ def preset_notes(tier):
     cfg = resolve_preset(tier)
     parts = {
         "gpu": "stays on the GPU",
-        "on_demand": "waits in CPU memory and is lent to the GPU for each encode (the transformer steps aside meanwhile)",
+        "on_demand": ("waits in CPU memory and takes turns with the transformer: the text encoder is lent to the GPU "
+                      "while a request is encoded, then the transformer while it is sampled"),
     }
     return (f"AuK {cfg.vram_tier} GB preset: {cfg.model_variant.replace('_convrot', ' ConvRot').upper()} transformer; "
             f"{cfg.auk_text_encoder_variant.replace('_convrot', ' ConvRot').upper()} Qwen2.5-Omni encoder that "
