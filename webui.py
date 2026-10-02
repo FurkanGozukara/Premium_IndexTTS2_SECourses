@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 import webbrowser
 from typing import Any
 
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="IndexTTS 2.5 Premium SECourses",
+        description="Ultimate Text To Speech Generator With Voice Cloning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -34,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP bind address; omitted by default so Gradio uses its own default",
     )
     parser.add_argument("--share", action="store_true", help="Create a Gradio public share link")
-    parser.add_argument("--model_dir", default=str(ROOT / "models"), help="IndexTTS 2.5 model directory")
+    parser.add_argument("--model_dir", default=str(ROOT / "models"), help="Shared speech model directory")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose generation logging by default")
     parser.add_argument("--no-browser", dest="no_browser", action="store_true", help="Do not open a browser window")
     parser.add_argument("--browser", choices=("default", "chrome"), default="default", help="Browser to open after startup")
@@ -51,8 +52,10 @@ def configure_environment(args: argparse.Namespace) -> None:
 
 def create_demo(args: argparse.Namespace):
     configure_environment(args)
+    started = time.perf_counter()
+    print(">> Loading Gradio and application modules...", flush=True)
     from ui.app import build_app
-
+    print(f">> Modules ready in {time.perf_counter() - started:.2f}s; building interface...", flush=True)
     demo = build_app(args)
     demo.queue(default_concurrency_limit=2)
     return demo
@@ -79,8 +82,8 @@ def install_live_training_route(demo: Any) -> None:
     from fastapi.responses import JSONResponse
     from ui.training_tab import LIVE_TRAINING_ROUTE, live_training_snapshot
 
-    def live_training_status() -> JSONResponse:
-        return JSONResponse(live_training_snapshot(), headers={"Cache-Control": "no-store"})
+    def live_training_status(model: str | None = None) -> JSONResponse:
+        return JSONResponse(live_training_snapshot(model=model), headers={"Cache-Control": "no-store"})
 
     try:
         demo.server_app.add_api_route(LIVE_TRAINING_ROUTE, live_training_status, methods=["GET"], include_in_schema=False)
@@ -89,7 +92,9 @@ def install_live_training_route(demo: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    startup_started = time.perf_counter()
     configure_console_output()
+    print(">> Starting Ultimate Text To Speech Generator With Voice Cloning", flush=True)
     args = build_parser().parse_args(argv)
     try:
         for line in describe_migration(migrate_legacy_best_checkpoints(ROOT / "loras")):
@@ -118,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         css=demo.launch_css,
         head=demo.launch_head,
         app_kwargs=demo.launch_app_kwargs,
+        # Gradio's run history serialises every call's inputs and outputs into the
+        # browser's local storage, on the main thread, for every event; with this
+        # interface's lists it filled the storage quota and slowed every click.
+        run_history=False,
         allowed_paths=[
             str(ROOT / "outputs"),
             str(ROOT / "datasets"),
@@ -130,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     install_live_training_route(demo)
     # The port is chosen at launch when it was not requested, so repeat it on an
     # unbuffered line that survives redirected output.
-    print(f">> IndexTTS 2.5 Premium SECourses is ready at {demo.local_url}", flush=True)
+    print(f">> Ultimate Text To Speech Generator With Voice Cloning is ready at {demo.local_url} ({time.perf_counter()-startup_started:.2f}s startup)", flush=True)
     if not args.no_browser:
         open_app_browser(demo.local_url, args.browser)
     demo.block_thread()

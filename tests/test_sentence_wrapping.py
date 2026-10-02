@@ -131,8 +131,11 @@ def test_upload_event_uses_all_current_preview_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_tab, "apply_pronunciation_dictionary", lambda text, _path: text.replace("TTS", "speech"))
     demo = build_app(SimpleNamespace(device="cpu", model_dir=str(ROOT / "models")))
     upload = next(fn for fn in demo.fns.values() if fn.name == "load_caption")
-    preview = next(fn for fn in demo.fns.values() if fn.name == "update_preview")
-    assert upload.inputs == preview.inputs
+    gathered = next(fn for fn in demo.fns.values() if fn.name == "update_preview")
+    # The browser packs the plain controls; files and other inputs reach the step directly.
+    packing = demo.fns[gathered.trigger_after]
+    assert {id(item) for item in upload.inputs} == {id(item) for item in [*packing.inputs, *gathered.inputs[1:]]}
+    preview = SimpleNamespace(fn=gathered.fn.original)
     path = tmp_path / "wrapped.srt"
     path.write_text("1\n00:00:01,000 --> 00:00:03,000\nTTS reads this\nwhole sentence.\n\n"
                     "2\n00:00:04,000 --> 00:00:06,000\nThen read another one.\n", encoding="utf-8")

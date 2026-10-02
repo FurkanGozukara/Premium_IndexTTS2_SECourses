@@ -81,3 +81,24 @@ def test_number_followed_by_plus_is_spoken_as_plus(normalizer, capsys):
     assert "30+" not in normalized
     assert "normalization failed" not in capsys.readouterr().out
     assert "five plus five" in normalizer.normalize("It costs 5+5 dollars.", lang="EN").lower()
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+@pytest.mark.parametrize("empty_result", ["", "   "])
+def test_empty_normalizer_result_preserves_text_and_annotations(
+    normalizer, monkeypatch, capsys, language, empty_result
+):
+    backend = normalizer.en_normalizer if language == "en" else normalizer.zh_normalizer
+    monkeypatch.setattr(backend, "normalize", lambda _text: empty_result)
+    source = "Open Paint.net with <API|ay pee eye> and GPT-5."
+
+    assert normalizer.normalize(source, lang=language) == source
+    assert "using the original text" in capsys.readouterr().out
+
+
+def test_paint_net_sentence_is_not_silently_dropped(normalizer):
+    source = "Now I am opening Paint.net to edit the image."
+    normalized = normalizer.normalize(source, lang="en")
+
+    assert "opening" in normalized.lower()
+    assert "edit the image" in normalized.lower()

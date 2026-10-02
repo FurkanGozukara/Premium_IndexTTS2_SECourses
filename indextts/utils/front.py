@@ -180,6 +180,8 @@ class TextNormalizer:
             replaced_text, original_name_list = self.save_names(replaced_text)
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
+                if replaced_text.strip() and not result.strip():
+                    raise ValueError("normalizer returned empty text")
             except Exception as exc:
                 # WeText can reject otherwise usable punctuation-heavy fragments.
                 # Preserve the source instead of dropping the whole Chinese segment.
@@ -208,6 +210,8 @@ class TextNormalizer:
                 # 保护技术术语（如 GPT-5-Nano）避免被英文normalizer错误处理
                 replaced_text, tech_list = self.save_tech_terms(text)
                 result = self.en_normalizer.normalize(replaced_text)
+                if replaced_text.strip() and not result.strip():
+                    raise ValueError("normalizer returned empty text")
                 # 恢复技术术语
                 result = self.restore_tech_terms(result, tech_list)
             except Exception as exc:

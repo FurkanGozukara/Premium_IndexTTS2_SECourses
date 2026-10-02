@@ -126,7 +126,7 @@ class ProgressReporter:
             "desc": self.desc,
             "stage": self.stage,
             "elapsed_s": elapsed,
-            "eta_s": eta,
+            "eta_s": self.extra.get("eta_s", eta),
             "speed": speed,
             "speed_unit": speed_unit,
             "vram_used_gb": vram_used,

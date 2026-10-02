@@ -28,6 +28,20 @@ DECODING_KNOBS: dict[str, tuple[float, ...]] = {
 DECODING_WER_WEIGHT = 4.0
 DECODING_MIN_SCORE_GAIN = 0.005
 DECODING_KEYS = ("temperature", "inference_cfg_rate", "num_beams")
+OMNIVOICE_DECODING_KNOBS = {"num_step": (16, 64), "guidance_scale": (1.5, 2.5)}
+
+
+def apply_decoding_settings(infer: Mapping[str, Any], settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply a selected sweep to the backend that owns its parameters."""
+    result = dict(infer)
+    if "num_step" in settings:
+        result["omnivoice"] = {**result.get("omnivoice", {}),
+                              "num_step": int(settings["num_step"]),
+                              "guidance_scale": float(settings["guidance_scale"])}
+    else:
+        result.update({key: settings[key] for key in DECODING_KEYS})
+        result["num_beams"] = int(result["num_beams"])
+    return result
 
 
 def _adapter_dir(path: str | Path) -> Path:
@@ -52,9 +66,11 @@ def load_decoding_settings(adapter_or_checkpoint_path: str | Path | None) -> dic
     if not isinstance(settings, Mapping):
         return None
     try:
-        return {"temperature": float(settings["temperature"]), "inference_cfg_rate": float(settings["inference_cfg_rate"]),
-                "num_beams": int(settings["num_beams"]), "score": float(value.get("score", 0.0)),
-                "generated_at": str(value.get("generated_at", ""))}
+        parsed = ({"num_step": int(settings["num_step"]), "guidance_scale": float(settings["guidance_scale"])}
+                  if "num_step" in settings else
+                  {"temperature": float(settings["temperature"]), "inference_cfg_rate": float(settings["inference_cfg_rate"]),
+                   "num_beams": int(settings["num_beams"])})
+        return {**parsed, "score": float(value.get("score", 0.0)), "generated_at": str(value.get("generated_at", ""))}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -102,9 +118,12 @@ def decoding_markdown(report: Mapping[str, Any]) -> str:
     base = report["base_settings"]
     chosen = report.get("settings") or base
     verdict = "adopted" if report.get("accepted") else "kept the defaults"
-    lines = [f"**Decoding sweep {verdict}.** Baseline temperature {base['temperature']:g}, guidance {base['inference_cfg_rate']:g}, "
-             f"beams {int(base['num_beams'])}" + (f"; adopted temperature {chosen['temperature']:g}, guidance {chosen['inference_cfg_rate']:g}, "
-                                                    f"beams {int(chosen['num_beams'])} (score {float(report.get('score', 0.0)):+.4f})." if report.get("accepted") else "."), ""]
+    def describe(settings):
+        if "num_step" in settings:
+            return f"diffusion steps {int(settings['num_step'])}, guidance {settings['guidance_scale']:g}"
+        return f"temperature {settings['temperature']:g}, guidance {settings['inference_cfg_rate']:g}, beams {int(settings['num_beams'])}"
+    lines = [f"**Decoding sweep {verdict}.** Baseline {describe(base)}" +
+             (f"; adopted {describe(chosen)} (score {float(report.get('score', 0.0)):+.4f})." if report.get("accepted") else "."), ""]
     if report.get("reasons"):
         lines.extend(["Reasons: " + "; ".join(report["reasons"]) + ".", ""])
     lines.extend(["| Change | Similarity gain | Word error change | Score | Passes |", "|---|---:|---:|---:|---|"])
@@ -121,7 +140,7 @@ def decoding_markdown(report: Mapping[str, Any]) -> str:
 
 
 def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: str,
-                       knobs: Mapping[str, Sequence[float]] = DECODING_KNOBS, wer_weight: float = DECODING_WER_WEIGHT,
+                       knobs: Mapping[str, Sequence[float]] | None = None, wer_weight: float = DECODING_WER_WEIGHT,
                        min_score_gain: float = DECODING_MIN_SCORE_GAIN) -> dict[str, Any]:
     """Sweep decoding settings for the selected checkpoint on the speech benchmark and save the winner."""
     from .speech_eval import (_benchmark_infer_kwargs, _benchmark_runtime, _lenient_terms, _file_sha256,
@@ -171,16 +190,21 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
     if not baseline_rows:
         raise ValueError("the speech benchmark has no measurement of the selected checkpoint to sweep decoding settings against")
     infer = dict(inference.get("infer_kwargs") or {}) or _benchmark_infer_kwargs(config)
-    base_settings = {"temperature": float(infer.get("temperature", 0.8)), "inference_cfg_rate": float(infer.get("inference_cfg_rate", 0.7)),
-                     "num_beams": int(infer.get("num_beams", 3) or 1)}
+    omni = getattr(config, "tts_model", "indextts") == "omnivoice"
+    knobs = knobs if knobs is not None else (OMNIVOICE_DECODING_KNOBS if omni else DECODING_KNOBS)
+    if omni:
+        settings = infer.get("omnivoice") or {}
+        base_settings = {"num_step": int(settings.get("num_step", 32)), "guidance_scale": float(settings.get("guidance_scale", 2.0))}
+    else:
+        base_settings = {"temperature": float(infer.get("temperature", 0.8)), "inference_cfg_rate": float(infer.get("inference_cfg_rate", 0.7)),
+                         "num_beams": int(infer.get("num_beams", 3) or 1)}
     policy = dict(plan.get("policy") or {})
     lenient = _lenient_terms(config, plan)
     attempt = out / "grids" / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     variants: list[dict[str, Any]] = []
 
     def render(settings: Mapping[str, Any], suffix: str) -> tuple[list[dict[str, Any]], list[str]]:
-        trial = dict(infer)
-        trial.update({key: (int(value) if key == "num_beams" else float(value)) for key, value in settings.items()})
+        trial = apply_decoding_settings(infer, settings)
         return render_benchmark_rows(config, plan, run_dir=run_dir, checkpoint=checkpoint, label=label, runtime=runtime,
                                      infer=trial, attempt=attempt, out=out, state=state, update=update, cancelled=cancelled,
                                      lenient=lenient, grid_suffix=suffix, baseline=baseline_rows)
@@ -194,7 +218,8 @@ def run_decoding_sweep(config: Any, state_dir: str | Path, *, checkpoint_path: s
             rows, grids = render(settings, f"_{knob}_{float(value):g}".replace(".", "_"))
             verdict = evaluate_variant(rows, baseline_rows, policy=policy, wer_weight=wer_weight, min_score_gain=min_score_gain)
             variants.append({"kind": "single", "knob": knob, "value": value, "settings": settings, "grids": grids, "chosen": False, **verdict})
-            print(f">> decoding {knob} {value:g}: similarity {verdict['similarity'] if verdict['similarity'] is None else round(verdict['similarity'], 4):+} "
+            similarity_text = f"{verdict['similarity']:+.4f}" if verdict['similarity'] is not None else "unavailable"
+            print(f">> decoding {knob} {value:g}: similarity {similarity_text} "
                   f"| word error {100 * verdict['wer_increase']:+.2f} points | score {verdict['score']:+.4f} | "
                   f"{'passes' if verdict['passes'] else '; '.join(verdict['reasons'])}", flush=True)
     combined_settings, winners = select_decoding(base_settings, variants)

@@ -26,15 +26,17 @@ from indextts.training.media import (
 )
 
 from .common import (
-    PROCESS_MANAGER,
-    ROOT,
-    STATE_ROOT,
+    IDLE_POLL_SECONDS,
+    bind_gathered_api,
     btn,
     dedupe_updates,
     open_folder,
     parse_multiline_paths,
+    PROCESS_MANAGER,
     progress_panel_html,
     read_json,
+    ROOT,
+    STATE_ROOT,
     stats_html,
     tail_text,
     write_json_atomic,
@@ -345,7 +347,7 @@ def dataset_poll_updates(
         updates[1] = f"Attached to running run {run_name} | {updates[1]}"
         updates[-2] = gr.Timer(1.0, active=True)
     else:
-        updates[-2] = gr.Timer(5.0, active=True)
+        updates[-2] = gr.Timer(IDLE_POLL_SECONDS, active=True)
     return adopted_state, adopted_dataset, *updates
 
 
@@ -737,7 +739,9 @@ def build_dataset_tab(
             traceback.print_exc()
             raise gr.Error(str(exc)) from exc
 
-    prep_event = prepare_button.click(
+    # Uploads stay direct inputs; the settings travel in one browser-packed payload.
+    prep_event = bind_gathered_api(
+        prepare_button.click,
         start_prep,
         [uploads, *config_components],
         [
@@ -819,7 +823,7 @@ def build_dataset_tab(
         queue=False,
     )
 
-    def cache_features(dataset_value: str, name_value: str, output_value: str):
+    def cache_features(dataset_value: str, name_value: str, output_value: str = "datasets", model_value: str = "indextts"):
         dataset_dir = Path(dataset_value) if dataset_value else Path(output_value) / name_value
         if not dataset_dir.is_absolute():
             dataset_dir = ROOT / dataset_dir
@@ -830,7 +834,7 @@ def build_dataset_tab(
         progress_path = state / "progress.json"
         job = PROCESS_MANAGER.start(
             "dataset_cache",
-            [sys.executable, str(ROOT / "tools" / "cache_dataset_features.py"), "--dataset-dir", str(dataset_dir), "--model-dir", str(getattr(args, "model_dir", ROOT / "models")), "--device", device_default, "--progress-file", str(progress_path)],
+            [sys.executable, str(ROOT / "tools" / "cache_dataset_features.py"), "--dataset-dir", str(dataset_dir), "--model-dir", str(getattr(args, "model_dir", ROOT / "models")), "--device", device_default, "--tts-model", model_value, "--progress-file", str(progress_path)],
             state_dir=state,
             log_path=state / "cache.log",
             cwd=ROOT,
@@ -879,7 +883,7 @@ def build_dataset_tab(
 
     cache_event = cache_button.click(
         cache_features,
-        [existing, name, output_root],
+        [existing, name, output_root, registry["app.model"].component if "app.model" in registry else gr.State("indextts")],
         [
             progress,
             status,
@@ -917,7 +921,8 @@ def build_dataset_tab(
         if not path:
             return gr.skip(), gr.skip()
         return gr.update(choices=scan_datasets(), value=path), path
-    curation_path.change(select_audited_dataset, curation_path, [existing, dataset_path_state], queue=False)
+    # The Training tab also follows this control (one deferring handler per control; see ui/model_controls.py).
+    curation_path.change(select_audited_dataset, curation_path, [existing, dataset_path_state], queue=False, trigger_mode="multiple")
     refresh_existing.click(lambda: gr.update(choices=scan_datasets()), outputs=existing, queue=False)
     open_existing.click(lambda path: open_folder(path or _LAST_DATASET_FOLDER), existing, existing_info, queue=False)
     open_button.click(lambda path: open_folder(path or _LAST_DATASET_FOLDER), dataset_path_state, status, queue=False)

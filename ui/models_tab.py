@@ -33,6 +33,7 @@ from .common import (
     ROOT,
     _terminate_process_tree,
     btn,
+    on_gathered,
     open_folder,
     runtime_config_from_values,
     tail_text,
@@ -206,7 +207,7 @@ def _tier_choices() -> list[tuple[str, str]]:
     ] + [("Custom", "custom")]
 
 
-def _model_status_rows(model_dir: str | Path) -> list[list[Any]]:
+def _model_status_rows(model_dir: str | Path, model_id: str = "indextts") -> list[list[Any]]:
     root = Path(model_dir).expanduser().resolve()
     expected = (
         "config.yaml",
@@ -218,28 +219,34 @@ def _model_status_rows(model_dir: str | Path) -> list[list[Any]]:
         "feat2.pt",
         "multilingual_zh_ja_yue_char_del.tiktoken",
     )
+    if model_id == "omnivoice":
+        expected = ("omnivoice/config.json", "omnivoice/model.safetensors", "omnivoice/tokenizer.json",
+                    "omnivoice/audio_tokenizer/model.safetensors", "quantized/OmniVoice/omnivoice_convrot_int8.safetensors")
     rows = []
     for name in expected:
         path = root / name
         kind = "INT8 ConvRot" if name.endswith(".safetensors") and is_int8_convrot_checkpoint(path) else path.suffix.lstrip(".").upper()
         rows.append([name, "Ready" if path.is_file() else "Missing", round(path.stat().st_size / 1024**2, 2) if path.is_file() else 0.0, kind, str(path)])
-    for directory in ("qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0", "hf_cache/bigvgan"):
+    for directory in (() if model_id == "omnivoice" else ("qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0", "hf_cache/bigvgan")):
         path = root / directory
         rows.append([directory, "Ready" if path.is_dir() else "Missing", "", "Directory", str(path)])
     return rows
 
 
-def _tier_notes(tier_value: str, device_value: str) -> str:
+def _tier_notes(tier_value: str, device_value: str, model_id: str = "indextts") -> str:
     """Describe a restored tier/device without applying any runtime settings."""
 
     if tier_value == "custom":
         return "Custom runtime settings."
     total = _gpu_total(device_value)
     requested = tier_value if tier_value != "auto" else str(auto_tier(total) if total else 6)
+    if model_id == "omnivoice":
+        from indextts.runtime.omnivoice_presets import preset_notes as omni_notes
+        return omni_notes(requested)
     return preset_notes(requested)
 
 
-def _estimate_html(config: RuntimeConfig, total_gb: float) -> str:
+def _estimate_html(config: RuntimeConfig, total_gb: float, model_id: str = "indextts") -> str:
     if str(config.device).strip().lower() == "cpu":
         return (
             '<div class="summary-strip status-ok"><b>CPU diagnostics mode</b> | '
@@ -247,6 +254,10 @@ def _estimate_html(config: RuntimeConfig, total_gb: float) -> str:
         )
     if total_gb <= 0:
         total_gb = 32.0
+    if model_id == "omnivoice":
+        return ('<div class="summary-strip"><b>OmniVoice memory</b> | '
+                f'{total_gb:.1f} GB GPU | Reserve {config.vram_reserve_gb:.1f} GB | '
+                'Peak memory depends on reference length, text and batch size. Use the benchmark for a measured result.</div>')
     estimate = estimate_vram_gb(config, total_gb)
     cls = "status-ok" if estimate["fits"] else "status-error"
     verdict = "Fits selected GPU" if estimate["fits"] else "Estimated to exceed the selected GPU"
@@ -290,6 +301,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
     if initial_device not in _device_choices():
         initial_device = "auto"
     tab = ModelsTab()
+    tab.index_panels = []
     c = tab.controls
 
     with gr.Tab("Models & Performance", id="models-performance"):
@@ -327,7 +339,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
 
         with gr.Accordion("Model Variant & Compute", open=True):
             with gr.Row():
-                variant = gr.Dropdown(choices=["bf16", "int8_convrot"], value="bf16", label="GPT model variant", info="BF16 gives the official quality path; INT8 ConvRot reduces GPT weight memory.")
+                variant = gr.Dropdown(choices=["bf16", "int8_convrot"], value="bf16", label="Model variant", info="BF16 gives the official quality path; INT8 ConvRot reduces transformer weight memory.")
                 dtype = gr.Dropdown(choices=["bf16", "fp16", "fp32"], value="bf16", label="GPT dtype", info="BF16 is recommended on modern NVIDIA GPUs; FP32 is the CPU-compatible fallback.")
                 attention = gr.Dropdown(choices=["sdpa", "flash_attention_2", "eager"], value="sdpa", label="Attention backend", info="SDPA is the compatible default; FlashAttention 2 requires its optional package.")
                 use_accel = gr.Checkbox(value=False, label="Use acceleration engine", info="Enables the optional CUDA-graph/flash-attention path; use beams=1.")
@@ -347,7 +359,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             _register(registry, "runtime.s2mel_estimator_autocast", s2mel_bf16, False, kind="bool")
             _register(registry, "runtime.use_deepspeed", use_deepspeed, False, kind="bool")
 
-        with gr.Accordion("Block Swap & Memory", open=False):
+        with gr.Accordion("Block Swap & Memory", open=False) as swap_panel:
+            tab.index_panels.append(swap_panel)
             with gr.Row():
                 blocks = gr.Slider(-1, 24, value=0, step=1, label="GPT blocks to swap", info="0 keeps all blocks resident; -1 lets runtime fit automatically; up to 24 streams from CPU.")
                 ring = gr.Slider(1, 4, value=2, step=1, label="Swap ring size", info="2 overlaps transfer and compute; 1 uses least VRAM.")
@@ -362,7 +375,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             _register(registry, "runtime.vram_reserve_gb", reserve, 2.0, kind="float", minimum=0, maximum=12)
             _register(registry, "runtime.max_section_batch_size_hint", hint, 8, kind="int", minimum=1, maximum=64)
 
-        with gr.Accordion("Auxiliary Model Residency", open=False):
+        with gr.Accordion("Auxiliary Model Residency", open=False) as aux_panel:
+            tab.index_panels.append(aux_panel)
             gr.Markdown("GPU is fastest, on-demand moves a model around each use, and CPU is available for reference encoders on very small GPUs.")
             aux_components = {}
             with gr.Row():
@@ -412,7 +426,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             benchmark_state = gr.State("")
             benchmark_timer = gr.Timer(2.0)
 
-    runtime_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("runtime.")]
+    runtime_specs = [spec for spec in registry.specs if spec.component is not None and (spec.key.startswith("runtime.") or spec.key == "app.model")]
+    model_selector = registry["app.model"].component if "app.model" in registry else gr.State("indextts")
     runtime_keys = [spec.key for spec in runtime_specs]
     runtime_components = [spec.component for spec in runtime_specs]
     c.update({spec.key: spec.component for spec in runtime_specs})
@@ -428,6 +443,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         spec
         for spec in runtime_specs
         if spec.key not in {
+            "app.model",
             "runtime.device", "runtime.vram_tier", "runtime.lora_path",
             "runtime.lora_strength", "runtime.lora_merge_into_base",
             "runtime.decoder_adapter", "runtime.decoder_adapter_strength",
@@ -435,13 +451,16 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         }
     ]
 
-    def apply_tier(tier_value: str, device_value: str):
+    def apply_tier(tier_value: str, device_value: str, model_id: str = "indextts"):
         if tier_value == "custom":
             return (*[gr.skip()] * len(tier_output_specs), "Custom runtime settings.", gr.skip())
         total = _gpu_total(device_value)
         free = _gpu_free(device_value)
         requested = tier_value if tier_value != "auto" else str(auto_tier(total) if total else 6)
-        cfg = resolve_preset(requested, total or float(requested), free)
+        resolver = resolve_preset
+        if model_id == "omnivoice":
+            from indextts.runtime.omnivoice_presets import resolve_preset as resolver
+        cfg = resolver(requested, total or float(requested), free)
         cfg.device = device_value
         values = cfg.to_dict()
         flat = {
@@ -450,45 +469,51 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             "runtime.vram_tier": tier_value,
         }
         updates = [flat.get(spec.key, gr.skip()) for spec in tier_output_specs]
-        notes = preset_notes(requested)
-        estimate = _estimate_html(cfg, total or float(requested))
+        notes = _tier_notes(requested, device_value, model_id)
+        estimate = _estimate_html(cfg, total or float(requested), model_id)
         return (*updates, notes, estimate)
 
     # Programmatic preset restoration must not overwrite explicit residency
     # choices (notably Quality's on-demand emotion model).
-    tab.tier.input(
+    tab.tier.select(
         apply_tier,
-        [tab.tier, tab.device],
+        [tab.tier, tab.device, model_selector],
         [*[spec.component for spec in tier_output_specs], tab.notes, tab.estimate],
         queue=False,
     )
-    # Restoring a preset changes the selected tier programmatically. Refresh
-    # its description without reapplying hardware defaults over preset values.
-    for component in (tab.tier, tab.device):
-        component.change(
-            _tier_notes,
-            [tab.tier, tab.device],
-            tab.notes,
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-            api_name=False,
-        )
-
     def estimate_runtime(*items: Any):
         try:
-            _, cfg = values_to_config(*items)
-            return _estimate_html(cfg, _gpu_total(cfg.device))
+            options, cfg = values_to_config(*items)
+            return _estimate_html(cfg, _gpu_total(cfg.device), options.get("tts_model", "indextts"))
         except Exception as exc:
             return f'<div class="status-error">Estimate failed: {exc}</div>'
 
-    for component in runtime_components:
-        if component in {tab.tier}:
-            continue
-        component.change(estimate_runtime, runtime_components, tab.estimate, queue=False, show_progress="hidden", trigger_mode="always_last")
+    def describe_runtime(*items: Any):
+        """Tier description and memory estimate. Restoring a preset changes the tier
+        programmatically, so this only describes it; it never reapplies tier defaults."""
+        values = dict(zip(runtime_keys, items))
+        notes = _tier_notes(str(values.get("runtime.vram_tier") or "auto"), str(values.get("runtime.device") or "auto"),
+                            str(values.get("app.model") or "indextts"))
+        return notes, estimate_runtime(*items)
+
+    # One deferring event for every runtime control: a preset or model switch that
+    # changes many of them describes the runtime once. Other handlers that follow
+    # runtime values chain after it (tab.runtime_event) instead of listening to the
+    # same controls, because Gradio 6.29 restarts every handler of a deferred
+    # trigger and two deferring handlers on one control restart each other.
+    # The adapter dropdown already has its deferring restore handler, which this follows.
+    lora_component = c.get("runtime.lora_path")
+    tab.describe_runtime = (describe_runtime, runtime_components, [tab.notes, tab.estimate])
+    tab.runtime_event = on_gathered(
+        [component.change for component in runtime_components if component is not lora_component],
+        describe_runtime, runtime_components, [tab.notes, tab.estimate],
+        queue=False, show_progress="hidden", trigger_mode="always_last", api_name="estimate_runtime",
+    )
 
     def apply_runtime(*items: Any):
         try:
+            if LAZY_ENGINE.busy:
+                raise ValueError("Wait for generation to finish or cancel it before applying runtime settings.")
             options, cfg = values_to_config(*items)
             previous = json.dumps(APPLIED_RUNTIME, sort_keys=True, default=str)
             current = json.dumps(options, sort_keys=True, default=str)
@@ -505,7 +530,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                 f" Saved to {saved_path}.{detail}"
             )
             print(">> " + message, flush=True)
-            return message, _estimate_html(cfg, _gpu_total(cfg.device))
+            return message, _estimate_html(cfg, _gpu_total(cfg.device), options.get("tts_model", "indextts"))
         except Exception as exc:
             traceback.print_exc()
             raise gr.Error(str(exc)) from exc
@@ -513,15 +538,22 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
     apply_button.click(apply_runtime, runtime_components, [tab.apply_status, tab.estimate], api_name="apply_runtime", queue=False)
 
     def unload():
+        if LAZY_ENGINE.busy:
+            raise gr.Error("Cancel the active generation before unloading its model.")
         unloaded = LAZY_ENGINE.unload()
         return "Model unloaded and VRAM caches released." if unloaded else "No in-process model was loaded."
 
     unload_button.click(unload, outputs=tab.apply_status, queue=False)
     refresh_gpu.click(lambda: (gr.update(value=_gpu_rows()), gr.update(choices=_device_choices()), gr.update(choices=_tier_choices())), outputs=[gpu_table, tab.device, tab.tier], queue=False)
-    refresh_files.click(lambda: _model_status_rows(model_dir), outputs=tab.model_status, queue=False)
+    def model_status(model: str):
+        return _model_status_rows(model_dir, model)
+
+    refresh_files.click(model_status, inputs=model_selector, outputs=tab.model_status, queue=False)
+    # Runs after a model switch or preset load (ui/model_controls.py).
+    tab.model_refreshes = [(model_status, [model_selector], [tab.model_status])]
     open_models.click(lambda: open_folder(model_dir), outputs=download_status, queue=False)
 
-    def download_int8(progress=gr.Progress(track_tqdm=False)):
+    def download_int8(model_id: str, progress=gr.Progress(track_tqdm=False)):
         started = time.perf_counter()
         print(">> INT8 model download/verification started", flush=True)
 
@@ -537,16 +569,20 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             print(">> " + message, flush=True)
 
         try:
-            path = ensure_int8_gpt(model_dir, callback)
+            if model_id == "omnivoice":
+                from indextts.backends.omnivoice import ensure_model
+                _, path = ensure_model(model_dir, quantized=True, progress=progress)
+            else:
+                path = ensure_int8_gpt(model_dir, callback)
             info = describe_checkpoint(path)
             message = f"INT8 GPT ready: {path} ({info.get('quantized_layers', 0)} quantized layers) in {time.perf_counter() - started:.1f}s."
             print(">> " + message, flush=True)
-            return message, _model_status_rows(model_dir)
+            return message, _model_status_rows(model_dir, model_id)
         except Exception as exc:
             traceback.print_exc()
             raise gr.Error(str(exc)) from exc
 
-    def download_base(progress=gr.Progress(track_tqdm=False)):
+    def download_base(model_id: str, progress=gr.Progress(track_tqdm=False)):
         started = time.perf_counter()
         print(">> Base model download/verification started", flush=True)
 
@@ -560,18 +596,22 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             print(">> " + message, flush=True)
 
         try:
-            ensure_base_models(model_dir, callback)
+            if model_id == "omnivoice":
+                from indextts.backends.omnivoice import ensure_model
+                ensure_model(model_dir, progress=progress)
+            else:
+                ensure_base_models(model_dir, callback)
             message = f"Base models verified in {time.perf_counter() - started:.1f}s."
             print(">> " + message, flush=True)
-            return message, _model_status_rows(model_dir)
+            return message, _model_status_rows(model_dir, model_id)
         except Exception as exc:
             traceback.print_exc()
             raise gr.Error(str(exc)) from exc
 
-    int8_download.click(download_int8, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
-    base_download.click(download_base, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
+    int8_download.click(download_int8, inputs=model_selector, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
+    base_download.click(download_base, inputs=model_selector, outputs=[download_status, tab.model_status], concurrency_limit=1, concurrency_id="model-download")
 
-    def benchmark(tier_value: str, device_value: str, emulate_value: bool, subtitle_value: bool, idle_wait_value: float):
+    def benchmark(tier_value: str, device_value: str, emulate_value: bool, subtitle_value: bool, idle_wait_value: float, model_id: str = "indextts", variant: str = "bf16"):
         try:
             wait_s = float(idle_wait_value)
             if not math.isfinite(wait_s) or not 0 <= wait_s <= BENCHMARK_MAX_IDLE_WAIT_S:
@@ -593,6 +633,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         command = [
             sys.executable,
             str(ROOT / "tools" / "vram_benchmark.py"),
+            "--model", model_id,
+            "--variant", variant,
             "--tier",
             str(resolved),
             "--beams",
@@ -628,7 +670,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
 
     benchmark_outputs = [benchmark_output, benchmark_state, benchmark_button, cancel_benchmark_button]
     benchmark_button.click(
-        benchmark, [tab.tier, tab.device, emulate, subtitle_bench, idle_wait], benchmark_outputs,
+        benchmark, [tab.tier, tab.device, emulate, subtitle_bench, idle_wait, model_selector, c["runtime.model_variant"]], benchmark_outputs,
         concurrency_limit=1, concurrency_id="vram-benchmark",
     )
     cancel_benchmark_button.click(

@@ -86,7 +86,10 @@ def _build_hadamard(
         raise ValueError(f"Regular Hadamard size must be a power of four, got {size}")
     resolved_device = torch.device(device)
     key = (size, str(resolved_device), dtype)
-    with _HADAMARD_LOCK:
+    # The cached matrix outlives the call that builds it. Built under
+    # torch.inference_mode (a validation pass), it would be an inference tensor
+    # that a later adapter training step could never save for backward.
+    with _HADAMARD_LOCK, torch.inference_mode(False):
         cached = _HADAMARD_CACHE.get(key)
         if cached is not None:
             return cached
@@ -771,7 +774,8 @@ class ConvRotInt8Linear(nn.Module):
 
         if self._rhs_is_current():
             return self.weight_int8_rhs
-        rhs, original_k, original_n = _prepare_int8_rhs(self.weight_int8)
+        with torch.inference_mode(False):  # a cache, as in _build_hadamard
+            rhs, original_k, original_n = _prepare_int8_rhs(self.weight_int8)
         if original_k != self.in_features or original_n != self.out_features:
             raise ValueError(
                 "weight_int8 shape changed from the configured "
@@ -971,6 +975,9 @@ def _find_tensor_state_dict(value: Any) -> Mapping[str, torch.Tensor] | None:
 
 
 def _torch_load_state_dict(path: str | os.PathLike[str]) -> Mapping[str, torch.Tensor]:
+    if str(path).lower().endswith(".safetensors"):
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            return OrderedDict((key, handle.get_tensor(key)) for key in handle.keys())
     kwargs = {"map_location": "cpu", "weights_only": True}
     try:
         checkpoint = torch.load(path, mmap=True, **kwargs)
@@ -1563,12 +1570,16 @@ def convert_gpt_checkpoint(
     report_path: str | None = None,
     progress: Callable[[str], Any] | None = print,
     quantize_emo_encoder: bool = False,
+    linear_targets: Sequence[str] | None = None,
+    state_prefix: str = "",
+    model_id: str = "IndexTeam/IndexTTS-2.5",
 ) -> dict[str, Any]:
-    """Convert the IndexTTS 2.5 GPT checkpoint to mixed BF16/INT8 ConvRot.
+    """Convert a transformer checkpoint to mixed BF16/INT8 ConvRot.
 
     HF GPT-2 ``Conv1D`` weights are transposed from ``[in, out]`` to the
     ComfyUI/``nn.Linear`` ``[out, in]`` layout before rotation. The destination
-    and JSON report are both installed atomically.
+    and JSON report are both installed atomically. Other architectures supply
+    their nn.Linear paths; an optional prefix selects a submodel such as OmniVoice's llm.
     """
 
     started = time.perf_counter()
@@ -1592,9 +1603,21 @@ def convert_gpt_checkpoint(
 
     _emit(progress, f"Loading source checkpoint with mmap: {source}")
     state = _torch_load_state_dict(source)
-    targets = _select_conversion_targets(
-        state, quantize_emo_encoder=quantize_emo_encoder
-    )
+    if state_prefix:
+        state = OrderedDict((key[len(state_prefix):], value) for key, value in state.items() if key.startswith(state_prefix))
+        if not state:
+            raise ValueError(f"No tensors matched prefix {state_prefix!r}")
+    if linear_targets is None:
+        targets = _select_conversion_targets(state, quantize_emo_encoder=quantize_emo_encoder)
+    else:
+        targets = OrderedDict()
+        for base in linear_targets:
+            key = f"{base}.weight"
+            if key not in state or state[key].ndim != 2:
+                raise ValueError(f"Missing 2-D Linear weight: {key}")
+            targets[base] = {"source_key": key, "transpose": False}
+        if not targets:
+            raise ValueError("At least one Linear target is required")
     _emit(
         progress,
         f"Quantizing {len(targets)} layers with groups {resolved_groups} "
@@ -1636,6 +1659,7 @@ def convert_gpt_checkpoint(
 
     groups = {base: value[2] for base, value in quantized.items()}
     metadata = _json_metadata(groups, source.name)
+    metadata["indextts_model"] = model_id
     output_plan = _make_output_plan(state, targets, quantized)
     _emit(progress, f"Writing {len(output_plan)} tensors atomically to {destination}")
     _write_streaming_safetensors(destination, state, output_plan, metadata)
@@ -1648,6 +1672,9 @@ def convert_gpt_checkpoint(
         "format": COMFY_FORMAT,
         "format_version": "1.0",
         "source": str(source),
+        "state_prefix": state_prefix,
+        "model_id": model_id,
+        "selected_source_bytes": sum(value.numel() * value.element_size() for value in state.values()),
         "output": str(destination),
         "report": str(report_destination),
         "method": (

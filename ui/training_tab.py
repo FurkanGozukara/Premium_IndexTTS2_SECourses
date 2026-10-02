@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 import json
 import math
 from pathlib import Path
@@ -17,7 +17,8 @@ from typing import Any, Mapping, Sequence
 import gradio as gr
 import pandas as pd
 
-from indextts.lora.io import inspect_lora, scan_lora_files
+from indextts.lora.io import adapter_tree_files, inspect_lora, memoized_adapter_list, scan_lora_files
+from indextts.utils.path_cache import resolved_path
 from indextts.runtime.gpu import gpu_total_gb
 from indextts.runtime.vram_presets import VRAM_TIERS, auto_tier, preset_notes, resolve_training_preset
 from indextts.training.charts import (
@@ -52,17 +53,22 @@ from indextts.training.fluency_filter import (
     limits_from_values,
     preset as fluency_preset,
 )
-from indextts.training.plan import training_plan, training_plan_advisory, training_plan_line, validation_record_ids
+from indextts.training.plan import (
+    automatic_epochs, token_budget_micro_batches, training_plan, training_plan_advisory, training_plan_line, validation_record_ids,
+)
 from indextts.training.train_config import TrainConfig
 
 from .common import (
-    PROCESS_MANAGER,
-    ROOT,
+    IDLE_POLL_SECONDS,
+    bind_gathered_api,
     btn,
     dedupe_updates,
+    on_gathered,
     open_folder,
+    PROCESS_MANAGER,
     progress_panel_html,
     read_json,
+    ROOT,
     tail_text,
     write_json_atomic,
 )
@@ -165,6 +171,7 @@ TRAINING_TIER_FIELDS = (
     "sample_runtime_tier",
     "sample_min_free_vram_gb",
 )
+OMNI_CAPACITY_FIELDS = ("batch_size", "grad_accumulation", "train_mel_embed_head", "omni_batch_tokens", "learning_rate", "keep_last_n")
 _TRAINING_PATH_FIELDS = ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset")
 
 
@@ -176,6 +183,7 @@ def train_config_from_values(values: Mapping[str, Any]) -> TrainConfig:
         for key, value in values.items()
         if key.startswith("training.")
     }
+    payload["tts_model"] = values.get("app.model", payload.get("tts_model", "indextts"))
     beta_value = payload.get("betas", TRAIN_BETAS_TEXT)
     if isinstance(beta_value, str):
         pieces = [piece.strip() for piece in beta_value.split(",")]
@@ -216,7 +224,7 @@ def _resolved_training_tier(tier_value: str | None, device_value: str | None) ->
     return requested
 
 
-def training_tier_values(tier_value: str | None, device_value: str | None) -> dict[str, Any]:
+def training_tier_values(tier_value: str | None, device_value: str | None, model="indextts", method="dora") -> dict[str, Any]:
     """Training settings for a GPU VRAM preset on the selected training device."""
 
     tier = _resolved_training_tier(tier_value, device_value)
@@ -232,14 +240,30 @@ def training_tier_values(tier_value: str | None, device_value: str | None) -> di
             "sample_runtime_tier": "auto",
             "sample_min_free_vram_gb": TRAIN_DEFAULTS["sample_min_free_vram_gb"],
         }
+    if model == "omnivoice":
+        from indextts.runtime.omnivoice_presets import resolve_training_preset as omni_training_preset
+        return omni_training_preset(tier, method)
     preset = resolve_training_preset(tier)
     return {key: preset[key] for key in TRAINING_TIER_FIELDS}
 
 
-def _training_tier_note(tier_value: str | None, device_value: str | None) -> str:
+def _training_tier_note(tier_value: str | None, device_value: str | None, model="indextts", method="dora") -> str:
     tier = _resolved_training_tier(tier_value, device_value)
     if tier is None:
         return "CPU training: FP32 base precision, no block swap; samples render on the same device."
+    if model == "omnivoice":
+        if method == "full" and int(tier) < 16:
+            return f"**OmniVoice: {tier} GB tier.** Full fine-tuning needs at least the 16 GB tier. Select LoRA / DoRA for this smaller card."
+        values = training_tier_values(tier, device_value, model, method)
+        precision = "ConvRot INT8" if values["base_variant"] == "int8_convrot" else "BF16"
+        checkpointing = "on" if values["gradient_checkpointing"] else "off"
+        tokens = int(values["omni_batch_tokens"])
+        return (f"**OmniVoice {str(method).upper()}: {tier} GB tier profile.** {precision} base, "
+                f"{tokens:,} tokens per micro-batch × accumulation {values['grad_accumulation']} "
+                f"({tokens * int(values['grad_accumulation']):,} tokens, about four minutes of speech, per update); "
+                f"gradient checkpointing {checkpointing}; learning rate {values['learning_rate']:g}. "
+                "Adapters keep audio embeddings and heads frozen. Full fine-tuning updates all model weights and requires 16 GB or more. "
+                "Measured with clips up to 16 seconds; longer clips or custom trainable modules need more memory.")
     prefix = "Detected GPU tier" if str(tier_value or "auto").strip().lower() in {"auto", "custom", ""} else "Selected GPU tier"
     return f"**{prefix}: {tier} GB.** {preset_notes(tier)}"
 
@@ -247,10 +271,11 @@ def _training_tier_note(tier_value: str | None, device_value: str | None) -> str
 _NON_TRAINING_STATE_FOLDERS = frozenset({"analysis", "eval_jobs", "eval_job", ".sample_jobs", "samples"})
 
 
-def _training_states(root: str | Path = ROOT / "loras") -> list[Path]:
+def _training_states(root: str | Path = ROOT / "loras", model: str | None = None) -> list[Path]:
     values: list[tuple[float, Path]] = []
     base = Path(root).expanduser()
-    for status_path in base.rglob("status.json") if base.is_dir() else []:
+    files = adapter_tree_files(base) if base.is_dir() else ()
+    for status_path in (path for path in files if path.name == "status.json"):
         try:
             relative_parts = status_path.relative_to(base).parts
         except ValueError:
@@ -259,6 +284,8 @@ def _training_states(root: str | Path = ROOT / "loras") -> list[Path]:
         # below an adapter folder; only the adapter folder itself is a training run.
         if any(part.lower() in _NON_TRAINING_STATE_FOLDERS for part in relative_parts[:-1]):
             continue
+        if model is not None and (read_json(status_path.parent / "train_config.json", {}) or {}).get("tts_model", "indextts") != model:
+            continue
         try:
             values.append((status_path.stat().st_mtime, status_path.parent.resolve()))
         except OSError:
@@ -266,8 +293,8 @@ def _training_states(root: str | Path = ROOT / "loras") -> list[Path]:
     return [path for _, path in sorted(values, key=lambda item: item[0], reverse=True)]
 
 
-def latest_training_state(root: str | Path = ROOT / "loras") -> str:
-    states = _training_states(root)
+def latest_training_state(root: str | Path = ROOT / "loras", model: str | None = None) -> str:
+    states = _training_states(root, model)
     return str(states[0]) if states else ""
 
 
@@ -282,13 +309,16 @@ def adopt_training_state(
     *,
     root: str | Path = ROOT / "loras",
     page_load: bool = False,
+    model: str | None = None,
 ) -> tuple[str, bool]:
     """Resolve the per-session dashboard state without clinging to a stale run."""
 
     current = str(Path(displayed).expanduser().resolve()) if displayed else ""
+    if current and model is not None and (read_json(Path(current) / "train_config.json", {}) or {}).get("tts_model", "indextts") != model:
+        current = ""
     if current and _state_running(current):
         return current, True
-    newest = latest_training_state(root)
+    newest = latest_training_state(root, model)
     if page_load and newest:
         return newest, _state_running(newest)
     if newest and _state_running(newest):
@@ -296,14 +326,29 @@ def adopt_training_state(
     return current, False
 
 
-def _adapter_entries() -> list[Any]:
-    return scan_lora_files([str(ROOT / "loras")])
+def _adapter_entries(model: str | None = None) -> list[Any]:
+    from indextts.backends import checkpoint_matches_model
+    entries = scan_lora_files([str(ROOT / "loras")])
+    if model is None:
+        return entries
+    result = []
+    for entry in entries:
+        try:
+            if checkpoint_matches_model(inspect_lora(entry.path), model):
+                result.append(entry)
+        except (OSError, ValueError):
+            continue
+    return result
 
 
-def adapter_rows() -> tuple[list[list[Any]], list[str]]:
+def adapter_rows(model: str | None = None) -> tuple[list[list[Any]], list[str]]:
+    return memoized_adapter_list("adapter_rows", ROOT / "loras", _build_adapter_rows, model)
+
+
+def _build_adapter_rows(model: str | None = None) -> tuple[list[list[Any]], list[str]]:
     rows = []
     paths = []
-    for entry in _adapter_entries():
+    for entry in _adapter_entries(model):
         try:
             info = inspect_lora(entry.path)
         except Exception:
@@ -317,14 +362,18 @@ def adapter_rows() -> tuple[list[list[Any]], list[str]]:
             info.get("dataset", ""),
             info.get("date", ""),
             info.get("size_mb", 0),
-            str(Path(entry.path).resolve()),
+            str(resolved_path(entry.path)),
         ])
-        paths.append(str(Path(entry.path).resolve()))
+        paths.append(str(resolved_path(entry.path)))
     return rows, paths
 
 
-def _resume_choices() -> list[tuple[str, str]]:
-    return [("Start fresh", "")] + [(entry.relative_label, str(Path(entry.path).resolve())) for entry in _adapter_entries()]
+def _resume_choices(model: str | None = None) -> list[tuple[str, str]]:
+    return memoized_adapter_list("resume_choices", ROOT / "loras", _build_resume_choices, model)
+
+
+def _build_resume_choices(model: str | None = None) -> list[tuple[str, str]]:
+    return [("Start fresh", "")] + [(entry.relative_label, str(resolved_path(entry.path))) for entry in _adapter_entries(model)]
 
 
 def _dataset_choices() -> list[tuple[str, str]]:
@@ -463,6 +512,8 @@ def _training_plan_markdown(
     seed: int = 42,
     val_split_mode: str = "record",
     fluency_filter: str | None = "all",
+    model: str | None = "indextts",
+    batch_tokens: int | None = 0,
 ) -> str:
     try:
         if not dataset_path:
@@ -483,6 +534,15 @@ def _training_plan_markdown(
         record_ids = [str(row["id"]) for row in rows if row.get("id")]
         if not record_ids:
             return "Training plan unavailable: the manifest is empty."
+        validation_ids = validation_record_ids(rows, val_fraction, seed, val_split_mode)
+        token_batches = None
+        training_rows = [row for row in rows if row.get("id") and str(row["id"]) not in validation_ids]
+        if model == "omnivoice" and int(batch_tokens or 0) > 0:
+            # OmniVoice groups clips into batches of a token budget instead of a clip count.
+            token_batches = token_budget_micro_batches(training_rows, int(batch_tokens), seed)
+        automatic = model == "omnivoice" and not int(epochs or 0)
+        if automatic:
+            epochs = automatic_epochs(sum(float(row.get("duration_s") or 0.0) for row in training_rows))
         plan = training_plan(
             len(record_ids),
             batch_size,
@@ -492,10 +552,12 @@ def _training_plan_markdown(
             val_fraction,
             record_ids=record_ids,
             seed=seed,
-            validation_count=len(validation_record_ids(rows, val_fraction, seed, val_split_mode)),
+            validation_count=len(validation_ids),
+            micro_batches_per_epoch=token_batches,
         )
         advisory = training_plan_advisory(plan, batch_size, grad_accumulation)
-        return f"### Training plan\n\n{training_plan_line(plan)}\n\n{advisory}{fluency_note}"
+        length_note = f"\n\nAutomatic length: **{epochs} epochs** for this dataset's training audio." if automatic else ""
+        return f"### Training plan\n\n{training_plan_line(plan)}{length_note}\n\n{advisory}{fluency_note}"
     except Exception as exc:
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         return f"Training plan unavailable: {message[:160]}"
@@ -554,7 +616,8 @@ def _checkpoint_rows(state_dir: str | Path | None) -> list[list[Any]]:
             if item.path and abs(item.strength - 1.0) < 1e-9:
                 by_path[str(Path(item.path).resolve())] = (item.val_loss, item.phase)
     rows = []
-    for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True):
+    checkpoints = [path for path in adapter_tree_files(root) if path.suffix.lower() == ".safetensors"] if root.is_dir() else []
+    for path in sorted(checkpoints, key=lambda item: item.stat().st_mtime, reverse=True):
         if path.name.startswith("."):
             continue
         try:
@@ -895,7 +958,9 @@ LIVE_TRAINING_JS = """
   const tick = async () => {
     if (document.visibilityState !== "visible" || !document.getElementById("training-live-panel")) { return; }
     try {
-      const response = await fetch(root + "%(route)s", {cache: "no-store"});
+      const selected = document.querySelector("#speech-model-selector input");
+      const model = selected && selected.value.toLowerCase().includes("omnivoice") ? "omnivoice" : "indextts";
+      const response = await fetch(root + "%(route)s?model=" + model, {cache: "no-store"});
       if (!response.ok) { return; }
       const data = await response.json();
       if (!data.active) { return; }
@@ -918,7 +983,7 @@ LIVE_TRAINING_JS = """
 """ % {"route": LIVE_TRAINING_ROUTE}
 
 
-def live_training_snapshot(root: str | Path = ROOT / "loras") -> dict[str, Any]:
+def live_training_snapshot(root: str | Path = ROOT / "loras", model: str | None = None) -> dict[str, Any]:
     """The live run's progress panel, status line and log tail for the browser's one-second poller.
 
     Inactive (nothing to swap) when no run is in progress; the Gradio timer then owns the dashboard.
@@ -926,8 +991,10 @@ def live_training_snapshot(root: str | Path = ROOT / "loras") -> dict[str, Any]:
     try:
         job = PROCESS_MANAGER.get("training")
         candidate = str(job.state_dir) if job is not None and job.running and getattr(job, "state_dir", None) else ""
+        if candidate and model is not None and (read_json(Path(candidate) / "train_config.json", {}) or {}).get("tts_model", "indextts") != model:
+            candidate = ""
         if not candidate or not _state_running(candidate):
-            newest = latest_training_state(root)
+            newest = latest_training_state(root, model)
             candidate = newest if newest and _state_running(newest) else ""
         if not candidate:
             return {"active": False}
@@ -944,7 +1011,10 @@ def live_training_snapshot(root: str | Path = ROOT / "loras") -> dict[str, Any]:
 def _finish_poll_updates(updates: list[Any], adopted_state: str, running: bool) -> None:
     if running and adopted_state:
         updates[1] = f"Attached to running run {Path(adopted_state).name} | {updates[1]}"
-    updates[-1] = gr.Timer(5.0, active=True)
+    # Every tick is a backend event, which costs the whole page some work; while
+    # idle a slow poll still adopts a run started elsewhere, and the one-second
+    # live route (LIVE_TRAINING_JS) already shows a live run's progress.
+    updates[-1] = gr.Timer(5.0 if running else IDLE_POLL_SECONDS, active=True)
 
 
 def training_poll_updates(
@@ -955,6 +1025,7 @@ def training_poll_updates(
     page_load: bool = False,
     request: gr.Request | None = None,
     force_heavy: bool = False,
+    model: str | None = None,
 ) -> tuple[Any, ...]:
     """Adopt a live run when idle, then return state plus the dashboard.
 
@@ -973,6 +1044,7 @@ def training_poll_updates(
         state_value,
         root=state_root,
         page_load=page_load,
+        model=model,
     )
     session = str(getattr(request, "session_hash", "") or "") if request is not None else ""
     if not session:
@@ -1035,6 +1107,11 @@ class TrainingTab:
     vram_tier: Any = None
     tier_note: Any = None
     device: Any = None
+    omnivoice_panel: Any = None
+    index_panels: tuple = ()
+    model_selector: Any = None
+    manager_outputs: tuple = ()
+    model_refreshes: list = field(default_factory=list)
 
 
 def _reg(
@@ -1060,6 +1137,7 @@ def build_training_tab(
     load_hook: Any | None = None,
 ) -> TrainingTab:
     controls: dict[str, Any] = {}
+    model_selector = registry["app.model"].component if "app.model" in registry else gr.State("indextts")
     datasets = _dataset_choices()
     initial_dataset = datasets[0][1] if datasets else str(ROOT / TRAIN_DEFAULTS["dataset_dir"])
     # State is deliberately session-local and empty at build time. The header load
@@ -1075,7 +1153,8 @@ def build_training_tab(
     if device_default == "auto":
         device_default = TRAIN_DEFAULTS["device"]
 
-    with gr.Tab("LoRA / DoRA Training", id="lora-training") as tab_block:
+    with gr.Tab("Voice Training", id="lora-training") as tab_block:
+        _reg(registry, controls, "tts_model", gr.State("indextts"), kind="str")
         with gr.Row():
             dataset = gr.Dropdown(
                 choices=datasets,
@@ -1100,6 +1179,29 @@ def build_training_tab(
         tier_note = gr.Markdown(_training_tier_note(TRAIN_DEFAULTS["vram_tier"], device_default), elem_classes=["section-note"])
         _reg(registry, controls, "dataset_dir", dataset, kind="str")
         _reg(registry, controls, "vram_tier", vram_tier, kind="choice", choices=["auto", *[str(tier) for tier in VRAM_TIERS]])
+
+        with gr.Accordion("OmniVoice training objective", open=True) as omnivoice_panel:
+            gr.Markdown("Full fine-tuning updates the transformer, audio embeddings and prediction heads. LoRA / DoRA adapt the selected projections. Codec features are cached automatically; training and validation retain the dataset's reviewed split.")
+            with gr.Row():
+                for field, label, info in (
+                        ("omni_prompt_ratio", "Maximum audio prompt fraction",
+                         "0 teaches one speaker's voice to speak without a reference (best for a personal voice); "
+                         "0.3, the upstream value, also teaches cloning from a prompt for multi-speaker datasets."),
+                        ("omni_drop_condition", "Condition dropout", None),
+                        ("omni_language_ratio", "Language conditioning probability", None)):
+                    component = gr.Slider(0, 1, value=TRAIN_DEFAULTS[field], step=.01, label=label, info=info)
+                    _reg(registry, controls, field, component, kind="float", minimum=0, maximum=1)
+            with gr.Row():
+                _reg(registry, controls, "omni_num_step", gr.Slider(4, 128, value=32, step=1, label="Sample diffusion steps"), kind="int", minimum=4, maximum=128)
+                _reg(registry, controls, "omni_guidance_scale", gr.Slider(0, 8, value=2, step=.1, label="Sample guidance"), kind="float", minimum=0, maximum=8)
+            with gr.Row():
+                _reg(registry, controls, "omni_batch_tokens", gr.Number(
+                    value=TRAIN_DEFAULTS["omni_batch_tokens"], minimum=0, maximum=65536, precision=0, label="Tokens per micro-batch",
+                    info="Clips of similar length are grouped up to this many padded tokens; with gradient accumulation it sets the audio per update "
+                         "(the upstream recipe uses about 8192). 0 uses the fixed Batch size instead."), kind="int", minimum=0, maximum=65536)
+                _reg(registry, controls, "omni_normalize_text", gr.Checkbox(
+                    value=TRAIN_DEFAULTS["omni_normalize_text"], label="Train on normalized transcripts",
+                    info="Spells out numbers, versions and units exactly as generation does, so the voice learns the text it will be given."), kind="bool")
 
         with gr.Accordion("Training data fluency", open=True):
             gr.Markdown(FLUENCY_INTRO, elem_classes=["section-note"])
@@ -1157,10 +1259,10 @@ def build_training_tab(
         fluency_limit_controls = [fluency_long_ms, fluency_max_long, fluency_max_hesitations, fluency_max_pause,
                                   fluency_max_fillers, fluency_fillers]
 
-        with gr.Accordion("LoRA / DoRA", open=True):
+        with gr.Accordion("Training method", open=True):
             with gr.Row():
-                name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="LoRA / DoRA name", info="Safe output folder and final safetensors basename.")
-                adapter_type = gr.Dropdown(choices=["lora", "dora"], value=TRAIN_DEFAULTS["adapter_type"], label="LoRA / DoRA type", info="DoRA is the quality default; LoRA uses slightly less compute.")
+                name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="Training run name", info="Safe output folder and final safetensors basename.")
+                adapter_type = gr.Dropdown(choices=["lora", "dora"], value=TRAIN_DEFAULTS["adapter_type"], allow_custom_value=True, label="Training method", info="LoRA and DoRA update adapters. OmniVoice also supports full fine-tuning.")
                 rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset.")
                 alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default equals rank for a scale of exactly one.")
                 dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="Regularizes training by randomly dropping adapter inputs. More dropout is not always better.")
@@ -1177,7 +1279,7 @@ def build_training_tab(
             )
             for field_name, component, kind, choices, minimum, maximum in (
                 ("name", name, "str", None, None, None),
-                ("adapter_type", adapter_type, "choice", ["lora", "dora"], None, None),
+                ("adapter_type", adapter_type, "choice", ["lora", "dora", "full"], None, None),
                 ("rank", rank, "int", None, 1, 256), ("alpha", alpha, "float", None, 1, 1024),
                 ("dropout", dropout, "float", None, 0, 0.5),
                 ("target_attention", target_attention, "bool", None, None, None),
@@ -1199,7 +1301,7 @@ def build_training_tab(
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
                 eps = gr.Number(value=TRAIN_DEFAULTS["eps"], minimum=1e-12, maximum=0.1, label="Adam epsilon", info="Numerical stability term for Adam-family optimizers.")
-                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=1, maximum=10000, precision=0, label="Epochs", info="Maximum passes through this dataset. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset.")
+                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=0, maximum=10000, precision=0, label="Epochs", info="Maximum passes through this dataset. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset. OmniVoice: 0 sizes the run from the training audio (25 epochs for 14 hours, more for smaller datasets).")
                 max_steps = gr.Number(value=TRAIN_DEFAULTS["max_steps"], minimum=0, precision=0, label="Maximum steps", info="0 derives steps from epochs; set 5 for a quick smoke run.")
                 batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="Clips per micro-batch. Larger batches need more memory and produce fewer updates per epoch.")
                 accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="Micro-batches combined into one optimizer update. Check the displayed update budget after changing it.")
@@ -1278,7 +1380,7 @@ def build_training_tab(
                 ("lr_scheduler", scheduler, "choice", ["cosine", "linear", "constant", "constant_with_warmup"], None, None),
                 ("warmup_steps", warmup, "int", None, 0, 1000000), ("weight_decay", weight_decay, "float", None, 0, 1),
                 ("betas", betas, "str", None, None, None), ("eps", eps, "float", None, 1e-12, 0.1),
-                ("epochs", epochs, "int", None, 1, 10000), ("max_steps", max_steps, "int", None, 0, 100000000),
+                ("epochs", epochs, "int", None, 0, 10000), ("max_steps", max_steps, "int", None, 0, 100000000),
                 ("batch_size", batch_size, "int", None, 1, 128), ("grad_accumulation", accumulation, "int", None, 1, 128),
                 ("max_grad_norm", grad_clip, "float", None, 0, 100), ("label_smoothing", smoothing, "float", None, 0, 0.5),
                 ("mel_loss_weight", mel_weight, "float", None, 0, 100), ("text_loss_weight", text_weight, "float", None, 0, 100),
@@ -1344,7 +1446,7 @@ def build_training_tab(
                     label="Save train state with every epoch checkpoint",
                     info="Only needed to Continue run from a specific epoch; costs ~4x disk per checkpoint.",
                 )
-                resume = gr.Dropdown(choices=_resume_choices(), value=TRAIN_DEFAULTS["resume_from"], label="Resume from", info="Resume preserves the checkpoint's rank, alpha, type, and adapter target layout. These must match its saved weights; differences from your selections are reported.")
+                resume = gr.Dropdown(choices=_resume_choices("indextts"), value=TRAIN_DEFAULTS["resume_from"], allow_custom_value=True, label="Resume from", info="Resume preserves the checkpoint's rank, alpha, type, and adapter target layout. These must match its saved weights; differences from your selections are reported.")
                 resume_mode = gr.Radio(
                     choices=[("Weights only", "weights_only"), ("Continue run", "continue")],
                     value=TRAIN_DEFAULTS["resume_mode"],
@@ -1456,7 +1558,7 @@ def build_training_tab(
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
 
-        with gr.Accordion("Epoch probe and two-signal early stopping", open=False):
+        with gr.Accordion("Epoch probe and two-signal early stopping", open=False) as probe_panel:
             gr.Markdown("After an epoch, a separate process renders a few held-out sentences with the checkpoint using the deployment settings and measures them against the real recordings "
                         "(speaker similarity, word error, pauses), scored against Base with the deployment score. The best-scoring epoch is kept as `best/<name>_probe_best.safetensors` and always joins the speech comparison. "
                         "Training then stops only when validation loss and the probe have both stalled, or when the probe shows the voice getting harder to understand while its score no longer improves. "
@@ -1496,7 +1598,7 @@ def build_training_tab(
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
 
-        with gr.Accordion("Voice decoder adaptation", open=False):
+        with gr.Accordion("Voice decoder adaptation", open=False) as decoder_panel:
             gr.Markdown("After the checkpoint is selected, adapt the semantic-to-mel decoder to this voice as well. The GPT LoRA / DoRA decides what is said and when; the decoder owns timbre and spectral detail. "
                         "The decoder adapter trains from the cached dataset in its own process, is saved next to the GPT adapter, and loads automatically whenever that adapter is selected.")
             with gr.Row():
@@ -1513,10 +1615,6 @@ def build_training_tab(
                     info="real: the semantic codes quantized from the recordings, as the decoder was pretrained. gpt: the selected checkpoint's own teacher-forced predictions for the same clips, which is what generation feeds the decoder. mixed: half of each.")
             decoder_always_gate = gr.Checkbox(value=TRAIN_DEFAULTS["decoder_adapter_always_gate"], label="Judge the decoder with the best adapter even when Base leads",
                 info="When the speech comparison preferred Base, the decoder is still tested through the full pipeline with the best-scoring adapter checkpoint, and adapter + decoder is judged against Base and every plain adapter by the same guards and deployment score; it becomes the recommendation only when it wins. Off keeps the old behavior: no decoder gate after a Base recommendation.")
-            with gr.Row():
-                decoding_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoding_sweep_enabled"], label="Sweep decoding settings after training",
-                    info="Renders the speech benchmark with the selected checkpoint at other temperatures, guidance rates, and beam counts; a change is kept only when it scores better than the defaults, and Voice Generation applies the winner with the adapter.")
-                decoding_timeout = gr.Number(value=TRAIN_DEFAULTS["decoding_sweep_timeout_s"], minimum=60, label="Decoding sweep timeout (s)")
             for name, component, kind, minimum, maximum in (
                 ("decoder_adapter_enabled", decoder_enabled, "bool", None, None),
                 ("decoder_adapter_rank", decoder_rank, "int", 1, 256),
@@ -1526,10 +1624,16 @@ def build_training_tab(
                 ("decoder_adapter_timeout_s", decoder_timeout, "float", 60, 1000000),
                 ("decoder_adapter_code_source", decoder_codes, "str", None, None),
                 ("decoder_adapter_always_gate", decoder_always_gate, "bool", None, None),
-                ("decoding_sweep_enabled", decoding_enabled, "bool", None, None),
-                ("decoding_sweep_timeout_s", decoding_timeout, "float", 60, 1000000),
             ):
                 _reg(registry, controls, name, component, kind=kind, minimum=minimum, maximum=maximum)
+
+        with gr.Accordion("Automatic decoding selection", open=False):
+            with gr.Row():
+                decoding_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["decoding_sweep_enabled"], label="Sweep decoding settings after training",
+                    info="Tests the development speech benchmark with the selected checkpoint. IndexTTS varies temperature, guidance and beams; OmniVoice varies diffusion steps and guidance. Only a measured improvement is saved, before independent final testing.")
+                decoding_timeout = gr.Number(value=TRAIN_DEFAULTS["decoding_sweep_timeout_s"], minimum=60, label="Decoding sweep timeout (s)")
+            _reg(registry, controls, "decoding_sweep_enabled", decoding_enabled, kind="bool")
+            _reg(registry, controls, "decoding_sweep_timeout_s", decoding_timeout, kind="float", minimum=60, maximum=1000000)
 
         with gr.Accordion("Sampling", open=False):
             with gr.Row():
@@ -1739,8 +1843,8 @@ def build_training_tab(
             },
         )
 
-        with gr.Accordion("LoRA Manager", open=False):
-            manager_rows, manager_paths = adapter_rows()
+        with gr.Accordion("Trained voice checkpoints", open=False):
+            manager_rows, manager_paths = adapter_rows("indextts")
             manager_paths_state = gr.State(manager_paths)
             selected_adapter = gr.State("")
             manager_table = gr.Dataframe(
@@ -1755,7 +1859,7 @@ def build_training_tab(
                 manager_delete = gr.Button("✖️  Delete", variant="stop", elem_classes=btn("pink"))
                 manager_open = gr.Button("🗂️  Open folder", elem_classes=btn("teal"))
 
-    config_specs = [spec for spec in registry.specs if spec.component is not None and spec.key.startswith("training.")]
+    config_specs = [spec for spec in registry.specs if spec.component is not None and (spec.key.startswith("training.") or spec.key == "app.model")]
     config_keys = [spec.key for spec in config_specs]
     config_components = [spec.component for spec in config_specs]
 
@@ -1770,7 +1874,7 @@ def build_training_tab(
             dataset_root = Path(config.dataset_dir)
             if not (dataset_root / "manifest.jsonl").is_file():
                 raise ValueError(f"Dataset manifest not found: {dataset_root}")
-            if not (dataset_root / "cache" / "index.jsonl").is_file():
+            if config.tts_model == "indextts" and not (dataset_root / "cache" / "index.jsonl").is_file():
                 raise ValueError("Dataset features are not cached. Use 'Cache features now' in Dataset Preparation first.")
             adapter_dir = Path(config.output_dir) / config.name
             from indextts.training.run_guard import ensure_run_destination
@@ -1802,7 +1906,8 @@ def build_training_tab(
                 cwd=ROOT,
                 metadata={"adapter_dir": str(adapter_dir)},
             )
-            message = f"Training {config.name} started with {config.adapter_type.upper()} rank {config.rank}."
+            method = "full fine-tuning" if config.adapter_type == "full" else f"{config.adapter_type.upper()} rank {config.rank}"
+            message = f"Training {config.name} started with {method}."
             print(">> " + message, flush=True)
             updates = list(training_poll_updates(str(adapter_dir), smoothing_value))
             updates[-1] = gr.Timer(5.0, active=True)
@@ -1836,7 +1941,10 @@ def build_training_tab(
             traceback.print_exc()
             raise gr.Error(str(exc)) from exc
 
-    start_event = start.click(
+    # 146 settings reach the server in one browser-packed payload (common.on_gathered);
+    # "start_training" keeps the original signature for programmatic callers.
+    start_event = bind_gathered_api(
+        start.click,
         start_training,
         [*config_components, smoothing_slider],
         [
@@ -1867,27 +1975,28 @@ def build_training_tab(
     poll_outputs = [state_dir, dashboard_progress, status_text, loss_plot, lr_plot_component, grad_plot, speed_plot_component, log, latest_sample, sample_label, checkpoints, generalization_summary, generalization_plot, timer]
 
     # Gradio injects the per-tab request so the poller can remember what each tab has seen.
-    def poll_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
-        return training_poll_updates(state_value, smoothing_value, request=gr_request)
+    def poll_dashboard(state_value: str, smoothing_value: float, model: str, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, request=gr_request, model=model)
 
-    def refresh_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
-        return training_poll_updates(state_value, smoothing_value, request=gr_request, force_heavy=True)
+    def refresh_dashboard(state_value: str, smoothing_value: float, model: str, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, request=gr_request, force_heavy=True, model=model)
 
-    def attach_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
-        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request)
+    def attach_dashboard(state_value: str, smoothing_value: float, model: str, gr_request: gr.Request = None):
+        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request, model=model)
 
-    def reopen_dashboard(state_value: str, smoothing_value: float, gr_request: gr.Request = None):
+    def reopen_dashboard(state_value: str, smoothing_value: float, model: str, gr_request: gr.Request = None):
         # Opening the tab shows the newest run, finished or live, and re-sends the dashboard:
         # charts rendered while the tab was hidden stay blank until they receive a value.
-        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request)
+        return training_poll_updates(state_value, smoothing_value, page_load=True, request=gr_request, model=model)
 
-    timer.tick(poll_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
-    tab_block.select(reopen_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden")
-    smoothing_slider.change(refresh_dashboard, [state_dir, smoothing_slider], poll_outputs, queue=False, show_progress="hidden", trigger_mode="always_last")
+    poll_inputs = [state_dir, smoothing_slider, model_selector]
+    timer.tick(poll_dashboard, poll_inputs, poll_outputs, queue=False, show_progress="hidden")
+    tab_block.select(reopen_dashboard, poll_inputs, poll_outputs, queue=False, show_progress="hidden")
+    smoothing_slider.change(refresh_dashboard, poll_inputs, poll_outputs, queue=False, show_progress="hidden", trigger_mode="always_last")
     if load_hook is not None:
         load_hook(
             attach_dashboard,
-            [state_dir, smoothing_slider],
+            poll_inputs,
             poll_outputs,
             queue=False,
             show_progress="hidden",
@@ -1895,8 +2004,13 @@ def build_training_tab(
         )
 
     with tab_block:
-        stop_confirm = gr.Checkbox(value=False, visible=False, label="Training stop confirmation")
-        force_confirm = gr.Checkbox(value=False, visible=False, label="Training force-stop confirmation")
+        stop_action = gr.State("")
+        stop_target = gr.State("")
+        with gr.Group(visible=False) as stop_panel:
+            stop_message = gr.Markdown()
+            with gr.Row():
+                stop_yes = gr.Button("🛑 Confirm training stop", variant="stop", elem_classes=btn("coral"))
+                stop_no = gr.Button("▶️ Keep training", elem_classes=btn("mint"))
 
     def graceful_stop(confirmed: bool, state_value: str):
         if not confirmed:
@@ -1924,8 +2038,14 @@ def build_training_tab(
             return "Training subprocess tree was force-stopped. The last completed checkpoint remains available."
         return "The active displayed run is not managed by this app process."
 
-    stop.click(graceful_stop, [stop_confirm, state_dir], status_text, js="(value, state) => [window.confirm('Stop gracefully after the current step and save?'), state]", queue=False)
-    force.click(force_stop, [force_confirm, state_dir], status_text, js="(value, state) => [window.confirm('Force stop training immediately? Unsaved work will be lost.'), state]", queue=False)
+    stop.click(lambda state: (gr.update(visible=True), "Stop after the current optimizer update and save a resumable checkpoint?", "stop", state),
+               state_dir, [stop_panel, stop_message, stop_action, stop_target], queue=False)
+    force.click(lambda state: (gr.update(visible=True), "Force stop immediately? Work since the last saved checkpoint will be lost.", "force", state),
+                state_dir, [stop_panel, stop_message, stop_action, stop_target], queue=False)
+    stop_no.click(lambda: (gr.update(visible=False), "", ""), outputs=[stop_panel, stop_action, stop_target], queue=False)
+    stop_yes.click(lambda action, state: force_stop(True, state) if action == "force" else graceful_stop(True, state),
+                   [stop_action, stop_target], status_text, queue=False, api_name="confirm_training_stop").then(
+                   lambda: (gr.update(visible=False), "", ""), outputs=[stop_panel, stop_action, stop_target], queue=False)
     open_output.click(lambda state: open_folder(state or _LAST_TRAINING_FOLDER), state_dir, status_text, queue=False)
 
     refresh_dataset_event = refresh_dataset.click(
@@ -1934,32 +2054,37 @@ def build_training_tab(
         [dataset, dataset_info],
         queue=False,
     )
-    dataset.change(_dataset_summary, dataset, dataset_info, queue=False)
+    # The training plan also follows the dataset; only one handler of a control may defer.
+    dataset.change(_dataset_summary, dataset, dataset_info, queue=False, trigger_mode="multiple")
     # Choosing a filter fills in its limits; loading a saved preset (a programmatic change) keeps the saved limits.
-    fluency_filter.input(
+    fluency_filter.select(
         _fluency_preset_values,
         fluency_filter,
         [fluency_description, *fluency_limit_controls],
         queue=False,
         show_progress="hidden",
     )
-    fluency_filter.change(_fluency_description, fluency_filter, fluency_description, queue=False, show_progress="hidden")
+    fluency_filter.change(_fluency_description, fluency_filter, fluency_description, queue=False, show_progress="hidden",
+                          trigger_mode="multiple")
     analyze_fluency.click(
         _fluency_analysis_markdown,
         [dataset, fluency_filter, *fluency_limit_controls, val_fraction, seed, val_split_mode],
         fluency_report,
         api_name="analyze_training_fluency",
     )
-    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode, fluency_filter]
-    for plan_input in plan_inputs:
-        plan_input.change(
-            _training_plan_markdown,
-            plan_inputs,
-            training_plan_readout,
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
+    plan_inputs = [dataset, batch_size, accumulation, epochs, max_steps, val_fraction, seed, val_split_mode, fluency_filter,
+                   model_selector, controls["training.omni_batch_tokens"]]
+    on_gathered(
+        # Model switches change the batch controls they restore, which already triggers the plan.
+        [plan_input.change for plan_input in plan_inputs if plan_input is not model_selector],
+        _training_plan_markdown,
+        plan_inputs,
+        training_plan_readout,
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+        api_name="training_plan",
+    )
     refresh_dataset_event.then(
         _training_plan_markdown,
         plan_inputs,
@@ -1967,7 +2092,7 @@ def build_training_tab(
         queue=False,
         show_progress="hidden",
     )
-    refresh_resume.click(lambda: gr.update(choices=_resume_choices()), outputs=resume, queue=False)
+    refresh_resume.click(lambda model: gr.update(choices=_resume_choices(model)), inputs=model_selector, outputs=resume, queue=False)
 
     def inspect_resume(path: str, current_type: str, current_rank: int, current_alpha: float):
         if not path:
@@ -1977,9 +2102,9 @@ def build_training_tab(
             warnings = []
             if info["adapter_type"] != current_type:
                 warnings.append(f"type mismatch: checkpoint {info['adapter_type']} vs UI {current_type}")
-            if int(info["rank"]) != int(current_rank):
+            if info["adapter_type"] != "full" and int(info["rank"]) != int(current_rank):
                 warnings.append(f"rank mismatch: checkpoint {info['rank']} vs UI {current_rank}")
-            if abs(float(info["alpha"]) - float(current_alpha)) > 1e-6:
+            if info["adapter_type"] != "full" and abs(float(info["alpha"]) - float(current_alpha)) > 1e-6:
                 warnings.append(f"alpha mismatch: checkpoint {info['alpha']} vs UI {current_alpha}")
             note = " | **Warning:** " + "; ".join(warnings) if warnings else " | Settings match."
             return f"{str(info['adapter_type']).upper()} rank {info['rank']} alpha {info['alpha']} | {info.get('steps', 0)} steps{note}"
@@ -1988,26 +2113,35 @@ def build_training_tab(
 
     resume.change(inspect_resume, [resume, adapter_type, rank, alpha], resume_info, queue=False)
 
-    tier_outputs = [controls[f"training.{field_name}"] for field_name in TRAINING_TIER_FIELDS]
+    tier_outputs = [controls[f"training.{field_name}"] for field_name in (*TRAINING_TIER_FIELDS, *OMNI_CAPACITY_FIELDS)]
 
-    def apply_training_tier(tier_value: str, device_value: str):
-        values = training_tier_values(tier_value, device_value)
-        return (*[values[field_name] for field_name in TRAINING_TIER_FIELDS], _training_tier_note(tier_value, device_value))
+    def apply_training_tier(tier_value: str, device_value: str, model_value: str = "indextts", method_value="dora"):
+        values = training_tier_values(tier_value, device_value, model_value, method_value)
+        return (*[values[field_name] for field_name in TRAINING_TIER_FIELDS],
+                *[values.get(field_name, gr.skip()) for field_name in OMNI_CAPACITY_FIELDS],
+                _training_tier_note(tier_value, device_value, model_value, method_value))
 
     # A user's own selection fills the VRAM controls. Presets restore the dropdown
     # programmatically together with the controls, so a change event only refreshes the note.
-    vram_tier.input(apply_training_tier, [vram_tier, device], [*tier_outputs, tier_note], queue=False)
-    apply_tier.click(apply_training_tier, [vram_tier, device], [*tier_outputs, tier_note], queue=False)
-    for component in (vram_tier, device):
-        component.change(
-            _training_tier_note,
-            [vram_tier, device],
-            tier_note,
-            queue=False,
-            show_progress="hidden",
-            trigger_mode="always_last",
-            api_name=False,
-        )
+    tier_inputs = [vram_tier, device, model_selector, adapter_type]
+    vram_tier.select(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
+    apply_tier.click(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
+    def apply_omni_method(tier_value, device_value, model_value, method_value):
+        return apply_training_tier(tier_value, device_value, model_value, method_value) if model_value == "omnivoice" else [gr.skip()] * (len(tier_outputs) + 1)
+    adapter_type.select(apply_omni_method, tier_inputs, [*tier_outputs, tier_note], queue=False, api_name=False)
+    gr.on(
+        [component.change for component in (vram_tier, device, adapter_type)],
+        _training_tier_note,
+        tier_inputs,
+        tier_note,
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+        api_name=False,
+    )
+    # The speech model's own change already starts a deferring handler (Models tab);
+    # the note follows model switches and preset loads instead (ui/model_controls.py).
+    model_refreshes = [(_training_tier_note, tier_inputs, [tier_note])]
 
     def manager_select(paths: list[str], evt: gr.SelectData):
         index = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
@@ -2025,11 +2159,11 @@ def build_training_tab(
 
     manager_table.select(manager_select, manager_paths_state, [selected_adapter, manager_details], queue=False)
 
-    def refresh_manager():
-        rows, paths = adapter_rows()
+    def refresh_manager(model):
+        rows, paths = adapter_rows(model)
         return rows, paths, "LoRA / DoRA list refreshed."
 
-    manager_refresh.click(refresh_manager, outputs=[manager_table, manager_paths_state, manager_details], queue=False)
+    manager_refresh.click(refresh_manager, inputs=model_selector, outputs=[manager_table, manager_paths_state, manager_details], queue=False)
 
     with tab_block:
         delete_confirm = gr.Checkbox(value=False, visible=False, label="LoRA / DoRA delete confirmation")
@@ -2084,6 +2218,11 @@ def build_training_tab(
         vram_tier=vram_tier,
         tier_note=tier_note,
         device=device,
+        omnivoice_panel=omnivoice_panel,
+        index_panels=(probe_panel, decoder_panel),
+        model_selector=model_selector,
+        manager_outputs=(manager_table, manager_paths_state, selected_adapter),
+        model_refreshes=model_refreshes,
     )
 
 
@@ -2094,19 +2233,20 @@ def bind_training_events(
 ) -> None:
     lora_component = generation.controls.get("runtime.lora_path")
     if lora_component is not None:
-        def refresh_generation_adapters():
+        def refresh_generation_adapters(model):
             from .generation_tab import _lora_choices
 
-            return gr.update(choices=_lora_choices())
+            return gr.update(choices=_lora_choices(model))
 
         if tab.start_event is not None:
             tab.start_event.then(
                 refresh_generation_adapters,
+                inputs=tab.model_selector,
                 outputs=lora_component,
                 queue=False,
             )
 
-        def use_adapter(state_value: str):
+        def use_adapter(state_value: str, model: str):
             if not state_value:
                 raise gr.Error("No training state is attached")
             try:
@@ -2114,15 +2254,18 @@ def bind_training_events(
             except ValueError as exc:
                 raise gr.Error(str(exc)) from exc
             from .generation_tab import _lora_choices
+            from indextts.backends import checkpoint_matches_model
+            if path and not checkpoint_matches_model(inspect_lora(path), model):
+                raise gr.Error("Select the speech model used by this training run first.")
 
             return (
-                gr.update(choices=_lora_choices(), value=path),
+                gr.update(choices=_lora_choices(model), value=path),
                 gr.Tabs(selected="voice-generation"),
             )
 
         use_event = tab.use_in_generation.click(
             use_adapter,
-            tab.state_dir,
+            [tab.state_dir, tab.model_selector],
             [lora_component, main_tabs],
             queue=False,
         )

@@ -8,12 +8,22 @@ import gradio as gr
 HELP_MARKDOWN = r"""
 ## Quick Start
 
-1. In **Voice Generation**, load a clean 3-15 second **Reference Voice**.
+1. Choose **Speech model** in the header. For voice cloning, load a clean 3-15 second **Reference Voice** in **Voice Generation**.
 2. Enter text, choose its language, and keep the per-language segment-token default.
 3. Leave the quality defaults in place and select **Generate voice**. Models load only on this first run.
 4. Watch section progress, elapsed time, ETA, realtime speed, VRAM, and the live console tail. Every task is saved below `outputs/`.
 
 Load last values restores the last run of every tab; nothing from earlier runs is shown until you click it in the header.
+
+## OmniVoice
+
+The header selection restores each model's saved settings and unloads the previous model. A running job must finish or be canceled before switching. Universal presets can store both model profiles; old presets belong to IndexTTS.
+
+Choose **Voice cloning**, **Auto voice**, or **Voice design**. A transcript must match the reference audio exactly; leaving it blank loads automatic transcription on demand. Voice design needs a description. OmniVoice writes 24 kHz audio and shares pause tags, section batching, subtitles and WAV/MP3/MP4 export with IndexTTS. Its sampling presets use 16, 32 or 64 diffusion steps with guidance 2; 32 is the official default, and more steps do not guarantee better speech for every prompt.
+
+In **Voice Training**, OmniVoice supports full fine-tuning, LoRA and DoRA. Full fine-tuning uses the BF16 base with FP32 trainable weights and requires checkpoint strength 1. LoRA and DoRA also support a frozen ConvRot INT8 base. Features are cached separately for each speech model. Validation uses fixed masked audio tokens; its loss and accuracy are not comparable to IndexTTS next-token metrics. The shared decoding sweep varies OmniVoice steps and guidance on development data before the frozen final test. IndexTTS's semantic-to-mel decoder adaptation is specific to IndexTTS.
+
+Start with the detected memory tier. Text length, references and batch size affect actual VRAM; the benchmark can test every tier under an emulated allocation budget. Full fine-tuning needs more memory than adapters.
 
 ## Reference Audio
 

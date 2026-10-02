@@ -79,7 +79,7 @@ def development_baseline(run_dir: str | Path, checkpoint: str) -> tuple[dict[str
 def freeze_deployment_selection(config: Any, checkpoint_path: str) -> dict[str, Any]:
     """Freeze development-selected weights and effective deployment settings before final testing."""
     from indextts.lora.decoder import find_decoder_adapter
-    from .decoding_sweep import DECODING_KEYS, load_decoding_settings
+    from .decoding_sweep import apply_decoding_settings, load_decoding_settings
     from .sampling import SAMPLE_FIXED_INFER_KWARGS
     from .speaking_rate import load_speaking_rate
 
@@ -182,7 +182,7 @@ def freeze_deployment_selection(config: Any, checkpoint_path: str) -> dict[str, 
                 settings = load_decoding_settings(checkpoint)
                 if settings is None:
                     raise ValueError("The adopted decoding settings cannot be loaded")
-                selected["infer_kwargs"].update({key: settings[key] for key in DECODING_KEYS})
+                selected["infer_kwargs"] = apply_decoding_settings(selected["infer_kwargs"], settings)
         candidates.append(selected)
     for candidate in candidates:
         candidate["sha256"] = artifacts.get(candidate["path"], "")
@@ -392,7 +392,7 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     # language defaults, the run's adapters with their profile's token target, pauses, expressive clip and
     # calibrated pace, all at the GPU tier's beams and diffusion steps. Every checkpoint of one run shares
     # those settings, so Base and the adapters form two batches.
-    deployment = bool(plan.get("deployment_settings", getattr(config, "speech_eval_deployment_settings", True))) and not final_test
+    deployment = bool(plan.get("deployment_settings", getattr(config, "speech_eval_deployment_settings", True))) and not final_test and getattr(config, "tts_model", "indextts") == "indextts"
     deployment_infer: dict[tuple[str, str], dict[str, Any]] = {}
 
     def deployment_settings_for(candidate: Mapping[str, Any], language: str) -> dict[str, Any]:
@@ -444,7 +444,7 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                 checkpoints=[GridCheckpoint(row["label"], row["path"]) for row in batch],
                 references=[group["reference"]], texts=[p["text"] for p in group["prompts"]], language=group["language"],
                 seeds=plan["seeds"], seed=plan["seeds"][0], output_root=str(attempt), grid_name=grid_name,
-                runtime={"runtime": selected_runtime, "model_dir": config.model_dir, "cfg_path": config.model_config, "use_qwen_emo": False},
+                runtime={"tts_model": getattr(config,"tts_model","indextts"), "runtime": selected_runtime, "model_dir": config.model_dir, "cfg_path": config.model_config, "use_qwen_emo": False},
                 infer_kwargs=selected_infer, include_verdicts=False)
             result = run_grid(grid_config, reporter=ProgressReporter("speech clips", progress_file=state / "progress.json"), cancel_callback=cancelled)
             if result.status != "complete":
@@ -519,6 +519,10 @@ def _benchmark_runtime(config: Any) -> Any:
 
 
 def _benchmark_infer_kwargs(config: Any) -> dict[str, Any]:
+    if getattr(config, "tts_model", "indextts") == "omnivoice":
+        return {"omnivoice": {"mode":"clone", "num_step":config.omni_num_step,"guidance_scale":config.omni_guidance_scale},
+                "max_text_tokens_per_segment":config.sample_max_text_tokens, "section_batch_size":1,
+                "latent_multiplier":round(1.72/config.sample_speaking_rate,4), "enable_pause_tags":True}
     from .sampling import SAMPLE_FIXED_INFER_KWARGS
     infer = dict(SAMPLE_FIXED_INFER_KWARGS)
     infer.update(top_p=config.sample_top_p, top_k=config.sample_top_k or None, temperature=config.sample_temperature,
@@ -626,7 +630,7 @@ def render_benchmark_rows(config: Any, plan: dict[str, Any], *, run_dir: Path, c
                                  references=[group["reference"]], texts=[p["text"] for p in group["prompts"]],
                                  language=group["language"], seeds=plan["seeds"], seed=plan["seeds"][0],
                                  output_root=str(attempt), grid_name=f"{group['id']}{grid_suffix}",
-                                 runtime={"runtime": dict(runtime), "model_dir": config.model_dir, "cfg_path": config.model_config,
+                                 runtime={"tts_model":getattr(config,"tts_model","indextts"), "runtime": dict(runtime), "model_dir": config.model_dir, "cfg_path": config.model_config,
                                           "use_qwen_emo": False},
                                  infer_kwargs=dict(infer), include_verdicts=False)
         result = run_grid(grid_config, reporter=ProgressReporter("benchmark clips", progress_file=state / "progress.json"),

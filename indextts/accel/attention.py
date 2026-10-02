@@ -3,7 +3,10 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+except (ImportError, OSError):
+    flash_attn_varlen_func = flash_attn_with_kvcache = None
 from torch import nn
 
 
@@ -120,6 +123,8 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        if flash_attn_varlen_func is None or flash_attn_with_kvcache is None:
+            raise RuntimeError("The optional acceleration engine needs FlashAttention built for the installed PyTorch. Use SDPA with acceleration disabled.")
         context = get_forward_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 

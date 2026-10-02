@@ -26,12 +26,16 @@ class EventCapture:
         self.events = events
 
     def click(self, fn, inputs=None, outputs=None, **kwargs):
-        self.events[kwargs.get("api_name") or fn.__name__] = {
+        # Browser-only steps have no function. The hidden API trigger registers
+        # after the page's packed step of the same name, so the API signature wins.
+        name = kwargs.get("api_name") or getattr(fn, "__name__", None) or f"browser_step_{len(self.events)}"
+        self.events[name] = {
             "fn": fn, "inputs": inputs, "outputs": outputs, **kwargs,
         }
         return self
 
     success = click
+    then = click
 
 
 def _bound_events(tmp_path, monkeypatch, generation_values=None):
@@ -53,6 +57,8 @@ def _bound_events(tmp_path, monkeypatch, generation_values=None):
         cancel_confirm_button=event, cancel_dismiss_button=event,
     )
     monkeypatch.setattr(batch, "ROOT", tmp_path)
+    # The documented API sits on a hidden button the page never shows.
+    monkeypatch.setattr(batch.gr, "Button", lambda *args, **kwargs: event)
     batch.bind_batch_events(tab, generation, SimpleNamespace(model_dir=str(tmp_path / "models")), None)
     return events
 

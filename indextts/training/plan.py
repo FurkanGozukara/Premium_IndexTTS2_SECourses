@@ -123,11 +123,14 @@ def training_plan(
     record_ids: Sequence[str] | None = None,
     seed: int = 42,
     validation_count: int | None = None,
+    micro_batches_per_epoch: int | None = None,
 ) -> dict[str, int]:
     """Calculate split sizes and optimizer updates without loading model assets.
 
     Supplying ``record_ids`` applies the trainer's exact deterministic split.
     ``validation_count`` is useful when the caller already constructed the split.
+    ``micro_batches_per_epoch`` replaces the clips-per-batch count for token-budget
+    batches (:func:`token_budget_micro_batches`).
     """
 
     clips = max(0, int(manifest_count))
@@ -149,7 +152,7 @@ def training_plan(
 
     training_clips = clips - validation_clips
     if training_clips:
-        micro_batches = max(1, math.ceil(training_clips / batch))
+        micro_batches = max(1, int(micro_batches_per_epoch) if micro_batches_per_epoch else math.ceil(training_clips / batch))
         optimizer_updates = max(1, math.ceil(micro_batches / accumulation))
         total_updates = step_limit if step_limit else epoch_count * optimizer_updates
     else:
@@ -165,6 +168,38 @@ def training_plan(
         "optimizer_updates_per_epoch": optimizer_updates,
         "total_optimizer_updates": total_updates,
     }
+
+
+AUTO_EPOCHS_REFERENCE_HOURS = 14.0
+
+
+def automatic_epochs(training_seconds: float) -> int:
+    """OmniVoice training length for ``epochs = 0``: more epochs for less audio.
+
+    Round-2 experiments (one voice, 8192-token updates): 14 hours of training
+    audio was best after about 25 epochs; a 2-hour subset still improved until
+    about epoch 55 and was clearly better at 75 epochs than at 25. The count
+    grows with the square root of the shortfall, clamped to 10-100 epochs;
+    validation early stopping and the best checkpoint guard the rest.
+    """
+
+    hours = max(float(training_seconds) / 3600.0, 1e-6)
+    return int(min(100, max(10, round(25 * math.sqrt(AUTO_EPOCHS_REFERENCE_HOURS / hours)))))
+
+
+def token_budget_micro_batches(rows: Sequence[Mapping[str, Any]], max_tokens: int, seed: int = 42) -> int:
+    """Micro-batches per epoch of OmniVoice's token-budget sampler for these manifest rows.
+
+    Lengths are estimated as the trainer counts them (audio frames at 25 per second,
+    text tokens, 20 special tokens) with about four characters per text token, and
+    grouped with the trainer's own shuffled sampler (within 1% of a real run).
+    """
+
+    from .dataset import TokenBudgetBatchSampler
+
+    lengths = [round(float(row.get("duration_s") or 0.0) * 25) + math.ceil(len(str(row.get("text") or "")) / 4) + 20
+               for row in rows]
+    return len(TokenBudgetBatchSampler(lengths, int(max_tokens), seed=int(seed))) if lengths else 0
 
 
 def training_plan_line(plan: dict[str, int]) -> str:
@@ -195,7 +230,9 @@ def training_plan_advisory(
 
 
 __all__ = [
+    "automatic_epochs",
     "suggested_epochs",
+    "token_budget_micro_batches",
     "training_plan",
     "training_plan_advisory",
     "training_plan_line",

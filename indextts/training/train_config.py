@@ -24,6 +24,18 @@ class TrainConfig:
     name: str
     output_dir: str = "loras"
 
+    tts_model: str = "indextts"
+    omni_prompt_ratio: float = 0.0
+    omni_drop_condition: float = 0.1
+    omni_language_ratio: float = 0.8
+    omni_num_step: int = 32
+    omni_guidance_scale: float = 2.0
+    # Padded tokens per micro-batch (0 keeps a fixed clip count per batch). The
+    # upstream recipe trains on about 8192 tokens per optimizer update.
+    omni_batch_tokens: int = 0
+    # Train on transcripts normalized exactly as generation normalizes text.
+    omni_normalize_text: bool = True
+
     adapter_type: str = "dora"
     rank: int = 128
     alpha: float = 128.0
@@ -221,8 +233,19 @@ class TrainConfig:
         self.dataset_dir = str(self.dataset_dir or "")
         self.name = _safe_name(self.name)
         self.output_dir = str(self.output_dir or "loras")
+        from indextts.backends import normalize_model
+        self.tts_model = normalize_model(self.tts_model)
+        for key in ("omni_prompt_ratio", "omni_drop_condition", "omni_language_ratio"):
+            value = _finite_float(getattr(self, key), key)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{key} must be in [0, 1]")
+            setattr(self, key, value)
+        self.omni_num_step = max(4, int(self.omni_num_step))
+        self.omni_guidance_scale = max(0.0, _finite_float(self.omni_guidance_scale, "omni_guidance_scale"))
+        self.omni_batch_tokens = max(0, int(self.omni_batch_tokens))
+        self.omni_normalize_text = bool(self.omni_normalize_text)
         self.adapter_type = str(self.adapter_type).lower()
-        if self.adapter_type not in {"lora", "dora"}:
+        if self.adapter_type not in ({"lora", "dora", "full"} if self.tts_model == "omnivoice" else {"lora", "dora"}):
             raise ValueError("LoRA / DoRA type must be 'lora' or 'dora'")
         self.rank = max(1, int(self.rank))
         self.alpha = float(self.alpha)
@@ -242,6 +265,10 @@ class TrainConfig:
         self.base_variant = str(self.base_variant).lower()
         if self.base_variant not in {"bf16", "int8_convrot"}:
             raise ValueError("base_variant must be 'bf16' or 'int8_convrot'")
+        if self.adapter_type == "full" and self.base_variant != "bf16":
+            raise ValueError("Full fine-tuning requires the BF16 base model.")
+        if self.adapter_type == "full" and tier != "auto" and int(tier) < 16:
+            raise ValueError("Full fine-tuning needs a 16 GB or larger training tier; choose LoRA / DoRA for smaller cards.")
         self.base_dtype = _dtype_name(self.base_dtype)
         self.mixed_precision = _dtype_name(self.mixed_precision)
         self.save_dtype = str(self.save_dtype).lower()
@@ -262,7 +289,8 @@ class TrainConfig:
         if self.optimizer not in {"adamw", "adamw_fused", "prodigy"}:
             raise ValueError("unsupported optimizer")
 
-        self.epochs = max(1, int(self.epochs))
+        # OmniVoice resolves 0 from the training audio (training.plan.automatic_epochs).
+        self.epochs = max(0 if self.tts_model == "omnivoice" else 1, int(self.epochs))
         self.max_steps = max(0, int(self.max_steps))
         self.batch_size = max(1, int(self.batch_size))
         self.grad_accumulation = max(1, int(self.grad_accumulation))

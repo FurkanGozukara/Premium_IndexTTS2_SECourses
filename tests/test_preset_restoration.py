@@ -24,12 +24,20 @@ def handler(demo, name):
 
 
 def assert_loaded(demo, result, name, expected):
+    from ui.model_profiles import capture_profile
+    # Shared presets now also preserve the complete snapshot for each model.
+    expected = capture_profile(expected)
     specs = demo.preset_registry.component_specs
     assert result[0]["value"] == (SYSTEM_PREFIX + name if demo.preset_store.is_system(name) else name)
     assert result[1] == name
-    assert dict(zip((spec.key for spec in specs), result[2:2 + len(specs)])) == {
-        spec.key: expected[spec.key] for spec in specs
-    }
+    if len(result) == 5 + len(demo.preset_state_keys):
+        # The page's own events: browser values travel in one index-addressed payload.
+        payload, states = result[4], result[5:]
+        loaded = {key: payload[str(index)] for index, key in enumerate(demo.preset_payload_keys)}
+        loaded.update(zip(demo.preset_state_keys, states))
+    else:
+        loaded = dict(zip((spec.key for spec in specs), result[2:2 + len(specs)]))
+    assert loaded == {spec.key: expected[spec.key] for spec in specs}
     assert demo.preset_store.get_last_used() == name
 
 

@@ -73,7 +73,11 @@ def resolve_sample_runtime(
         training_tier = str(getattr(config, "vram_tier", "auto") or "auto").strip().lower()
         requested = training_tier if training_tier != "auto" else str(auto_tier(total))
     resolved = fit_tier_to_free_vram(requested, free) if share_gpu else requested
-    runtime = resolve_preset(str(resolved), total, free)
+    if getattr(config, "tts_model", "indextts") == "omnivoice":
+        from indextts.runtime.omnivoice_presets import resolve_preset as resolve_omni
+        runtime = resolve_omni(str(resolved), total, free)
+    else:
+        runtime = resolve_preset(str(resolved), total, free)
     runtime.device = config.device
     return runtime
 
@@ -194,6 +198,7 @@ def generate_training_sample(
     )
     request = {
         "runtime": {
+            "tts_model": config.tts_model,
             "runtime": runtime.to_dict(),
             "model_dir": config.model_dir,
             "cfg_path": config.model_config,
@@ -218,6 +223,10 @@ def generate_training_sample(
         "max_text_tokens": config.sample_max_text_tokens,
         "infer_kwargs": infer_kwargs,
     }
+    if config.tts_model == "omnivoice":
+        request["omnivoice"] = {"mode":"clone", "num_step":config.omni_num_step,
+            "guidance_scale":config.omni_guidance_scale,
+            "reference_text": reference.with_suffix(".txt").read_text(encoding="utf-8-sig") if reference.with_suffix(".txt").is_file() else ""}
     write_json_atomic(request_path, request, indent=2, ensure_ascii=False)
     worker = Path(__file__).resolve().parents[2] / "webui_subprocess_worker.py"
     command = [

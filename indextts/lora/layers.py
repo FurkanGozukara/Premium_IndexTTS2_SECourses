@@ -11,10 +11,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-try:
-    from transformers.pytorch_utils import Conv1D
-except ImportError:  # pragma: no cover - transformers is an IndexTTS dependency.
-    Conv1D = None  # type: ignore[assignment,misc]
+def _transformers_conv1d() -> type | None:
+    # Imported on first use: transformers takes seconds to load, and the
+    # interface imports this module only to list and inspect adapter files.
+    try:
+        from transformers.pytorch_utils import Conv1D
+    except ImportError:  # pragma: no cover - transformers is an IndexTTS dependency.
+        return None
+    return Conv1D
 
 
 def _is_int8_base(module: nn.Module) -> bool:
@@ -244,7 +248,8 @@ class LoRAAdapter(nn.Module):
     def _base_shape(base: nn.Module) -> tuple[int, int, str]:
         if isinstance(base, nn.Linear):
             return int(base.in_features), int(base.out_features), "linear"
-        if Conv1D is not None and isinstance(base, Conv1D):
+        conv1d = _transformers_conv1d()
+        if conv1d is not None and isinstance(base, conv1d):
             return int(base.nx), int(base.nf), "conv1d"
         if _is_int8_base(base):
             return int(base.in_features), int(base.out_features), "int8"

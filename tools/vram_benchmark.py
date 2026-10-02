@@ -45,6 +45,7 @@ def _non_negative_seconds(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=["indextts", "omnivoice"], default="indextts")
     parser.add_argument("--tier", type=int, choices=VRAM_TIERS, default=32)
     parser.add_argument("--all", action="store_true", help="Run every tier in a clean subprocess")
     parser.add_argument("--variant", choices=["bf16", "int8_convrot"])
@@ -200,7 +201,14 @@ def _wait_for_idle(timeout_s: float = DEFAULT_IDLE_TIMEOUT_S) -> dict[str, Any]:
 def run_one(args: argparse.Namespace) -> dict[str, Any]:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     config = resolve_preset(str(args.tier), float(args.tier))
+    model_id = getattr(args, "model", "indextts")
+    if model_id == "omnivoice":
+        from indextts.runtime.omnivoice_presets import resolve_preset as omni_preset
+        config = omni_preset(str(args.tier), float(args.tier))
     hints = generation_hints(args.tier)
+    if model_id == "omnivoice":
+        hints = {"num_beams_max": 1, "max_text_tokens_per_segment": 120,
+                 "section_batch_size_max": config.max_section_batch_size_hint}
     beams = max(1, int(args.beams if args.beams is not None else hints["num_beams_max"]))
     text_tokens = max(
         8,
@@ -218,6 +226,7 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     config.validate()
 
     result: dict[str, Any] = {
+        "model": model_id,
         "tier": args.tier,
         "variant": config.model_variant,
         "blocks_to_swap": config.blocks_to_swap,
@@ -244,7 +253,7 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             measured_peaks[key] = max(measured_peaks.get(key, 0.0), snapshot[key])
 
     try:
-        reference_audio = _resolve_reference_audio(args.reference)
+        reference_audio = _resolve_reference_audio(args.reference) if model_id == "indextts" or args.reference else None
         result["reference_audio"] = str(reference_audio)
 
         result["idle_check"] = _wait_for_idle(args.idle_timeout_s)
@@ -260,14 +269,12 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(0)
         load_started = time.perf_counter()
-        from indextts.infer_v2_5 import IndexTTS2
-
-        tts = IndexTTS2(
-            cfg_path=str(ROOT / "models" / "config.yaml"),
-            model_dir=str(ROOT / "models"),
-            runtime=config,
-            use_qwen_emo=True,
-        )
+        if model_id == "omnivoice":
+            from webui_generation_runner import create_tts
+            tts = create_tts({**config.to_dict(), "tts_model": model_id, "model_dir": str(ROOT / "models")})
+        else:
+            from indextts.infer_v2_5 import IndexTTS2
+            tts = IndexTTS2(cfg_path=str(ROOT / "models" / "config.yaml"), model_dir=str(ROOT / "models"), runtime=config, use_qwen_emo=True)
         result["load_time_s"] = time.perf_counter() - load_started
         load_stats = memory_stats("cuda:0")
         result["load_allocated_gb"] = load_stats["allocated_gb"]
@@ -284,6 +291,8 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             "do_sample": False,
             "verbose": False,
         }
+        if model_id == "omnivoice":
+            common["omnivoice"] = {"mode": "clone" if reference_audio else "auto"}
         if batch > 1 or args.subtitle:
             texts = [TEXT] * batch
             if args.subtitle:
@@ -373,9 +382,10 @@ def run_all(args: argparse.Namespace) -> int:
     output_dir = ROOT / "outputs" / "vram_benchmark"
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    reference_audio = _resolve_reference_audio(args.reference)
+    reference_audio = _resolve_reference_audio(args.reference) if getattr(args, "model", "indextts") == "indextts" or args.reference else None
     for tier in VRAM_TIERS:
         command = [sys.executable, str(Path(__file__).resolve()), "--tier", str(tier), "--child"]
+        command.extend(["--model", getattr(args, "model", "indextts")])
         for name, flag in (
             (args.variant, "--variant"),
             (args.blocks_to_swap, "--blocks-to-swap"),
@@ -391,7 +401,8 @@ def run_all(args: argparse.Namespace) -> int:
             command.append("--subtitle")
         if args.lora_path:
             command.extend(["--lora-path", str(args.lora_path)])
-        command.extend(["--reference", str(reference_audio)])
+        if reference_audio:
+            command.extend(["--reference", str(reference_audio)])
         command.extend(["--idle-timeout", str(args.idle_timeout_s)])
         env = os.environ.copy()
         env.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -405,6 +416,7 @@ def run_all(args: argparse.Namespace) -> int:
             errors="replace",
             capture_output=True,
             check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         print(completed.stdout, end="")
         if completed.stderr:

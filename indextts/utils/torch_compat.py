@@ -21,8 +21,9 @@ def install_native_enum_pytree_compatibility() -> bool:
     """
 
     try:
-        from torch._library.opaque_object import is_opaque_type
+        from torch._library import opaque_object
         from torch.utils import _pytree
+        is_opaque_type = getattr(opaque_object, "is_custom_class", None) or opaque_object.is_opaque_type
     except (ImportError, AttributeError):
         return False
 

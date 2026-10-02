@@ -144,7 +144,7 @@ def models_demo(monkeypatch, tmp_path):
 def test_tier_only_responds_to_user_input_and_cancel_does_not_queue(models_demo):
     demo, tab = models_demo
     tier = next(fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == "apply_tier")
-    assert tier.targets == [(tab.tier._id, "input")]
+    assert tier.targets == [(tab.tier._id, "select")]
     for name in ("_cancel_benchmark", "_refresh_benchmark"):
         callback = next(fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == name)
         assert callback.queue is False

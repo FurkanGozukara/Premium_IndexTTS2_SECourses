@@ -7,6 +7,8 @@ import contextlib
 from dataclasses import dataclass, field
 import gc
 import html
+import inspect
+import itertools
 import json
 import os
 from pathlib import Path
@@ -23,6 +25,7 @@ import traceback
 from typing import Any, Callable, Mapping, Sequence
 
 import gradio as gr
+from gradio.context import get_blocks_context, get_render_context, set_render_context
 
 from indextts.runtime.progress import format_duration, format_rate, read_progress_file
 from indextts.utils.atomic_json import read_json_retry
@@ -32,7 +35,7 @@ from indextts.version import APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_TITLE = "IndexTTS 2.5 Premium SECourses"
+APP_TITLE = "Ultimate Text To Speech Generator With Voice Cloning"
 FAVICON_PATH = ROOT / "ui_assets" / "indextts_premium_favicon.svg"
 STATE_ROOT = ROOT / ".ui_state"
 STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -85,6 +88,29 @@ APP_HEAD = """
   if (!paint(mode)) {
     document.addEventListener("DOMContentLoaded", function () { paint(mode); });
   }
+  // A preset or model switch changes many inputs of one browser-packed handler
+  // at once, and each fires its trigger. Every call settles a moment later: the
+  // last one of the burst resolves and its chain goes on; earlier ones reject,
+  // which ends their chains before any backend step (ui/common.py on_gathered).
+  // Settling matters: Gradio runs an event's listeners one after another.
+  window.ttsLatestOnly = function (key) {
+    var latest = window.ttsLatestOnly.latest || (window.ttsLatestOnly.latest = {});
+    var token = (latest[key] || 0) + 1;
+    latest[key] = token;
+    return new Promise(function (resolve, reject) {
+      setTimeout(function () {
+        if (latest[key] === token) { resolve(); } else { reject(new Error("superseded")); }
+      }, 0);
+    });
+  };
+  // The app launches with Gradio's run history off. Histories saved by earlier
+  // launches (each launch has a new app id) can never be opened again, yet they
+  // filled this address's storage quota; remove them.
+  try {
+    Object.keys(window.localStorage).forEach(function (key) {
+      if (key.indexOf("gradio:run-history:") === 0) { window.localStorage.removeItem(key); }
+    });
+  } catch (e) {}
 })();
 </script>
 """
@@ -115,7 +141,8 @@ async () => {
       )
     : null;
   const scope = panel || document;
-  const heads = () => Array.from(scope.querySelectorAll("button.label-wrap"));
+  // The other speech model's sections stay closed and unmounted.
+  const heads = () => Array.from(scope.querySelectorAll("button.label-wrap")).filter((head) => head.offsetParent !== null);
   const first = heads();
   if (!first.length) { return; }
   const expand = first.some((head) => !head.classList.contains("open"));
@@ -274,12 +301,13 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
   border-bottom: 1px solid var(--border-color-primary);
 }
 .app-header > :first-child { flex: 1 1 auto; min-width: 0; }
+.app-header > .form:has(#speech-model-selector) { flex: 0 0 220px !important; width: 220px; }
 .app-header h1 { margin: 0 !important; line-height: 1.2; }
 .app-header p { margin: var(--size-1) 0 0 !important; color: var(--body-text-color-subdued); }
 /* Gradio's own row rule is scoped, so the header strip has to out-specify it. */
 .row.header-actions {
-  flex: 0 0 auto !important;
-  width: auto !important;
+  flex: 0 0 676px !important;
+  width: 676px !important;
   min-width: 0 !important;
   flex-wrap: nowrap;
   justify-content: flex-end;
@@ -476,7 +504,7 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
 /* Let Vega axis labels extend into the block padding instead of being clipped on narrow layouts. */
 .gradio-plot .vega-embed, .gradio-plot .vega-embed svg, .gradio-plot .vega-embed .chart-wrapper { overflow: visible !important; }
 
-@media (max-width: 900px) {
+@media (max-width: 1400px) {
   .app-header { flex-wrap: wrap; }
   .row.header-actions {
     flex: 1 1 100% !important;
@@ -494,7 +522,214 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
 """
 
 
-APP_CSS = _BASE_CSS + _button_palette_css() + "\n"
+# Gradio 6.29 keeps a loading status for every component that has been an
+# input or output of a backend event and refreshes all of them whenever any
+# event starts or finishes. One event that carried every preset control made
+# each later click cost about a third of a second in the browser. Bulk values
+# therefore travel in one hidden JSON payload: a browser-only step gathers or
+# applies them, so backend events see a single component.
+GATHER_VALUES_JS = "(...values) => [values]"
+APPLY_VALUES_JS = """
+(payload, ...current) => {
+  if (!payload || typeof payload !== "object") { return current.map(() => undefined); }
+  return current.map((value, index) => {
+    if (!Object.prototype.hasOwnProperty.call(payload, index)) { return undefined; }
+    const next = payload[index];
+    if (next && typeof next === "object" && next.__type__ === "update") { return next; }
+    // Unchanged values are skipped, so they fire no change events.
+    return JSON.stringify(value) === JSON.stringify(next) ? undefined : next;
+  });
+}
+"""
+
+
+def untrack_hidden_progress(demo: Any) -> int:
+    """Give hidden-progress events no progress targets.
+
+    Gradio's browser runtime tracks a loading status for every progress target
+    (the outputs by default) and refreshes all tracked components on every later
+    event. Events that never show progress need no such status, so their outputs
+    stay out of that per-event work. Returns how many events were changed.
+    """
+
+    changed = 0
+    for fn in demo.fns.values():
+        if getattr(fn, "show_progress", None) == "hidden" and getattr(fn, "show_progress_on", None) is None:
+            fn.show_progress_on = []
+            changed += 1
+    return changed
+
+
+@contextlib.contextmanager
+def hidden_plumbing_context() -> Any:
+    """Hidden helper components made inside ``gr.Tabs``, which takes only tabs as
+    children, are placed at the page root instead."""
+
+    context = get_render_context()
+    blocks = get_blocks_context()
+    moved = isinstance(context, gr.Tabs) and blocks is not None
+    if moved:
+        set_render_context(blocks.root_block)
+    try:
+        yield
+    finally:
+        if moved:
+            set_render_context(context)
+
+
+def values_payload_component() -> gr.JSON:
+    with hidden_plumbing_context():
+        return gr.JSON(value=None, visible=False)
+
+
+def gather_values(trigger: Any, components: Sequence[Any], payload: Any, **kwargs: Any) -> Any:
+    """Copy ``components`` into ``payload`` in the browser; chain the backend step on the result."""
+
+    return trigger(None, list(components), payload, js=GATHER_VALUES_JS, queue=False,
+                   show_progress="hidden", api_name=False, **kwargs)
+
+
+def apply_values(event: Any, payload: Any, components: Sequence[Any]) -> Any:
+    """Apply a ``{index: value or update}`` payload to ``components`` in the browser."""
+
+    return event.then(None, [payload, *components], list(components), js=APPLY_VALUES_JS, queue=False,
+                      show_progress="hidden", api_name=False)
+
+
+# Controls whose browser value is plain JSON; files, media, tables and State stay
+# direct inputs so Gradio still prepares them.
+_PLAIN_VALUE_TYPES = (gr.Textbox, gr.Number, gr.Slider, gr.Checkbox, gr.Dropdown, gr.Radio, gr.CheckboxGroup)
+
+
+def is_plain_value(component: Any) -> bool:
+    return isinstance(component, _PLAIN_VALUE_TYPES)
+
+
+def prepare_gathered(components: Sequence[Any], payload: Any) -> list[Any]:
+    """Gathered plain values, each prepared as Gradio prepares a direct input."""
+
+    values = list(payload) if isinstance(payload, (list, tuple)) else [None] * len(components)
+    return [component.preprocess(value) for component, value in zip(components, values)]
+
+
+def _gathered_step(fn: Callable[..., Any], inputs: Sequence[Any]) -> tuple[Callable[..., Any], list[Any], list[Any]]:
+    """Wrap ``fn`` to take the gathered plain values plus every other input directly."""
+
+    inputs = list(inputs)
+    browser = [component for component in inputs if is_plain_value(component)]
+    direct = [component for component in inputs if not is_plain_value(component)]
+
+    def values(payload: Any, direct_values: Sequence[Any]) -> list[Any]:
+        shown = iter(payload if isinstance(payload, (list, tuple)) else [None] * len(browser))
+        given = iter(direct_values)
+        # Each gathered value gets the same preparation Gradio gives a direct input.
+        return [component.preprocess(next(shown)) if is_plain_value(component) else next(given) for component in inputs]
+
+    # Gradio streams a handler only when the function it calls is a generator, so
+    # the wrapper keeps the handler's kind (Start training and Prepare dataset stream).
+    if inspect.isgeneratorfunction(fn):
+        def unpack(payload: Any, *direct_values: Any, **kwargs: Any) -> Any:
+            yield from fn(*values(payload, direct_values), **kwargs)
+    else:
+        def unpack(payload: Any, *direct_values: Any, **kwargs: Any) -> Any:
+            return fn(*values(payload, direct_values), **kwargs)
+
+    # Keep the handler's name for logs and lookups; no __wrapped__, because Gradio
+    # would then check the inner function's argument count against the payload.
+    unpack.__name__ = getattr(fn, "__name__", "handler")
+    unpack.original = fn  # type: ignore[attr-defined]
+    return unpack, browser, direct
+
+
+_GATHER_KEYS = itertools.count()
+
+
+def _latest_only_js() -> str:
+    """Browser step that lets only the last call of a same-moment burst continue.
+
+    Gradio 6.29 checks ``trigger_mode="always_last"`` before the first submission
+    registers, so triggers fired together all reached the server (a model
+    switch ran the training plan four times). The step has no inputs or outputs,
+    so a dropped call touches no component. The key is per chain: dropping a
+    call drops the steps chained after it, which are the same for every call.
+    """
+
+    key = f"gather-{next(_GATHER_KEYS)}"
+    return f"() => window.ttsLatestOnly ? window.ttsLatestOnly({key!r}) : undefined"
+
+
+def _gather_after(gate: Any, browser: Sequence[Any], box: Any) -> Any:
+    return gate.success(None, list(browser), box, js=GATHER_VALUES_JS, queue=False, show_progress="hidden",
+                        api_name=False)
+
+
+def on_gathered(triggers: Sequence[Any], fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, **kwargs: Any) -> Any:
+    """``gr.on`` whose many inputs reach the server in one browser-packed payload.
+
+    A browser-only step copies ``inputs`` into a hidden payload; the backend step
+    then takes that payload, so only it, the direct inputs (files, media, State)
+    and the outputs join Gradio's per-event status refresh. Triggers fired in the
+    same moment run the handler once, and a deferred backend step restarts by
+    itself and reads the newest payload.
+    """
+
+    unpack, browser, direct = _gathered_step(fn, inputs)
+    box = values_payload_component()
+    gate = gr.on(list(triggers), None, None, None, js=_latest_only_js(), queue=False, show_progress="hidden",
+                 api_name=False)
+    return _gather_after(gate, browser, box).then(unpack, [box, *direct], outputs, **kwargs)
+
+
+def then_gathered(event: Any, fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, **kwargs: Any) -> Any:
+    """``event.then`` with browser-packed inputs (see :func:`on_gathered`)."""
+
+    unpack, browser, direct = _gathered_step(fn, inputs)
+    box = values_payload_component()
+    gate = event.then(None, None, None, js=_latest_only_js(), queue=False, show_progress="hidden", api_name=False)
+    return _gather_after(gate, browser, box).then(unpack, [box, *direct], outputs, **kwargs)
+
+
+def bind_gathered_api(trigger: Any, fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, *,
+                      api_name: str, **kwargs: Any) -> Any:
+    """The page's ``trigger`` runs ``fn`` with browser-packed inputs; ``api_name``
+    keeps the original signature for programmatic callers on a hidden trigger
+    the page never fires."""
+
+    event = on_gathered([trigger], fn, inputs, outputs, api_name=False, **kwargs)
+    with hidden_plumbing_context():
+        api_trigger = gr.Button(visible=False)
+    api_trigger.click(fn, list(inputs), outputs, api_name=api_name, **kwargs)
+    return event
+
+
+def payload_values(keys: Sequence[str], payload: Any) -> dict[str, Any]:
+    """The gathered list of values as a mapping, or an empty one when nothing arrived."""
+
+    return dict(zip(keys, payload)) if isinstance(payload, (list, tuple)) else {}
+
+
+def values_payload(keys: Sequence[str], values: Mapping[str, Any]) -> dict[str, Any]:
+    """Index-addressed payload for :data:`APPLY_VALUES_JS`; missing keys stay unchanged."""
+
+    return {str(index): values[key] for index, key in enumerate(keys) if key in values}
+
+
+# The header's speech model sets a body class (ui/model_controls.py); only the
+# active model's controls take space, including ones mounted later by lazy
+# tabs and accordions. Full fine-tuning has no adapter rank or targets.
+MODEL_VISIBILITY_CSS = """
+body.tts-model-omnivoice .tts-only-indextts,
+body:not(.tts-model-omnivoice) .tts-only-omnivoice,
+body.train-method-full .train-adapter-field { display: none !important; }
+"""
+
+
+APP_CSS = _BASE_CSS + _button_palette_css() + MODEL_VISIBILITY_CSS + "\n"
+
+
+# Status timers of idle tabs: a slow poll still adopts a job started elsewhere,
+# and each tick is a server call plus a browser status refresh.
+IDLE_POLL_SECONDS = 30.0
 
 
 CONFIRM_CANCEL_JS = "(value) => [window.confirm('Cancel the running job?')]"
@@ -536,6 +771,48 @@ def output_task_is_active(task_folder: str | os.PathLike[str] | None) -> bool:
     return bool(status and status not in OUTPUT_TASK_TERMINAL_STATUSES)
 
 
+# Folders that never hold a dashboard task; skipping them keeps the walk off
+# the tens of thousands of grid cells and experiment renders below outputs/.
+_NON_TASK_OUTPUT_DIRS = frozenset({"grids", "training_runs", "worker_runtime_e2e", ".sample_jobs"})
+_PROGRESS_CACHE: dict[str, tuple[float, tuple[Path, ...]]] = {}
+_PROGRESS_LOCK = threading.Lock()
+
+
+def _progress_files(output_root: Path, *, top_level: bool) -> tuple[Path, ...]:
+    """``progress.json`` files of candidate task folders, briefly cached.
+
+    Single generations are numbered folders directly below ``outputs``; batch
+    items can be nested, so that scope walks the tree, skipping folders the
+    dashboard never shows.
+    """
+
+    if not output_root.is_dir():
+        return ()
+    if top_level:
+        found = []
+        with os.scandir(output_root) as entries:
+            for entry in entries:
+                if entry.is_dir() and not entry.name.startswith((".", "_")):
+                    path = Path(entry.path) / "progress.json"
+                    if path.is_file():
+                        found.append(path)
+        return tuple(found)
+    key = str(output_root)
+    with _PROGRESS_LOCK:
+        cached = _PROGRESS_CACHE.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 2.0:
+            return cached[1]
+        found = []
+        for directory, dirnames, filenames in os.walk(output_root):
+            dirnames[:] = [name for name in dirnames
+                           if name.lower() not in _NON_TASK_OUTPUT_DIRS and not name.startswith((".", "_"))]
+            if "progress.json" in filenames:
+                found.append(Path(directory, "progress.json"))
+        result = tuple(found)
+        _PROGRESS_CACHE[key] = (time.monotonic(), result)
+        return result
+
+
 def latest_output_task(
     root: str | os.PathLike[str] = ROOT / "outputs",
     *,
@@ -547,16 +824,11 @@ def latest_output_task(
     if scope not in {"generation", "batch"}:
         raise ValueError(f"Unsupported output task scope: {scope}")
     candidates: list[tuple[float, Path]] = []
-    for progress_path in output_root.rglob("progress.json") if output_root.is_dir() else []:
+    for progress_path in _progress_files(output_root, top_level=scope == "generation"):
         task_folder = progress_path.parent
         metadata_path = task_folder / "metadata.json"
-        request_path = task_folder / "request.json"
-        if not metadata_path.is_file() or not request_path.is_file():
-            continue
-        try:
-            parts = task_folder.resolve().relative_to(output_root).parts
-        except (OSError, ValueError):
-            continue
+        # The walk starts at the resolved root, so its paths need no resolve() each.
+        parts = task_folder.relative_to(output_root).parts
         if scope == "generation" and len(parts) != 1:
             continue
         if scope == "batch" and len(parts) < 2:
@@ -571,11 +843,13 @@ def latest_output_task(
             continue
         try:
             modified = max(progress_path.stat().st_mtime, metadata_path.stat().st_mtime)
-        except OSError:
+        except OSError:  # also a folder without metadata.json
             continue
-        candidates.append((modified, task_folder.resolve()))
+        candidates.append((modified, task_folder))
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return str(candidates[0][1]) if candidates else ""
+    # The request file marks a real task; check it newest first instead of for every folder.
+    newest = next((folder for _, folder in candidates if (folder / "request.json").is_file()), None)
+    return str(newest.resolve()) if newest is not None else ""
 
 
 def adopt_output_task(
@@ -1322,6 +1596,7 @@ def runtime_config_from_values(values: Mapping[str, Any], *, model_dir: str = "m
     resolved_model_dir = str(Path(model_dir).expanduser().resolve())
     config.update(
         {
+            "tts_model": values.get("app.model", "indextts"),
             "model_dir": resolved_model_dir,
             "cfg_path": str(Path(resolved_model_dir) / "config.yaml"),
             "use_qwen_emo": bool(values.get("runtime.use_qwen_emo", True)),
@@ -1334,6 +1609,7 @@ def runtime_config_from_values(values: Mapping[str, Any], *, model_dir: str = "m
 __all__ = [
     "APP_CSS",
     "APP_HEAD",
+    "IDLE_POLL_SECONDS",
     "APP_TITLE",
     "APP_VERSION",
     "OUTPUT_TASK_TERMINAL_STATUSES",

@@ -464,6 +464,11 @@ class PresetStore:
 
         values = self.registry.defaults()
         values.update(tier_registry_overrides(tier))
+        if "app.model" in self.registry:
+            from .model_profiles import capture_profile, model_defaults, profiled_keys
+            values = capture_profile(values)
+            omni = model_defaults(self.registry, "omnivoice", tier)
+            values["app.profiles"]["omnivoice"] = {key: omni[key] for key in profiled_keys(omni)}
         return self.registry.coerce(values)
 
     def retire_legacy_system_presets(self) -> list[str]:
@@ -499,6 +504,9 @@ class PresetStore:
                 )
             if not isinstance(values, Mapping):
                 values = self.registry.values_from_sequence(list(values))
+            if "app.model" in self.registry:
+                from .model_profiles import capture_profile
+                values = capture_profile(values)
             payload = self._payload(clean, values, system=False)
             self._write_atomic(self._path(clean, system=False), self._serialize(payload))
             self.set_last_used(clean)
@@ -546,6 +554,9 @@ class PresetStore:
                 values = self._migrate_legacy(payload)
             else:
                 values = {key: value for key, value in payload.items() if key != "_meta"}
+            if "app.model" in self.registry:
+                from .model_profiles import migrate_model_values
+                values = migrate_model_values(values)
             result = self.registry.coerce(values)
             self.set_last_used(requested)
             return result

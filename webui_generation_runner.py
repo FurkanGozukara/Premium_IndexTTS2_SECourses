@@ -132,7 +132,6 @@ def create_tts(
 ):
     import torch
 
-    from indextts.infer_v2_5 import IndexTTS2
     from indextts.runtime.vram_presets import RuntimeConfig
 
     options = dict(runtime_options or {})
@@ -143,6 +142,12 @@ def create_tts(
     model_dir = str(
         options.get("model_dir", runtime_payload.get("model_dir", "models"))
     )
+    from indextts.backends import normalize_model
+    model_id = normalize_model(options.get("tts_model", runtime_payload.get("tts_model")))
+    if model_id == "omnivoice":
+        from indextts.backends.omnivoice import OmniVoiceEngine
+        return OmniVoiceEngine(model_dir, runtime, progress_callback)
+    from indextts.infer_v2_5 import IndexTTS2
     if runtime.gpt_dtype == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         print(">> BF16 is unavailable on this GPU; using full precision.")
         runtime.gpt_dtype = "fp32"
@@ -527,6 +532,8 @@ def run_generation_request(
     mp3_bitrate = request["mp3_bitrate"]
     image_path = request.get("image_path")
     infer_kwargs = dict(request["infer_kwargs"])
+    if request.get("omnivoice") is not None:
+        infer_kwargs["omnivoice"] = request["omnivoice"]
     # Normal generation, batch items and subtitle units share these exact
     # Gradio request values, including disabled recovery and zero budgets.
     recovery = SpeechRecoveryConfig(
@@ -650,7 +657,7 @@ def run_generation_request(
 
             rendered_units = []
             original_progress = tts.gr_progress
-            sampling_rate = 22050
+            sampling_rate = getattr(tts, "sampling_rate", 22050)
             subtitle_console_started_at = time.perf_counter()
             assembled_audio_seconds = 0.0
             timing_executor = None
@@ -1039,13 +1046,18 @@ def run_generation_request(
             f">> seed={primary_stats['seed']} | segments={primary_stats['segments_count']} | "
             f"audio={primary_stats['audio_seconds']:.3f}s | RTF={primary_stats['rtf']:.4f}"
         )
-        print(
-            f">> GPT={primary_stats['gpt_time']:.3f}s | s2mel={primary_stats['s2mel_time']:.3f}s | "
-            f"vocoder={primary_stats['vocoder_time']:.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB"
-        )
+        if primary_stats.get("model") == "omnivoice":
+            print(f">> OmniVoice synthesis={primary_stats.get('generation_time_s', 0):.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB")
+        else:
+            print(
+                f">> GPT={primary_stats['gpt_time']:.3f}s | s2mel={primary_stats['s2mel_time']:.3f}s | "
+                f"vocoder={primary_stats['vocoder_time']:.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB"
+            )
         print(">> =======================")
 
         return {
+            "model": primary_stats.get("model", "indextts"),
+            "generation_time_s": primary_stats.get("generation_time_s", processing_elapsed_seconds),
             "output_path": output,
             "video_path": video_output,
             "subtitle_status": subtitle_status_message,

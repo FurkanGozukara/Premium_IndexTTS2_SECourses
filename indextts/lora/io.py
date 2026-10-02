@@ -7,6 +7,10 @@ import math
 import os
 import re
 import tempfile
+import threading
+import time
+from copy import deepcopy
+from functools import lru_cache
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +20,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
+
+from indextts.utils.path_cache import file_state, invalidate_tree, resolved_path, tree_files, walked_stat
 
 from .layers import LoRAAdapter
 
@@ -185,8 +191,12 @@ def save_lora(
 
     if dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("LoRA safetensors dtype must be torch.bfloat16 or torch.float32")
-    if not adapters:
-        raise ValueError("at least one LoRA / DoRA module is required")
+    metadata_value = _coerce_metadata(metadata)
+    full_checkpoint = metadata_value.adapter_type == "full"
+    if not adapters and not (full_checkpoint and full_modules):
+        raise ValueError("at least one LoRA / DoRA module or a full fine-tuning checkpoint is required")
+    if full_checkpoint and adapters:
+        raise ValueError("a full fine-tuning checkpoint cannot contain LoRA / DoRA modules")
 
     tensors: dict[str, torch.Tensor] = {}
     for module_path, adapter in adapters.items():
@@ -211,18 +221,17 @@ def save_lora(
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    metadata_value = _coerce_metadata(metadata)
-    ranks = {adapter.rank for adapter in adapters.values()}
-    alphas = {adapter.alpha for adapter in adapters.values()}
-    adapter_types = {"dora" if adapter.use_dora else "lora" for adapter in adapters.values()}
+    ranks = {adapter.rank for adapter in adapters.values()} if adapters else {0}
+    alphas = {adapter.alpha for adapter in adapters.values()} if adapters else {0.0}
+    adapter_types = {"dora" if adapter.use_dora else "lora" for adapter in adapters.values()} if adapters else {"full"}
     if len(ranks) != 1 or len(alphas) != 1 or len(adapter_types) != 1:
         raise ValueError("one LoRA / DoRA file cannot contain mixed ranks, alphas, or types")
     actual_rank = next(iter(ranks))
     actual_alpha = next(iter(alphas))
     actual_type = next(iter(adapter_types))
-    if metadata_value.rank not in (0, actual_rank):
+    if not full_checkpoint and metadata_value.rank not in (0, actual_rank):
         raise ValueError("metadata rank disagrees with the LoRA / DoRA modules being saved")
-    if metadata_value.alpha > 0.0 and metadata_value.alpha != actual_alpha:
+    if not full_checkpoint and metadata_value.alpha > 0.0 and metadata_value.alpha != actual_alpha:
         raise ValueError("metadata alpha disagrees with the LoRA / DoRA modules being saved")
     metadata_value = replace(
         metadata_value,
@@ -283,6 +292,10 @@ def _analyze_lora_structure(
         if key.endswith(".lora_A.weight")
     }
     if not module_paths:
+        metadata = LoraMetadata.from_header(header)
+        if metadata.adapter_type == "full" and shapes and all(key.startswith("full.") for key in shapes):
+            metadata = replace(metadata, rank=0, alpha=0.0, target_modules=[])
+            return _LoraStructure(metadata, "full", 0, 0.0, [], [], True)
         raise ValueError(f"{source} does not contain LoRA / DoRA tensors")
 
     inferred_ranks: set[int] = set()
@@ -354,6 +367,15 @@ def _analyze_lora_structure(
 
 
 def _read_lora_structure(source: Path) -> _LoraStructure:
+    source = resolved_path(source)
+    stat = source.stat()
+    return deepcopy(_cached_lora_structure(source, stat.st_mtime_ns, stat.st_size))
+
+
+@lru_cache(maxsize=512)
+def _cached_lora_structure(source: Path, modified_ns: int, size: int) -> _LoraStructure:
+    # Panels repeatedly inspect the same files. Atomic checkpoint replacements
+    # invalidate this cache without reading tensor payloads or storing weights.
     with safe_open(str(source), framework="pt", device="cpu") as handle:
         header = handle.metadata() or {}
         shapes: dict[str, tuple[int, ...]] = {}
@@ -394,34 +416,52 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Return compact LoRA / DoRA information used by the model manager UI."""
 
     source = Path(path)
-    structure = _read_lora_structure(source)
-    metadata = structure.metadata
+    walked = walked_stat(source)
+    info = _inspected_lora(os.fspath(source), *(walked or file_state(source)))
+    if isinstance(info, Exception):
+        raise ValueError(str(info)) from info
+    info = {**info, "targets": list(info["targets"]), "train_config": dict(info["train_config"])}
+    if not info["recommended_reference"]:
+        # A reference saved beside the checkpoint may appear after the checkpoint
+        # itself; a recent walk that listed the checkpoint also listed its folder.
+        sibling = source.with_name(f"{source.stem}_reference.wav")
+        if (walked_stat(sibling) is not None) if walked else sibling.is_file():
+            info["recommended_reference"] = str(sibling)
+    return info
 
+
+@lru_cache(maxsize=4096)
+def _inspected_lora(path: str, modified_ns: int, size: int) -> dict[str, Any] | Exception:
+    # Adapter lists inspect every checkpoint again after any one of them changes;
+    # unchanged files reuse their summary (or their format error) instead of
+    # reopening the file. Read errors are not remembered.
+    source = Path(path)
+    try:
+        structure = _cached_lora_structure(resolved_path(source), modified_ns, size)
+    except OSError:
+        raise
+    except Exception as exc:
+        return exc
+    metadata = structure.metadata
     reference = ""
     if metadata.recommended_reference:
         configured = Path(metadata.recommended_reference)
         if not configured.is_absolute():
             configured = source.parent / configured
         reference = str(configured)
-    else:
-        sibling = source.with_name(f"{source.stem}_reference.wav")
-        if sibling.is_file():
-            reference = str(sibling)
-
-    created = metadata.created_at
-    if not created:
-        created = datetime.fromtimestamp(source.stat().st_mtime).astimezone().isoformat()
+    created = metadata.created_at or datetime.fromtimestamp(modified_ns / 1e9).astimezone().isoformat()
     return {
         "adapter_type": structure.adapter_type,
         "rank": structure.rank,
         "alpha": structure.alpha,
-        "targets": list(structure.target_modules),
+        "targets": tuple(structure.target_modules),
         "steps": metadata.trained_steps,
         "epochs": metadata.epochs,
         "dataset": metadata.dataset_name,
         "date": created,
-        "size_mb": round(source.stat().st_size / (1024 * 1024), 3),
+        "size_mb": round(size / (1024 * 1024), 3),
         "base_variant": metadata.base_variant,
+        "base_model": metadata.base_model,
         "train_config": dict(metadata.train_config),
         "recommended_reference": reference,
     }
@@ -436,40 +476,117 @@ def _metadata_summary(info: Mapping[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def scan_lora_files(root_dirs: list[str]) -> list[LoraEntry]:
-    """Recursively find valid LoRA safetensors under one or more roots."""
+def adapter_tree_files(root: str | os.PathLike[str]) -> tuple[Path, ...]:
+    """Every file below ``root`` outside run artifact folders (see ``path_cache.tree_files``)."""
 
-    entries: list[LoraEntry] = []
-    seen: set[str] = set()
+    return tree_files(root)
+
+
+def invalidate_adapter_tree() -> None:
+    invalidate_tree()
+
+
+def adapter_files_signature(root: str | os.PathLike[str]) -> tuple[tuple[str, int, int], ...]:
+    """Path, modification time and size of every safetensors file below ``root``.
+
+    Lists built from adapter files (choices, tables, folders) stay valid while
+    this signature is unchanged, so they can be reused instead of reinspecting
+    hundreds of checkpoints for every interface action.
+    """
+
+    signature = []
+    for path in adapter_tree_files(root) if Path(root).is_dir() else ():
+        if path.suffix.lower() != ".safetensors":
+            continue
+        try:
+            signature.append((str(path), *file_state(path)))
+        except OSError:
+            continue
+    return tuple(signature)
+
+
+_LIST_MEMO: dict[tuple[Any, ...], Any] = {}
+_LIST_MEMO_LOCK = threading.Lock()
+
+
+def memoized_adapter_list(name: str, root: str | os.PathLike[str], build: Any, *args: Any) -> Any:
+    """``build(*args)``, reused while the adapter files below ``root`` are unchanged."""
+
+    key = (name, str(root), args, adapter_files_signature(root))
+    with _LIST_MEMO_LOCK:
+        if key in _LIST_MEMO:
+            return deepcopy(_LIST_MEMO[key])
+    value = build(*args)
+    with _LIST_MEMO_LOCK:
+        stale = [item for item in _LIST_MEMO if item[:3] == key[:3]]
+        for item in stale:
+            del _LIST_MEMO[item]
+        _LIST_MEMO[key] = deepcopy(value)
+    return value
+
+
+_SCAN_CACHE: dict[tuple[Any, ...], list[LoraEntry]] = {}
+
+
+def scan_lora_files(root_dirs: list[str]) -> list[LoraEntry]:
+    """Recursively find valid LoRA safetensors under one or more roots.
+
+    The result is reused while the candidate files keep their size and
+    modification time, so repeated lists cost one directory walk and a stat
+    per file instead of reinspecting every adapter.
+    """
+
+    candidates: list[tuple[Path, Path]] = []
+    signature: list[Any] = []
     for root_value in root_dirs:
         root = Path(root_value)
         if not root.is_dir():
             continue
-        for candidate in root.rglob("*"):
-            if not candidate.is_file() or candidate.suffix.lower() != ".safetensors":
+        for candidate in adapter_tree_files(root):
+            if candidate.suffix.lower() != ".safetensors":
                 continue
             if candidate.name.lower().endswith(".s2mel.safetensors"):
                 continue  # voice decoder adapters load with their GPT adapter, never as one
-            canonical = os.path.normcase(str(candidate.resolve()))
-            if canonical in seen:
-                continue
             try:
-                info = inspect_lora(candidate)
-            except Exception:
+                state = file_state(candidate)
+            except OSError:
                 continue
-            if (info.get("train_config") or {}).get("component") == "s2mel":
-                continue
-            seen.add(canonical)
-            relative = candidate.relative_to(root).as_posix()
-            label = f"{root.name}/{relative}" if root.name else relative
-            entries.append(
-                LoraEntry(
-                    name=candidate.stem,
-                    path=str(candidate),
-                    relative_label=label,
-                    metadata_summary=_metadata_summary(info),
-                )
+            candidates.append((root, candidate))
+            signature.append((str(candidate), *state))
+    key = (tuple(str(value) for value in root_dirs), tuple(signature))
+    cached = _SCAN_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+    entries = _scan_candidates(candidates)
+    _SCAN_CACHE.clear()
+    _SCAN_CACHE[key] = entries
+    return list(entries)
+
+
+def _scan_candidates(candidates: list[tuple[Path, Path]]) -> list[LoraEntry]:
+    entries: list[LoraEntry] = []
+    seen: set[str] = set()
+    for root, candidate in candidates:
+        canonical = os.path.normcase(str(resolved_path(candidate)))
+        if canonical in seen:
+            continue
+        try:
+            info = inspect_lora(candidate)
+        except Exception:
+            continue
+        if (info.get("train_config") or {}).get("component") == "s2mel":
+            continue
+        seen.add(canonical)
+        relative = candidate.relative_to(root).as_posix()
+        label = f"{root.name}/{relative}" if root.name else relative
+        entries.append(
+            LoraEntry(
+                name=candidate.stem,
+                path=str(candidate),
+                relative_label=label,
+                metadata_summary=_metadata_summary(info),
             )
+        )
     entries.sort(key=lambda entry: (entry.relative_label.lower(), entry.path.lower()))
     return entries
 

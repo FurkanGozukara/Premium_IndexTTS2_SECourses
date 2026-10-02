@@ -30,18 +30,23 @@ from indextts.utils.task_output_utils import write_metadata_file
 from webui_generation_runner import run_generation_request
 
 from .common import (
+    IDLE_POLL_SECONDS,
+    GATHER_VALUES_JS,
     LAZY_ENGINE,
     PROCESS_MANAGER,
     ROOT,
     adopt_output_task,
     btn,
     open_folder,
+    prepare_gathered,
     progress_panel_html,
     read_json,
     tail_text,
+    values_payload_component,
     write_json_atomic,
 )
 from .generation_tab import (
+    OMNIVOICE_DEFAULT_REFERENCE,
     GenerationTab,
     _Tee,
     prepare_generation_request,
@@ -223,7 +228,7 @@ def batch_task_updates(
             "",
             gr.skip(),
             "",
-            gr.Timer(5.0, active=True),
+            gr.Timer(IDLE_POLL_SECONDS, active=True),
         )
     task_folder = Path(task_value)
     metadata = read_json(task_folder / "metadata.json", {}) or {}
@@ -259,7 +264,7 @@ def batch_task_updates(
         message,
         gr.skip(),
         log_value,
-        gr.Timer(5.0, active=True),
+        gr.Timer(IDLE_POLL_SECONDS, active=True),
     )
 class _BatchCanceled(RuntimeError):
     pass
@@ -584,7 +589,8 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                     reference = common_reference
                     if batch_values["batch.reference_mode"] == "Per-file reference":
                         reference = _per_file_reference(item)
-                        if not reference:
+                        optional_reference = generation_values.get("app.model") == "omnivoice" and generation_values.get("omnivoice.mode", "clone") != "clone"
+                        if not reference and not optional_reference:
                             raise ValueError("Missing same-stem reference")
                     pattern = str(batch_values["batch.naming_pattern"] or "{index:03d}_{name}")
                     filename = pattern.format(index=index, name=item["name"], stem=item["name"])
@@ -739,7 +745,11 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         time_ranges: str,
         lora_path: str,
         auto_lora_reference: bool,
+        model_id: str = "indextts",
+        voice_mode: str = "clone",
     ):
+        if model_id == "omnivoice" and voice_mode != "clone":
+            return (gr.skip(),) * 5 + ("Reference audio is optional for this voice mode.",)
         if reference_mode != "One reference for all":
             return (gr.skip(),) * 6
         try:
@@ -751,6 +761,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 time_ranges,
                 lora_path,
                 auto_lora_reference,
+                default_reference=OMNIVOICE_DEFAULT_REFERENCE if model_id == "omnivoice" else None,
             )
         except ValueError as exc:
             gr.Warning(str(exc), title="Batch Reference Voice")
@@ -776,7 +787,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             generation.reference_ranges,
             generation.controls["runtime.lora_path"],
             generation.controls["generation.auto_lora_reference"],
-        ],
+        ] + ([registry["app.model"].component, registry["omnivoice.mode"].component] if registry is not None else []),
         outputs=[
             generation.prompt_audio,
             generation.reference_media,
@@ -789,19 +800,35 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         show_progress="minimal",
         api_name="prepare_batch_reference",
     )
+    media_inputs = [tab.files, tab.text, tab.folder, generation.prompt_audio, generation.image, generation.emotion_audio]
+    batch_outputs = [tab.task_state, tab.progress, tab.status, tab.results, tab.log, tab.task_timer]
+    values_box = values_payload_component()
+
+    def generate_batch(files, paragraphs, folder, common_reference, image_path, emotion_audio, gathered):
+        """The page's batch run: the browser packed the batch and request controls into ``gathered``."""
+        yield from run_batch(files, paragraphs, folder, common_reference, image_path, emotion_audio,
+                             *prepare_gathered([*batch_components, *generation_components], gathered))
+
+    # Files stay direct inputs (Gradio prepares them); the many plain controls travel
+    # in one browser-packed payload so a batch does not slow every later click.
     event = reference_event.success(
+        None, [*batch_components, *generation_components], values_box, js=GATHER_VALUES_JS,
+        queue=False, show_progress="hidden", api_name=False,
+    ).then(
+        generate_batch,
+        inputs=[*media_inputs, values_box],
+        outputs=batch_outputs,
+        api_name=False,
+        concurrency_limit=1,
+        concurrency_id="generation",
+        show_progress="hidden",
+        stream_every=0.5,
+    )
+    # The documented API keeps the original signature behind a trigger the page never fires.
+    gr.Button(visible=False).click(
         run_batch,
-        inputs=[
-            tab.files,
-            tab.text,
-            tab.folder,
-            generation.prompt_audio,
-            generation.image,
-            generation.emotion_audio,
-            *batch_components,
-            *generation_components,
-        ],
-        outputs=[tab.task_state, tab.progress, tab.status, tab.results, tab.log, tab.task_timer],
+        inputs=[*media_inputs, *batch_components, *generation_components],
+        outputs=batch_outputs,
         api_name="generate_batch",
         concurrency_limit=1,
         concurrency_id="generation",

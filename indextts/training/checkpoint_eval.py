@@ -14,7 +14,6 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Subset
 
-from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.lora.apply import apply_lora, move_adapters_to_device, remove_lora
 from indextts.quant.convrot_int8 import load_gpt_checkpoint
 from indextts.runtime.progress import ProgressReporter
@@ -66,6 +65,7 @@ def parse_strengths(text: str) -> list[float]:
 @dataclass
 class CheckpointEvalConfig:
     adapter_dir: str
+    tts_model: str = ""
     dataset_dir: str = ""
     checkpoints: list[str] = field(default_factory=list)
     include_base: bool = True
@@ -189,6 +189,8 @@ class CheckpointEvalReport:
     elapsed_s: float
     reference_mode: str = "self"
     recommended_kind: str = "adapter"
+    tts_model: str = "indextts"
+    metric: str = "next_audio_token_loss"
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -248,6 +250,7 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
             resolved_checkpoints.append(str(path))
     result.checkpoints = resolved_checkpoints
     defaults = _training_defaults(adapter_dir, result.checkpoints)
+    result.tts_model = str(result.tts_model or defaults.get("tts_model") or "indextts")
     result.dataset_dir = str(result.dataset_dir or defaults.get("dataset_dir") or "")
     if not result.dataset_dir:
         raise ValueError("dataset_dir is missing from the evaluation config and LoRA / DoRA metadata")
@@ -291,6 +294,25 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
 
 
 def build_evaluation_model(config: CheckpointEvalConfig) -> UnifiedVoice:
+    # The GPT model code loads transformers; the interface imports this module without it.
+    from indextts.gpt.model_v2 import UnifiedVoice
+
+    if config.tts_model == "omnivoice":
+        from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+        install_native_enum_pytree_compatibility()
+        from omnivoice import OmniVoice
+        from indextts.backends.omnivoice import ensure_model
+        folder, quant = ensure_model(config.model_dir, quantized=config.base_variant == "int8_convrot")
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[config.base_dtype]
+        if config.device == "cpu":
+            dtype = torch.float32
+        torch.set_num_threads(min(torch.get_num_threads(), 8))
+        model = OmniVoice.from_pretrained(str(folder), device_map=config.device, dtype=dtype, train=True)
+        model.llm.config.use_cache = False
+        model.llm.set_attn_implementation("sdpa")
+        if config.base_variant == "int8_convrot":
+            load_gpt_checkpoint(model.llm, quant, device=config.device, dtype=dtype, strict=True)
+        return model.eval().requires_grad_(False)
     """Load a fresh base GPT with no LoRA / DoRA attached."""
 
     device = torch.device(config.device)
@@ -369,9 +391,12 @@ def _summary_markdown(
     best: CheckpointEvalRow | None,
     reference_mode: str,
     analysis: Any = None,
+    tts_model: str = "indextts",
 ) -> str:
     base = next((row for row in rows if row.kind == "base"), None)
-    if reference_mode == "other":
+    if tts_model == "omnivoice":
+        reference_sentence = "Measured with fixed audio-token masks and identical prompt sampling at every checkpoint (OmniVoice masked diffusion)."
+    elif reference_mode == "other":
         reference_sentence = (
             "Measured with inference-like references (a different clip of the same speaker "
             "supplies the voice and emotion vectors)."
@@ -387,10 +412,10 @@ def _summary_markdown(
             "that number predicts these held-out tokens better than Base."
         )
     if best is None or best.val_loss is None:
-        lines.append("No LoRA / DoRA checkpoint produced a measurable validation score.")
+        lines.append("No checkpoint produced a measurable validation score.")
         return "  \n".join(lines) + "\n\n" + GENERALIZATION_LEGEND
     accuracy = (
-        f", {best.val_accuracy * 100:.1f}% next-token accuracy"
+        f", {best.val_accuracy * 100:.1f}% {'masked-token' if tts_model == 'omnivoice' else 'next-token'} accuracy"
         if best.val_accuracy is not None
         else ""
     )
@@ -478,11 +503,35 @@ def evaluate_checkpoints(
     cfg, train_defaults = _resolved_config(CheckpointEvalConfig.from_dict(config))
     device = torch.device(cfg.device)
     descriptors = [checkpoint_descriptor(path) for path in cfg.checkpoints]
+    if any(str((item.get("metadata") or {}).get("adapter_type", item.get("kind"))) == "full" for item in descriptors):
+        if any(abs(strength - 1.0) > 1e-9 for strength in cfg.strengths):
+            raise ValueError("Full fine-tuned checkpoints require strength 1.0; strength sweeps apply to LoRA / DoRA.")
     total = (1 if cfg.include_base else 0) + len(descriptors) * len(cfg.strengths)
     progress = reporter or ProgressReporter("checkpoints", total=total)
     progress.total = total
     progress.set_stage("load model")
     model = build_evaluation_model(cfg)
+    dataset_class, make_loader, loader_metrics = LoraTrainDataset, _make_loader, _loader_metrics
+    if cfg.tts_model == "omnivoice":
+        from transformers import AutoTokenizer
+        from omnivoice.data.collator import PaddingDataCollator
+        from indextts.backends.omnivoice import ensure_model
+        from .omnivoice_data import OmniVoiceDataset, masked_audio_metrics
+        from .train_config import TrainConfig
+        folder, _ = ensure_model(cfg.model_dir)
+        tokenizer = AutoTokenizer.from_pretrained(str(folder))
+        omni_config = TrainConfig.from_dict({**train_defaults, "dataset_dir": cfg.dataset_dir,
+            "name": Path(cfg.adapter_dir).name, "tts_model": "omnivoice", "seed":cfg.seed,
+            "val_fraction":cfg.val_fraction})
+        def dataset_class(_root, split, **_options):
+            return OmniVoiceDataset(omni_config, tokenizer, split)
+        def make_loader(dataset, batch_size):
+            core = dataset.dataset if isinstance(dataset, Subset) else dataset
+            return DataLoader(dataset, batch_size=batch_size,
+                              collate_fn=PaddingDataCollator(core.processor, batch_tokens=0), num_workers=0)
+        def loader_metrics(model, loader, device, *, max_batches, loss_options):
+            dtype = {"bf16":torch.bfloat16,"fp16":torch.float16,"fp32":torch.float32}[cfg.base_dtype]
+            return masked_audio_metrics(model, loader, device, dtype=dtype, max_batches=max_batches, cancel_callback=cancel_callback)
 
     dataset_options = {
         "val_fraction": float(cfg.val_fraction or 0.0),
@@ -496,23 +545,23 @@ def evaluate_checkpoints(
         if cfg.reference_mode == "other"
         else {"speaker_ref_mode": "self", "emo_ref_mode": "self"}
     )
-    val_dataset = LoraTrainDataset(
+    val_dataset = dataset_class(
         cfg.dataset_dir, split="val", **reference_options, **dataset_options
     )
     if len(val_dataset) == 0:
         raise ValueError("the configured validation split contains no items")
-    val_loader = _make_loader(val_dataset, cfg.batch_size)
+    val_loader = make_loader(val_dataset, cfg.batch_size)
     train_loader: DataLoader | None = None
     train_items = 0
     if cfg.train_subset > 0:
-        train_dataset = LoraTrainDataset(
+        train_dataset = dataset_class(
             cfg.dataset_dir, split="train", **reference_options, **dataset_options
         )
         generator = torch.Generator().manual_seed(int(cfg.seed or 0))
         indices = torch.randperm(len(train_dataset), generator=generator).tolist()[:cfg.train_subset]
         train_items = len(indices)
         if indices:
-            train_loader = _make_loader(Subset(train_dataset, indices), cfg.batch_size)
+            train_loader = make_loader(Subset(train_dataset, indices), cfg.batch_size)
 
     rows: list[CheckpointEvalRow] = []
     completed = 0
@@ -524,14 +573,14 @@ def evaluate_checkpoints(
         if cancel_callback is not None and cancel_callback():
             raise RuntimeError("Checkpoint evaluation canceled")
         row_started = time.perf_counter()
-        val = _loader_metrics(
+        val = loader_metrics(
             model,
             val_loader,
             device,
             max_batches=cfg.max_batches,
             loss_options=train_defaults,
         )
-        train = _loader_metrics(
+        train = loader_metrics(
             model,
             train_loader,
             device,
@@ -629,7 +678,7 @@ def evaluate_checkpoints(
     candidates = [*candidates, *(row for row in rows if row.kind == "base" and row.val_loss is not None)]
     best = min(candidates, key=lambda row: float(row.val_loss)) if candidates else None
     summary = _summary_markdown(
-        rows, best, cfg.reference_mode, load_training_analysis(cfg.adapter_dir)
+        rows, best, cfg.reference_mode, load_training_analysis(cfg.adapter_dir), cfg.tts_model
     )
     elapsed = time.perf_counter() - started
     progress.finish()
@@ -648,6 +697,8 @@ def evaluate_checkpoints(
         elapsed_s=elapsed,
         reference_mode=cfg.reference_mode,
         recommended_kind="base" if best is not None and best.kind == "base" else "adapter",
+        tts_model=cfg.tts_model,
+        metric="masked_audio_token_loss" if cfg.tts_model == "omnivoice" else "next_audio_token_loss",
     )
 
 

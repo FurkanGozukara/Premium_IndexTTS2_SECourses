@@ -12,6 +12,8 @@ from typing import Any, Mapping, Sequence
 
 import gradio as gr
 
+from indextts.lora.io import adapter_tree_files, memoized_adapter_list
+from indextts.utils.path_cache import file_state, resolved_path
 from indextts.runtime.gpu import list_gpus
 from indextts.training.analysis import (
     ANALYSIS_SERIES,
@@ -47,15 +49,19 @@ from indextts.training.speaking_rate import (
 )
 
 from .common import (
-    PROCESS_MANAGER,
-    ROOT,
+    IDLE_POLL_SECONDS,
+    bind_gathered_api,
     btn,
+    on_gathered,
     open_folder,
     parse_multiline_paths,
+    PROCESS_MANAGER,
     progress_panel_html,
     read_json,
+    ROOT,
     runtime_config_from_values,
     tail_text,
+    then_gathered,
     write_json_atomic,
 )
 from .generation_tab import (
@@ -126,7 +132,21 @@ def _preprocess_dynamic_checkpoint_ids(
     return list(payload or [])
 
 
-def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]:
+class CheckpointCheckboxGroup(gr.CheckboxGroup):
+    """Keep dynamic-ID handling when Gradio rebuilds a session component."""
+
+    is_template = True
+
+    def preprocess(self, payload):
+        return _preprocess_dynamic_checkpoint_ids(payload)
+
+
+def _adapter_folders(root: str | Path = ROOT / "loras", model: str | None = None) -> list[tuple[str, str]]:
+    return memoized_adapter_list("adapter_folders", root, _build_adapter_folders, str(root), model)
+
+
+def _build_adapter_folders(root: str | Path = ROOT / "loras", model: str | None = None) -> list[tuple[str, str]]:
+    from indextts.backends import checkpoint_matches_model
     base = Path(root).expanduser().resolve()
     choices: list[tuple[str, str]] = []
     for folder in sorted((item for item in base.iterdir() if item.is_dir()), key=lambda item: item.name.lower()) if base.is_dir() else []:
@@ -137,10 +157,13 @@ def _adapter_folders(root: str | Path = ROOT / "loras") -> list[tuple[str, str]]
         try:
             full = checkpoint_descriptor(preferred["path"])
             metadata = full.get("metadata") or {}
+            if model is not None and not checkpoint_matches_model(metadata, model):
+                continue
             saved_type = str(metadata.get("adapter_type") or "").strip().lower()
             adapter_type = {
                 "lora": "LoRA",
                 "dora": "DoRA",
+                "full": "Full",
             }.get(saved_type, "LoRA / DoRA")
             rank = int(metadata.get("rank") or 0)
             steps = int(metadata.get("steps") or 0)
@@ -509,29 +532,31 @@ def latest_grid_state(root: str | Path = ROOT / "outputs" / "grids") -> str:
     return str(values[0][1]) if values else ""
 
 
-def latest_lora_folder(root: str | Path = ROOT / "loras") -> str:
+def latest_lora_folder(root: str | Path = ROOT / "loras", model: str | None = None) -> str:
     """Return the newest LoRA / DoRA training folder by status/checkpoint mtime."""
 
     base = Path(root).expanduser().resolve()
     values: list[tuple[float, Path]] = []
-    folders = (
-        (item for item in base.iterdir() if item.is_dir())
-        if base.is_dir()
-        else []
-    )
-    for folder in folders:
-        candidates = [folder / "status.json", *folder.rglob("*.safetensors")]
+    # One shared walk of the adapter tree, grouped by training folder.
+    candidates_by_folder: dict[str, list[Path]] = {}
+    for path in adapter_tree_files(base) if base.is_dir() else ():
+        parts = path.relative_to(base).parts
+        if len(parts) > 1 and (path.suffix.lower() == ".safetensors" or (len(parts) == 2 and path.name == "status.json")):
+            candidates_by_folder.setdefault(parts[0], []).append(path)
+    for name, candidates in candidates_by_folder.items():
+        folder = base / name
+        if model is not None and (read_json(folder / "train_config.json", {}) or {}).get("tts_model", "indextts") != model:
+            continue
         modified = 0.0
         found = False
         for candidate in candidates:
             try:
-                if candidate.is_file():
-                    found = True
-                    modified = max(modified, candidate.stat().st_mtime)
+                modified = max(modified, file_state(candidate)[0] / 1e9)
+                found = True
             except OSError:
                 continue
         if found:
-            values.append((modified, folder.resolve()))
+            values.append((modified, resolved_path(folder)))
     values.sort(key=lambda item: (item[0], str(item[1]).lower()), reverse=True)
     return str(values[0][1]) if values else ""
 
@@ -657,7 +682,7 @@ def grid_status_updates(
             gr.skip(),
             gr.skip(),
             gr.update(choices=_saved_grid_choices(output_root)),
-            gr.Timer(5.0, active=True),
+            gr.Timer(IDLE_POLL_SECONDS, active=True),
         )
     root = Path(state)
     status = read_json(root / "status.json", {}) or {}
@@ -690,7 +715,7 @@ def grid_status_updates(
         result_state,
         _grid_rows(state),
         gr.update(choices=_saved_grid_choices(output_root), value=result_state or None),
-        gr.Timer(1.0 if running else 5.0, active=True),
+        gr.Timer(1.0 if running else IDLE_POLL_SECONDS, active=True),
     )
 
 
@@ -711,7 +736,7 @@ def checkpoint_eval_status_updates(
             gr.skip(),
             gr.skip(),
             gr.skip(),
-            gr.Timer(5.0, active=True),
+            gr.Timer(IDLE_POLL_SECONDS, active=True),
         )
     root = Path(state_value)
     status = read_json(root / "status.json", {}) or {}
@@ -742,7 +767,7 @@ def checkpoint_eval_status_updates(
         checkpoint_update,
         payload["mapping"] if payload else gr.skip(),
         payload["recommended"] if payload else gr.skip(),
-        gr.Timer(5.0 if terminal else 1.0, active=True),
+        gr.Timer(IDLE_POLL_SECONDS if terminal else 1.0, active=True),
     )
 
 
@@ -836,7 +861,8 @@ def build_grid_tab(
     tab = GridTab()
     tab.model_dir = str(Path(getattr(options, "model_dir", ROOT / "models")).expanduser().resolve())
     controls = tab.controls
-    adapter_choices = _adapter_folders()
+    # The page starts on IndexTTS; a model switch or preset load refreshes the list.
+    adapter_choices = _adapter_folders(model="indextts")
     initial_adapter = ""
     initial_payload = _analysis_payload(initial_adapter)
     initial_context = _adapter_context(initial_adapter)
@@ -956,7 +982,7 @@ def build_grid_tab(
             tab.eval_timer = gr.Timer(5.0, active=True)
 
         gr.Markdown("### Grid setup")
-        tab.checkpoint_group = gr.CheckboxGroup(
+        tab.checkpoint_group = CheckpointCheckboxGroup(
             choices=initial_payload["choices"],
             value=initial_payload["selected"],
             label="Checkpoints",
@@ -965,7 +991,6 @@ def build_grid_tab(
         # Gradio preprocesses against the Python component's startup choices, but this
         # list is intentionally filled later when an adapter is selected.  The mapping
         # used to build a grid remains the authority and ignores unknown identifiers.
-        tab.checkpoint_group.preprocess = _preprocess_dynamic_checkpoint_ids  # type: ignore[method-assign]
         tab.checkpoint_map = gr.State(initial_payload["mapping"])
         tab.recommended = gr.State(initial_payload["recommended"])
         # Checkpoint identifiers are rebuilt for every adapter, so they stay out of presets too.
@@ -1161,18 +1186,21 @@ def build_grid_tab(
         tab.recommended,
     ]
     refresh_adapter.click(
-        lambda: gr.update(choices=_adapter_folders()), outputs=tab.adapter, queue=False
+        lambda model: gr.update(choices=_adapter_folders(model=model)), inputs=registry["app.model"].component if "app.model" in registry else gr.State("indextts"), outputs=tab.adapter, queue=False
     ).then(
         adapter_selection_updates,
         [tab.adapter, references, texts],
         tab.selection_outputs,
         queue=False,
     )
+    # Programmatic folder changes (preset loads, model switches) refresh the analysis
+    # quietly: no progress overlay on the hidden Grid tab.
     tab.adapter.change(
         adapter_selection_updates,
         [tab.adapter, references, texts],
         tab.selection_outputs,
         queue=False,
+        show_progress="hidden",
     )
 
     def analyze_now(adapter_dir: str, current_references: str, current_texts: str):
@@ -1235,7 +1263,7 @@ def build_grid_tab(
     )
     # Completion polling also updates this dropdown.  Listen only to direct user
     # input so that a completed grid cannot trigger two overlapping renders.
-    tab.saved_grids.input(
+    tab.saved_grids.select(
         lambda path: (path or "", _grid_rows(path), f"Opened saved grid {Path(path).name}." if path else "Select a saved grid."),
         tab.saved_grids,
         [tab.result_state, tab.result_table, tab.status],
@@ -1300,8 +1328,8 @@ def build_grid_tab(
             api_name="attach_checkpoint_grid",
         )
 
-        def load_last_checkpoint_values(current_references: str, current_texts: str):
-            adapter_dir = latest_lora_folder()
+        def load_last_checkpoint_values(current_references: str, current_texts: str, model: str = "indextts"):
+            adapter_dir = latest_lora_folder(model=model)
             selection = adapter_selection_updates(adapter_dir or None, current_references, current_texts)
             eval_state = latest_checkpoint_eval_state(adapter_dir)
             eval_updates = checkpoint_eval_status_updates(
@@ -1311,7 +1339,7 @@ def build_grid_tab(
             )
             return (
                 gr.update(
-                    choices=_adapter_folders(),
+                    choices=_adapter_folders(model=model),
                     value=adapter_dir or None,
                 ),
                 *selection,
@@ -1324,7 +1352,7 @@ def build_grid_tab(
 
         load_hook(
             load_last_checkpoint_values,
-            inputs=[references, texts],
+            inputs=[references, texts, registry["app.model"].component if "app.model" in registry else gr.State("indextts")],
             outputs=[
                 tab.adapter,
                 *tab.selection_outputs,
@@ -1371,6 +1399,8 @@ def build_grid_config_from_ui(
     runtime["lora_merge_into_base"] = False
 
     infer_kwargs = dict(generation_request["infer_kwargs"])
+    if generation_values.get("app.model") == "omnivoice":
+        infer_kwargs["omnivoice"] = generation_request["omnivoice"]
     grid_speaking_rate = min(
         1.5,
         max(0.5, float(grid_values.get("grid.speaking_rate", 1.0))),
@@ -1480,20 +1510,28 @@ def bind_grid_events(
         tab.controls["grid.strengths"],
         tab.controls["grid.references"],
         tab.controls["grid.texts"],
-        *runtime_components,
     ]
-    seen_triggers: set[int] = set()
-    for component in summary_triggers:
-        if id(component) in seen_triggers:
-            continue
-        seen_triggers.add(id(component))
-        component.change(
-            runtime_line,
-            runtime_line_inputs,
-            tab.runtime_summary,
-            queue=False,
-            show_progress="hidden",
-        )
+    on_gathered(
+        [component.change for component in summary_triggers],
+        runtime_line,
+        runtime_line_inputs,
+        tab.runtime_summary,
+        queue=False,
+        show_progress="hidden",
+        trigger_mode="always_last",
+        api_name="runtime_line",
+    )
+    # Runtime controls already start the Models tab's deferring description;
+    # the grid summary follows it rather than listening to them as well.
+    runtime_followers = [getattr(models, "runtime_event", None)]
+    lora_restored = getattr(generation, "lora_restored_event", None)
+    if lora_restored is not None and getattr(models, "describe_runtime", None):
+        runtime_followers.append(then_gathered(lora_restored, *models.describe_runtime, queue=False, show_progress="hidden",
+                                               trigger_mode="always_last", api_name=False))
+    for event in runtime_followers:
+        if event is not None:
+            then_gathered(event, runtime_line, runtime_line_inputs, tab.runtime_summary, queue=False, show_progress="hidden",
+                          trigger_mode="always_last", api_name=False)
 
     def start_evaluation(
         adapter_dir: str,
@@ -1541,7 +1579,8 @@ def bind_grid_events(
             gr.Timer(1.0, active=True),
         )
 
-    tab.evaluate_button.click(
+    bind_gathered_api(
+        tab.evaluate_button.click,
         start_evaluation,
         [
             tab.adapter,
@@ -1554,6 +1593,7 @@ def bind_grid_events(
         [tab.eval_state, tab.eval_progress, tab.eval_status, tab.eval_log, tab.eval_timer],
         concurrency_limit=1,
         concurrency_id="checkpoint_eval",
+        api_name="start_evaluation",
     )
 
     grid_keys = list(tab.controls)
@@ -1603,7 +1643,8 @@ def bind_grid_events(
             gr.Timer(1.0, active=True),
         )
 
-    tab.generate_button.click(
+    bind_gathered_api(
+        tab.generate_button.click,
         start_grid,
         [tab.checkpoint_map, *grid_components, *generation_components],
         [tab.state, tab.progress, tab.status, tab.log, tab.timer],
@@ -1634,19 +1675,22 @@ def bind_grid_events(
 
     lora_component = generation.controls.get("runtime.lora_path")
     if lora_component is not None:
-        def use_recommended(adapter_dir: str):
+        def use_recommended(adapter_dir: str, model: str):
             try:
                 path = recommended_generation_value(adapter_dir)
             except ValueError as exc:
                 raise gr.Error(str(exc)) from exc
+            from indextts.backends import checkpoint_matches_model
+            if path and not checkpoint_matches_model(checkpoint_descriptor(path)["metadata"], model):
+                raise gr.Error("Select the speech model used by this training run first.")
             return (
-                gr.update(choices=_lora_choices(), value=path),
+                gr.update(choices=_lora_choices(model), value=path),
                 gr.Tabs(selected="voice-generation"),
             )
 
         use_event = tab.use_generation.click(
             use_recommended,
-            tab.adapter,
+            [tab.adapter, training.model_selector],
             [lora_component, main_tabs],
             queue=False,
         )
@@ -1661,9 +1705,10 @@ def bind_grid_events(
             if not state_value:
                 raise gr.Error("No training run is attached")
             adapter_dir = str(Path(state_value).resolve())
+            model = (read_json(Path(adapter_dir) / "train_config.json", {}) or {}).get("tts_model", "indextts")
             updates = adapter_selection_updates(adapter_dir, current_references, current_texts)
             return (
-                gr.update(choices=_adapter_folders(), value=adapter_dir),
+                gr.update(choices=_adapter_folders(model=model), value=adapter_dir),
                 gr.Tabs(selected="checkpoint-grid"),
                 *updates,
             )

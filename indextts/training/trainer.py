@@ -681,6 +681,7 @@ class LoraTrainer:
         strengths = parse_strengths(config.eval_strengths)
         eval_config = CheckpointEvalConfig(
             adapter_dir=str(self.adapter_dir),
+            tts_model=config.tts_model,
             dataset_dir=str(self.dataset_dir),
             include_base=config.eval_include_base,
             strengths=strengths,
@@ -1142,7 +1143,8 @@ class LoraTrainer:
         atomic_write_json(config_path, config.to_dict())
         self.write_status(phase="calibrating_decoding", decoding_sweep_status="running",
                           decoding_sweep_message="Sweeping decoding settings", message="Sweeping decoding settings on the speech benchmark")
-        self.log(">> starting the decoding sweep (temperature, guidance rate, beams) for the recommended checkpoint")
+        knobs = "diffusion steps and guidance" if getattr(config, "tts_model", "indextts") == "omnivoice" else "temperature, guidance and beams"
+        self.log(f">> starting the decoding sweep ({knobs}) for the recommended checkpoint")
         process = subprocess.Popen([sys.executable, "-m", "indextts.training.speech_eval", "--config", str(config_path),
                                     "--state-dir", str(job_dir), "--decoding-sweep", "--checkpoint", str(checkpoint_path)],
                                    cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1177,8 +1179,11 @@ class LoraTrainer:
         report = read_json_retry(self.adapter_dir / "analysis" / "decoding.json", {}) or {}
         if process.returncode == 0 and not failure and report:
             if settings is not None:
-                summary = (f"Decoding sweep adopted temperature {settings['temperature']:g}, guidance {settings['inference_cfg_rate']:g}, "
-                           f"beams {settings['num_beams']} (score {settings['score']:+.4f})")
+                if "num_step" in settings:
+                    summary = f"Decoding sweep adopted {settings['num_step']} diffusion steps, guidance {settings['guidance_scale']:g} (score {settings['score']:+.4f})"
+                else:
+                    summary = (f"Decoding sweep adopted temperature {settings['temperature']:g}, guidance {settings['inference_cfg_rate']:g}, "
+                               f"beams {settings['num_beams']} (score {settings['score']:+.4f})")
                 self.write_status(decoding_sweep_status="complete", decoding_sweep_message=summary)
             else:
                 summary = "Decoding sweep kept the default settings: no change beat them on the speech benchmark"
@@ -1496,7 +1501,11 @@ class LoraTrainer:
         moving_losses: deque[float],
     ) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
+            # Deployment files may use BF16. Keep the optimizer's actual weights
+            # too, otherwise continuation silently rounds FP32 parameters.
+            "trainable_weights": [[p.detach().cpu().clone() for p in group["params"]]
+                                  for group in optimizer.param_groups],
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
@@ -1687,6 +1696,22 @@ class LoraTrainer:
     ) -> None:
         if not state:
             return
+        weights = state.get("trainable_weights")
+        if weights is not None:
+            groups = optimizer.param_groups
+            if len(weights) != len(groups) or any(
+                len(saved) != len(group["params"]) or any(
+                    tuple(value.shape) != tuple(parameter.shape)
+                    for value, parameter in zip(saved, group["params"])
+                ) for saved, group in zip(weights, groups)
+            ):
+                raise ValueError("Saved training weights do not match the optimizer parameters")
+            with torch.no_grad():
+                for saved, group in zip(weights, groups):
+                    for value, parameter in zip(saved, group["params"]):
+                        parameter.copy_(value)
+        else:
+            self.log(">> Legacy resume state: using deployment weights; saved precision may differ from training precision")
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         if rebuild_scheduler_horizon:
@@ -2565,6 +2590,10 @@ def run_training(
     state_dir: str | Path | None = None,
     reporter: ProgressReporter | None = None,
 ) -> TrainingResult:
+    config = TrainConfig.from_dict(config)
+    if config.tts_model == "omnivoice":
+        from .omnivoice_trainer import OmniVoiceTrainer
+        return OmniVoiceTrainer(config, state_dir=state_dir, reporter=reporter).run()
     return LoraTrainer(config, state_dir=state_dir, reporter=reporter).run()
 
 

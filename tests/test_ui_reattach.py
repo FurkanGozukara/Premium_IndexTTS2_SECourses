@@ -15,7 +15,7 @@ from indextts.training.charts import (
     loss_frame,
 )
 from ui.batch_tab import batch_task_updates
-from ui.common import adopt_output_task, latest_output_task, output_task_is_active
+from ui.common import IDLE_POLL_SECONDS, adopt_output_task, latest_output_task, output_task_is_active
 from ui.dataset_tab import (
     _path_list_from_state,
     _path_list_state_value,
@@ -67,7 +67,7 @@ def test_training_discovers_and_adopts_newest_running_state(tmp_path: Path) -> N
     _write_json(live / "status.json", {"phase": "stopped", "step": 8, "total_steps": 60})
     idle = training_poll_updates(str(live), 0.9, state_root=tmp_path)
     assert Path(idle[0]) == live.resolve()
-    assert idle[-1].value == 5.0
+    assert idle[-1].value == IDLE_POLL_SECONDS
 
 
 def test_dataset_discovers_running_state_and_uses_matching_dataset(tmp_path: Path) -> None:

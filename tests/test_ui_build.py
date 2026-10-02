@@ -101,8 +101,16 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
     })
     assert restored_training.train_full_modules_fp32 is False
     dependencies = {item.get("api_name"): item for item in demo.config["dependencies"]}
-    assert dependencies["generate_voice"]["trigger_only_on_success"] is True
-    assert dependencies["generate_voice"]["trigger_after"] is not None
+    by_id = {item["id"]: item for item in demo.config["dependencies"]}
+    # The page generates only after the reference step succeeded; the request
+    # controls travel in one browser-packed payload between the two.
+    page_generation = next(item for item in demo.config["dependencies"]
+                           if demo.fns[item["id"]].name == "generate_voice" and item.get("trigger_after") is not None)
+    packing = by_id[page_generation["trigger_after"]]
+    assert packing["trigger_only_on_success"] is True and packing["trigger_after"] is not None
+    assert len(page_generation["inputs"]) == 6
+    # The documented endpoint keeps every control as a direct input for API callers.
+    assert len(dependencies["generate_voice"]["inputs"]) == 5 + len(packing["inputs"])
     assert {
         "grid.adapter_dir",
         "grid.checkpoints",
@@ -202,8 +210,18 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
         for target in dependency["targets"]
         if target[0] == saved_grid["id"]
     ]
-    assert (saved_grid["id"], "input") in saved_grid_targets
+    assert (saved_grid["id"], "select") in saved_grid_targets
     assert (saved_grid["id"], "change") not in saved_grid_targets
+
+    # Model visibility is a body class the stylesheet reads, so mounting a lazy tab
+    # or accordion needs no server event and cannot reset checkpoint choices.
+    assert not [fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == "mounted_visibility"]
+    assert not any(target[1] == "expand" for dependency in demo.config["dependencies"] for target in dependency["targets"])
+    assert ".tts-only-indextts" in APP_CSS and ".tts-only-omnivoice" in APP_CSS
+    omni_panel = components[("accordion", "OmniVoice · voice and generation")]
+    assert "tts-only-omnivoice" in omni_panel["props"]["elem_classes"]
+    assert omni_panel["props"]["visible"] is True
+    assert "tts-only-indextts" in components[("accordion", "Emotion Control")]["props"]["elem_classes"]
 
 
 def test_blank_batch_folder_does_not_scan_working_directory(tmp_path, monkeypatch):
@@ -234,7 +252,7 @@ def test_completed_batch_stops_item_polling_timer() -> None:
 
 
 def test_mobile_header_actions_wrap_within_the_viewport() -> None:
-    mobile_rules = APP_CSS.split("@media (max-width: 900px)", 1)[1]
+    mobile_rules = APP_CSS.split("@media (max-width: 1400px)", 1)[1]
 
     assert ".app-header { flex-wrap: wrap; }" in mobile_rules
     assert ".row.header-actions" in mobile_rules
@@ -280,10 +298,11 @@ def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():
         if "window.confirm(" in (dependency.get("js") or "")
     ]
 
-    assert len(confirmations) == 5
+    assert len(confirmations) == 3
     for dependency in confirmations:
         confirmation_input = components[dependency["inputs"][0]]
         assert confirmation_input["type"] == "checkbox"
         assert confirmation_input["props"]["visible"] is False
     button_labels = {item["props"].get("value") for item in demo.config["components"] if item["type"] == "button"}
     assert {"🛑  Yes, cancel generation", "▶️  Keep generating", "🛑  Yes, cancel grid", "▶️  Keep rendering grid"}.issubset(button_labels)
+    assert {"🛑 Confirm training stop", "▶️ Keep training"}.issubset(button_labels)

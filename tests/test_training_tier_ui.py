@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from ui.app import build_app
-from ui.training_tab import TRAINING_TIER_FIELDS, training_tier_values
+from ui.training_tab import TRAINING_TIER_FIELDS, OMNI_CAPACITY_FIELDS, training_tier_values
 
 
 def _demo():
@@ -27,11 +27,11 @@ def test_training_tier_dropdown_sits_beside_the_dataset_and_fills_the_vram_contr
         if getattr(fn.fn, "__name__", "") == "apply_training_tier"
     ]
     assert {tuple(callback.targets[0]) for callback in callbacks} == {
-        (training.vram_tier._id, "input"), (training.apply_tier_button._id, "click"),
+        (training.vram_tier._id, "select"), (training.apply_tier_button._id, "click"),
     }
-    expected_outputs = [training.controls[f"training.{name}"] for name in TRAINING_TIER_FIELDS] + [training.tier_note]
+    expected_outputs = [training.controls[f"training.{name}"] for name in (*TRAINING_TIER_FIELDS, *OMNI_CAPACITY_FIELDS)] + [training.tier_note]
     for callback in callbacks:
-        assert callback.inputs == [training.vram_tier, training.device]
+        assert callback.inputs == [training.vram_tier, training.device, training.model_selector, training.controls["training.adapter_type"]]
         assert callback.outputs == expected_outputs
         large = callback.fn("auto", "cuda:0")
         small = callback.fn("auto", "cuda:1")
@@ -44,9 +44,17 @@ def test_training_tier_dropdown_sits_beside_the_dataset_and_fills_the_vram_contr
         assert "CPU" in callback.fn("auto", "cpu")[-1]
 
     note_callbacks = [fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == "_training_tier_note"]
-    assert {tuple(callback.targets[0]) for callback in note_callbacks} == {
-        (training.vram_tier._id, "change"), (training.device._id, "change"),
-    }
+    triggers = {tuple(target) for callback in note_callbacks for target in callback.targets}
+    # Tier, device and method changes refresh the note directly; a model switch or
+    # preset load refreshes it as a chained step (the selector's own change event
+    # already starts the Models tab's deferring description).
+    assert {(training.vram_tier._id, "change"), (training.device._id, "change"),
+            (training.controls["training.adapter_type"]._id, "change")} <= triggers
+    assert (training.model_selector._id, "change") not in triggers
+    # The chained step refreshes every model-dependent display in one call.
+    follow = [fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == "refresh_model_displays"]
+    assert follow and all(training.tier_note in fn.outputs for fn in follow)
+    assert all(target[1] == "then" for fn in follow for target in fn.targets)
 
 
 def test_training_tier_values_follow_the_measured_tables(monkeypatch):

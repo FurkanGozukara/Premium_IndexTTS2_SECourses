@@ -7,6 +7,22 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v7.0",
+        "2026-10-02",
+        """
+### Ultimate Text To Speech Generator With Voice Cloning
+
+- **Two speech models:** choose IndexTTS 2.5 or OmniVoice in the header. Shared generation, batch, subtitles, media export, dataset and monitoring panels follow the selection. Each universal preset remembers both models' settings; switching unloads the previous engine and is protected while a job runs.
+- **OmniVoice:** automatic public downloads, voice cloning with an optional transcript, voice design, automatic voices, multilingual output, cached reference prompts, BF16 and ConvRot INT8. Memory tiers and speed, balanced and quality sampling controls use the same runtime interface.
+- **Training:** OmniVoice full fine-tuning, LoRA and DoRA reuse dataset manifests, adapter files, live progress, fixed-mask validation, resumable optimizer state, checkpoint grids and the development/final-test selection workflow. Model-specific parameters and compatible checkpoints appear only for the selected model.
+- **Startup and continuation:** deferred imports and cached checkpoint inspection reduce repeated work, startup logs show each stage, and resumable checkpoints retain full training precision even when deployment weights use BF16. Training stop confirmation appears inside the page.
+- **OmniVoice training recipe:** clips train in micro-batches of 4,096 tokens, accumulated to the upstream 8,192 tokens per update; full fine-tuning at learning rate 2e-5 is the default from 16 GB and rank-32 DoRA below, all on the BF16 base, with gradient checkpointing under 24 GB. Training text is normalized as generation normalizes it, each voice's speaking rate is calibrated for generation without a reference, the audio prompt fraction defaults to 0 for single-speaker voices, epochs 0 sizes the run from the dataset's training audio (more epochs for smaller voices), and the Training plan counts token batches. DoRA on the INT8 base no longer fails after the first validation.
+- **Responsive interface:** a model switch shows the other model's panels at once and settles in under a second; preset loads are about twice as fast. Gradio's browser run history, which stored every call in local storage and slowed each click, is off and its leftovers are removed; triggers fired together run their handler once; model-dependent displays refresh in one call; adapter lists stay fast while a training saves checkpoints; idle status timers poll every 30 seconds; startup is about 4 seconds shorter.
+
+Existing IndexTTS presets remain supported. Restart after updating.
+""".strip(),
+    ),
+    (
         "v6.22",
         "2026-09-26",
         """

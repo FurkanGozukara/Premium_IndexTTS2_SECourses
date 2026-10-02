@@ -109,15 +109,24 @@ def test_only_presets_load_automatically_and_attachments_use_header_button(demo)
     assert len(last_values) == 1
     button_id = last_values[0]["id"]
     assert last_values[0]["props"]["interactive"] is False
-    initial_load = load_dependencies[0]
+    initial_load = backend_loads[0]
+    by_id = {dependency["id"]: dependency for dependency in config["dependencies"]}
+
+    def follows(dependency: dict[str, Any], ancestor: int) -> bool:
+        # The browser applies the loaded values between the load and the steps after it.
+        current = dependency.get("trigger_after")
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = by_id[current].get("trigger_after")
+        return False
+
     enable_dependency = next(
         dependency
         for dependency in config["dependencies"]
-        if dependency["outputs"] == [button_id]
-        and dependency.get("trigger_after") == initial_load["id"]
+        if dependency["outputs"] == [button_id] and follows(dependency, initial_load["id"])
     )
     assert enable_dependency["outputs"] == [button_id]
-    assert enable_dependency["trigger_after"] == initial_load["id"]
     sections_id = next(
         component["id"]
         for component in config["components"]
@@ -189,11 +198,11 @@ def test_build_time_results_are_blank_even_with_existing_catalogs(demo) -> None:
         )
     ) == []
     assert _table_data(
-        _find_in_tab(config, "LoRA / DoRA Training", "dataframe", "Checkpoints")
+        _find_in_tab(config, "Voice Training", "dataframe", "Checkpoints")
     ) == []
     assert (
         _find_in_tab(
-            config, "LoRA / DoRA Training", "textbox", "Training log (last 60 lines)"
+            config, "Voice Training", "textbox", "Training log (last 60 lines)"
         )["props"].get("value")
         is None
     )
@@ -247,8 +256,10 @@ def test_build_time_results_are_blank_even_with_existing_catalogs(demo) -> None:
 def test_button_hues_and_icons_are_unique_within_every_tab(demo) -> None:
     config = demo.config
     tabs = _tab_component_ids(config)
+    # Hidden API triggers (visible=False) are never shown on the page.
     buttons = [
-        component for component in config["components"] if component["type"] == "button"
+        component for component in config["components"]
+        if component["type"] == "button" and component.get("props", {}).get("visible", True) is not False
     ]
     tab_button_ids = set().union(*tabs.values())
     global_buttons = [

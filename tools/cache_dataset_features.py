@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", dest="dataset_dir", help="Dataset directory containing manifest.jsonl")
     parser.add_argument("--config", help="Optional FeatureCacheConfig JSON file")
     parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--tts-model", choices=["indextts", "omnivoice"], default=None)
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--semantic-layer", type=int, default=None)
@@ -49,6 +50,7 @@ def main() -> int:
         raise SystemExit("dataset_dir is required (positional argument or config JSON)")
     for argument, field in (
         (args.model_dir, "model_dir"),
+        (args.tts_model, "tts_model"),
         (args.model_config, "model_config"),
         (args.device, "device"),
         (args.semantic_layer, "semantic_layer"),
@@ -76,7 +78,11 @@ def main() -> int:
         free_text = "unknown" if free_gb is None else f"{free_gb:.1f} GB"
         print(f">> feature cache batch size {config.batch_size} for {free_text} free VRAM on {config.device}", flush=True)
     reporter = ProgressReporter("segments", progress_file=args.progress_file) if args.progress_file else None
-    summary = cache_dataset_features(config, reporter=reporter)
+    if payload.get("tts_model") == "omnivoice":
+        from indextts.training.omnivoice_data import cache_omnivoice_features
+        summary = cache_omnivoice_features(config, reporter=reporter)
+    else:
+        summary = cache_dataset_features(config, reporter=reporter)
     print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))
     return 0 if not summary.cancelled else 2
 

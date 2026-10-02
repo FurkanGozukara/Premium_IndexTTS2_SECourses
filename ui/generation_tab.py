@@ -21,7 +21,8 @@ from typing import Any, Mapping, Sequence
 
 import gradio as gr
 
-from indextts.lora.io import inspect_lora, scan_lora_files
+from indextts.lora.io import inspect_lora, memoized_adapter_list, scan_lora_files
+from indextts.utils.path_cache import resolved_path
 from indextts.runtime.progress import read_progress_file
 from indextts.training.media import SUPPORTED_MEDIA_EXTENSIONS, probe_media
 from indextts.utils.subtitle_utils import SUBTITLE_FORMAT_SUMMARY, SUPPORTED_SUBTITLE_EXTENSIONS
@@ -90,24 +91,30 @@ from indextts.utils.text_segmentation import (
 from webui_generation_runner import current_timestamp, format_elapsed_duration, run_generation_request
 
 from .common import (
-    GenerationCanceled,
-    LAZY_ENGINE,
-    PROCESS_MANAGER,
-    ROOT,
     adopt_output_task,
     btn,
     extract_reference_audio,
+    GATHER_VALUES_JS,
+    GenerationCanceled,
     is_cancellation,
+    LAZY_ENGINE,
+    on_gathered,
     open_folder,
     output_task_is_active,
+    prepare_gathered,
+    PROCESS_MANAGER,
     progress_panel_html,
     read_json,
     resolve_path_value,
+    ROOT,
     runtime_config_from_values,
     tail_text,
+    then_gathered,
+    values_payload_component,
     write_json_atomic,
 )
 from .presets_store import PresetRegistry
+from .model_controls import build_omnivoice_controls, omnivoice_language_control
 
 
 LANGUAGES = ("ZH", "EN", "JA", "AR", "ES")
@@ -152,6 +159,9 @@ REFERENCE_AUDIO_EXTENSIONS = frozenset(
     }
 )
 _AUTO_REFERENCE_SOURCES = frozenset({"library_auto", "lora_auto"})
+# OmniVoice voice cloning falls back to the bundled demo voice rather than the
+# newest library file; its Auto voice and Voice design modes need no reference.
+OMNIVOICE_DEFAULT_REFERENCE = "demo_voice.mp3"
 
 
 @dataclass(frozen=True)
@@ -287,6 +297,7 @@ INFER_KWARG_KEYS = frozenset(
 
 RUNNER_REQUEST_KEYS = frozenset(
     {
+        "omnivoice",
         "prompt",
         "text",
         "subtitle_mode",
@@ -467,12 +478,16 @@ def build_generation_request(
     segment_target_tokens = (
         smart_segment_target(str(merged.get("runtime.lora_path") or "")) if segmentation_mode == "smart" else None
     )
+    omnivoice = merged.get("app.model") == "omnivoice"
+    language = merged.get("omnivoice.language", "AUTO") if omnivoice else _value(merged, "generation.language")
     request = {
+        "omnivoice": ({key.removeprefix("omnivoice."): value for key, value in merged.items()
+                       if key.startswith("omnivoice.") and key != "omnivoice.language"} if omnivoice else None),
         "prompt": str(prompt or ""),
         "text": str(text or ""),
         "subtitle_mode": bool(_value(merged, "generation.use_caption_timing")),
         "subtitle_file": subtitle_file,
-        "language": str(_value(merged, "generation.language") or "EN").upper(),
+        "language": str(language or ("AUTO" if omnivoice else "EN")).upper(),
         "save_used_audio": bool(_value(merged, "generation.save_used_audio")),
         "save_as_mp3": bool(_value(merged, "generation.save_as_mp3")),
         "mp3_bitrate": str(_value(merged, "generation.mp3_bitrate")),
@@ -547,7 +562,11 @@ def prepare_generation_request(
     output_root: str | os.PathLike[str] = "outputs",
 ) -> dict[str, Any]:
     prompt_path = resolve_path_value(prompt)
-    if not prompt_path or not Path(prompt_path).is_file():
+    if values.get("app.model") == "omnivoice":
+        from indextts.backends.omnivoice import validate_voice_settings
+        validate_voice_settings({key.removeprefix("omnivoice."): value for key, value in values.items() if key.startswith("omnivoice.")})
+    needs_reference = values.get("app.model") != "omnivoice" or values.get("omnivoice.mode", "clone") == "clone"
+    if needs_reference and (not prompt_path or not Path(prompt_path).is_file()):
         raise ValueError("Reference Voice audio is required before generation")
     subtitle_path = resolve_path_value(subtitle_file)
     image_source = resolve_path_value(image_path)
@@ -610,7 +629,7 @@ def prepare_generation_request(
         "inputs": {
             "text": text,
             "language": request["language"],
-            "speaker_reference_audio": str(Path(prompt_path).resolve()),
+            "speaker_reference_audio": str(Path(prompt_path).resolve()) if prompt_path else None,
             "emotion_reference_audio": str(Path(emotion_path).resolve()) if emotion_path else None,
             "subtitle_file": str(Path(subtitle_path).resolve()) if subtitle_path else None,
             "source_image": str(Path(image_path).resolve()) if image_path else None,
@@ -619,7 +638,7 @@ def prepare_generation_request(
             "execution_mode": "subprocess" if _value(values, "generation.use_subprocess") else "in_process",
             "resolved_generation_kwargs": request["infer_kwargs"],
             "runtime": request["runtime"],
-            "request_values": {key: value for key, value in values.items() if key.startswith(("generation.", "runtime."))},
+            "request_values": {key: value for key, value in values.items() if key == "app.model" or key.startswith(("generation.", "runtime.", "omnivoice."))},
         },
         "outputs": {
             "final_audio_path": None,
@@ -691,6 +710,12 @@ def _preview_tokenizer(model_dir: str):
     return get_tokenizer(multilingual=True, model_dir=model_dir)
 
 
+@lru_cache(maxsize=2)
+def _omnivoice_preview_tokenizer(model_dir: str):
+    from tokenizers import Tokenizer
+    return Tokenizer.from_file(str(Path(model_dir) / "omnivoice" / "tokenizer.json"))
+
+
 @lru_cache(maxsize=8)
 def _preview_capacity(model_dir: str) -> int:
     try:
@@ -751,6 +776,7 @@ def preview_segments(
     segmentation_mode: str = "budget",
     target_tokens: int | None = None,
     words_per_second: float = 0.0,
+    model_id: str = "indextts",
 ) -> tuple[list[list[Any]], str]:
     subtitle_path = resolve_path_value(subtitle_file)
     if caption_timing and subtitle_path:
@@ -766,11 +792,15 @@ def preview_segments(
     if not str(text or "").strip():
         return [], "0 sections"
     try:
-        tokenizer = _preview_tokenizer(str(Path(model_dir).resolve()))
-        raw_token_len = lambda value: len(tokenizer.encode(value, allowed_special="all"))
+        if model_id == "omnivoice":
+            tokenizer = _omnivoice_preview_tokenizer(str(Path(model_dir).resolve()))
+            raw_token_len = lambda value: len(tokenizer.encode(value, add_special_tokens=False).ids)
+        else:
+            tokenizer = _preview_tokenizer(str(Path(model_dir).resolve()))
+            raw_token_len = lambda value: len(tokenizer.encode(value, allowed_special="all"))
     except Exception:
         raw_token_len = lambda value: max(1, len(str(value).split()) * 2)
-    prefix = f"<|{str(language or 'EN').lower()}|> "
+    prefix = "" if model_id == "omnivoice" else f"<|{str(language or 'EN').lower()}|> "
     mode = normalize_segmentation_mode(segmentation_mode) if str(segmentation_mode or "budget") != "budget" else "budget"
 
     def token_len(value: str) -> int:
@@ -788,10 +818,10 @@ def preview_segments(
         for segment in split_text_by_tokens(
             chunk.text,
             int(max_tokens),
-            capacity=_preview_capacity(str(Path(model_dir).resolve())),
+            capacity=2048 if model_id == "omnivoice" else _preview_capacity(str(Path(model_dir).resolve())),
             token_len=token_len,
             lang_prefix=prefix,
-            segment_budget_scale_non_cjk=float(segment_scale),
+            segment_budget_scale_non_cjk=1.0 if model_id == "omnivoice" else float(segment_scale),
             mode=mode,
             target_tokens=target_tokens,
         ):
@@ -1147,13 +1177,21 @@ def resolve_reference_selection(
     *,
     reference_root: str | os.PathLike[str] = REFERENCE_AUDIO_DIR,
     lora_reference: str | None = None,
+    default_reference: str | None = None,
 ) -> ReferenceSelection:
-    """Choose manual, LoRA, then newest library audio in that priority order."""
+    """Choose manual, LoRA, then library audio in that priority order.
+
+    The library fallback is ``default_reference`` when the library has that
+    file, otherwise its most recently modified audio.
+    """
 
     choices = reference_audio_choices(reference_root)
     choice_values = {_path_key(value): value for _, value in choices}
     selected = choice_values.get(_path_key(selected_library))
-    newest = _latest_reference_choice(choices)
+    default = next((value for _, value in choices if default_reference
+                    and Path(value).name.casefold() == default_reference.casefold()), None)
+    newest = default or _latest_reference_choice(choices)
+    fallback_note = "the default voice in reference_audios" if default else "the latest modified audio in reference_audios"
 
     source = str(reference_source or "empty")
     current = _existing_path(current_reference)
@@ -1196,18 +1234,17 @@ def resolve_reference_selection(
         elif missing_lora_reference:
             message = (
                 f"The selected LoRA / DoRA {lora_name} has no saved reference audio. "
-                f"Automatically loaded and will use {Path(newest).name}, the latest modified "
-                "audio in reference_audios."
+                f"Automatically loaded and will use {Path(newest).name}, {fallback_note}."
             )
         elif lora_path and not auto_lora_reference:
             message = (
                 "Automatic LoRA / DoRA reference loading is disabled. Automatically loaded and "
-                f"will use {Path(newest).name}, the latest modified audio in reference_audios."
+                f"will use {Path(newest).name}, {fallback_note}."
             )
         else:
             message = (
                 "No Reference Voice was provided. Automatically loaded and will use "
-                f"{Path(newest).name}, the latest modified audio in reference_audios."
+                f"{Path(newest).name}, {fallback_note}."
             )
         return ReferenceSelection(
             prompt=newest,
@@ -1283,6 +1320,7 @@ def prepare_reference_for_generation(
     *,
     reference_root: str | os.PathLike[str] = REFERENCE_AUDIO_DIR,
     lora_reference: str | None = None,
+    default_reference: str | None = None,
 ) -> PreparedReference:
     """Resolve and, when requested, trim the visible Gradio Reference Voice."""
 
@@ -1301,6 +1339,7 @@ def prepare_reference_for_generation(
         auto_lora_reference,
         reference_root=reference_root,
         lora_reference=lora_reference,
+        default_reference=default_reference,
     )
     if not selection.prompt:
         raise ValueError(selection.message)
@@ -1356,17 +1395,24 @@ def prepare_reference_for_generation(
     )
 
 
-def _lora_choices() -> list[tuple[str, str]]:
+def _lora_choices(model_id: str = "indextts") -> list[tuple[str, str]]:
+    return memoized_adapter_list("lora_choices", ROOT / "loras", _build_lora_choices, model_id)
+
+
+def _build_lora_choices(model_id: str = "indextts") -> list[tuple[str, str]]:
     entries = scan_lora_files([str(ROOT / "loras")])
     choices: list[tuple[str, str]] = [("None", "")]
     for entry in entries:
-        source = Path(entry.path).resolve()
+        source = resolved_path(entry.path)
         try:
             info = inspect_lora(source)
         except Exception:
             continue
+        from indextts.backends import checkpoint_matches_model
+        if not checkpoint_matches_model(info, model_id):
+            continue
         parent = source.parent.parent.name if source.parent.name.lower() == "best" else source.parent.name
-        adapter_type = "DoRA" if str(info.get("adapter_type", "")).lower() == "dora" else "LoRA"
+        adapter_type = {"dora": "DoRA", "full": "Full"}.get(str(info.get("adapter_type", "")).lower(), "LoRA")
         label = (
             f"{parent}/{source.stem}  ·  {adapter_type} r{int(info.get('rank', 0) or 0)}"
             f"  ·  {int(info.get('steps', 0) or 0)} steps"
@@ -1801,8 +1847,10 @@ def adapter_panel_html(
     decoding_line = (
         f"Decoding settings from the sweep: temperature <b>{decoding['temperature']:g}</b>, guidance "
         f"<b>{decoding['inference_cfg_rate']:g}</b>, beams <b>{decoding['num_beams']}</b> (applied with the calibrated speaking rate)."
-        if decoding else "Decoding settings: <b>defaults</b> (no accepted sweep override for this training)."
+        if decoding and "temperature" in decoding else "Decoding settings: <b>defaults</b> (no accepted sweep override for this training)."
     )
+    if decoding and "num_step" in decoding:
+        decoding_line = f"OmniVoice sweep: <b>{int(decoding['num_step'])} diffusion steps</b>, guidance <b>{decoding['guidance_scale']:g}</b>."
     provenance = ""
     if profile:
         provenance = (
@@ -2090,12 +2138,21 @@ def decoding_updates(path: str | None, auto_apply: bool) -> tuple[Any, Any, Any]
     if not auto_apply:
         return gr.skip(), gr.skip(), gr.skip()
     settings = load_decoding_settings(path) if path else None
+    if settings is not None and "num_step" in settings:
+        return gr.skip(), gr.skip(), gr.skip()
     if settings is None:
         return (gr.update(value=GENERATION_DEFAULTS["generation.temperature"]),
                 gr.update(value=GENERATION_DEFAULTS["generation.inference_cfg_rate"]),
                 gr.update(value=GENERATION_DEFAULTS["generation.num_beams"]))
     return (gr.update(value=settings["temperature"]), gr.update(value=settings["inference_cfg_rate"]),
             gr.update(value=settings["num_beams"]))
+
+
+def omnivoice_decoding_updates(path: str | None, auto_apply: bool) -> tuple[Any, Any]:
+    settings = load_decoding_settings(path) if path and auto_apply else None
+    if settings and "num_step" in settings:
+        return gr.update(value=settings["num_step"]), gr.update(value=settings["guidance_scale"])
+    return gr.skip(), gr.skip()
 
 
 def saved_lora_speaking_rate(path: str | None) -> float | None:
@@ -2142,23 +2199,31 @@ def save_lora_speaking_rate(
 
 
 def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int = 10) -> list[list[Any]]:
-    rows: list[tuple[float, list[Any]]] = []
     root_path = Path(root).expanduser().resolve()
-    for metadata_path in root_path.rglob("metadata.json") if root_path.is_dir() else []:
-        try:
-            parts = metadata_path.parent.resolve().relative_to(root_path).parts
-        except ValueError:
+    candidates: list[tuple[float, Path]] = []
+    # Walk without the folders this list never shows, newest metadata first, and
+    # read only as many files as the table needs (outputs/ can hold thousands).
+    for directory, dirnames, filenames in os.walk(root_path) if root_path.is_dir() else ():
+        dirnames[:] = [name for name in dirnames
+                       if not name.startswith("_") and name.lower() not in {"grids", "worker_runtime_e2e", ".sample_jobs"}]
+        if "metadata.json" not in filenames:
             continue
+        metadata_path = Path(directory, "metadata.json")
+        parts = metadata_path.parent.relative_to(root_path).parts
         lowered = [part.lower() for part in parts]
-        if any(part.startswith("_") for part in parts):
-            continue
-        if any(part in {"grids", "worker_runtime_e2e", ".sample_jobs"} for part in lowered):
-            continue
         first = lowered[0] if lowered else ""
         if first.startswith("ui_") and any(
             token in part for part in lowered for token in ("batch", "smoke")
         ):
             continue
+        try:
+            candidates.append((metadata_path.stat().st_mtime, metadata_path))
+        except OSError:
+            continue
+    rows: list[list[Any]] = []
+    for _, metadata_path in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if len(rows) >= limit:
+            break
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
@@ -2168,21 +2233,25 @@ def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int =
             continue
         task = metadata.get("task", {})
         created = metadata.get("created_at", "")
-        row = [task.get("id", metadata_path.parent.name), created, metadata.get("status", ""), output, str(metadata_path.parent)]
-        rows.append((metadata_path.stat().st_mtime, row))
-    return [row for _, row in sorted(rows, key=lambda item: item[0], reverse=True)[:limit]]
+        rows.append([task.get("id", metadata_path.parent.name), created, metadata.get("status", ""), output, str(metadata_path.parent)])
+    return rows
 
 
 def _summary_html(result: Mapping[str, Any]) -> str:
+    timing = (
+        f"OmniVoice {float(result.get('generation_time_s', 0.0) or 0.0):.2f}s | "
+        if result.get("model") == "omnivoice" else
+        f"GPT {float(result.get('gpt_time', 0.0) or 0.0):.2f}s, "
+        f"s2mel {float(result.get('s2mel_time', 0.0) or 0.0):.2f}s, "
+        f"vocoder {float(result.get('vocoder_time', 0.0) or 0.0):.2f}s | "
+    )
     return (
         '<div class="summary-strip">'
         f"Seed <b>{html.escape(str(result.get('seed', '--')))}</b> | "
         f"Segments <b>{html.escape(str(result.get('segments_count', '--')))}</b> | "
         f"Audio <b>{float(result.get('audio_seconds', 0.0) or 0.0):.2f}s</b> | "
         f"RTF <b>{float(result.get('rtf', 0.0) or 0.0):.3f}</b> | "
-        f"GPT {float(result.get('gpt_time', 0.0) or 0.0):.2f}s, "
-        f"s2mel {float(result.get('s2mel_time', 0.0) or 0.0):.2f}s, "
-        f"vocoder {float(result.get('vocoder_time', 0.0) or 0.0):.2f}s | "
+        f"{timing}"
         f"Peak VRAM {float(result.get('peak_vram_gb', 0.0) or 0.0):.2f} GB"
         "</div>"
     )
@@ -2669,8 +2738,10 @@ def build_generation_tab(
     load_hook: Any | None = None,
 ) -> GenerationTab:
     model_dir = str(getattr(args, "model_dir", ROOT / "models"))
+    model_selector = registry["app.model"].component if "app.model" in registry else gr.State("indextts")
     initial_reference_choices = reference_audio_choices()
     tab = GenerationTab()
+    tab.index_panels = []
     c = tab.controls
 
     with gr.Tab("Voice Generation", id="voice-generation"):
@@ -2773,6 +2844,7 @@ def build_generation_tab(
                             choices=list(LANGUAGES), value="EN", label="Language",
                             info="Normalization and pronunciation.", scale=1, min_width=100,
                         )
+                        omnivoice_language_control(registry)
                         max_tokens = gr.Slider(
                             20, 300, value=60, step=1, label="Max tokens per segment",
                             info="Hard limit per speech segment; longer segments need more VRAM.",
@@ -2853,7 +2925,7 @@ def build_generation_tab(
                     label="Live section preview",
                     buttons=["fullscreen"],
                 )
-                with gr.Accordion("🔤 Pronunciation check & dictionary", open=False):
+                with gr.Accordion("🔤 Pronunciation check & dictionary", open=False) as pronunciation_panel:
                     gr.Markdown(
                         "The engine reads `<word|PHONES>` annotations natively: ARPAbet phones with stress digits and dots between "
                         "syllables, for example `<Qwen|K W EH1 N>`. **Check unknown words** lists the words in the text that the "
@@ -2895,6 +2967,7 @@ def build_generation_tab(
                         label="Pronunciation dictionary (pronunciations/dictionary.json)",
                         buttons=["fullscreen"],
                     )
+                tab.index_panels.append(pronunciation_panel)
                 _register(registry, "generation.apply_pronunciation_dictionary", apply_pronunciation, kind="bool")
 
             with gr.Column(scale=1, min_width=320):
@@ -2937,6 +3010,8 @@ def build_generation_tab(
             lora = gr.Dropdown(
                 choices=_lora_choices(),
                 value="",
+                # Profile values can arrive before the model-specific choice refresh.
+                allow_custom_value=True,
                 label="LoRA / DoRA",
                 info="Select a trained LoRA / DoRA, or None for Base model (no LoRA / DoRA), which clones from the reference only.",
                 scale=6,
@@ -2993,6 +3068,7 @@ def build_generation_tab(
             )
             save_lora_rate = gr.Button("⏱️  Save speaking rate", elem_classes=btn("purple"), scale=1)
             pick_expressive = gr.Button("🎭  Pick expressive clip", elem_classes=btn("mint"), scale=1)
+        tab.index_panels.append(pick_expressive)
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
@@ -3007,7 +3083,9 @@ def build_generation_tab(
         )
         _register(registry, "generation.auto_lora_emotion_reference", auto_emotion, kind="bool")
 
-        with gr.Accordion("Emotion Control", open=False):
+        tab.omnivoice_panel = build_omnivoice_controls(registry)
+        with gr.Accordion("Emotion Control", open=False) as emotion_panel:
+            tab.index_panels.append(emotion_panel)
             emotion_mode = gr.Radio(
                 choices=list(EMOTION_MODES), value=EMOTION_MODES[0], label="Emotion source",
                 info="Use the speaker tone, another reference, eight manual vectors, or emotion text analysis.",
@@ -3099,7 +3177,8 @@ def build_generation_tab(
             ):
                 _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
 
-        with gr.Accordion("Diffusion / CFM", open=False):
+        with gr.Accordion("Diffusion / CFM", open=False) as diffusion_panel:
+            tab.index_panels.append(diffusion_panel)
             with gr.Row():
                 steps = gr.Slider(2, 200, value=25, step=1, label="Diffusion steps", info="25 is the quality default; 12-16 is faster and 35-50 can refine difficult audio. Time grows with the step count.")
                 cfg = gr.Slider(0, 2, value=0.7, step=0.05, label="CFG rate", info="0.7 is recommended; high values follow conditioning more aggressively.")
@@ -3169,7 +3248,8 @@ def build_generation_tab(
             _register(registry, "generation.max_speech_retries", speech_retries, kind="int", minimum=0, maximum=64)
             _register(registry, "generation.max_speech_split_depth", speech_split_depth, kind="int", minimum=0, maximum=8)
 
-        with gr.Accordion("Reference Processing", open=False):
+        with gr.Accordion("Reference Processing", open=False) as reference_panel:
+            tab.index_panels.append(reference_panel)
             with gr.Row():
                 max_spk = gr.Slider(3, 90, value=15, step=1, label="Maximum speaker audio length (s)", info="15 seconds preserves enough identity without wasting reference compute.")
                 max_emo = gr.Slider(3, 90, value=15, step=1, label="Maximum emotion audio length (s)", info="15 seconds is recommended for an emotion reference.")
@@ -3548,7 +3628,7 @@ def build_generation_tab(
         ],
         queue=False,
     )
-    tab.reference_audio_dropdown.input(
+    tab.reference_audio_dropdown.select(
         on_library_select,
         [tab.reference_audio_dropdown, tab.reference_source, ranges],
         [
@@ -3606,7 +3686,7 @@ def build_generation_tab(
         queue=False,
     )
 
-    refresh_lora.click(lambda: gr.update(choices=_lora_choices()), outputs=lora, queue=False)
+    refresh_lora.click(lambda model: gr.update(choices=_lora_choices(model)), inputs=model_selector, outputs=lora, queue=False)
     refresh_lora.click(lambda path: gr.update(choices=decoder_adapter_choices(str(path or ""), ROOT / "loras")),
                        inputs=lora, outputs=use_decoder, queue=False)
 
@@ -3678,6 +3758,7 @@ def build_generation_tab(
             tokens_update,
             sentence_pause_update,
             max_pause_update,
+            *omnivoice_decoding_updates(path, bool(items[3])),
         )
 
     def on_lora_selection(*items: Any):
@@ -3749,6 +3830,8 @@ def build_generation_tab(
         max_tokens,
         sentence_pause,
         max_pause,
+        registry["omnivoice.num_step"].component,
+        registry["omnivoice.guidance_scale"].component,
     ]
     panel_inputs = [lora, speaking_rate, max_tokens, budget_scale, language, auto_lora_tokens, auto_lora_pauses, segmentation_mode]
 
@@ -3777,23 +3860,24 @@ def build_generation_tab(
     def refresh_adapter_panel(path: Any, *panel_values: Any) -> str:
         return _lora_info(str(path or ""), **_panel_values(*panel_values))[0]
 
-    # The panel's seconds follow the speaking-rate slider and its token and pause lines follow the timing controls.
-    for component in (speaking_rate, max_tokens, budget_scale, language, auto_lora_tokens, auto_lora_pauses, segmentation_mode):
-        component.change(
-            refresh_adapter_panel, panel_inputs, lora_info,
-            queue=False, show_progress="hidden", trigger_mode="always_last",
-        )
-
+    # These follow the deferring panel/preview event below and must never defer
+    # themselves: in Gradio 6.29 a deferred event restarts every handler of its
+    # trigger when it finishes, and two deferring handlers on one control then
+    # restart each other indefinitely. They are fast and idempotent.
     def on_auto_tokens(path: Any, enabled: Any, scale: Any, lang: Any):
         return auto_max_tokens_update(str(path or ""), bool(enabled), scale, lang)
 
-    for component in (auto_lora_tokens, budget_scale, language):
-        component.change(on_auto_tokens, [lora, auto_lora_tokens, budget_scale, language], max_tokens, queue=False, show_progress="hidden")
+    gr.on(
+        [component.change for component in (auto_lora_tokens, budget_scale, language)],
+        on_auto_tokens, [lora, auto_lora_tokens, budget_scale, language], max_tokens,
+        queue=False, show_progress="hidden", trigger_mode="multiple", api_name="on_auto_tokens",
+    )
 
     def on_auto_pauses(path: Any, enabled: Any):
         return auto_pause_updates(str(path or ""), bool(enabled))
 
-    auto_lora_pauses.change(on_auto_pauses, [lora, auto_lora_pauses], [sentence_pause, max_pause], queue=False, show_progress="hidden")
+    auto_lora_pauses.change(on_auto_pauses, [lora, auto_lora_pauses], [sentence_pause, max_pause], queue=False,
+                            show_progress="hidden", trigger_mode="multiple")
 
     check_words.click(check_unknown_words, [tab.text, lora, dictionary_table], [unknown_words, pronunciation_status], queue=False)
     add_suggestions.click(add_suggestions_and_save, [unknown_words, dictionary_table], [dictionary_table, pronunciation_status], queue=False)
@@ -3802,20 +3886,25 @@ def build_generation_tab(
     # A user's choice applies the adapter's automatic settings (.input fires only for user interaction).
     # A preset load or page restore changes the dropdown programmatically (.change): the saved values,
     # including the voice decoder adapter and speaking rate, must stay exactly as saved.
-    lora.input(
+    lora.select(
         on_lora_selection,
         lora_selection_inputs,
         lora_selection_outputs,
         queue=False,
         api_name="apply_lora_selection",
     )
-    lora.change(
+    # Programmatic adapter changes (preset loads, switches) are frequent; the browser
+    # packs the timing controls so only a few components join Gradio's status refresh.
+    tab.lora_restored_event = on_gathered(
+        [lora.change],
         on_lora_restored,
         [*lora_selection_inputs, use_decoder],
         [lora_info, tab.prompt_audio, tab.reference_media, tab.reference_video, reference_status,
          tab.reference_source, lora_saved_rate, use_decoder],
         queue=False,
         api_name="refresh_lora_panel",
+        show_progress="hidden",
+        trigger_mode="always_last",
     )
     for switch in (auto_rate, auto_ref):
         switch.input(
@@ -3830,11 +3919,13 @@ def build_generation_tab(
 
     preview_inputs = [
         tab.text, language, max_tokens, caption_timing, tab.subtitle_file, pause_tags, budget_scale, apply_pronunciation, lora,
-        segmentation_mode, speaking_rate,
+        segmentation_mode, speaking_rate, model_selector,
     ]
 
     def update_preview(*items: Any):
-        text, lang, tokens, timing, subtitle, pauses, scale, apply_pron, lora_path, split_mode, rate = items
+        if len(items) == 11:
+            items = (*items, "indextts")
+        text, lang, tokens, timing, subtitle, pauses, scale, apply_pron, lora_path, split_mode, rate, model_id = items
         if apply_pron:
             try:
                 text = apply_pronunciation_dictionary(str(text or ""), str(lora_path or ""))
@@ -3845,12 +3936,31 @@ def build_generation_tab(
         return preview_segments(
             text, lang, tokens, timing, subtitle, pauses, scale, model_dir=model_dir,
             segmentation_mode=mode, target_tokens=target, words_per_second=preview_words_per_second(str(lora_path or ""), rate),
+            model_id=model_id,
         )
 
-    for component in (tab.text, language, max_tokens, caption_timing, pause_tags, budget_scale, apply_pronunciation, lora, segmentation_mode, speaking_rate):
-        component.change(update_preview, preview_inputs, [segment_preview, preview_count], queue=False, show_progress="hidden", trigger_mode="always_last")
-    for component in (tab.text, max_tokens, budget_scale):
-        component.input(update_preview, preview_inputs, [segment_preview, preview_count], queue=False, show_progress="hidden", trigger_mode="always_last")
+    view_outputs = [lora_info, segment_preview, preview_count]
+
+    def refresh_text_views(*items: Any):
+        """The adapter panel's token, pause and seconds lines and the live section preview."""
+        return (refresh_adapter_panel(*items[:len(panel_inputs)]), *update_preview(*items[len(panel_inputs):]))
+
+    # One deferring event for every timing control: a preset load that changes
+    # several of them refreshes both views once, and no control starts two
+    # deferring handlers (see on_auto_tokens above).
+    on_gathered(
+        [component.change for component in (tab.text, language, max_tokens, caption_timing, pause_tags, budget_scale,
+                                             apply_pronunciation, segmentation_mode, speaking_rate,
+                                             auto_lora_tokens, auto_lora_pauses)]
+        + [component.input for component in (tab.text, max_tokens, budget_scale)],
+        refresh_text_views, [*panel_inputs, *preview_inputs], view_outputs,
+        queue=False, show_progress="hidden", trigger_mode="always_last", api_name="refresh_text_views",
+    )
+    # A new adapter or speech model changes the dictionary, timing and tokenizer behind the preview.
+    # A chained step defers safely: Gradio restarts only that step, not the trigger's other handlers.
+    then_gathered(tab.lora_restored_event, update_preview, preview_inputs, [segment_preview, preview_count],
+                  queue=False, show_progress="hidden", api_name="update_preview", trigger_mode="always_last")
+    tab.model_refreshes = [(update_preview, preview_inputs, [segment_preview, preview_count])]
 
     def load_caption(*items: Any):
         path = resolve_path_value(items[4])
@@ -3917,7 +4027,7 @@ def bind_generation_events(
     request_specs = [
         spec
         for spec in registry.specs
-        if spec.component is not None and spec.key.startswith(("generation.", "runtime."))
+        if spec.component is not None and (spec.key == "app.model" or spec.key.startswith(("generation.", "runtime.", "omnivoice.")))
     ]
     tab.request_keys = [spec.key for spec in request_specs]
     tab.request_components = [spec.component for spec in request_specs]
@@ -4006,8 +4116,12 @@ def bind_generation_events(
         lora_path: str,
         auto_lora_reference: bool,
         gr_request: gr.Request = None,
+        model_id: str = "indextts",
+        voice_mode: str = "clone",
     ):
         _claim_generation_card(gr_request)
+        if model_id == "omnivoice" and voice_mode != "clone":
+            return (gr.skip(),) * 5 + ("Reference audio is optional for this voice mode.",)
         try:
             prepared = prepare_reference_for_generation(
                 prompt,
@@ -4017,6 +4131,7 @@ def bind_generation_events(
                 time_ranges,
                 lora_path,
                 auto_lora_reference,
+                default_reference=OMNIVOICE_DEFAULT_REFERENCE if model_id == "omnivoice" else None,
             )
         except ValueError as exc:
             gr.Warning(str(exc), title="Reference Voice")
@@ -4031,39 +4146,73 @@ def bind_generation_events(
             prepared.message,
         )
 
+    reference_inputs = [
+        tab.prompt_audio,
+        tab.reference_media,
+        tab.reference_audio_dropdown,
+        tab.reference_source,
+        tab.reference_ranges,
+        tab.controls["runtime.lora_path"],
+        tab.controls["generation.auto_lora_reference"],
+    ]
+    reference_outputs = [
+        tab.prompt_audio,
+        tab.reference_media,
+        tab.reference_video,
+        tab.reference_audio_dropdown,
+        tab.reference_source,
+        tab.reference_status,
+    ]
+    model_component = registry["app.model"].component if "app.model" in registry else gr.State("indextts")
     reference_event = tab.generate_button.click(
         prepare_visible_reference,
-        inputs=[
-            tab.prompt_audio,
-            tab.reference_media,
-            tab.reference_audio_dropdown,
-            tab.reference_source,
-            tab.reference_ranges,
-            tab.controls["runtime.lora_path"],
-            tab.controls["generation.auto_lora_reference"],
-        ],
-        outputs=[
-            tab.prompt_audio,
-            tab.reference_media,
-            tab.reference_video,
-            tab.reference_audio_dropdown,
-            tab.reference_source,
-            tab.reference_status,
-        ],
+        inputs=[*reference_inputs, model_component, registry["omnivoice.mode"].component],
+        outputs=reference_outputs,
         queue=False,
         show_progress="minimal",
-        api_name="prepare_reference_voice",
+        api_name=False,
     )
-    generation_event = reference_event.success(
+    media_inputs = [tab.prompt_audio, tab.text, tab.subtitle_file, tab.image, tab.emotion_audio]
+    request_box = values_payload_component()
+
+    def generate_voice(prompt: str, text: str, subtitle_file: str | None, image_path: str | None,
+                       emotion_audio: str | None, gathered: Any, gr_request: gr.Request = None,
+                       progress=gr.Progress(track_tqdm=False)):
+        """The page's generation: the browser packed every request control into ``gathered``."""
+        values = prepare_gathered(tab.request_components, gathered)
+        yield from generate(prompt, text, subtitle_file, image_path, emotion_audio, gr_request, *values, progress=progress)
+
+    # 132 request controls reach the server in one payload (common.GATHER_VALUES_JS),
+    # so a generation does not slow every later click in the page.
+    reference_event.success(
+        None, tab.request_components, request_box, js=GATHER_VALUES_JS, queue=False, show_progress="hidden", api_name=False,
+    ).then(
+        generate_voice,
+        inputs=[*media_inputs, request_box],
+        outputs=generation_outputs,
+        api_name=False,
+        concurrency_limit=1,
+        concurrency_id="generation",
+        show_progress="hidden",
+        stream_every=0.5,
+    )
+
+    # The documented API keeps its original signatures for programmatic callers
+    # (the tutorial narration client resolves the reference, then generates with
+    # every control). The hidden trigger is never fired by the page.
+    api_trigger = gr.Button(visible=False)
+
+    def prepare_reference_voice(prompt: str | None, media_path: str | None, selected_library: str | None,
+                                reference_source: str, time_ranges: str, lora_path: str, auto_lora_reference: bool,
+                                gr_request: gr.Request = None):
+        return prepare_visible_reference(prompt, media_path, selected_library, reference_source, time_ranges,
+                                         lora_path, auto_lora_reference, gr_request)
+
+    api_trigger.click(prepare_reference_voice, reference_inputs, reference_outputs, queue=False,
+                      api_name="prepare_reference_voice")
+    api_trigger.click(
         generate,
-        inputs=[
-            tab.prompt_audio,
-            tab.text,
-            tab.subtitle_file,
-            tab.image,
-            tab.emotion_audio,
-            *tab.request_components,
-        ],
+        inputs=[*media_inputs, *tab.request_components],
         outputs=generation_outputs,
         api_name="generate_voice",
         concurrency_limit=1,

@@ -15,7 +15,10 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 from safetensors import safe_open
 
+from functools import lru_cache
+
 from indextts.utils.atomic_json import replace_with_retry, write_json_atomic
+from indextts.utils.path_cache import file_state, resolved_path
 
 from .charts import empty_series_frame, load_metrics
 
@@ -71,8 +74,7 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Read only safetensors metadata, keeping analysis independent from torch."""
 
     source = Path(path)
-    with safe_open(str(source), framework="numpy", device="cpu") as handle:
-        header = dict(handle.metadata() or {})
+    header = _safetensors_header(os.fspath(source), *file_state(source))
     train_config: dict[str, Any] = {}
     try:
         decoded = json.loads(header.get("train_config", "{}"))
@@ -81,6 +83,7 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
     return {
+        "base_model": str(header.get("base_model", "")),
         "adapter_type": str(header.get("adapter_type", "")).lower(),
         "rank": _integer(header.get("rank")),
         "alpha": _finite_float(header.get("alpha")) or 0.0,
@@ -90,6 +93,13 @@ def inspect_lora(path: str | os.PathLike[str]) -> dict[str, Any]:
         "train_config": train_config,
         "recommended_reference": str(header.get("recommended_reference", "")),
     }
+
+
+@lru_cache(maxsize=4096)
+def _safetensors_header(path: str, modified_ns: int, size: int) -> Mapping[str, str]:
+    # Checkpoint lists describe every file of a run again after it saves one more.
+    with safe_open(path, framework="numpy", device="cpu") as handle:
+        return dict(handle.metadata() or {})
 
 
 @dataclass
@@ -204,7 +214,7 @@ def classify_epoch_phases(
 def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Describe a LoRA / DoRA file using its location, name, and saved metadata."""
 
-    source = Path(path).expanduser().resolve()
+    source = resolved_path(path)
     info = inspect_lora(source)
     if source.name.lower().endswith(".s2mel.safetensors") or (info.get("train_config") or {}).get("component") == "s2mel":
         return {
@@ -245,6 +255,7 @@ def checkpoint_descriptor(path: str | os.PathLike[str]) -> dict[str, Any]:
     checkpoint_type = {
         "lora": "LoRA Checkpoint",
         "dora": "DoRA Checkpoint",
+        "full": "Full fine-tune Checkpoint",
     }.get(saved_type, "LoRA / DoRA Checkpoint")
     if kind == "best":
         label = (
@@ -379,7 +390,7 @@ def phase_display_label(phase: str | None) -> str:
 
 
 def discover_checkpoints(adapter_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
-    root = Path(adapter_dir).expanduser().resolve()
+    root = resolved_path(adapter_dir)
     candidates = list(root.glob("*.safetensors"))
     best_dir = root / "best"
     if best_dir.is_dir():
@@ -502,7 +513,7 @@ def _summary(
     else:
         best = by_epoch.get(best_epoch)
         accuracy = best.val_accuracy if best is not None else None
-        accuracy_text = f", {accuracy * 100:.1f}% next-token accuracy" if accuracy is not None else ""
+        accuracy_text = f", {accuracy * 100:.1f}% audio-token accuracy" if accuracy is not None else ""
         lines = [
             f"**Lowest logged validation loss: epoch {best_epoch}** (loss {best_val_loss:.2f}{accuracy_text} on held-out clips)."
         ]

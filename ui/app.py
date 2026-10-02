@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from argparse import Namespace
 import inspect
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -30,11 +31,19 @@ from .common import (
     APP_TITLE,
     APP_VERSION,
     ROOT,
+    LAZY_ENGINE,
+    PROCESS_MANAGER,
     TOGGLE_SECTIONS_JS,
     TOGGLE_THEME_JS,
     app_theme,
+    apply_values,
     btn,
+    gather_values,
+    payload_values,
     runtime_config_from_values,
+    untrack_hidden_progress,
+    values_payload,
+    values_payload_component,
 )
 from .dataset_tab import bind_dataset_events, build_dataset_tab
 from .generation_tab import (
@@ -55,6 +64,9 @@ from .models_tab import (
 )
 from .gpu_tier_presets import tier_preset_name
 from .presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
+from .model_controls import MODEL_CLASS_JS, bind_model_controls
+from .model_profiles import capture_profile, switch_profile
+from indextts.backends import MODEL_CHOICES
 from .request_guard import configure_request_guard
 from .training_tab import LIVE_TRAINING_JS, bind_training_events, build_training_tab
 
@@ -322,6 +334,17 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 f"Version {APP_VERSION} | [Premium release, tutorials, and support](https://www.patreon.com/posts/139297407)",
                 container=False,
             )
+            registry.register("app.model", gr.Dropdown(
+                choices=MODEL_CHOICES, value="indextts", label="Speech model",
+                info="Separate saved settings.", min_width=200, scale=0,
+                elem_id="speech-model-selector",
+            ), "indextts", kind="choice", choices=[key for _, key in MODEL_CHOICES])
+            # The model's panels follow a body class (ui/model_controls.py). Gradio runs
+            # an event's listeners one after another, so this one is registered first.
+            speech_model = registry["app.model"].component
+            speech_model.change(None, speech_model, None, js=MODEL_CLASS_JS, queue=False, show_progress="hidden",
+                                api_name=False)
+            registry.register("app.profiles", gr.State({"_active": "indextts"}), {"_active": "indextts"}, kind="dict")
             with gr.Row(elem_classes=["header-actions"], scale=0):
                 last_values_button = gr.Button(
                     "🕘  Load last values",
@@ -381,12 +404,18 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             elem_id="main-tabs",
             elem_classes=["main-tabs"],
         ) as main_tabs:
-            generation = build_generation_tab(options, registry, load_hook=last_values_button.click)
-            batch = build_batch_tab(options, registry, load_hook=last_values_button.click)
-            dataset = build_dataset_tab(options, registry, load_hook=last_values_button.click)
-            training = build_training_tab(options, registry, load_hook=last_values_button.click)
-            grid = build_grid_tab(options, registry, load_hook=last_values_button.click)
-            models = build_models_tab(options, registry)
+            def build_panel(label, factory, **kwargs):
+                started = time.perf_counter()
+                print(f">> Building {label}...", flush=True)
+                result = factory(options, registry, **kwargs)
+                print(f">> {label} ready in {time.perf_counter() - started:.2f}s", flush=True)
+                return result
+            generation = build_panel("Voice Generation", build_generation_tab, load_hook=last_values_button.click)
+            batch = build_panel("Batch Generation", build_batch_tab, load_hook=last_values_button.click)
+            dataset = build_panel("Dataset Preparation", build_dataset_tab, load_hook=last_values_button.click)
+            training = build_panel("Voice Training", build_training_tab, load_hook=last_values_button.click)
+            grid = build_panel("Checkpoint Grid", build_grid_tab, load_hook=last_values_button.click)
+            models = build_panel("Models & Performance", build_models_tab)
             build_help_tab()
             with gr.Tab("📜 Changelog", id="changelog", render_children=False):
                 build_changelog_tab()
@@ -397,6 +426,10 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         bind_dataset_events(dataset, training)
         bind_training_events(training, generation, main_tabs)
         bind_grid_events(grid, training, generation, models, main_tabs)
+        # Model visibility is a body class the stylesheet reads, so lazily
+        # mounted tabs and accordions need no server round trip of their own.
+        after_model_values = bind_model_controls(registry, generation, models, training, grid)
+        demo.load(None, registry["app.model"].component, None, js=MODEL_CLASS_JS)
 
         def loaded_last_values_notice() -> None:
             message = "Loaded the last run of every tab."
@@ -415,11 +448,23 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         component_specs = registry.component_specs
         preset_components = [spec.component for spec in component_specs]
         component_keys = [spec.key for spec in component_specs]
+        # Browser values travel in one hidden payload (common.APPLY_VALUES_JS);
+        # server-side State values are returned directly.
+        state_specs = [spec for spec in component_specs if isinstance(spec.component, gr.State)]
+        browser_specs = [spec for spec in component_specs if not isinstance(spec.component, gr.State)]
+        browser_keys = [spec.key for spec in browser_specs]
+        browser_components = [spec.component for spec in browser_specs]
+        state_components = [spec.component for spec in state_specs]
+        values_box = values_payload_component()
 
         def load_values(
             requested: str | None,
             runtime_overlay: RuntimeConfig | None = None,
-        ):
+            current_model: str | None = None,
+            allow_busy: bool = False,
+        ) -> tuple[str, dict[str, Any], str]:
+            if not allow_busy and (LAZY_ENGINE.busy or any(job.running for job in PROCESS_MANAGER._jobs.values())):
+                raise gr.Error("Wait for the current job to finish or cancel it before loading a preset.")
             name = requested or store.default_preset_name()
             clean = name[len(SYSTEM_PREFIX):] if name.startswith(SYSTEM_PREFIX) else name
             values = store.load(clean)
@@ -430,19 +475,40 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 system_preset=store.is_system(clean),
                 detected_tier=store.detected_tier,
             )
-            display = _display_name(store, clean)
+            values = capture_profile(values)
+            if store.is_system(clean) and current_model and current_model != values["app.model"]:
+                values = switch_profile(registry, current_model, values)
             scope = "read-only GPU VRAM" if store.is_system(clean) else "user"
+            return clean, values, f"Loaded {scope} preset **{clean}**. Missing keys used defaults; unknown keys were ignored."
+
+        def ui_load(clean: str, values: Mapping[str, Any], message: str, bookmark: str | None = None):
             return (
-                gr.update(choices=store.list_presets(), value=display),
+                gr.update(choices=store.list_presets(), value=_display_name(store, clean)),
                 clean,
-                *[values[key] for key in component_keys],
-                f"Loaded {scope} preset **{clean}**. Missing keys used defaults; unknown keys were ignored.",
-                clean,
+                message,
+                bookmark or clean,
+                values_payload(browser_keys, values),
+                *[values[spec.key] for spec in state_specs],
             )
 
-        def save_values(name: str, *items: Any):
+        ui_outputs = [preset_dropdown, preset_name, preset_status, browser_preset, values_box, *state_components]
+
+        def preset_ui_event(event):
+            """Apply the loaded values in the browser, then refresh model-filtered lists."""
+            return after_model_values(apply_values(event, values_box, browser_components))
+
+        def load_selected(requested, current_model=None):
+            return ui_load(*load_values(requested, current_model=current_model))
+
+        # A dropdown pick uses select: Gradio 6.29 also dispatches input when the list loses focus.
+        for trigger in (load_button.click, preset_dropdown.select):
+            preset_ui_event(trigger(load_selected, [preset_dropdown, registry["app.model"].component], ui_outputs,
+                                    queue=False, show_progress="hidden", api_name=False))
+
+        def save_values(name: str, gathered: Any, *states: Any):
             try:
-                values = dict(zip(component_keys, items))
+                values = capture_profile({**payload_values(browser_keys, gathered),
+                                          **dict(zip((spec.key for spec in state_specs), states))})
                 saved = store.save(name, values)
                 return gr.update(choices=store.list_presets(), value=saved), saved, f"Saved user preset **{saved}**.", saved
             except PermissionError as exc:
@@ -452,67 +518,46 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 gr.Error(str(exc))
                 return gr.update(choices=store.list_presets()), gr.skip(), f"Preset save failed: {exc}", gr.skip()
 
-        save_button.click(
+        gather_values(save_button.click, browser_components, values_box).then(
             save_values,
-            [preset_name, *preset_components],
+            [preset_name, values_box, *state_components],
             [preset_dropdown, preset_name, preset_status, browser_preset],
             queue=False,
-            api_name="save_preset",
-        )
-        load_button.click(
-            load_values,
-            preset_dropdown,
-            [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
-            queue=False,
-            api_name="load_preset",
-        )
-        preset_dropdown.input(
-            load_values,
-            preset_dropdown,
-            [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
-            queue=False,
-            api_name="select_preset",
+            api_name=False,
         )
 
         delete_confirm = gr.Checkbox(value=False, visible=False, label="Preset delete confirmation")
 
-        def delete_value(confirmed: bool, requested: str):
+        def delete_value(confirmed: bool, requested: str, current_model: str):
             if not confirmed:
-                return (gr.skip(), gr.skip(), *[gr.skip()] * len(preset_components), "Preset deletion dismissed.", gr.skip())
+                return (gr.skip(), gr.skip(), "Preset deletion dismissed.", gr.skip(), gr.skip(), *[gr.skip()] * len(state_specs))
             clean = (requested or "").removeprefix(SYSTEM_PREFIX)
             try:
                 if not store.delete(clean):
                     gr.Warning(f"User preset '{clean}' was not found")
-                fallback = store.default_preset_name()
-                return load_values(fallback)[:-2] + (
-                    f"Deleted user preset **{clean}** and loaded the **{fallback}** preset detected for this GPU.",
-                    fallback,
-                )
+                fallback, values, _ = load_values(store.default_preset_name(), current_model=current_model)
+                return ui_load(fallback, values,
+                               f"Deleted user preset **{clean}** and loaded the **{fallback}** preset detected for this GPU.")
             except PermissionError as exc:
                 gr.Warning(str(exc))
-                return (gr.update(choices=store.list_presets(), value=_display_name(store, clean)), clean, *[gr.skip()] * len(preset_components), str(exc), clean)
+                return (gr.update(choices=store.list_presets(), value=_display_name(store, clean)), clean, str(exc), clean,
+                        gr.skip(), *[gr.skip()] * len(state_specs))
 
-        delete_button.click(
+        preset_ui_event(delete_button.click(
             delete_value,
-            [delete_confirm, preset_dropdown],
-            [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
-            js="(value, name) => [window.confirm('Delete this user preset? System presets cannot be deleted.'), name]",
+            [delete_confirm, preset_dropdown, registry["app.model"].component],
+            ui_outputs,
+            js="(value, name, model) => [window.confirm('Delete this user preset? System presets cannot be deleted.'), name, model]",
             queue=False,
-        )
+            api_name=False,
+        ))
 
-        def reset_values():
-            fallback = store.default_preset_name()
-            return load_values(fallback)[:-2] + (
-                f"Reset every registered control to the **{fallback}** preset detected for this GPU.",
-                fallback,
-            )
+        def reset_values(current_model):
+            fallback, values, _ = load_values(store.default_preset_name(), current_model=current_model)
+            return ui_load(fallback, values, f"Reset every registered control to the **{fallback}** preset detected for this GPU.")
 
-        reset_button.click(
-            reset_values,
-            outputs=[preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
-            queue=False,
-            api_name="reset_preset",
-        )
+        preset_ui_event(reset_button.click(reset_values, registry["app.model"].component, ui_outputs,
+                                           queue=False, api_name=False))
 
         def initial_load():
             # Read the durable bookmark for every new page/session. A State
@@ -522,14 +567,12 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             if _display_name(store, requested) not in store.list_presets():
                 requested = store.default_preset_name()
             overlay = persisted_runtime if store.is_system(requested) else None
-            return load_values(requested, overlay)
+            return ui_load(*load_values(requested, overlay, allow_busy=True))
 
-        initial_load_event = demo.load(
-            initial_load,
-            None,
-            [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset],
-            queue=False,
-        )
+        initial_load_event = preset_ui_event(demo.load(initial_load, None, ui_outputs, queue=False, api_name="initial_load"))
+        # Order of the browser payload and the State values in the page's preset events.
+        demo.preset_payload_keys = list(browser_keys)
+        demo.preset_state_keys = [spec.key for spec in state_specs]
         initial_load_event.then(
             lambda: gr.update(interactive=True),
             outputs=last_values_button,
@@ -537,6 +580,35 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             show_progress="hidden",
             api_name=False,
         )
+
+        # The documented API keeps its original signatures (the tutorial narration
+        # client loads presets by name and reads every value from load_preset).
+        # These events have a hidden trigger the page never fires, so their many
+        # components never join the browser's per-event status refresh.
+        api_trigger = gr.Button(visible=False)
+        preset_outputs = [preset_dropdown, preset_name, *preset_components, preset_status, browser_preset]
+
+        def api_load(clean: str, values: Mapping[str, Any], message: str, bookmark: str | None = None):
+            return (gr.update(choices=store.list_presets(), value=_display_name(store, clean)), clean,
+                    *[values[key] for key in component_keys], message, bookmark or clean)
+
+        def load_selected_preset(requested):
+            return api_load(*load_values(requested))
+
+        def api_reset_values():
+            fallback, values, _ = load_values(store.default_preset_name())
+            return api_load(fallback, values, f"Reset every registered control to the **{fallback}** preset detected for this GPU.")
+
+        def api_save_values(name: str, *items: Any):
+            values = dict(zip(component_keys, items))
+            gathered = [values.get(key) for key in browser_keys]
+            return save_values(name, gathered, *[values.get(spec.key) for spec in state_specs])
+
+        api_trigger.click(load_selected_preset, preset_dropdown, preset_outputs, queue=False, api_name="load_preset")
+        api_trigger.click(load_selected_preset, preset_dropdown, preset_outputs, queue=False, api_name="select_preset")
+        api_trigger.click(api_reset_values, None, preset_outputs, queue=False, api_name="reset_preset")
+        api_trigger.click(api_save_values, [preset_name, *preset_components],
+                          [preset_dropdown, preset_name, preset_status, browser_preset], queue=False, api_name="save_preset")
         demo.load(None, None, None, js=LIVE_TRAINING_JS)
         def refresh_preset_choices(requested: str | None):
             available = store.list_presets()
@@ -551,6 +623,8 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                     preset_dropdown,
                     queue=False,
                 )
+        # Last, once every event exists: hidden-progress events track no output status.
+        untrack_hidden_progress(demo)
 
     coverage = startup_request_self_check(registry, options.model_dir)
     startup_values = store.load(initial_last)

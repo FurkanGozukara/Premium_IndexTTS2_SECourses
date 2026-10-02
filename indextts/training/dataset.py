@@ -352,6 +352,70 @@ class LengthBucketBatchSampler(BatchSampler):
         yield from batches
 
 
+class TokenBudgetBatchSampler(BatchSampler):
+    """Length-grouped batches holding at most ``max_tokens`` padded tokens each.
+
+    Clips of similar length share a batch, so a batch of short clips holds
+    many of them and a batch of long clips few; padding stays small and each
+    optimizer update sees a steady amount of audio. Batches are rebuilt per
+    epoch from the seed, so a continued run sees the same order.
+    """
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        max_tokens: int,
+        *,
+        max_batch_size: int = 64,
+        shuffle: bool = True,
+        seed: int = 42,
+        length_jitter: float = 0.1,
+    ) -> None:
+        self.lengths = [max(1, int(value)) for value in lengths]
+        self.max_tokens = max(1, int(max_tokens))
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.length_jitter = max(0.0, float(length_jitter))
+        self.epoch = 0
+        self._cache: tuple[int, list[list[int]]] | None = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = max(0, int(epoch))
+
+    def _batches(self) -> list[list[int]]:
+        if self._cache is not None and self._cache[0] == self.epoch:
+            return self._cache[1]
+        rng = random.Random(self.seed + self.epoch)
+        # A small random stretch of each length changes which neighbours share a
+        # batch from epoch to epoch while padding stays within the jitter.
+        jitter = self.length_jitter if self.shuffle else 0.0
+        keys = [length * (1.0 + jitter * (rng.random() - 0.5)) for length in self.lengths]
+        ordered = sorted(range(len(self.lengths)), key=keys.__getitem__)
+        batches: list[list[int]] = []
+        batch: list[int] = []
+        longest = 0
+        for index in ordered:
+            candidate = max(longest, self.lengths[index])
+            if batch and (candidate * (len(batch) + 1) > self.max_tokens or len(batch) >= self.max_batch_size):
+                batches.append(batch)
+                batch, candidate = [], self.lengths[index]
+            batch.append(index)
+            longest = candidate
+        if batch:
+            batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        self._cache = (self.epoch, batches)
+        return batches
+
+    def __len__(self) -> int:
+        return len(self._batches())
+
+    def __iter__(self) -> Iterator[list[int]]:
+        yield from self._batches()
+
+
 def load_cache_index(dataset_dir: str | Path) -> dict[str, Any]:
     path = Path(dataset_dir) / "cache_index.json"
     if not path.is_file():

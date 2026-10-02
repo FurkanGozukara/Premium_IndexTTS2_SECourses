@@ -268,8 +268,11 @@ def decoder_adapter_choices(lora_path: str | os.PathLike[str] | None, loras_root
     choices: list[tuple[str, str]] = [(auto_label, DECODER_CHOICE_AUTO), ("None (GPT adapter only)", DECODER_CHOICE_NONE)]
     root = Path(loras_root) if loras_root else None
     if root is not None and root.is_dir():
+        from .io import adapter_tree_files
+
         found_key = str(Path(found).resolve()) if found else ""
-        for file in sorted(root.rglob(f"*{DECODER_ADAPTER_SUFFIX}"), key=lambda item: str(item).lower()):
+        files = (path for path in adapter_tree_files(root) if path.name.lower().endswith(DECODER_ADAPTER_SUFFIX))
+        for file in sorted(files, key=lambda item: str(item).lower()):
             resolved = str(file.resolve())
             if resolved == found_key:
                 continue

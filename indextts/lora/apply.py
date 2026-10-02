@@ -312,6 +312,8 @@ def apply_lora(
     """Load a LoRA / DoRA file and apply it without reloading any base weights."""
 
     loaded = load_lora(path)
+    if loaded.adapter_type == "full" and float(strength) != 1.0:
+        raise ValueError("Full fine-tuning checkpoints use strength 1.0.")
     use_dora = loaded.adapter_type == "dora"
     existing = _find_adapters(model)
     if not _can_reuse(existing, loaded, use_dora):

@@ -1,4 +1,8 @@
-# IndexTTS 2.5 Premium - The Complete Beginner-to-Advanced Guide
+# Ultimate Text To Speech Generator With Voice Cloning
+
+**Version 7.0 — IndexTTS 2.5 and OmniVoice.** Choose the speech model in the header. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember both profiles. Existing IndexTTS presets continue to work.
+
+OmniVoice supports reference voice cloning, voice design with supported tags, automatic voices, multilingual generation, BF16 and ConvRot INT8, and full/LoRA/DoRA fine-tuning. Public model files download on demand. See [OmniVoice setup, training and validation](docs/OMNIVOICE.md) for model-specific controls, measured limits and dependency notes. The rest of this guide documents the shared application and established IndexTTS controls.
 
 ## App Download Link
 - You can get the app installer from here https://www.patreon.com/SECourses/posts/indextts-2-5-and-139297407
@@ -6,6 +10,8 @@
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V7.0 OmniVoice and a shared model interface:** choose IndexTTS 2.5 or OmniVoice in the header. Universal presets remember both profiles. OmniVoice adds automatic downloads, voice design, BF16/ConvRot INT8 inference and full/LoRA/DoRA training through the shared generation and evaluation workflows. Startup shows each loading stage.
 
 **V6.22 length penalty 2.0 by default:** the built-in settings, every GPU tier preset and API generation requests that leave it out now use Length penalty 2.0 instead of 0, so beam search no longer prefers the shortest finished candidate, which could drop a word; user presets keep their stored value.
 
@@ -691,7 +697,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v6.22 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v7.0 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 

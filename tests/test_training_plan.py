@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from indextts.training.dataset import TokenBudgetBatchSampler
 from indextts.training.plan import (
+    automatic_epochs,
     suggested_epochs,
+    token_budget_micro_batches,
     training_plan,
     training_plan_advisory,
 )
@@ -82,3 +85,27 @@ def test_training_plan_advisory_suggests_reduction_above_measured_range() -> Non
     text = training_plan_advisory(plan, 1, 1)
     assert "Maximum budget: 21,000" in text
     assert "saved checkpoints and Base" in text
+
+
+def test_token_budget_plan_counts_the_trainers_own_batches() -> None:
+    # 2 s clips with 40-character transcripts: 50 frames + 10 text tokens + 20 special tokens.
+    rows = [{"duration_s": 2.0, "text": "x" * 40} for _ in range(100)]
+    assert token_budget_micro_batches(rows, 800, seed=7) == len(TokenBudgetBatchSampler([80] * 100, 800, seed=7))
+    plan = training_plan(100, 64, 2, 3, 0, 0, micro_batches_per_epoch=token_budget_micro_batches(rows, 800, seed=7))
+    assert plan["micro_batches_per_epoch"] == len(TokenBudgetBatchSampler([80] * 100, 800, seed=7))
+    assert plan["total_optimizer_updates"] == 3 * -(-plan["micro_batches_per_epoch"] // 2)
+
+
+def test_automatic_epochs_train_smaller_voices_longer() -> None:
+    # 14 hours trained best after about 25 epochs; a 2-hour subset still improved until about epoch 55.
+    assert automatic_epochs(14 * 3600) == 25
+    assert 55 <= automatic_epochs(2 * 3600) <= 75
+    assert automatic_epochs(60) == 100 and automatic_epochs(500 * 3600) == 10
+
+
+def test_epochs_zero_means_automatic_only_for_omnivoice() -> None:
+    from indextts.training.train_config import TrainConfig
+
+    base = {"dataset_dir": "data", "name": "test"}
+    assert TrainConfig.from_dict({**base, "tts_model": "omnivoice", "epochs": 0}).epochs == 0
+    assert TrainConfig.from_dict({**base, "tts_model": "indextts", "epochs": 0}).epochs == 1

@@ -88,6 +88,21 @@ def test_cpu_fallback_matches_dequantized_linear() -> None:
     torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-5)
 
 
+def test_caches_built_in_inference_mode_still_train_adapters() -> None:
+    # A validation pass under torch.inference_mode builds the rotation and weight caches;
+    # the next adapter training step must still backpropagate through the frozen layer.
+    from indextts.quant.convrot_int8 import clear_hadamard_cache
+
+    clear_hadamard_cache()
+    generator = torch.Generator().manual_seed(11)
+    layer = _make_layer(torch.randn((24, 64), generator=generator), torch.randn((24,), generator=generator))
+    with torch.inference_mode():
+        layer(torch.randn((2, 64), generator=generator))
+    x = torch.randn((2, 64), generator=generator, requires_grad=True)
+    layer(x).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
 class _TinyConv1DModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()

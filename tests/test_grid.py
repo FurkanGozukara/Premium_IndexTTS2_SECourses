@@ -62,6 +62,16 @@ def test_changing_adapters_preserves_comparison_text_and_reference(monkeypatch):
     assert defaults[7:9] == ("suggested.wav", "Suggested sample.")
 
 
+def test_dynamic_checkpoint_ids_survive_gradio_component_reconstruction():
+    from ui.grid_tab import CheckpointCheckboxGroup
+    original = CheckpointCheckboxGroup(choices=[("Base", "base")])
+    rebuilt = original.__class__(choices=[("Base", "base"), ("New", "checkpoint-0")])
+    assert rebuilt.get_block_name() == "checkboxgroup"
+    # A pending callback may contain IDs from the previous folder. The grid's
+    # checkpoint mapping filters them; Gradio must not reject unrelated events.
+    assert rebuilt.preprocess(["base", "checkpoint-7"]) == ["base", "checkpoint-7"]
+
+
 def _audible_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as handle:

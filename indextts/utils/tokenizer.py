@@ -3,7 +3,6 @@ import os
 from functools import lru_cache
 from typing import Optional
 import torch
-from transformers import AutoTokenizer
 from whisper.tokenizer import Tokenizer
 
 import tiktoken
@@ -332,6 +331,10 @@ class QwenTokenizer():
             ]
         }
         self.special_tokens = special_tokens
+        # transformers takes seconds to import; the interface needs only this
+        # module's language table.
+        from transformers import AutoTokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(token_path)
         self.tokenizer.add_special_tokens(special_tokens)
         self.skip_special_tokens = skip_special_tokens

@@ -141,6 +141,8 @@ def build_speech_plan(config: Any, train_records: Sequence[Mapping[str, Any]],
         source = audio_path(config.dataset_dir, reference_row)
         reference = reference.with_suffix(source.suffix)
         shutil.copy2(source, reference)
+        if getattr(config, "tts_model", "indextts") == "omnivoice":
+            reference.with_suffix(".txt").write_text(str(reference_row["text"]), encoding="utf-8")
         prompts = [{"id": str(row["id"]), "text": str(row["text"]),
                     "audio": str(audio_path(evaluation_dataset, row)), "kind": "matched",
                     "audio_sha256": hashlib.sha256(audio_path(evaluation_dataset, row).read_bytes()).hexdigest(),
