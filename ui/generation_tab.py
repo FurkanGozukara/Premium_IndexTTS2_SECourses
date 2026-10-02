@@ -3983,6 +3983,7 @@ def build_generation_tab(
         + [component.input for component in (tab.text, max_tokens, budget_scale)],
         refresh_text_views, [*panel_inputs, *preview_inputs], view_outputs,
         queue=False, show_progress="hidden", trigger_mode="always_last", api_name="refresh_text_views",
+        skip_repeats=True,
     )
     # A new adapter or speech model changes the dictionary, timing and tokenizer behind the preview.
     # A chained step defers safely: Gradio restarts only that step, not the trigger's other handlers.

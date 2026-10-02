@@ -180,7 +180,7 @@ def bind_auk_edit_events(tab: AukEditTab, generation: Any, args: Any, registry: 
 
     on_gathered([task_box.change, *[component.change for component in field_components]], preview,
                 [task_box, *field_components], [tab.preview, tab.notes], queue=False, show_progress="hidden",
-                trigger_mode="always_last", api_name=False)
+                trigger_mode="always_last", api_name=False, skip_repeats=True)
 
     generation_keys = list(generation.request_keys)
     generation_components = list(generation.request_components)

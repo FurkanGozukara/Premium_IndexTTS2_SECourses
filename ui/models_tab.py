@@ -539,6 +539,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         [component.change for component in runtime_components if component is not lora_component],
         describe_runtime, runtime_components, [tab.notes, tab.estimate],
         queue=False, show_progress="hidden", trigger_mode="always_last", api_name="estimate_runtime",
+        skip_repeats=True,
     )
 
     def apply_runtime(*items: Any):

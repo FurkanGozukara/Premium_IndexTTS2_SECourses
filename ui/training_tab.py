@@ -2138,6 +2138,7 @@ def build_training_tab(
         show_progress="hidden",
         trigger_mode="always_last",
         api_name="training_plan",
+        skip_repeats=True,
     )
     refresh_dataset_event.then(
         _training_plan_markdown,

@@ -1521,6 +1521,7 @@ def bind_grid_events(
         show_progress="hidden",
         trigger_mode="always_last",
         api_name="runtime_line",
+        skip_repeats=True,
     )
     # Runtime controls already start the Models tab's deferring description;
     # the grid summary follows it rather than listening to them as well.

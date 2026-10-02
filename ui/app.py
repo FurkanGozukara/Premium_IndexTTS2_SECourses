@@ -412,12 +412,14 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 print(f">> {label} ready in {time.perf_counter() - started:.2f}s", flush=True)
                 return result
             generation = build_panel("Voice Generation", build_generation_tab, load_hook=last_values_button.click)
-            auk_edit = build_panel("AuK Audio Editing", build_auk_edit_tab)
             batch = build_panel("Batch Generation", build_batch_tab, load_hook=last_values_button.click)
             dataset = build_panel("Dataset Preparation", build_dataset_tab, load_hook=last_values_button.click)
             training = build_panel("Voice Training", build_training_tab, load_hook=last_values_button.click)
             grid = build_panel("Checkpoint Grid", build_grid_tab, load_hook=last_values_button.click)
             models = build_panel("Models & Performance", build_models_tab)
+            # After the busy tabs: Gradio finds a component by walking the layout in order, on every
+            # event, so a tab placed before Training and Models would slow every model switch.
+            auk_edit = build_panel("AuK Audio Editing", build_auk_edit_tab)
             build_help_tab()
             with gr.Tab("📜 Changelog", id="changelog", render_children=False):
                 build_changelog_tab()

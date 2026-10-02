@@ -93,6 +93,15 @@ APP_HEAD = """
   // last one of the burst resolves and its chain goes on; earlier ones reject,
   // which ends their chains before any backend step (ui/common.py on_gathered).
   // Settling matters: Gradio runs an event's listeners one after another.
+  // A display that follows value changes can be triggered twice by one model switch
+  // or preset load with the same values; the repeat ends its chain before the server.
+  window.ttsChangedOnly = function (key, values) {
+    var shown = window.ttsChangedOnly.shown || (window.ttsChangedOnly.shown = {});
+    var text = JSON.stringify(values), now = Date.now(), last = shown[key];
+    shown[key] = {text: text, at: now};
+    if (last && last.text === text && now - last.at < 2000) { throw new Error("unchanged"); }
+    return [values];
+  };
   window.ttsLatestOnly = function (key) {
     var latest = window.ttsLatestOnly.latest || (window.ttsLatestOnly.latest = {});
     var token = (latest[key] || 0) + 1;
@@ -658,12 +667,16 @@ def _latest_only_js() -> str:
     return f"() => window.ttsLatestOnly ? window.ttsLatestOnly({key!r}) : undefined"
 
 
-def _gather_after(gate: Any, browser: Sequence[Any], box: Any) -> Any:
-    return gate.success(None, list(browser), box, js=GATHER_VALUES_JS, queue=False, show_progress="hidden",
-                        api_name=False)
+def _gather_after(gate: Any, browser: Sequence[Any], box: Any, *, skip_repeats: bool = False) -> Any:
+    js = GATHER_VALUES_JS
+    if skip_repeats:
+        key = f"changed-{next(_GATHER_KEYS)}"
+        js = f"(...values) => window.ttsChangedOnly ? window.ttsChangedOnly({key!r}, values) : [values]"
+    return gate.success(None, list(browser), box, js=js, queue=False, show_progress="hidden", api_name=False)
 
 
-def on_gathered(triggers: Sequence[Any], fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, **kwargs: Any) -> Any:
+def on_gathered(triggers: Sequence[Any], fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, *,
+                skip_repeats: bool = False, **kwargs: Any) -> Any:
     """``gr.on`` whose many inputs reach the server in one browser-packed payload.
 
     A browser-only step copies ``inputs`` into a hidden payload; the backend step
@@ -671,13 +684,18 @@ def on_gathered(triggers: Sequence[Any], fn: Callable[..., Any], inputs: Sequenc
     and the outputs join Gradio's per-event status refresh. Triggers fired in the
     same moment run the handler once, and a deferred backend step restarts by
     itself and reads the newest payload.
+
+    ``skip_repeats`` is for displays computed from their inputs alone: a call whose
+    gathered values equal the previous call's (within two seconds) stops in the
+    browser, because every backend event costs the page a status refresh.
     """
 
     unpack, browser, direct = _gathered_step(fn, inputs)
     box = values_payload_component()
     gate = gr.on(list(triggers), None, None, None, js=_latest_only_js(), queue=False, show_progress="hidden",
                  api_name=False)
-    return _gather_after(gate, browser, box).then(unpack, [box, *direct], outputs, **kwargs)
+    gathered = _gather_after(gate, browser, box, skip_repeats=skip_repeats)
+    return (gathered.success if skip_repeats else gathered.then)(unpack, [box, *direct], outputs, **kwargs)
 
 
 def then_gathered(event: Any, fn: Callable[..., Any], inputs: Sequence[Any], outputs: Any, **kwargs: Any) -> Any:
