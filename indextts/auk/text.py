@@ -14,15 +14,19 @@ from pathlib import Path
 # changing their wording makes the model read the instruction aloud or repeat the reference.
 # Zero-shot TTS uses the English template for every language.
 CLONE_TEMPLATE = 'Say the following with the same voice: "{text}"'
-DESIGN_TEMPLATE = 'Generate speech based on the following description: "{description}". The content to speak is: "{text}".'
+# Voice design in the canonical form upstream's prompt enhancer writes. The longer wording below
+# makes the base model speak parts of the description: 14 % against 1.8 % word errors (docs/AUK.md).
+DESIGN_TEMPLATE = 'Based on the following description: "{description}", generate speech content "{text}".'
 DESIGN_TEMPLATE_ZH = '请基于下面的描述: "{description}",生成语音内容"{text}".'
-# A trained voice speaks without a reference; its training used this description.
+# The wording a trained voice learns and later speaks with (no reference). The run's voice record
+# keeps it, so a voice always hears the instruction it was trained on.
+VOICE_TEMPLATE = 'Generate speech based on the following description: "{description}". The content to speak is: "{text}".'
 TRAINED_VOICE_DESCRIPTION = "The trained speaker's natural voice, clear studio recording"
 
 GENERATION_DEFAULTS = {
     "mode": "clone", "reference_text": "", "voice_description": "",
     "num_step": 32, "guidance_scale": 2.0, "sway_coef": -1.0, "solver": "euler",
-    "max_reference_seconds": 12.0, "trim_reference_silence": True,
+    "max_reference_seconds": 15.0, "trim_reference_silence": True,
     "edge_seconds": 0.0, "match_loudness": True,
 }
 VOICE_MODES = ("clone", "design", "auto")
@@ -102,12 +106,20 @@ def quote_text(text: str) -> str:
     return re.sub(r'"([^"]*)"', "“\\1”", str(text).strip()).replace('"', "”")
 
 
-def build_instruction(text: str, mode: str, description: str = "", language: str = "en") -> str:
+def build_instruction(text: str, mode: str, description: str = "", language: str = "en", template: str = "") -> str:
+    """The instruction AuK receives; ``template`` is a trained voice's own wording (see voice_template)."""
     if mode == "clone":
         return CLONE_TEMPLATE.format(text=quote_text(text))
     description = str(description or "").strip() or TRAINED_VOICE_DESCRIPTION
-    template = DESIGN_TEMPLATE_ZH if str(language).lower() == "zh" else DESIGN_TEMPLATE
+    template = template or (DESIGN_TEMPLATE_ZH if str(language).lower() == "zh" else DESIGN_TEMPLATE)
     return template.format(description=quote_text(description), text=quote_text(text))
+
+
+def voice_template(language: str = "en", recorded: str = "") -> str:
+    """The wording a trained voice speaks with: its record's, else the one every earlier voice learned."""
+    if str(language).lower() == "zh":
+        return DESIGN_TEMPLATE_ZH
+    return recorded or VOICE_TEMPLATE
 
 
 def trained_voice(adapter_path) -> dict:

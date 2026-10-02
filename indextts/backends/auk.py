@@ -42,7 +42,7 @@ HOP = SAMPLE_RATE // LATENT_RATE  # 480 samples per latent frame
 from indextts.auk.text import (  # noqa: F401  (re-exported for callers of the engine module)
     CLONE_TEMPLATE, DESIGN_TEMPLATE, DESIGN_TEMPLATE_ZH, GENERATION_DEFAULTS, SECONDS_PER_BYTE, SHORT_TEXT_BYTES,
     SHORT_TEXT_SPEED, TRAINED_VOICE_DESCRIPTION, build_instruction, detect_language, f5_seconds, normalize_auk_text,
-    quote_text, text_units, trained_voice, validate_voice_settings,
+    quote_text, text_units, trained_voice, validate_voice_settings, voice_template,
 )
 
 SEGMENT_SECONDS_LIMIT = MAX_CONTEXT_SECONDS
@@ -459,6 +459,27 @@ class AukEngine:
         seconds = min(max(0.4, seconds), float(max_seconds or SEGMENT_SECONDS_LIMIT))
         return math.ceil(seconds * LATENT_RATE) / LATENT_RATE
 
+    def _fit_context(self, segments, max_tokens, budget, language, pace, paced_by_reference, edge_seconds,
+                     duration_factor):
+        """Split again every section whose speech would not fit the context beside the reference.
+
+        AuK renders a section in the context the reference leaves; a longer estimate would be
+        clamped, which rushes the speech (word errors rose from 2 % to 8-54 % in docs/AUK.md).
+        """
+        fitted = []
+        for segment in segments:
+            seconds = self.estimate_seconds(segment, language, pace, paced_by_reference=paced_by_reference,
+                                            edge_seconds=edge_seconds, duration_factor=duration_factor,
+                                            max_seconds=10 * SEGMENT_SECONDS_LIMIT)
+            tokens = int(max_tokens * budget / seconds) if seconds > budget else 0
+            parts = [part for part in self.split_text_by_tokens(segment, max(4, tokens)) if part.strip()] if tokens else []
+            if len(parts) > 1 and tokens < max_tokens:
+                fitted.extend(self._fit_context(parts, max(4, tokens), budget, language, pace, paced_by_reference,
+                                                edge_seconds, duration_factor))
+            else:
+                fitted.append(segment)
+        return fitted
+
     # ------------------------------------------------------------------ synthesis core
 
     def _encode(self, instructions, audios16):
@@ -530,7 +551,7 @@ class AukEngine:
         return result
 
     def infer_texts(self, spk_audio_prompt, texts, lang="EN", *, auk=None,
-              max_text_tokens_per_segment=80, interval_silence=200, sentence_pause_ms=0,
+              max_text_tokens_per_segment=60, interval_silence=200, sentence_pause_ms=0,
               segmentation_mode="budget", segment_target_tokens=None, enable_pause_tags=True,
               text_normalization=True, duration_factor=1.0, seed=None, target_duration_s=None,
               target_duration_mode="off", section_batch_size=1, on_text_complete=None,
@@ -554,7 +575,9 @@ class AukEngine:
             reference = self.prepare_reference(spk_audio_prompt, settings, language)
         pace, pace_source = self.pace(reference)
         description = settings["voice_description"] if mode == "design" else self._voice.get("description", "")
-        budget = SEGMENT_SECONDS_LIMIT - (reference.seconds if reference is not None else 0.0)
+        # Upstream trains up to 30 s on each side, so a section may use the whole context whatever the
+        # reference's length; subtracting the reference only rushed the speech (docs/AUK.md).
+        budget = SEGMENT_SECONDS_LIMIT
 
         plans, speech, owners, natural = [], [], [], []
         for text_index, text in enumerate(texts):
@@ -571,6 +594,8 @@ class AukEngine:
                     source = normalize_auk_text(source, language)
                 segments = [part for part in self.split_text_by_tokens(source, max_text_tokens_per_segment,
                     mode=segmentation_mode, target_tokens=segment_target_tokens) if part.strip()]
+                segments = self._fit_context(segments, max_text_tokens_per_segment, budget, language, pace,
+                                             pace_source == "reference", settings["edge_seconds"], duration_factor)
                 for index, segment in enumerate(segments):
                     plan.append(("segment", len(speech)))
                     speech.append(segment.strip())
@@ -592,7 +617,10 @@ class AukEngine:
                 estimated = [min(budget, max(0.6, value * scale)) for value in estimated]
             natural.extend(estimated)
 
-        instructions = [build_instruction(part, mode, description, language) for part in speech]
+        # A trained voice hears the wording it was trained with; the base model's Auto voice and
+        # voice design use the canonical design wording.
+        template = voice_template(language, self._voice.get("template", "")) if mode == "auto" and self._voice else ""
+        instructions = [build_instruction(part, mode, description, language, template) for part in speech]
         base_seed = int(seed) if seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
         batch_size = 1 if getattr(self, "low_vram", False) else max(1, int(section_batch_size))
         total = math.ceil(len(speech) / batch_size)

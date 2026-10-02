@@ -174,8 +174,9 @@ def auk_defaults(tier="auto"):
     values.update({
         "runtime.lora_path": "", "runtime.decoder_adapter": "none", "runtime.blocks_to_swap": 0,
         "runtime.use_qwen_emo": False,
-        # About 20 seconds of speech per section (AuK's training clips are at most 30 s).
-        "generation.max_text_tokens_per_segment": 80,
+        # About 15 seconds of speech per section: the best of 40-300 tokens in docs/AUK.md (AuK's
+        # training clips are at most 30 s; longer sections are split again before rendering).
+        "generation.max_text_tokens_per_segment": 60,
         "generation.latent_multiplier": 1.72,
         "generation.auto_lora_emotion_reference": False,
         "generation.auto_lora_speaking_rate": False,
@@ -184,10 +185,10 @@ def auk_defaults(tier="auto"):
         "training.tts_model": "auk", "training.name": "auk_voice",
         "training.adapter_type": method, "training.max_steps": 0,
         "training.rank": 32, "training.alpha": 64.0,
-        "training.blocks_to_swap": 0, "training.num_workers": 0,
+        "training.blocks_to_swap": 0, "training.num_workers": 2,
         "training.train_spk_proj": False, "training.train_emo_layers": False,
         "training.decoder_adapter_enabled": False, "training.decoding_sweep_enabled": False,
-        "training.sample_max_text_tokens": 80,
+        "training.sample_max_text_tokens": 60,
     })
     values.update({"training." + key: value for key, value in resolve_training_preset(cfg.vram_tier, method).items()})
     values["training.vram_tier"] = cfg.vram_tier

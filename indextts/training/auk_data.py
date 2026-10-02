@@ -191,9 +191,9 @@ def normalized_transcripts(root, rows, log=print):
 
 def training_instruction(text: str, description: str, language: str = "en") -> str:
     """The no-reference instruction a trained voice learns (and Auto voice later sends)."""
-    from indextts.auk.text import build_instruction
+    from indextts.auk.text import build_instruction, voice_template
 
-    return build_instruction(text, "auto", description, language)
+    return build_instruction(text, "auto", description, language, template=voice_template(language))
 
 
 def clone_instruction(text: str) -> str:
@@ -291,14 +291,14 @@ def cache_auk_conditions(config, rows, instructions, reporter=None, cancel_callb
 
 def voice_record(records, description) -> dict | None:
     """The trained voice's pace relative to upstream's byte model, and its training description."""
-    from indextts.auk.text import f5_seconds
+    from indextts.auk.text import VOICE_TEMPLATE, f5_seconds
 
     speech = sum(float(row["cache"]["speech_seconds"]) for row in records)
     reference = sum(f5_seconds(row["train_text"], str(row.get("language") or "en").lower()) for row in records)
     if speech <= 0 or reference <= 0:
         return None
-    return {"pace": speech / reference, "description": description, "clips": len(records),
-            "speech_hours": round(speech / 3600, 3)}
+    return {"pace": speech / reference, "description": description, "template": VOICE_TEMPLATE,
+            "clips": len(records), "speech_hours": round(speech / 3600, 3)}
 
 
 class AukDataset(Dataset):

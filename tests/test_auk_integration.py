@@ -46,7 +46,7 @@ def test_switch_roundtrip_keeps_each_models_profile_and_auk_only_values():
     auk = switch_profile(controls, "auk", index)
     assert auk["app.model"] == "auk"
     assert auk["runtime.lora_path"] == ""
-    assert auk["generation.max_text_tokens_per_segment"] == 80
+    assert auk["generation.max_text_tokens_per_segment"] == 60
     auk.update({"runtime.lora_path": "auk.safetensors", "auk.num_step": 48,
                 "runtime.auk_text_encoder_variant": "int8_convrot"})
     omni = switch_profile(controls, "omnivoice", auk)
@@ -104,7 +104,7 @@ def test_instructions_are_upstream_templates():
 
     assert build_instruction('Say "hi" now', "clone") == 'Say the following with the same voice: "Say “hi” now"'
     design = build_instruction("Hello.", "design", "a calm voice")
-    assert design == 'Generate speech based on the following description: "a calm voice". The content to speak is: "Hello.".'
+    assert design == 'Based on the following description: "a calm voice", generate speech content "Hello.".'
     assert build_instruction("你好", "design", "温柔", "zh").startswith("请基于下面的描述")
     # Auto voice speaks with the trained description (a default when none was saved).
     assert "trained speaker" in build_instruction("Hello.", "auto")
@@ -285,3 +285,32 @@ def test_on_demand_residency_lends_one_model_at_a_time():
     resident = AukEngine.__new__(AukEngine)
     resident._text_offload = None
     resident._residency("text")  # both models resident: nothing to lend
+
+
+def test_trained_voices_keep_the_wording_they_learned():
+    from indextts.auk.text import VOICE_TEMPLATE, build_instruction, voice_template
+    from indextts.training.auk_data import training_instruction, voice_record
+
+    learned = training_instruction("Hello.", "The trained speaker's natural voice", "en")
+    assert learned.startswith("Generate speech based on the following description:")
+    assert build_instruction("Hello.", "auto", "The trained speaker's natural voice", "en", voice_template("en")) == learned
+    assert voice_template("en", "Custom {description}: {text}") == "Custom {description}: {text}"
+    assert voice_template("zh").startswith("请基于下面的描述")
+    rows = [{"cache": {"speech_seconds": 2.0}, "train_text": "Hello there friend.", "language": "en"}]
+    assert voice_record(rows, "desc")["template"] == VOICE_TEMPLATE
+
+
+def test_sections_longer_than_the_context_are_split_again():
+    from indextts.backends.auk import AukEngine
+
+    engine = AukEngine.__new__(AukEngine)
+
+    def split(text, max_tokens, **_options):
+        words = text.split()
+        return [" ".join(words[start:start + max_tokens]) for start in range(0, len(words), max_tokens)]
+
+    engine.split_text_by_tokens = split
+    parts = engine._fit_context([" ".join(["word"] * 200)], 200, 30.0, "en", 1.0, False, 0.0, 1.0)
+    assert len(parts) > 1 and sum(len(part.split()) for part in parts) == 200
+    assert all(AukEngine.estimate_seconds(part, "en", 1.0, max_seconds=1000) <= 30.0 for part in parts)
+    assert engine._fit_context(["A short sentence."], 60, 30.0, "en", 1.0, False, 0.0, 1.0) == ["A short sentence."]
