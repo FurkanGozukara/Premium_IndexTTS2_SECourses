@@ -293,10 +293,61 @@ def _resolved_config(config: CheckpointEvalConfig) -> tuple[CheckpointEvalConfig
     return result, defaults
 
 
+def _auk_evaluation_parts(cfg, train_defaults, device, cancel_callback):
+    """AuK's dataset, loader and metric for checkpoint evaluation (no-reference objective, cached conditioning)."""
+    from safetensors import safe_open
+    from indextts.backends.auk import ensure_model
+    from .auk_data import AukDataset, cache_auk_conditions, collate, flow_validation_loss
+    from .train_config import TrainConfig
+
+    auk_config = TrainConfig.from_dict({**train_defaults, "dataset_dir": cfg.dataset_dir, "name": Path(cfg.adapter_dir).name,
+                                        "tts_model": "auk", "seed": cfg.seed, "val_fraction": cfg.val_fraction,
+                                        "auk_prompt_fraction": 0.0, "device": cfg.device, "model_dir": cfg.model_dir})
+    folder, _, _ = ensure_model(cfg.model_dir)
+    with safe_open(str(folder / "vae.safetensors"), framework="pt", device="cpu") as handle:
+        vae_stats = (handle.get_tensor("global_mean").float().to(device), handle.get_tensor("global_log_std").float().to(device))
+
+    def dataset_class(_root, split, **_options):
+        dataset = AukDataset(auk_config, split)
+        if len(dataset):
+            dataset.conditions = cache_auk_conditions(auk_config, dataset.records, dataset.instructions)
+        return dataset
+
+    def make_loader(dataset, batch_size):
+        return DataLoader(dataset, batch_size=batch_size, collate_fn=collate, num_workers=0)
+
+    def encode(batch):
+        text = batch["text"].to(device)
+        context = torch.arange(text.shape[1], device=device)[None, :] < batch["text_lens"].to(device)[:, None]
+        empty = torch.zeros(text.shape[0], 0, 64, device=device)
+        return text.float(), context, empty, torch.zeros(text.shape[0], dtype=torch.long, device=device)
+
+    def loader_metrics(model, loader, device, *, max_batches, loss_options):
+        if loader is None:
+            return {"loss": None, "mel_loss": None, "text_loss": None, "accuracy": None}
+        loss, _per_t = flow_validation_loss(model, loader, device, encode, vae_stats, max_batches=max_batches,
+                                            cancel_callback=cancel_callback)
+        return {"loss": loss, "mel_loss": loss, "text_loss": None, "accuracy": None}
+
+    return dataset_class, make_loader, loader_metrics
+
+
 def build_evaluation_model(config: CheckpointEvalConfig) -> UnifiedVoice:
     # The GPT model code loads transformers; the interface imports this module without it.
     from indextts.gpt.model_v2 import UnifiedVoice
 
+    if config.tts_model == "auk":
+        from indextts.auk.loader import build_int8_model, build_model, read_config, read_state
+        from indextts.backends.auk import ensure_model
+        folder, _, quantized = ensure_model(config.model_dir, dit_variant=config.base_variant)
+        model_config = read_config(folder)
+        if config.base_variant == "int8_convrot":
+            model = build_int8_model(model_config, quantized["dit"], device=config.device)
+        else:
+            dtype = torch.float32 if config.device == "cpu" else {"bf16": torch.bfloat16, "fp16": torch.bfloat16,
+                                                                  "fp32": torch.float32}[config.base_dtype]
+            model = build_model(model_config, read_state(folder / "auk_base.safetensors"), device=config.device, dtype=dtype)
+        return model.eval().requires_grad_(False)
     if config.tts_model == "omnivoice":
         from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
         install_native_enum_pytree_compatibility()
@@ -396,6 +447,9 @@ def _summary_markdown(
     base = next((row for row in rows if row.kind == "base"), None)
     if tts_model == "omnivoice":
         reference_sentence = "Measured with fixed audio-token masks and identical prompt sampling at every checkpoint (OmniVoice masked diffusion)."
+    elif tts_model == "auk":
+        reference_sentence = ("Measured with each clip's own fixed noise at flow times 0.0 to 0.9 at every checkpoint "
+                              "(AuK flow matching, without a reference prompt).")
     elif reference_mode == "other":
         reference_sentence = (
             "Measured with inference-like references (a different clip of the same speaker "
@@ -532,6 +586,8 @@ def evaluate_checkpoints(
         def loader_metrics(model, loader, device, *, max_batches, loss_options):
             dtype = {"bf16":torch.bfloat16,"fp16":torch.float16,"fp32":torch.float32}[cfg.base_dtype]
             return masked_audio_metrics(model, loader, device, dtype=dtype, max_batches=max_batches, cancel_callback=cancel_callback)
+    elif cfg.tts_model == "auk":
+        dataset_class, make_loader, loader_metrics = _auk_evaluation_parts(cfg, train_defaults, device, cancel_callback)
 
     dataset_options = {
         "val_fraction": float(cfg.val_fraction or 0.0),
@@ -698,7 +754,7 @@ def evaluate_checkpoints(
         reference_mode=cfg.reference_mode,
         recommended_kind="base" if best is not None and best.kind == "base" else "adapter",
         tts_model=cfg.tts_model,
-        metric="masked_audio_token_loss" if cfg.tts_model == "omnivoice" else "next_audio_token_loss",
+        metric={"omnivoice": "masked_audio_token_loss", "auk": "flow_matching_loss"}.get(cfg.tts_model, "next_audio_token_loss"),
     )
 
 

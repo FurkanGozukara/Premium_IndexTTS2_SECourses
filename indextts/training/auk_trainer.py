@@ -417,7 +417,8 @@ class AukTrainer(LoraTrainer):
         message = self.early_stopping.reason or ("Stopped; resumable checkpoint saved" if stop else "AuK training complete")
         recommended = result.best_path
         if not stop:
-            actions = [("speech evaluation", self._run_automatic_speech_evaluation)]
+            actions = [("checkpoint evaluation", self._run_automatic_evaluation),
+                       ("speech evaluation", self._run_automatic_speech_evaluation)]
             for label, action in actions:
                 try:
                     recommended = action(terminal_phase="post_training", terminal_message=message,

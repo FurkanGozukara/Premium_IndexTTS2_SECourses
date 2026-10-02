@@ -45,7 +45,7 @@ def _non_negative_seconds(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["indextts", "omnivoice"], default="indextts")
+    parser.add_argument("--model", choices=["indextts", "omnivoice", "auk"], default="indextts")
     parser.add_argument("--tier", type=int, choices=VRAM_TIERS, default=32)
     parser.add_argument("--all", action="store_true", help="Run every tier in a clean subprocess")
     parser.add_argument("--variant", choices=["bf16", "int8_convrot"])
@@ -205,8 +205,11 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     if model_id == "omnivoice":
         from indextts.runtime.omnivoice_presets import resolve_preset as omni_preset
         config = omni_preset(str(args.tier), float(args.tier))
+    elif model_id == "auk":
+        from indextts.runtime.auk_presets import resolve_preset as auk_preset
+        config = auk_preset(str(args.tier), float(args.tier))
     hints = generation_hints(args.tier)
-    if model_id == "omnivoice":
+    if model_id in {"omnivoice", "auk"}:
         hints = {"num_beams_max": 1, "max_text_tokens_per_segment": 120,
                  "section_batch_size_max": config.max_section_batch_size_hint}
     beams = max(1, int(args.beams if args.beams is not None else hints["num_beams_max"]))
@@ -269,7 +272,7 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(0)
         load_started = time.perf_counter()
-        if model_id == "omnivoice":
+        if model_id in {"omnivoice", "auk"}:
             from webui_generation_runner import create_tts
             tts = create_tts({**config.to_dict(), "tts_model": model_id, "model_dir": str(ROOT / "models")})
         else:
@@ -291,8 +294,8 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             "do_sample": False,
             "verbose": False,
         }
-        if model_id == "omnivoice":
-            common["omnivoice"] = {"mode": "clone" if reference_audio else "auto"}
+        if model_id in {"omnivoice", "auk"}:
+            common[model_id] = {"mode": "clone" if reference_audio else "auto"}
         if batch > 1 or args.subtitle:
             texts = [TEXT] * batch
             if args.subtitle:

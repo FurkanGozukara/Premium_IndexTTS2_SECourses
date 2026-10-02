@@ -613,8 +613,11 @@ class IndexTTS2:
         resolved = os.path.abspath(requested) if requested else ""
         if resolved and os.path.isfile(resolved):
             from indextts.lora import inspect_lora
-            if "omnivoice" in str(inspect_lora(resolved).get("base_model", "")).lower():
-                raise ValueError("This checkpoint belongs to OmniVoice. Select OmniVoice or choose an IndexTTS adapter.")
+            from indextts.backends import MODEL_LABELS, checkpoint_model
+            owner = checkpoint_model(inspect_lora(resolved))
+            if owner != "indextts":
+                label = MODEL_LABELS[owner]
+                raise ValueError(f"This checkpoint belongs to {label}. Select {label} or choose an IndexTTS adapter.")
         if resolved and resolved == self._lora_path and self._lora_handle is not None:
             if self._lora_merged:
                 unmerge_lora_from_model(self.gpt)

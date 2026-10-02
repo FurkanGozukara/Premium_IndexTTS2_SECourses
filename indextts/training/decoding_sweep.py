@@ -35,9 +35,11 @@ def apply_decoding_settings(infer: Mapping[str, Any], settings: Mapping[str, Any
     """Apply a selected sweep to the backend that owns its parameters."""
     result = dict(infer)
     if "num_step" in settings:
-        result["omnivoice"] = {**result.get("omnivoice", {}),
-                              "num_step": int(settings["num_step"]),
-                              "guidance_scale": float(settings["guidance_scale"])}
+        # Steps and guidance belong to the flow model whose settings the request carries.
+        owner = "auk" if result.get("auk") is not None else "omnivoice"
+        result[owner] = {**(result.get(owner) or {}),
+                         "num_step": int(settings["num_step"]),
+                         "guidance_scale": float(settings["guidance_scale"])}
     else:
         result.update({key: settings[key] for key in DECODING_KEYS})
         result["num_beams"] = int(result["num_beams"])

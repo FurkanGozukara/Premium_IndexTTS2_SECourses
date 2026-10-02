@@ -167,19 +167,25 @@ def normalized_transcripts(root, rows, log=print):
     def key(row):
         return hashlib.sha256(f"{str(row.get('language') or 'en').lower()}\0{row['text']}".encode("utf-8")).hexdigest()
 
+    def save():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {"version": TEXT_VERSION, "texts": texts})
+
     missing = [row for row in rows if key(row) not in texts]
     if missing:
         log(f">> Normalizing {len(missing)} transcripts as generation does (cached for later runs)")
-    for row in missing:
+    for index, row in enumerate(missing, start=1):
         text = str(row["text"])
         try:
             normalized = normalize_auk_text(text, str(row.get("language") or "en").lower())
         except Exception:
             normalized = text
         texts[key(row)] = normalized if normalized.strip() else text
+        if index % 500 == 0:
+            save()
+            log(f">> Normalized {index}/{len(missing)} transcripts")
     if missing:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, {"version": TEXT_VERSION, "texts": texts})
+        save()
     return {str(row["id"]): texts[key(row)] for row in rows}
 
 
