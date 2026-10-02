@@ -58,8 +58,11 @@ def empty_model(config: dict, num_text_layers: int = 36) -> AukModel:
 
 
 def _finish(model: AukModel) -> AukModel:
+    # The checkpoint's rotary frequencies are BF16-rounded values the model was
+    # trained with (upstream loads them); exact ones are computed only if absent.
     rotary = model.transformer.rotary_embed
-    rotary.inv_freq = RotaryEmbedding(rotary.inv_freq.numel() * 2).inv_freq
+    if rotary.inv_freq.is_meta:
+        rotary.inv_freq = RotaryEmbedding(rotary.inv_freq.numel() * 2).inv_freq
     remaining = [name for name, tensor in [*model.named_parameters(), *model.named_buffers()] if tensor.is_meta]
     if remaining:
         raise RuntimeError(f"AuK checkpoint is missing {len(remaining)} tensors: {remaining[:6]}")

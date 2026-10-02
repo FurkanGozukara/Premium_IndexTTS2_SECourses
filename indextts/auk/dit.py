@@ -14,6 +14,11 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 
+# nn.RMSNorm's default epsilon follows the input dtype; upstream always normalises
+# in float32 (under autocast), so the epsilon is fixed to float32's.
+RMS_EPS = torch.finfo(torch.float32).eps
+
+
 class RotaryEmbedding(nn.Module):
     """x_transformers' rotary embedding (interleaved pairs, base 10000, no xpos)."""
 
@@ -136,12 +141,12 @@ class Attention(nn.Module):
         self.mask_enabled = mask_enabled
         self.context_dim = context_dim
         self.to_qkv = nn.Linear(dim, 3 * self.inner_dim)
-        self.q_norm = nn.RMSNorm(dim_head, elementwise_affine=True)
-        self.k_norm = nn.RMSNorm(dim_head, elementwise_affine=True)
+        self.q_norm = nn.RMSNorm(dim_head, eps=RMS_EPS, elementwise_affine=True)
+        self.k_norm = nn.RMSNorm(dim_head, eps=RMS_EPS, elementwise_affine=True)
         if context_dim is not None:
             self.to_qkv_c = nn.Linear(context_dim, 3 * self.inner_dim)
-            self.c_q_norm = nn.RMSNorm(dim_head, elementwise_affine=True)
-            self.c_k_norm = nn.RMSNorm(dim_head, elementwise_affine=True)
+            self.c_q_norm = nn.RMSNorm(dim_head, eps=RMS_EPS, elementwise_affine=True)
+            self.c_k_norm = nn.RMSNorm(dim_head, eps=RMS_EPS, elementwise_affine=True)
         self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, dim), nn.Dropout(dropout)])
         if context_dim is not None:
             self.to_out_c = nn.Linear(self.inner_dim, context_dim)
@@ -262,7 +267,7 @@ class Flux2Edit(nn.Module):
         super().__init__()
         self.dim = dim
         self.time_embed = TimestepEmbedding(dim)
-        self.txt_norm = nn.RMSNorm(dim, elementwise_affine=True)
+        self.txt_norm = nn.RMSNorm(dim, eps=RMS_EPS, elementwise_affine=True)
         self.txt_proj = nn.Linear(text_hidden_dim, dim)
         self.audio_embed = AudioPromptEmbedding(latent_dim, dim)
         self.rotary_embed = RotaryEmbedding(dim_head)
