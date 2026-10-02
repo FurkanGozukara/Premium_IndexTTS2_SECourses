@@ -174,7 +174,7 @@ def test_train_config_accepts_auk_methods_and_automatic_epochs():
     assert config.adapter_type == "full" and config.epochs == 0
     assert config.auk_prompt_fraction == 1.0 and config.auk_reference_seconds == 3.0
     with pytest.raises(ValueError):
-        TrainConfig.from_dict({"dataset_dir": "x", "name": "voice", "tts_model": "indextts", "adapter_type": "full"})
+        TrainConfig.from_dict({"dataset_dir": "x", "name": "voice", "tts_model": "auk", "adapter_type": "bitfit"})
 
 
 def test_adapter_targets_cover_attention_feed_forward_and_adaln():

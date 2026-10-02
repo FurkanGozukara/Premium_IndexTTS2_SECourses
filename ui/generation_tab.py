@@ -742,7 +742,8 @@ def _auk_preview_tokenizer(model_dir: str):
 
 
 # Settings models segment with their own tokenizer and section capacity.
-_SETTINGS_TOKENIZERS = {"omnivoice": _omnivoice_preview_tokenizer, "auk": _auk_preview_tokenizer}
+# Looked up by name when the preview runs, so the tokenizer loaders stay replaceable.
+_SETTINGS_TOKENIZERS = {"omnivoice": "_omnivoice_preview_tokenizer", "auk": "_auk_preview_tokenizer"}
 _SETTINGS_CAPACITY = {"omnivoice": 2048, "auk": 4096}
 
 
@@ -840,7 +841,7 @@ def preview_segments(
 
     try:
         if model_id in _SETTINGS_TOKENIZERS:
-            tokenizer = _SETTINGS_TOKENIZERS[model_id](str(Path(model_dir).resolve()))
+            tokenizer = globals()[_SETTINGS_TOKENIZERS[model_id]](str(Path(model_dir).resolve()))
             raw_token_len = lambda value: len(tokenizer.encode(value, add_special_tokens=False).ids)
         else:
             tokenizer = _preview_tokenizer(str(Path(model_dir).resolve()))
