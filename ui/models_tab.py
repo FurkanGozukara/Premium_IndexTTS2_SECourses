@@ -222,12 +222,19 @@ def _model_status_rows(model_dir: str | Path, model_id: str = "indextts") -> lis
     if model_id == "omnivoice":
         expected = ("omnivoice/config.json", "omnivoice/model.safetensors", "omnivoice/tokenizer.json",
                     "omnivoice/audio_tokenizer/model.safetensors", "quantized/OmniVoice/omnivoice_convrot_int8.safetensors")
+    elif model_id == "auk":
+        from indextts.auk import text_encoder_folder
+        from indextts.backends.auk import QUANT_FILES
+
+        encoder = text_encoder_folder(root).relative_to(root).as_posix()
+        expected = ("auk/config.yaml", "auk/auk_base.safetensors", "auk/vae.safetensors", f"{encoder}/config.json",
+                    f"{encoder}/tokenizer.json", *(f"quantized/{name}" for name in QUANT_FILES.values()))
     rows = []
     for name in expected:
         path = root / name
         kind = "INT8 ConvRot" if name.endswith(".safetensors") and is_int8_convrot_checkpoint(path) else path.suffix.lstrip(".").upper()
         rows.append([name, "Ready" if path.is_file() else "Missing", round(path.stat().st_size / 1024**2, 2) if path.is_file() else 0.0, kind, str(path)])
-    for directory in (() if model_id == "omnivoice" else ("qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0", "hf_cache/bigvgan")):
+    for directory in (() if model_id != "indextts" else ("qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0", "hf_cache/bigvgan")):
         path = root / directory
         rows.append([directory, "Ready" if path.is_dir() else "Missing", "", "Directory", str(path)])
     return rows
@@ -243,6 +250,9 @@ def _tier_notes(tier_value: str, device_value: str, model_id: str = "indextts") 
     if model_id == "omnivoice":
         from indextts.runtime.omnivoice_presets import preset_notes as omni_notes
         return omni_notes(requested)
+    if model_id == "auk":
+        from indextts.runtime.auk_presets import preset_notes as auk_notes
+        return auk_notes(requested)
     return preset_notes(requested)
 
 
@@ -254,8 +264,9 @@ def _estimate_html(config: RuntimeConfig, total_gb: float, model_id: str = "inde
         )
     if total_gb <= 0:
         total_gb = 32.0
-    if model_id == "omnivoice":
-        return ('<div class="summary-strip"><b>OmniVoice memory</b> | '
+    if model_id in {"omnivoice", "auk"}:
+        label = "OmniVoice" if model_id == "omnivoice" else "AuK"
+        return (f'<div class="summary-strip"><b>{label} memory</b> | '
                 f'{total_gb:.1f} GB GPU | Reserve {config.vram_reserve_gb:.1f} GB | '
                 'Peak memory depends on reference length, text and batch size. Use the benchmark for a measured result.</div>')
     estimate = estimate_vram_gb(config, total_gb)
@@ -279,6 +290,7 @@ class ModelsTab:
     model_status: Any = None
     refresh_gpu: Any = None
     refresh_files: Any = None
+    auk_panels: list = field(default_factory=list)
 
 
 def _register(
@@ -358,6 +370,23 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             _register(registry, "runtime.use_cuda_kernel_bigvgan", bigvgan_kernel, False, kind="bool")
             _register(registry, "runtime.s2mel_estimator_autocast", s2mel_bf16, False, kind="bool")
             _register(registry, "runtime.use_deepspeed", use_deepspeed, False, kind="bool")
+
+        with gr.Accordion("AuK text encoder", open=True) as auk_panel:
+            tab.auk_panels = [auk_panel]
+            with gr.Row():
+                auk_text_variant = gr.Dropdown(
+                    choices=[("BF16 (official)", "bf16"), ("INT8 ConvRot", "int8_convrot")], value="bf16",
+                    label="Qwen2.5-Omni encoder precision",
+                    info="INT8 ConvRot keeps the encoder in about 4.5 GB instead of 7.5 GB.")
+                auk_text_residency = gr.Dropdown(
+                    choices=[("Keep on the GPU", "gpu"), ("Load for each encode", "on_demand")], value="gpu",
+                    label="Encoder residency",
+                    info="On demand waits in CPU memory and takes turns with the transformer on the GPU: "
+                         "less VRAM, about a second more per section batch.")
+            _register(registry, "runtime.auk_text_encoder_variant", auk_text_variant, "bf16", kind="choice",
+                      choices=["bf16", "int8_convrot"])
+            _register(registry, "runtime.auk_text_encoder_residency", auk_text_residency, "gpu", kind="choice",
+                      choices=["gpu", "on_demand"])
 
         with gr.Accordion("Block Swap & Memory", open=False) as swap_panel:
             tab.index_panels.append(swap_panel)
@@ -460,6 +489,8 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         resolver = resolve_preset
         if model_id == "omnivoice":
             from indextts.runtime.omnivoice_presets import resolve_preset as resolver
+        elif model_id == "auk":
+            from indextts.runtime.auk_presets import resolve_preset as resolver
         cfg = resolver(requested, total or float(requested), free)
         cfg.device = device_value
         values = cfg.to_dict()
@@ -572,6 +603,10 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             if model_id == "omnivoice":
                 from indextts.backends.omnivoice import ensure_model
                 _, path = ensure_model(model_dir, quantized=True, progress=progress)
+            elif model_id == "auk":
+                from indextts.backends.auk import ensure_model
+                _, _, files = ensure_model(model_dir, dit_variant="int8_convrot", text_variant="int8_convrot", progress=progress)
+                path = files["dit"]
             else:
                 path = ensure_int8_gpt(model_dir, callback)
             info = describe_checkpoint(path)
@@ -598,6 +633,9 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         try:
             if model_id == "omnivoice":
                 from indextts.backends.omnivoice import ensure_model
+                ensure_model(model_dir, progress=progress)
+            elif model_id == "auk":
+                from indextts.backends.auk import ensure_model
                 ensure_model(model_dir, progress=progress)
             else:
                 ensure_base_models(model_dir, callback)

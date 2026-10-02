@@ -1399,8 +1399,9 @@ def build_grid_config_from_ui(
     runtime["lora_merge_into_base"] = False
 
     infer_kwargs = dict(generation_request["infer_kwargs"])
-    if generation_values.get("app.model") == "omnivoice":
-        infer_kwargs["omnivoice"] = generation_request["omnivoice"]
+    model = generation_values.get("app.model")
+    if model in {"omnivoice", "auk"}:
+        infer_kwargs[model] = generation_request[model]
     grid_speaking_rate = min(
         1.5,
         max(0.5, float(grid_values.get("grid.speaking_rate", 1.0))),

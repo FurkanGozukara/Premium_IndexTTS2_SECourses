@@ -44,7 +44,7 @@ _INFER_KEYS = {
     "auto_retry_incomplete_speech", "max_speech_retries", "max_speech_split_depth",
 }
 _RUNNER_EXTRA_KEYS = {
-    "omnivoice",
+    "omnivoice", "auk",
     "segment_budget_scale_non_cjk", "cfm_temperature", "seed",
     "reuse_spk_cond_for_emo", "enable_pause_tags", "trim_silence_ms_threshold", "max_pause_ms",
     "segmentation_mode", "segment_target_tokens", "sentence_pause_ms",

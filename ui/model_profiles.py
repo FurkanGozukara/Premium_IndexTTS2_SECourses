@@ -1,7 +1,7 @@
 """Model-specific values inside a universal preset; legacy presets stay IndexTTS.
 
 Controls fall into three groups. Model-only controls (``INDEX_ONLY``,
-``TRAINING_INDEX_ONLY`` and every ``omnivoice.*`` key) exist for one model,
+``TRAINING_INDEX_ONLY``, ``AUK_ONLY`` and every ``omnivoice.*`` / ``auk.*`` key) exist for one model,
 are hidden for the other and keep one value. Shared inputs such as the text,
 captions, references and output options keep one value too, so switching the
 model never discards what the user typed. Shared controls whose good values
@@ -67,8 +67,20 @@ SHARED_ACROSS_MODELS = frozenset({"runtime.device", "training.dataset_dir", "tra
 OMNIVOICE_PROFILED = frozenset({"training.omni_batch_tokens"})
 
 
+# AuK's own runtime settings (its Qwen2.5-Omni encoder); one value, shown only for AuK.
+AUK_ONLY = frozenset({"runtime.auk_text_encoder_variant", "runtime.auk_text_encoder_residency"})
+
+
 def is_omnivoice_only(key):
     return (key.startswith("omnivoice.") or key.startswith("training.omni_")) and key not in OMNIVOICE_PROFILED
+
+
+def is_auk_only(key):
+    return key.startswith("auk.") or key.startswith("training.auk_") or key in AUK_ONLY
+
+
+def is_model_only(key):
+    return key in INDEX_ONLY or key in TRAINING_INDEX_ONLY or is_omnivoice_only(key) or is_auk_only(key)
 
 
 def migrate_model_values(values):
@@ -94,7 +106,7 @@ def profiled_keys(keys):
     for key in keys:
         if key.startswith("app.") or key in SHARED_ACROSS_MODELS:
             continue
-        if key in INDEX_ONLY or key in TRAINING_INDEX_ONLY or is_omnivoice_only(key):
+        if is_model_only(key):
             continue
         if key.startswith(("runtime.", "training.", "grid.")) or key in GENERATION_PROFILED:
             result.append(key)
@@ -146,8 +158,40 @@ def model_defaults(registry, model, tier="auto"):
         })
         result.update({"training." + key: value for key, value in resolve_training_preset(cfg.vram_tier, method).items()})
         result["training.vram_tier"] = cfg.vram_tier
+    elif model == "auk":
+        result.update(auk_defaults(tier))
     result["app.model"] = model
     return result
+
+
+def auk_defaults(tier="auto"):
+    """AuK's GPU-tier runtime and its generation and training starting points."""
+    from indextts.runtime.auk_presets import default_training_method, resolve_preset, resolve_training_preset
+
+    cfg = resolve_preset(tier)
+    method = default_training_method(cfg.vram_tier)
+    values = {"runtime." + key: value for key, value in cfg.to_dict().items() if key != "aux_residency"}
+    values.update({
+        "runtime.lora_path": "", "runtime.decoder_adapter": "none", "runtime.blocks_to_swap": 0,
+        "runtime.use_qwen_emo": False,
+        # About 20 seconds of speech per section (AuK's training clips are at most 30 s).
+        "generation.max_text_tokens_per_segment": 80,
+        "generation.latent_multiplier": 1.72,
+        "generation.auto_lora_emotion_reference": False,
+        "generation.auto_lora_speaking_rate": False,
+        "generation.auto_lora_max_tokens": False,
+        "generation.section_batch_size": 1,
+        "training.tts_model": "auk", "training.name": "auk_voice",
+        "training.adapter_type": method, "training.max_steps": 0,
+        "training.rank": 32, "training.alpha": 64.0,
+        "training.blocks_to_swap": 0, "training.num_workers": 0,
+        "training.train_spk_proj": False, "training.train_emo_layers": False,
+        "training.decoder_adapter_enabled": False, "training.decoding_sweep_enabled": False,
+        "training.sample_max_text_tokens": 80,
+    })
+    values.update({"training." + key: value for key, value in resolve_training_preset(cfg.vram_tier, method).items()})
+    values["training.vram_tier"] = cfg.vram_tier
+    return values
 
 
 def switch_profile(registry, target, values):

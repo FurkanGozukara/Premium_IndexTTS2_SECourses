@@ -13,14 +13,21 @@ import gradio as gr
 
 from .common import (LAZY_ENGINE, PROCESS_MANAGER, apply_values, gather_values, payload_values,
                      then_gathered, values_payload, values_payload_component)
-from .model_profiles import INDEX_ONLY, TRAINING_INDEX_ONLY, profiled_keys, switch_profile
+from .model_profiles import AUK_ONLY, INDEX_ONLY, TRAINING_INDEX_ONLY, profiled_keys, switch_profile
+from indextts.backends import SETTINGS_MODELS
+
+# What the shared "train embeddings and heads" switch trains for each model.
+HEAD_LABELS = {"indextts": "Train mel embedding head", "omnivoice": "Train audio embeddings and heads",
+               "auk": "Train input and output layers"}
 
 
 # The stylesheet (MODEL_VISIBILITY_CSS in common.py) hides the inactive model's
 # controls from a body class, so a switch, a preset load and every lazily
 # mounted tab or accordion show the right layout without a server round trip.
-MODEL_ONLY_CLASS = {"indextts": "tts-only-indextts", "omnivoice": "tts-only-omnivoice"}
-MODEL_CLASS_JS = "(model) => { document.body.classList.toggle('tts-model-omnivoice', model === 'omnivoice'); }"
+MODEL_ONLY_CLASS = {"indextts": "tts-only-indextts", "omnivoice": "tts-only-omnivoice", "auk": "tts-only-auk"}
+# IndexTTS is the default layout (no class), so the page is right before the first event.
+MODEL_CLASS_JS = ("(model) => { for (const id of ['omnivoice', 'auk']) "
+                  "document.body.classList.toggle('tts-model-' + id, model === id); }")
 METHOD_CLASS_JS = "(method) => { document.body.classList.toggle('train-method-full', method === 'full'); }"
 
 
@@ -63,6 +70,94 @@ def omnivoice_language_control(registry):
     )
     registry.register("omnivoice.language", component, "AUTO", kind="choice", choices=[value for _, value in choices])
     return component
+
+
+def auk_language_control(registry):
+    """AuK speaks English and Chinese (its training data); Auto picks from the text."""
+    from indextts.auk.text import LANGUAGES
+
+    component = gr.Dropdown(
+        choices=list(LANGUAGES), value="AUTO", label="Language",
+        info="AuK was trained on English and Chinese.", scale=1, min_width=100,
+        elem_classes=[MODEL_ONLY_CLASS["auk"]],
+    )
+    registry.register("auk.language", component, "AUTO", kind="choice", choices=[value for _, value in LANGUAGES])
+    return component
+
+
+AUK_SAMPLING_PRESETS = {"Max speed": 16, "Balanced": 32, "Max quality": 64}
+AUK_DESCRIPTION_EXAMPLES = (
+    "A calm middle-aged man with a deep, warm voice, speaking clearly at a moderate pace.",
+    "A young woman with a bright, friendly voice, speaking cheerfully and a little fast.",
+    "An elderly man with a slightly raspy, gentle voice, telling a story slowly.",
+    "A confident female news presenter with a clear, neutral accent.",
+)
+
+
+def build_auk_controls(registry):
+    from indextts.auk.text import GENERATION_DEFAULTS as AUK
+
+    with gr.Accordion("AuK · voice and generation", open=True, elem_classes=[MODEL_ONLY_CLASS["auk"]]) as panel:
+        gr.Markdown("Clone a reference voice, describe a new voice, or let a trained AuK voice speak without a "
+                    "reference (Auto voice). References work best with 8 to 20 seconds of clean speech. The reference "
+                    "transcript only sets the speaking pace; leave it blank to transcribe the reference once.")
+
+        def register(name, component, **kwargs):
+            return registry.register("auk." + name, component, component.value, **kwargs)
+        with gr.Row():
+            register("mode", gr.Dropdown(choices=[("Voice cloning", "clone"), ("Voice design", "design"), ("Auto voice", "auto")],
+                                         value=AUK["mode"], label="Voice mode",
+                                         info="Auto voice speaks in a selected AuK fine-tune's own voice."),
+                     kind="choice", choices=["clone", "design", "auto"])
+            register("voice_description", gr.Textbox(value="", label="Voice description", lines=2,
+                                                      placeholder=AUK_DESCRIPTION_EXAMPLES[0],
+                                                      info="Voice design: age, gender, timbre, emotion and pace in plain words."),
+                     kind="str")
+        with gr.Accordion("Voice description examples", open=False):
+            gr.Markdown("\n".join(f"- {item}" for item in AUK_DESCRIPTION_EXAMPLES))
+        register("reference_text", gr.Textbox(value="", label="Reference transcript", lines=2,
+                                              info="Words spoken in the reference; used only to match its pace. "
+                                                   "Blank transcribes the reference once with Whisper."), kind="str")
+        quality = gr.Radio([*AUK_SAMPLING_PRESETS, "Custom"], value="Balanced", label="Sampling preset",
+                           info="16 / 32 / 64 flow steps with guidance 2. 32 is the official setting.")
+        with gr.Row():
+            register("num_step", gr.Slider(4, 128, value=AUK["num_step"], step=1, label="AuK flow steps",
+                                           info="32 is the official default; fewer steps are faster."),
+                     kind="int", minimum=4, maximum=128)
+            register("guidance_scale", gr.Slider(0, 6, value=AUK["guidance_scale"], step=0.1, label="AuK guidance (CFG)",
+                                                 info="2.0 is the official default."),
+                     kind="float", minimum=0, maximum=6)
+        sampling = [registry["auk.num_step"].component, registry["auk.guidance_scale"].component]
+        presets_js = "{" + ", ".join(f"'{name}': {steps}" for name, steps in AUK_SAMPLING_PRESETS.items()) + "}"
+        steps_js = "{" + ", ".join(f"{steps}: '{name}'" for name, steps in AUK_SAMPLING_PRESETS.items()) + "}"
+        quality.input(None, [quality, *sampling], sampling, queue=False, api_name=False, show_progress="hidden",
+                      js=f"(preset, steps, guidance) => preset === 'Custom' ? [steps, guidance] : [{presets_js}[preset], 2]")
+        gr.on([control.change for control in sampling], None, sampling, quality, queue=False, api_name=False,
+              show_progress="hidden",
+              js=f"(steps, guidance) => Number(guidance) === 2 ? ({steps_js}[Number(steps)] || 'Custom') : 'Custom'")
+        with gr.Accordion("Advanced AuK sampling", open=False):
+            with gr.Row():
+                register("sway_coef", gr.Slider(-1, 1, value=AUK["sway_coef"], step=0.05, label="Sway sampling",
+                                                info="-1 concentrates steps early in the flow (official)."),
+                         kind="float", minimum=-1, maximum=1)
+                register("solver", gr.Dropdown(choices=[("Euler (official)", "euler"), ("Midpoint", "midpoint")],
+                                               value=AUK["solver"], label="ODE solver",
+                                               info="Midpoint costs two model passes per step."),
+                         kind="choice", choices=["euler", "midpoint"])
+                register("max_reference_seconds", gr.Slider(3, 30, value=AUK["max_reference_seconds"], step=0.5,
+                                                            label="Max reference length (s)",
+                                                            info="Longer references are cut at a pause."),
+                         kind="float", minimum=3, maximum=30)
+                register("edge_seconds", gr.Slider(0, 1, value=AUK["edge_seconds"], step=0.05,
+                                                   label="Extra section time (s)",
+                                                   info="Added to every estimated section length."),
+                         kind="float", minimum=0, maximum=1)
+            with gr.Row():
+                register("trim_reference_silence", gr.Checkbox(value=AUK["trim_reference_silence"],
+                                                               label="Trim reference silence"), kind="bool")
+                register("match_loudness", gr.Checkbox(value=AUK["match_loudness"],
+                                                       label="Match the reference loudness"), kind="bool")
+    return panel
 
 
 def build_omnivoice_controls(registry):
@@ -117,8 +212,13 @@ def bind_model_controls(registry, generation, models, training, grid):
     for spec in registry.specs:
         if spec.component is not None and (spec.key in INDEX_ONLY or spec.key in TRAINING_INDEX_ONLY):
             add_model_class(spec.component, "indextts")
+        elif spec.component is not None and spec.key in AUK_ONLY:
+            add_model_class(spec.component, "auk")
     for block in (generation.omnivoice_panel, training.omnivoice_panel):
         add_model_class(block, "omnivoice")
+    for block in (generation.auk_panel, getattr(training, "auk_panel", None), *getattr(models, "auk_panels", ())):
+        if block is not None:
+            add_model_class(block, "auk")
 
     method = registry["training.adapter_type"].component
     adapter_fields = [registry["training." + name].component for name in
@@ -144,7 +244,7 @@ def bind_model_controls(registry, generation, models, training, grid):
         from .grid_tab import _adapter_folders, latest_lora_folder
         from .training_tab import _resume_choices, adapter_rows
 
-        omni = model == "omnivoice"
+        settings_model = model in SETTINGS_MODELS
         updates = {}
         for key, choices in (("runtime.lora_path", _lora_choices(model)), ("training.resume_from", _resume_choices(model))):
             value = values.get(key) or ""
@@ -154,11 +254,11 @@ def bind_model_controls(registry, generation, models, training, grid):
         if grid_value not in {path for _, path in folders}:
             grid_value = latest_lora_folder(model=model) or None
         updates["grid.adapter_dir"] = {"choices": folders, "value": grid_value}
-        methods = ["lora", "dora", "full"] if omni else ["lora", "dora"]
+        methods = ["lora", "dora", "full"] if settings_model else ["lora", "dora"]
         method_value = values.get("training.adapter_type") if values.get("training.adapter_type") in methods else "dora"
         updates["training.adapter_type"] = {"choices": methods, "value": method_value}
         rows, paths = adapter_rows(model)
-        label = "Train audio embeddings and heads" if omni else "Train mel embedding head"
+        label = HEAD_LABELS.get(model, "Train mel embedding head")
         return updates, {"label": label, "rows": rows, "paths": paths}
 
     def digest(value):
@@ -167,8 +267,9 @@ def bind_model_controls(registry, generation, models, training, grid):
     # What each page already shows (the lists built at startup, for IndexTTS), so a
     # refresh sends a list of hundreds of checkpoints only when it actually changed.
     built, built_extras = listed_updates("indextts", {})
-    # Inspecting every OmniVoice checkpoint once takes a moment; do it before the first switch.
-    threading.Thread(target=listed_updates, args=("omnivoice", {}), name="warm-omnivoice-lists", daemon=True).start()
+    # Inspecting every checkpoint of the other models once takes a moment; do it before the first switch.
+    for other in SETTINGS_MODELS:
+        threading.Thread(target=listed_updates, args=(other, {}), name=f"warm-{other}-lists", daemon=True).start()
     built_sent = {**{key: digest(update["choices"]) for key, update in built.items()},
                   "label": digest("Train mel embedding head"), "rows": digest(built_extras["rows"])}
     sent_lists = gr.State(built_sent)

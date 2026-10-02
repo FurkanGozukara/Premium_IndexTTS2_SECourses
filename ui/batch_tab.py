@@ -45,6 +45,7 @@ from .common import (
     values_payload_component,
     write_json_atomic,
 )
+from indextts.backends import SETTINGS_MODELS, needs_reference
 from .generation_tab import (
     OMNIVOICE_DEFAULT_REFERENCE,
     GenerationTab,
@@ -589,7 +590,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                     reference = common_reference
                     if batch_values["batch.reference_mode"] == "Per-file reference":
                         reference = _per_file_reference(item)
-                        optional_reference = generation_values.get("app.model") == "omnivoice" and generation_values.get("omnivoice.mode", "clone") != "clone"
+                        optional_reference = not needs_reference(generation_values)
                         if not reference and not optional_reference:
                             raise ValueError("Missing same-stem reference")
                     pattern = str(batch_values["batch.naming_pattern"] or "{index:03d}_{name}")
@@ -746,9 +747,10 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
         lora_path: str,
         auto_lora_reference: bool,
         model_id: str = "indextts",
-        voice_mode: str = "clone",
+        omnivoice_mode: str = "clone",
+        auk_mode: str = "clone",
     ):
-        if model_id == "omnivoice" and voice_mode != "clone":
+        if {"omnivoice": omnivoice_mode, "auk": auk_mode}.get(model_id, "clone") != "clone":
             return (gr.skip(),) * 5 + ("Reference audio is optional for this voice mode.",)
         if reference_mode != "One reference for all":
             return (gr.skip(),) * 6
@@ -761,7 +763,7 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                 time_ranges,
                 lora_path,
                 auto_lora_reference,
-                default_reference=OMNIVOICE_DEFAULT_REFERENCE if model_id == "omnivoice" else None,
+                default_reference=OMNIVOICE_DEFAULT_REFERENCE if model_id in SETTINGS_MODELS else None,
             )
         except ValueError as exc:
             gr.Warning(str(exc), title="Batch Reference Voice")
@@ -787,7 +789,8 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             generation.reference_ranges,
             generation.controls["runtime.lora_path"],
             generation.controls["generation.auto_lora_reference"],
-        ] + ([registry["app.model"].component, registry["omnivoice.mode"].component] if registry is not None else []),
+        ] + ([registry["app.model"].component, registry["omnivoice.mode"].component, registry["auk.mode"].component]
+             if registry is not None else []),
         outputs=[
             generation.prompt_audio,
             generation.reference_media,

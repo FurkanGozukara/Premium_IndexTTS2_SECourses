@@ -114,7 +114,9 @@ from .common import (
     write_json_atomic,
 )
 from .presets_store import PresetRegistry
-from .model_controls import build_omnivoice_controls, omnivoice_language_control
+from .model_controls import auk_language_control, build_auk_controls, build_omnivoice_controls, omnivoice_language_control
+from indextts.backends import (DEFAULT_REFERENCE, MODEL_LABELS, SETTINGS_MODELS, model_settings, needs_reference,
+                               validate_model_settings)
 
 
 LANGUAGES = ("ZH", "EN", "JA", "AR", "ES")
@@ -159,9 +161,9 @@ REFERENCE_AUDIO_EXTENSIONS = frozenset(
     }
 )
 _AUTO_REFERENCE_SOURCES = frozenset({"library_auto", "lora_auto"})
-# OmniVoice voice cloning falls back to the bundled demo voice rather than the
-# newest library file; its Auto voice and Voice design modes need no reference.
-OMNIVOICE_DEFAULT_REFERENCE = "demo_voice.mp3"
+# OmniVoice and AuK voice cloning fall back to the bundled demo voice rather than the
+# newest library file; their other voice modes need no reference.
+OMNIVOICE_DEFAULT_REFERENCE = DEFAULT_REFERENCE
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,7 @@ INFER_KWARG_KEYS = frozenset(
 RUNNER_REQUEST_KEYS = frozenset(
     {
         "omnivoice",
+        "auk",
         "prompt",
         "text",
         "subtitle_mode",
@@ -478,16 +481,17 @@ def build_generation_request(
     segment_target_tokens = (
         smart_segment_target(str(merged.get("runtime.lora_path") or "")) if segmentation_mode == "smart" else None
     )
-    omnivoice = merged.get("app.model") == "omnivoice"
-    language = merged.get("omnivoice.language", "AUTO") if omnivoice else _value(merged, "generation.language")
+    model = merged.get("app.model") or "indextts"
+    settings_model = model in SETTINGS_MODELS
+    language = merged.get(f"{model}.language", "AUTO") if settings_model else _value(merged, "generation.language")
     request = {
-        "omnivoice": ({key.removeprefix("omnivoice."): value for key, value in merged.items()
-                       if key.startswith("omnivoice.") and key != "omnivoice.language"} if omnivoice else None),
+        "omnivoice": model_settings(merged, "omnivoice") if model == "omnivoice" else None,
+        "auk": model_settings(merged, "auk") if model == "auk" else None,
         "prompt": str(prompt or ""),
         "text": str(text or ""),
         "subtitle_mode": bool(_value(merged, "generation.use_caption_timing")),
         "subtitle_file": subtitle_file,
-        "language": str(language or ("AUTO" if omnivoice else "EN")).upper(),
+        "language": str(language or ("AUTO" if settings_model else "EN")).upper(),
         "save_used_audio": bool(_value(merged, "generation.save_used_audio")),
         "save_as_mp3": bool(_value(merged, "generation.save_as_mp3")),
         "mp3_bitrate": str(_value(merged, "generation.mp3_bitrate")),
@@ -562,11 +566,9 @@ def prepare_generation_request(
     output_root: str | os.PathLike[str] = "outputs",
 ) -> dict[str, Any]:
     prompt_path = resolve_path_value(prompt)
-    if values.get("app.model") == "omnivoice":
-        from indextts.backends.omnivoice import validate_voice_settings
-        validate_voice_settings({key.removeprefix("omnivoice."): value for key, value in values.items() if key.startswith("omnivoice.")})
-    needs_reference = values.get("app.model") != "omnivoice" or values.get("omnivoice.mode", "clone") == "clone"
-    if needs_reference and (not prompt_path or not Path(prompt_path).is_file()):
+    model = values.get("app.model") or "indextts"
+    validate_model_settings(model, model_settings(values, model))
+    if needs_reference(values) and (not prompt_path or not Path(prompt_path).is_file()):
         raise ValueError("Reference Voice audio is required before generation")
     subtitle_path = resolve_path_value(subtitle_file)
     image_source = resolve_path_value(image_path)
@@ -638,7 +640,7 @@ def prepare_generation_request(
             "execution_mode": "subprocess" if _value(values, "generation.use_subprocess") else "in_process",
             "resolved_generation_kwargs": request["infer_kwargs"],
             "runtime": request["runtime"],
-            "request_values": {key: value for key, value in values.items() if key == "app.model" or key.startswith(("generation.", "runtime.", "omnivoice."))},
+            "request_values": {key: value for key, value in values.items() if key == "app.model" or key.startswith(("generation.", "runtime.", "omnivoice.", "auk."))},
         },
         "outputs": {
             "final_audio_path": None,
@@ -714,6 +716,18 @@ def _preview_tokenizer(model_dir: str):
 def _omnivoice_preview_tokenizer(model_dir: str):
     from tokenizers import Tokenizer
     return Tokenizer.from_file(str(Path(model_dir) / "omnivoice" / "tokenizer.json"))
+
+
+@lru_cache(maxsize=2)
+def _auk_preview_tokenizer(model_dir: str):
+    from tokenizers import Tokenizer
+    from indextts.auk import text_encoder_folder
+    return Tokenizer.from_file(str(text_encoder_folder(model_dir) / "tokenizer.json"))
+
+
+# Settings models segment with their own tokenizer and section capacity.
+_SETTINGS_TOKENIZERS = {"omnivoice": _omnivoice_preview_tokenizer, "auk": _auk_preview_tokenizer}
+_SETTINGS_CAPACITY = {"omnivoice": 2048, "auk": 4096}
 
 
 @lru_cache(maxsize=8)
@@ -792,15 +806,15 @@ def preview_segments(
     if not str(text or "").strip():
         return [], "0 sections"
     try:
-        if model_id == "omnivoice":
-            tokenizer = _omnivoice_preview_tokenizer(str(Path(model_dir).resolve()))
+        if model_id in _SETTINGS_TOKENIZERS:
+            tokenizer = _SETTINGS_TOKENIZERS[model_id](str(Path(model_dir).resolve()))
             raw_token_len = lambda value: len(tokenizer.encode(value, add_special_tokens=False).ids)
         else:
             tokenizer = _preview_tokenizer(str(Path(model_dir).resolve()))
             raw_token_len = lambda value: len(tokenizer.encode(value, allowed_special="all"))
     except Exception:
         raw_token_len = lambda value: max(1, len(str(value).split()) * 2)
-    prefix = "" if model_id == "omnivoice" else f"<|{str(language or 'EN').lower()}|> "
+    prefix = "" if model_id in SETTINGS_MODELS else f"<|{str(language or 'EN').lower()}|> "
     mode = normalize_segmentation_mode(segmentation_mode) if str(segmentation_mode or "budget") != "budget" else "budget"
 
     def token_len(value: str) -> int:
@@ -818,10 +832,10 @@ def preview_segments(
         for segment in split_text_by_tokens(
             chunk.text,
             int(max_tokens),
-            capacity=2048 if model_id == "omnivoice" else _preview_capacity(str(Path(model_dir).resolve())),
+            capacity=_SETTINGS_CAPACITY.get(model_id) or _preview_capacity(str(Path(model_dir).resolve())),
             token_len=token_len,
             lang_prefix=prefix,
-            segment_budget_scale_non_cjk=1.0 if model_id == "omnivoice" else float(segment_scale),
+            segment_budget_scale_non_cjk=1.0 if model_id in SETTINGS_MODELS else float(segment_scale),
             mode=mode,
             target_tokens=target_tokens,
         ):
@@ -2239,8 +2253,8 @@ def recent_outputs(root: str | os.PathLike[str] = ROOT / "outputs", limit: int =
 
 def _summary_html(result: Mapping[str, Any]) -> str:
     timing = (
-        f"OmniVoice {float(result.get('generation_time_s', 0.0) or 0.0):.2f}s | "
-        if result.get("model") == "omnivoice" else
+        f"{MODEL_LABELS.get(result.get('model'), 'Model')} {float(result.get('generation_time_s', 0.0) or 0.0):.2f}s | "
+        if result.get("model") in SETTINGS_MODELS else
         f"GPT {float(result.get('gpt_time', 0.0) or 0.0):.2f}s, "
         f"s2mel {float(result.get('s2mel_time', 0.0) or 0.0):.2f}s, "
         f"vocoder {float(result.get('vocoder_time', 0.0) or 0.0):.2f}s | "
@@ -2845,6 +2859,7 @@ def build_generation_tab(
                             info="Normalization and pronunciation.", scale=1, min_width=100,
                         )
                         omnivoice_language_control(registry)
+                        auk_language_control(registry)
                         max_tokens = gr.Slider(
                             20, 300, value=60, step=1, label="Max tokens per segment",
                             info="Hard limit per speech segment; longer segments need more VRAM.",
@@ -3084,6 +3099,7 @@ def build_generation_tab(
         _register(registry, "generation.auto_lora_emotion_reference", auto_emotion, kind="bool")
 
         tab.omnivoice_panel = build_omnivoice_controls(registry)
+        tab.auk_panel = build_auk_controls(registry)
         with gr.Accordion("Emotion Control", open=False) as emotion_panel:
             tab.index_panels.append(emotion_panel)
             emotion_mode = gr.Radio(
@@ -4027,7 +4043,7 @@ def bind_generation_events(
     request_specs = [
         spec
         for spec in registry.specs
-        if spec.component is not None and (spec.key == "app.model" or spec.key.startswith(("generation.", "runtime.", "omnivoice.")))
+        if spec.component is not None and (spec.key == "app.model" or spec.key.startswith(("generation.", "runtime.", "omnivoice.", "auk.")))
     ]
     tab.request_keys = [spec.key for spec in request_specs]
     tab.request_components = [spec.component for spec in request_specs]
@@ -4117,10 +4133,12 @@ def bind_generation_events(
         auto_lora_reference: bool,
         gr_request: gr.Request = None,
         model_id: str = "indextts",
-        voice_mode: str = "clone",
+        omnivoice_mode: str = "clone",
+        auk_mode: str = "clone",
     ):
         _claim_generation_card(gr_request)
-        if model_id == "omnivoice" and voice_mode != "clone":
+        voice_mode = {"omnivoice": omnivoice_mode, "auk": auk_mode}.get(model_id, "clone")
+        if voice_mode != "clone":
             return (gr.skip(),) * 5 + ("Reference audio is optional for this voice mode.",)
         try:
             prepared = prepare_reference_for_generation(
@@ -4131,7 +4149,7 @@ def bind_generation_events(
                 time_ranges,
                 lora_path,
                 auto_lora_reference,
-                default_reference=OMNIVOICE_DEFAULT_REFERENCE if model_id == "omnivoice" else None,
+                default_reference=DEFAULT_REFERENCE if model_id in SETTINGS_MODELS else None,
             )
         except ValueError as exc:
             gr.Warning(str(exc), title="Reference Voice")
@@ -4166,7 +4184,7 @@ def bind_generation_events(
     model_component = registry["app.model"].component if "app.model" in registry else gr.State("indextts")
     reference_event = tab.generate_button.click(
         prepare_visible_reference,
-        inputs=[*reference_inputs, model_component, registry["omnivoice.mode"].component],
+        inputs=[*reference_inputs, model_component, registry["omnivoice.mode"].component, registry["auk.mode"].component],
         outputs=reference_outputs,
         queue=False,
         show_progress="minimal",

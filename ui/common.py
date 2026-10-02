@@ -719,7 +719,9 @@ def values_payload(keys: Sequence[str], values: Mapping[str, Any]) -> dict[str, 
 # tabs and accordions. Full fine-tuning has no adapter rank or targets.
 MODEL_VISIBILITY_CSS = """
 body.tts-model-omnivoice .tts-only-indextts,
+body.tts-model-auk .tts-only-indextts,
 body:not(.tts-model-omnivoice) .tts-only-omnivoice,
+body:not(.tts-model-auk) .tts-only-auk,
 body.train-method-full .train-adapter-field { display: none !important; }
 """
 
@@ -1582,6 +1584,8 @@ def runtime_config_from_values(values: Mapping[str, Any], *, model_dir: str = "m
         "lora_strength": values.get("runtime.lora_strength", 1.0),
         "lora_merge_into_base": values.get("runtime.lora_merge_into_base", False),
         "max_section_batch_size_hint": values.get("runtime.max_section_batch_size_hint", 8),
+        "auk_text_encoder_variant": values.get("runtime.auk_text_encoder_variant", "bf16"),
+        "auk_text_encoder_residency": values.get("runtime.auk_text_encoder_residency", "gpu"),
     }
     # The generation tab's "Voice decoder adapter" choice: "auto" (the selected LoRA / DoRA's own file),
     # "none" (GPT adapter only), or an explicit decoder adapter file. Older presets saved a boolean.
