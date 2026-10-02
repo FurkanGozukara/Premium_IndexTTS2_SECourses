@@ -133,11 +133,10 @@ class AukTrainer(LoraTrainer):
     def _encoder(self):
         """The frozen Qwen2.5-Omni encoder, loaded only for reference-prompt objectives."""
         if getattr(self, "_qwen", None) is None:
-            from indextts.auk import text_encoder_folder
-            from indextts.auk.conditioning import QwenConditioner
+            from .auk_data import load_text_encoder
 
             self.log(">> Loading the frozen Qwen2.5-Omni encoder for reference-prompt training")
-            self._qwen = QwenConditioner(text_encoder_folder(self.config.model_dir), device=self.config.device)
+            self._qwen = load_text_encoder(self.config)
         return self._qwen
 
     def _encode(self, batch, *, sample, generator=None):

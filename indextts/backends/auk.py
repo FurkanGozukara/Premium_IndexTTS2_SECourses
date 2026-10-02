@@ -277,17 +277,12 @@ class AukEngine:
               f"text encoder {self.runtime.auk_text_encoder_variant} ({self.text_residency})", flush=True)
         self.config = read_config(folder)
         text_device = self.device if self.text_residency == "gpu" else "cpu"
-        int8_text = "text" in quantized
-        # The INT8 text model is quantized on the CPU and then moved, so the GPU never holds its
-        # BF16 weights; the loader keeps Qwen's float32 RoPE frequencies and pins W8A16 kernels.
-        self.conditioner = QwenConditioner(qwen_dir, device="cpu" if int8_text else text_device,
-                                           dtype=torch.bfloat16 if cuda else torch.float32,
-                                           attn_implementation=self.runtime.attention_backend)
-        if int8_text:
-            from indextts.auk.thinker_files import load_int8_text_model
-
-            load_int8_text_model(self.conditioner.model.model, quantized["text"], device="cpu")
-            self.conditioner.to(text_device)
+        # The low-VRAM configurations (INT8 or on-demand text encoder) also keep the 0.6 GB token
+        # table in CPU memory; the BF16 GPU-resident path stays exactly as upstream loads it.
+        self.conditioner = QwenConditioner(qwen_dir, device=text_device, dtype=torch.bfloat16 if cuda else torch.float32,
+                                           attn_implementation=self.runtime.attention_backend,
+                                           int8_path=quantized.get("text"),
+                                           cpu_embeddings=cuda and ("text" in quantized or self.text_residency != "gpu"))
         self._text_offload = OffloadedModule(self.conditioner.model, self.device) if self.text_residency != "gpu" else None
         num_layers = self.conditioner.num_layers
         # On demand, the GPU holds one model at a time: the text encoder while encoding and the
@@ -308,7 +303,8 @@ class AukEngine:
         for name in ("layer_weights", "layer_scale"):
             getattr(self.model, name).data = getattr(self.model, name).data.to(self.device)
         self._dit_offload = None
-        self.vae = build_vae(self.config, folder / "vae.safetensors", device=self.device)
+        # The VAE encodes references and decodes while the transformer samples, so it is lent with it.
+        self.vae = build_vae(self.config, folder / "vae.safetensors", device=dit_device)
         gc.collect()
         if cuda:
             torch.cuda.empty_cache()
@@ -356,7 +352,8 @@ class AukEngine:
         self._lora_path, self._lora_strength, self._lora_merged = path, float(strength), bool(merge_into_base)
         self.model.eval().requires_grad_(False)
         if self._text_offload is not None:
-            self._dit_offload = OffloadedModule(self.model, self.device, label="transformer")
+            self._dit_offload = OffloadedModule(torch.nn.ModuleList([self.model, self.vae]), self.device,
+                                                label="transformer and VAE")
         self._voice = trained_voice(path)
 
     # ------------------------------------------------------------------ text
@@ -418,9 +415,8 @@ class AukEngine:
         lang = str(language or "auto").lower()
         lang = lang if lang in {"en", "zh"} else "en"
         print(f">> Transcribing reference {Path(path).name} once with Whisper (pace estimate)", flush=True)
-        self._residency("idle")
         transcript = transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
-                                device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
+                                device=self._whisper_device()).text.strip()
         try:
             REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             temporary = cached.with_suffix(f".{os.getpid()}.tmp")
@@ -749,9 +745,19 @@ class AukEngine:
 
         lang = str(language or "en").lower()
         lang = lang if lang in {"en", "zh"} else "en"
-        self._residency("idle")
         return transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
-                          device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
+                          device=self._whisper_device()).text.strip()
+
+    def _whisper_device(self) -> str:
+        """Whisper runs beside AuK only where 3 GB stay free (on demand, both models step aside
+        first); otherwise on the CPU, which is quick for a reference or one edit source."""
+        if not str(self.device).startswith("cuda"):
+            return "cpu"
+        from indextts.training.whisper_asr import whisper_device_for_free_vram
+
+        self._residency("idle")
+        free, _total = torch.cuda.mem_get_info(torch.device(self.device))
+        return whisper_device_for_free_vram(str(self.device), free / 1024**3, required_gb=3.0)
 
     def unload(self):
         self._reference = self._reference_key = None

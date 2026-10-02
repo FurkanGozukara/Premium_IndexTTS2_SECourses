@@ -22,9 +22,8 @@ MAX_CONTEXT_SECONDS = 30.0  # upstream training clips: 0.3-30 s per side
 
 
 def text_encoder_folder(model_dir):
-    """The Qwen2.5-Omni folder to load: the slim Thinker-only copy when present, else the full snapshot."""
-    from pathlib import Path
+    """The Qwen2.5-Omni folder to read: the slim Thinker-only copy when present, else the full snapshot."""
+    from .thinker_files import full_folder, slim_folder
 
-    root = Path(model_dir)
-    slim = root / "quantized" / "AuK" / "qwen2_5_omni_thinker"
-    return slim if (slim / "config.json").is_file() and (slim / "tokenizer.json").is_file() else root / "qwen2_5_omni_3b"
+    slim = slim_folder(model_dir)
+    return slim if (slim / "config.json").is_file() and (slim / "tokenizer.json").is_file() else full_folder(model_dir)

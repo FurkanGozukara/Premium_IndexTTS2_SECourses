@@ -219,19 +219,35 @@ def fuse(hidden_states, fusion) -> torch.Tensor:
     return (stacked * weights[:, None, None, None]).sum(dim=0) * fusion["layer_scale"].to(stacked.device)
 
 
+def text_encoder_files(config):
+    """The AuK folder, the Qwen Thinker folder and the INT8 text file the training encoder uses.
+
+    Tiers that train an INT8 base also encode with the INT8 text model, which fits their GPU;
+    its conditioning matches BF16 within BF16's own error (docs/AUK.md).
+    """
+    from indextts.backends.auk import ensure_model
+
+    int8 = config.base_variant == "int8_convrot" and str(config.device).startswith("cuda")
+    folder, qwen, quantized = ensure_model(config.model_dir, text_variant="int8_convrot" if int8 else "bf16")
+    return folder, qwen, quantized.get("text")
+
+
+def load_text_encoder(config):
+    from indextts.auk.conditioning import QwenConditioner
+
+    _, qwen, int8_path = text_encoder_files(config)
+    return QwenConditioner(qwen, device=config.device, int8_path=int8_path, cpu_embeddings=bool(int8_path))
+
+
 def cache_auk_conditions(config, rows, instructions, reporter=None, cancel_callback=None, batch_size=16):
     """Fused Qwen conditioning of each instruction (no reference audio), cached by content."""
-    from indextts.auk import text_encoder_folder
-    from indextts.auk.conditioning import QwenConditioner
-    from indextts.backends.auk import ensure_model
     from .features import _atomic_torch_save, _sha256
 
     root = Path(config.dataset_dir).resolve()
     cache = root / CACHE_DIR / "conditions"
     cache.mkdir(parents=True, exist_ok=True)
-    folder, _, _ = ensure_model(config.model_dir)
-    encoder_dir = text_encoder_folder(config.model_dir)
-    weights = sorted(encoder_dir.glob("*.safetensors"))
+    folder, encoder_dir, int8_path = text_encoder_files(config)
+    weights = sorted(Path(encoder_dir).glob("*.safetensors")) + ([Path(int8_path)] if int8_path else [])
     encoder_hash = hashlib.sha256("".join(_hash_once(path, root / CACHE_DIR / f"encoder_{path.stem}.json")
                                           for path in weights).encode()).hexdigest()
     fusion = fusion_state(folder)
@@ -247,7 +263,7 @@ def cache_auk_conditions(config, rows, instructions, reporter=None, cancel_callb
     if todo:
         log = reporter.log if reporter is not None and hasattr(reporter, "log") else print
         log(f">> Encoding {len(todo)} AuK training instructions with the frozen Qwen2.5-Omni encoder (cached)")
-        encoder = QwenConditioner(encoder_dir, device=config.device)
+        encoder = load_text_encoder(config)
         try:
             for start in range(0, len(todo), batch_size):
                 if cancel_callback and cancel_callback():

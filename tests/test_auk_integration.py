@@ -236,9 +236,51 @@ def test_runtime_config_validates_auk_encoder_fields():
 def test_auk_tier_presets_shrink_memory_with_the_card():
     from indextts.runtime.auk_presets import resolve_preset, resolve_training_preset
 
-    big, mid, small = resolve_preset(32), resolve_preset(12), resolve_preset(6)
+    big, mid, ten, small = resolve_preset(32), resolve_preset(12), resolve_preset(10), resolve_preset(6)
     assert (big.model_variant, big.auk_text_encoder_variant, big.auk_text_encoder_residency) == ("bf16", "bf16", "gpu")
-    assert mid.auk_text_encoder_variant == "int8_convrot"
-    assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "int8_convrot"
+    assert mid.auk_text_encoder_variant == "int8_convrot" and mid.model_variant == "bf16"
+    assert ten.model_variant == "int8_convrot" and ten.auk_text_encoder_residency == "gpu"
+    # On demand the encoder and the transformer take turns, so the BF16 transformer fits again.
+    assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "bf16"
     assert resolve_training_preset(32, "full")["base_variant"] == "bf16"
+    assert resolve_training_preset(32, "full")["gradient_checkpointing"] is False
     assert resolve_training_preset(8, "dora")["base_variant"] == "int8_convrot"
+
+
+def test_cpu_token_table_lookup_is_exact():
+    import torch
+    from indextts.auk.conditioning import _CpuEmbedding
+
+    embedding = torch.nn.Embedding(50, 8, padding_idx=0)
+    ids = torch.tensor([[3, 7, 0, 49]])
+    moved = _CpuEmbedding(embedding)
+    assert torch.equal(moved(ids), embedding(ids))
+    assert not list(moved.parameters()) and moved.weight.shape == (50, 8)
+
+
+def test_on_demand_residency_lends_one_model_at_a_time():
+    from indextts.backends.auk import AukEngine
+
+    class Loan:
+        def __init__(self):
+            self.active = False
+
+        def activate(self, active):
+            self.active = bool(active)
+
+    class Conditioner:
+        device = None
+
+    engine = AukEngine.__new__(AukEngine)
+    engine.device, engine.conditioner = "cuda:0", Conditioner()
+    engine._text_offload, engine._dit_offload = Loan(), Loan()
+    engine._residency("text")
+    assert engine._text_offload.active and not engine._dit_offload.active
+    assert str(engine.conditioner.device) == "cuda:0"
+    engine._residency("dit")
+    assert engine._dit_offload.active and not engine._text_offload.active
+    engine._residency("idle")
+    assert not engine._dit_offload.active and not engine._text_offload.active
+    resident = AukEngine.__new__(AukEngine)
+    resident._text_offload = None
+    resident._residency("text")  # both models resident: nothing to lend

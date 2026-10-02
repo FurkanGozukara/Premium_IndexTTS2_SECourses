@@ -53,11 +53,35 @@ class _HiddenOnly(torch.nn.Module):
         return hidden_states[..., :0]
 
 
+class _CpuEmbedding(torch.nn.Module):
+    """Token embeddings looked up in CPU memory (0.6 GB): the GPU receives only the rows a request uses.
+
+    The table is not a registered tensor, so moving or lending the module never copies it.
+    """
+
+    def __init__(self, embedding: torch.nn.Embedding):
+        super().__init__()
+        self.__dict__["table"] = embedding.weight.detach().cpu()
+        self.padding_idx = embedding.padding_idx
+
+    @property
+    def weight(self):
+        return self.table
+
+    def forward(self, input_ids):
+        return torch.nn.functional.embedding(input_ids.cpu(), self.table, self.padding_idx).to(input_ids.device)
+
+
 class QwenConditioner:
-    """The frozen Qwen2.5-Omni Thinker (text and audio encoder; no vision tower)."""
+    """The frozen Qwen2.5-Omni Thinker (text and audio encoder; no vision tower).
+
+    ``int8_path`` loads the ConvRot INT8 text model (quantized on the CPU, so the GPU never
+    holds its BF16 weights); ``cpu_embeddings`` keeps the token table in CPU memory.
+    Both give the low-VRAM tiers room; the token lookup itself is exact.
+    """
 
     def __init__(self, model_path: str | Path, device: str = "cuda", dtype: torch.dtype = torch.bfloat16,
-                 attn_implementation: str = "sdpa"):
+                 attn_implementation: str = "sdpa", int8_path: str | Path | None = None, cpu_embeddings: bool = False):
         from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
         from transformers.utils import logging as hf_logging
@@ -79,6 +103,12 @@ class QwenConditioner:
             thinker.visual = None
         thinker.lm_head = _HiddenOnly()
         thinker.requires_grad_(False).eval()
+        if int8_path:
+            from .thinker_files import load_int8_text_model
+
+            load_int8_text_model(thinker.model, int8_path, device="cpu")
+        if cpu_embeddings:
+            thinker.model.embed_tokens = _CpuEmbedding(thinker.model.embed_tokens)
         self.model = thinker.to(self.device)
         self.num_layers = int(thinker.config.text_config.num_hidden_layers)
         self.hidden_size = int(thinker.config.text_config.hidden_size)

@@ -1,10 +1,11 @@
 """Memory budgets for AuK: a 1.5B flow transformer plus the 3B Qwen2.5-Omni Thinker encoder.
 
-Weights (GB): Thinker BF16 7.5 (INT8 ConvRot about 4.5), transformer BF16 3.1 (INT8 about 1.6),
-VAE 0.6 (float32). Measured on an RTX A6000 with BF16 everywhere: 10.5 GB resident,
-11.0 GB peak for a 30 s context. The smaller tiers trade speed for memory: INT8 weights,
-then the encoder waiting in pinned CPU memory between encodes ("on_demand"), which also
-parks the transformer while the encoder runs.
+Measured whole-process peaks (GiB, CUDA context included; RTX A6000, 34 s clone request,
+docs/AUK.md): BF16 transformer and encoder resident 11.8 at section batch 1, 12.0 at 8;
+BF16 transformer with the INT8 encoder 9.1-9.3; both INT8 7.6-7.9. On demand, the encoder
+(INT8, token table in CPU memory) and the transformer with the VAE take turns on the GPU,
+one loan each per request, with bit-identical audio. INT8 saves memory, not time
+(13-28 % slower), so the BF16 transformer stays wherever it fits.
 """
 
 from .vram_presets import RuntimeConfig, auto_tier
@@ -15,12 +16,12 @@ FULL_MIN_TIER = 32
 # tier: (transformer variant, text encoder variant, text encoder residency, section batch hint)
 _INFERENCE = {
     32: ("bf16", "bf16", "gpu", 8),
-    24: ("bf16", "bf16", "gpu", 4),
-    16: ("bf16", "bf16", "gpu", 2),
-    12: ("bf16", "int8_convrot", "gpu", 1),
-    10: ("int8_convrot", "int8_convrot", "gpu", 1),
-    8: ("int8_convrot", "int8_convrot", "on_demand", 1),
-    6: ("int8_convrot", "int8_convrot", "on_demand", 1),
+    24: ("bf16", "bf16", "gpu", 8),
+    16: ("bf16", "bf16", "gpu", 8),
+    12: ("bf16", "int8_convrot", "gpu", 4),
+    10: ("int8_convrot", "int8_convrot", "gpu", 4),
+    8: ("bf16", "int8_convrot", "on_demand", 2),
+    6: ("bf16", "int8_convrot", "on_demand", 1),
 }
 
 
