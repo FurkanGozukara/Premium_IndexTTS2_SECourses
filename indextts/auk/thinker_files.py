@@ -94,6 +94,30 @@ def thinker_folder(model_dir: str | os.PathLike) -> Path:
     return slim if is_complete(slim) else full_folder(model_dir)
 
 
+def load_int8_text_model(text_model, path: str | os.PathLike, *, device, strict: bool = True):
+    """Load the ConvRot INT8 file into the Thinker text model (``thinker.model``).
+
+    ``load_gpt_checkpoint`` ends with ``model.to(dtype)``, which would also round the
+    text model's non-persistent float32 rotary frequencies (``inv_freq``,
+    ``original_inv_freq``) to BF16; the BF16 Thinker keeps them float32, so they are
+    restored here. Loading on the CPU and moving the module afterwards keeps the
+    GPU from ever holding the BF16 text weights.
+    """
+    import torch
+
+    from indextts.quant.convrot_int8 import load_gpt_checkpoint
+
+    persistent = set(text_model.state_dict().keys())
+    kept = {name: buffer.detach().clone() for name, buffer in text_model.named_buffers()
+            if name not in persistent and buffer.dtype == torch.float32}
+    report = load_gpt_checkpoint(text_model, str(path), device=device, dtype=torch.bfloat16, strict=strict)
+    for name, value in kept.items():
+        owner_path, _, leaf = name.rpartition(".")
+        owner = text_model.get_submodule(owner_path) if owner_path else text_model
+        owner._buffers[leaf] = value.to(device)
+    return report
+
+
 def slim_config(full_config: dict) -> dict:
     """The Thinker section of the Omni config, loadable as ``Qwen2_5OmniThinkerConfig``.
 
@@ -181,6 +205,7 @@ def build_slim_folder(source: str | os.PathLike, destination: str | os.PathLike,
                 total += nbytes
             partial = destination / (name + ".partial")
             save_file(tensors, str(partial), metadata={"format": "pt"})
+            shutil.copymode(source / "config.json", partial)  # safetensors creates owner-only files
             os.replace(partial, destination / name)
             if progress:
                 progress(f">> {name}: {len(tensors)} tensors, {sum(item[3] for item in shard) / 1e9:.2f} GB")
