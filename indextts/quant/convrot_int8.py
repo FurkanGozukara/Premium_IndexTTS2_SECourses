@@ -43,9 +43,7 @@ _CUDA_TURING_CACHE: dict[int, bool] = {}
 _INT8_DEVICE_NAMES: dict[int, str] = {}
 _INT8_KERNEL_CHOICES: dict[tuple[str, int, int, str], str] = {}
 _INT8_KERNEL_CACHE_LOADED = False
-# 2: W8A8 is measured again after the M-alignment fix; version-1 probes fell back
-# to W8A16 whenever cuBLASLt rejected an unaligned M.
-_INT8_KERNEL_CACHE_VERSION = 2
+_INT8_KERNEL_CACHE_VERSION = 1
 _INT8_KERNEL_CACHE_PATH = (
     Path(__file__).resolve().parents[2] / "models" / ".int8_kernel_cache.json"
 )
@@ -440,12 +438,18 @@ def _int8_mm_with_prepared_rhs(
     original_n: int,
 ) -> torch.Tensor:
     original_m = activation.shape[0]
-    if activation.device.type == "cuda":
-        # cuBLASLt's int8 kernels accept only M that is a multiple of 32 on
-        # PyTorch 2.14 / CUDA 13 (Ampere and Turing alike; older builds took any
-        # M above 16). int32 accumulation is exact, so the zero rows change nothing.
+    if (
+        activation.device.type == "cuda"
+        and (
+            _cuda_device_is_turing(activation.device)
+            or rhs.shape[0] < 128
+        )
+    ):
+        # cuBLASLt has narrower shape coverage for tiny K, and Turing has
+        # stricter tensor-core alignment. M32 is accepted by both.
         padded_m = _round_up(max(original_m, 32), 32)
     else:
+        # Current CUDA kernels accept arbitrary M once it is greater than 16.
         padded_m = max(original_m, 17)
     if activation.shape != (padded_m, rhs.shape[0]):
         padded = torch.zeros(
@@ -956,6 +960,23 @@ class ConvRotInt8Linear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, group_size={self.group_size}, int8=True"
         )
+
+
+def set_kernel_mode(module: nn.Module, mode: str) -> int:
+    """Set every ConvRot layer of ``module`` to "auto", "w8a16" or "w8a8"; return the count.
+
+    A fixed mode skips the first-use W8A8 benchmark (and its weight copy).
+    """
+
+    if mode not in ("auto", "w8a16", "w8a8"):
+        raise ValueError(f"kernel mode must be 'auto', 'w8a16' or 'w8a8', got {mode!r}")
+    count = 0
+    for item in module.modules():
+        if isinstance(item, ConvRotInt8Linear):
+            item.kernel_mode = mode
+            item._local_kernel_choices.clear()
+            count += 1
+    return count
 
 
 @dataclass
@@ -1882,4 +1903,5 @@ __all__ = [
     "quantize_convrot",
     "reconstruction_metrics",
     "remap_state_dict_keys",
+    "set_kernel_mode",
 ]

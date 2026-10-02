@@ -96,7 +96,8 @@ def thinker_folder(model_dir: str | os.PathLike) -> Path:
     return slim if is_complete(slim) else full_folder(model_dir)
 
 
-def load_int8_text_model(text_model, path: str | os.PathLike, *, device, strict: bool = True):
+def load_int8_text_model(text_model, path: str | os.PathLike, *, device, strict: bool = True,
+                         kernel_mode: str = "w8a16"):
     """Load the ConvRot INT8 file into the Thinker text model (``thinker.model``).
 
     ``load_gpt_checkpoint`` ends with ``model.to(dtype)``, which would also round the
@@ -104,10 +105,14 @@ def load_int8_text_model(text_model, path: str | os.PathLike, *, device, strict:
     ``original_inv_freq``) to BF16; the BF16 Thinker keeps them float32, so they are
     restored here. Loading on the CPU and moving the module afterwards keeps the
     GPU from ever holding the BF16 text weights.
+
+    ``kernel_mode`` defaults to W8A16: for AuK's shapes it is faster than W8A8 on the
+    measured GPU (RTX A6000) and closer to BF16, and it never runs cuBLASLt's int8
+    GEMM, which faults on some shapes with PyTorch 2.14 / CUDA 13.
     """
     import torch
 
-    from indextts.quant.convrot_int8 import load_gpt_checkpoint
+    from indextts.quant.convrot_int8 import load_gpt_checkpoint, set_kernel_mode
 
     persistent = set(text_model.state_dict().keys())
     kept = {name: buffer.detach().clone() for name, buffer in text_model.named_buffers()
@@ -117,6 +122,7 @@ def load_int8_text_model(text_model, path: str | os.PathLike, *, device, strict:
         owner_path, _, leaf = name.rpartition(".")
         owner = text_model.get_submodule(owner_path) if owner_path else text_model
         owner._buffers[leaf] = value.to(device)
+    set_kernel_mode(text_model, kernel_mode)
     return report
 
 

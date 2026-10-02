@@ -157,3 +157,4 @@ def test_int8_text_loader_keeps_float32_rope_buffers(tmp_path: Path) -> None:
     thinker_files.load_int8_text_model(loaded, destination, device="cpu")
     assert isinstance(loaded.proj, ConvRotInt8Linear) and loaded.proj.bias.dtype == torch.bfloat16
     assert loaded.inv_freq.dtype == torch.float32 and torch.equal(loaded.inv_freq, expected)
+    assert loaded.proj.kernel_mode == "w8a16"
