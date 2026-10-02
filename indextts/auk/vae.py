@@ -123,10 +123,11 @@ class CausalConvTranspose1d(nn.ConvTranspose1d):
         padding = 0 if causal else (kernel_size - stride) // 2
         super().__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
         self.causal = causal
+        self.trim = int(stride)
 
     def forward(self, x):
         x = super().forward(x)
-        return x[:, :, :-self.stride] if self.causal else x
+        return x[:, :, :-self.trim] if self.causal else x
 
 
 class EncoderConv(nn.Module):
