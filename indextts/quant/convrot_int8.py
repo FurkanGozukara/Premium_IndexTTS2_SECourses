@@ -1459,28 +1459,135 @@ def _write_raw_tensor(handle: Any, tensor: torch.Tensor) -> None:
     handle.write(value.numpy().tobytes())
 
 
-def _write_bf16_tensor(handle: Any, tensor: torch.Tensor) -> None:
+def _write_cast_tensor(handle: Any, tensor: torch.Tensor, dtype: torch.dtype) -> None:
     value = tensor.detach().cpu()
     if not value.is_contiguous():
         value = value.contiguous()
     flat = value.view(-1)
     chunk_elements = 16 * 1024 * 1024
     for start in range(0, flat.numel(), chunk_elements):
-        chunk = flat[start : start + chunk_elements].to(torch.bfloat16).contiguous()
+        chunk = flat[start : start + chunk_elements].to(dtype).contiguous()
         handle.write(chunk.view(torch.uint8).numpy().tobytes())
+
+
+def _write_bf16_tensor(handle: Any, tensor: torch.Tensor) -> None:
+    _write_cast_tensor(handle, tensor, torch.bfloat16)
+
+
+class _LazySafetensorsState(Mapping):
+    """Read-on-access view of the tensors of one or more safetensors files.
+
+    Only each file's header is read up front, so a sharded checkpoint is merged
+    without holding it in memory. ``prefix`` selects a submodel and is removed
+    from the keys. A key stored in two files is an error.
+    """
+
+    def __init__(self, files: Sequence[Path], prefix: str = "") -> None:
+        self.files = [Path(path) for path in files]
+        self._location: OrderedDict[str, tuple[int, str]] = OrderedDict()
+        self._info: dict[str, tuple[str, tuple[int, ...]]] = {}
+        self._handles: dict[int, Any] = {}
+        for index, path in enumerate(self.files):
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if prefix and not key.startswith(prefix):
+                        continue
+                    name = key[len(prefix):]
+                    if name in self._location:
+                        raise ValueError(f"Tensor {key!r} is stored in more than one source file")
+                    view = handle.get_slice(key)
+                    self._location[name] = (index, key)
+                    self._info[name] = (view.get_dtype(), tuple(view.get_shape()))
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        index, key = self._location[name]
+        handle = self._handles.get(index)
+        if handle is None:
+            handle = safe_open(str(self.files[index]), framework="pt", device="cpu")
+            self._handles[index] = handle
+        return handle.get_tensor(key)
+
+    def __iter__(self):
+        return iter(self._location)
+
+    def __len__(self) -> int:
+        return len(self._location)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._location
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        return self._info[name][1]
+
+    def nbytes(self, name: str) -> int:
+        dtype, shape = self._info[name]
+        return math.prod(shape) * _DTYPE_BYTES[dtype]
+
+
+def _state_shape(state: Mapping[str, torch.Tensor], key: str) -> list[int]:
+    if isinstance(state, _LazySafetensorsState):
+        return list(state.shape(key))
+    return list(state[key].shape)
+
+
+def _state_nbytes(state: Mapping[str, torch.Tensor]) -> int:
+    if isinstance(state, _LazySafetensorsState):
+        return sum(state.nbytes(key) for key in state)
+    return sum(value.numel() * value.element_size() for value in state.values())
+
+
+def _source_files(source: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> tuple[list[Path], Path | None]:
+    """The safetensors files of a list or directory source and the directory itself.
+
+    A directory with a ``*.safetensors.index.json`` contributes the shards named in
+    its weight map; otherwise every ``*.safetensors`` file in it, in name order.
+    """
+
+    if isinstance(source, (str, os.PathLike)):
+        folder = Path(source).expanduser().resolve()
+        if not folder.is_dir():
+            raise FileNotFoundError(folder)
+        names: set[str] = set()
+        for index in sorted(folder.glob("*.safetensors.index.json")):
+            weight_map = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
+            names.update(str(name) for name in weight_map.values())
+        files = [folder / name for name in sorted(names)] if names else sorted(folder.glob("*.safetensors"))
+    else:
+        folder = None
+        files = [Path(item).expanduser().resolve() for item in source]
+    if not files:
+        raise FileNotFoundError(f"No .safetensors source files in {source}")
+    for path in files:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() != ".safetensors":
+            raise ValueError(f"Multi-file sources must be .safetensors files: {path}")
+    return files, folder
+
+
+def _float32_keys(
+    state: Mapping[str, torch.Tensor], keep_float32: Sequence[str] | None
+) -> set[str]:
+    """Keys equal to or ending with one of ``keep_float32`` (``str.endswith`` matching)."""
+
+    if not keep_float32:
+        return set()
+    patterns = tuple(str(item) for item in keep_float32 if str(item))
+    return {key for key in state if key.endswith(patterns)} if patterns else set()
 
 
 def _make_output_plan(
     state: Mapping[str, torch.Tensor],
     targets: Mapping[str, Mapping[str, Any]],
     quantized: Mapping[str, tuple[torch.Tensor, torch.Tensor, int]],
+    float32_keys: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, tuple[str, Any]]:
     target_by_key = {item["source_key"]: base for base, item in targets.items()}
     plan: dict[str, tuple[str, Any]] = {}
-    for key, value in state.items():
+    for key in state:
         base = target_by_key.get(key)
         if base is None:
-            plan[key] = ("bf16", key)
+            plan[key] = ("f32" if key in float32_keys else "bf16", key)
             continue
         q, scale, group_size = quantized[base]
         plan[key] = ("tensor", q)
@@ -1494,7 +1601,9 @@ def _plan_dtype_shape(
 ) -> tuple[str, list[int]]:
     kind, payload = item
     if kind == "bf16":
-        return "BF16", list(state[payload].shape)
+        return "BF16", _state_shape(state, payload)
+    if kind == "f32":
+        return "F32", _state_shape(state, payload)
     tensor = payload
     dtype = {
         torch.int8: "I8",
@@ -1537,6 +1646,8 @@ def _write_streaming_safetensors(
             kind, payload = plan[key]
             if kind == "bf16":
                 _write_bf16_tensor(handle, state[payload])
+            elif kind == "f32":
+                _write_cast_tensor(handle, state[payload], torch.float32)
             else:
                 _write_raw_tensor(handle, payload)
         handle.flush()
@@ -1561,7 +1672,7 @@ def _emit(progress: Callable[[str], Any] | None, message: str) -> None:
 
 
 def convert_gpt_checkpoint(
-    src_pth: str,
+    src_pth: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
     dst_safetensors: str,
     *,
     group_sizes: Sequence[int] = DEFAULT_GROUP_SIZES,
@@ -1573,6 +1684,7 @@ def convert_gpt_checkpoint(
     linear_targets: Sequence[str] | None = None,
     state_prefix: str = "",
     model_id: str = "IndexTeam/IndexTTS-2.5",
+    keep_float32: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Convert a transformer checkpoint to mixed BF16/INT8 ConvRot.
 
@@ -1580,18 +1692,32 @@ def convert_gpt_checkpoint(
     ComfyUI/``nn.Linear`` ``[out, in]`` layout before rotation. The destination
     and JSON report are both installed atomically. Other architectures supply
     their nn.Linear paths; an optional prefix selects a submodel such as OmniVoice's llm.
+
+    ``src_pth`` is one checkpoint file, or a sharded safetensors checkpoint given
+    as a directory or a list of files; shards are merged lazily (tensors are
+    read when written). Non-quantized tensors whose key (after ``state_prefix``)
+    equals or ends with an entry of ``keep_float32`` are stored as F32, every
+    other one as BF16.
     """
 
     started = time.perf_counter()
-    source = Path(src_pth).expanduser().resolve()
+    single_file = isinstance(src_pth, (str, os.PathLike)) and not Path(src_pth).expanduser().is_dir()
+    if single_file:
+        source = Path(src_pth).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        source_files, source_folder = [source], None
+    else:
+        source_files, source_folder = _source_files(src_pth)
+        parents = {path.parent for path in source_files}
+        source = source_folder or (source_files[0] if len(source_files) == 1 or len(parents) > 1
+                                   else parents.pop())
     destination = Path(dst_safetensors).expanduser().resolve()
     report_destination = (
         Path(report_path).expanduser().resolve()
         if report_path is not None
         else destination.with_suffix(".report.json")
     )
-    if not source.is_file():
-        raise FileNotFoundError(source)
     if destination.suffix.lower() != ".safetensors":
         raise ValueError("Destination must end with .safetensors")
     resolved_groups = tuple(int(size) for size in group_sizes)
@@ -1601,23 +1727,31 @@ def convert_gpt_checkpoint(
     if target_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA conversion was requested, but CUDA is unavailable")
 
-    _emit(progress, f"Loading source checkpoint with mmap: {source}")
-    state = _torch_load_state_dict(source)
-    if state_prefix:
-        state = OrderedDict((key[len(state_prefix):], value) for key, value in state.items() if key.startswith(state_prefix))
-        if not state:
-            raise ValueError(f"No tensors matched prefix {state_prefix!r}")
+    if single_file:
+        _emit(progress, f"Loading source checkpoint with mmap: {source}")
+        state = _torch_load_state_dict(source)
+        if state_prefix:
+            state = OrderedDict((key[len(state_prefix):], value) for key, value in state.items() if key.startswith(state_prefix))
+    else:
+        _emit(progress, f"Indexing {len(source_files)} safetensors source file(s) lazily: {source}")
+        state = _LazySafetensorsState(source_files, state_prefix)
+    if state_prefix and not state:
+        raise ValueError(f"No tensors matched prefix {state_prefix!r}")
     if linear_targets is None:
         targets = _select_conversion_targets(state, quantize_emo_encoder=quantize_emo_encoder)
     else:
         targets = OrderedDict()
         for base in linear_targets:
             key = f"{base}.weight"
-            if key not in state or state[key].ndim != 2:
+            if key not in state or len(_state_shape(state, key)) != 2:
                 raise ValueError(f"Missing 2-D Linear weight: {key}")
             targets[base] = {"source_key": key, "transpose": False}
         if not targets:
             raise ValueError("At least one Linear target is required")
+    float32_keys = _float32_keys(state, keep_float32)
+    overlap = sorted(float32_keys & {item["source_key"] for item in targets.values()})
+    if overlap:
+        raise ValueError(f"keep_float32 matches quantized Linear weights: {overlap[:4]}")
     _emit(
         progress,
         f"Quantizing {len(targets)} layers with groups {resolved_groups} "
@@ -1660,12 +1794,12 @@ def convert_gpt_checkpoint(
     groups = {base: value[2] for base, value in quantized.items()}
     metadata = _json_metadata(groups, source.name)
     metadata["indextts_model"] = model_id
-    output_plan = _make_output_plan(state, targets, quantized)
+    output_plan = _make_output_plan(state, targets, quantized, float32_keys)
     _emit(progress, f"Writing {len(output_plan)} tensors atomically to {destination}")
     _write_streaming_safetensors(destination, state, output_plan, metadata)
 
     errors = [item["relative_weight_error_pct"] for item in layer_reports]
-    source_bytes = source.stat().st_size
+    source_bytes = sum(path.stat().st_size for path in source_files)
     output_bytes = destination.stat().st_size
     elapsed = time.perf_counter() - started
     report: dict[str, Any] = {
@@ -1674,7 +1808,7 @@ def convert_gpt_checkpoint(
         "source": str(source),
         "state_prefix": state_prefix,
         "model_id": model_id,
-        "selected_source_bytes": sum(value.numel() * value.element_size() for value in state.values()),
+        "selected_source_bytes": _state_nbytes(state),
         "output": str(destination),
         "report": str(report_destination),
         "method": (
@@ -1700,6 +1834,11 @@ def convert_gpt_checkpoint(
         "metadata": metadata,
         "layers": layer_reports,
     }
+    if not single_file:
+        report["source_files"] = [str(path) for path in source_files]
+    if keep_float32:
+        report["keep_float32"] = [str(item) for item in keep_float32]
+        report["f32_tensors"] = sum(1 for item in output_plan.values() if item[0] == "f32")
     _write_json_atomic(report_destination, report)
     _emit(
         progress,
