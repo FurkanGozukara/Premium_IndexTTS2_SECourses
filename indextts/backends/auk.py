@@ -54,13 +54,14 @@ GENERATION_DEFAULTS = {
     "mode": "clone", "reference_text": "", "voice_description": "",
     "num_step": 32, "guidance_scale": 2.0, "sway_coef": -1.0, "solver": "euler",
     "max_reference_seconds": 12.0, "trim_reference_silence": True,
-    "speech_rate": 0.0, "edge_seconds": 0.25, "match_loudness": True,
+    "edge_seconds": 0.0, "match_loudness": True,
 }
-# Characters (UTF-8 bytes, as upstream measures text) per second of ordinary speech
-# when neither a reference nor a trained voice gives the pace. One CJK character is
-# three bytes, so Mandarin at about 4.5 characters per second lands near English's
-# 14 characters per second.
-DEFAULT_BYTES_PER_SECOND = 14.0
+# Upstream's Prompt Enhancer duration model (pe.config.yaml runtime.duration): seconds of
+# ordinary speech per UTF-8 byte of normalized text, by script; text under 10 bytes is
+# slowed to 0.3x speed when no reference sets the pace.
+SECONDS_PER_BYTE = {"en": 0.0656, "zh": 0.0803}
+SHORT_TEXT_BYTES = 10
+SHORT_TEXT_SPEED = 0.3
 SEGMENT_SECONDS_LIMIT = MAX_CONTEXT_SECONDS
 
 
@@ -96,8 +97,44 @@ def normalize_auk_text(text: str, language: str = "auto") -> str:
 
 
 def text_units(text: str) -> int:
-    """Upstream's duration measure: the UTF-8 byte length of the spoken text."""
+    """UTF-8 byte length of the spoken text."""
     return len(str(text).strip().encode("utf-8"))
+
+
+def _script(character: str) -> str | None:
+    code = ord(character)
+    if 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF:
+        return "zh"
+    if character.isascii() and character.isalpha():
+        return "en"
+    return None
+
+
+def f5_seconds(text: str, language: str = "en") -> float:
+    """Upstream's language-weighted byte duration: CJK characters count as Chinese, ASCII
+    letters as English, and every other character takes the script before it (else the
+    one after it, else the text language)."""
+    text = str(text).strip()
+    scripts = [_script(character) for character in text]
+    default = "zh" if str(language).lower() == "zh" else "en"
+    seconds, previous = 0.0, None
+    for index, character in enumerate(text):
+        script = scripts[index] or previous
+        if script is None:
+            script = next((item for item in scripts[index + 1:] if item), default)
+        previous = scripts[index] or previous
+        seconds += len(character.encode("utf-8")) * SECONDS_PER_BYTE[script]
+    return seconds
+
+
+def speech_span(audio: np.ndarray, sample_rate: int, gate_db: float = -40.0) -> float:
+    """Seconds from the first to the last frame within ``gate_db`` of the peak (a VAD span)."""
+    frame = max(1, int(sample_rate * 0.01))
+    rms = _quiet_frames(audio, frame)
+    if not len(rms) or float(rms.max()) <= 0:
+        return len(audio) / sample_rate
+    loud = np.nonzero(rms >= float(rms.max()) * 10 ** (gate_db / 20.0))[0]
+    return (int(loud[-1]) + 1 - int(loud[0])) * frame / sample_rate if len(loud) else len(audio) / sample_rate
 
 
 def quote_text(text: str) -> str:
@@ -285,10 +322,10 @@ class PreparedReference:
     """A reference cut for the model: 24 kHz for the VAE, 16 kHz for the Qwen audio encoder."""
 
     def __init__(self, audio24: np.ndarray, audio16: np.ndarray, transcript: str, speech_seconds: float,
-                 bytes_per_second: float | None, source: str):
+                 pace: float | None, source: str):
         self.audio24, self.audio16 = audio24, audio16
         self.transcript, self.speech_seconds = transcript, speech_seconds
-        self.bytes_per_second, self.source = bytes_per_second, source
+        self.pace, self.source = pace, source
         self.seconds = len(audio24) / SAMPLE_RATE
         self.rms = _rms(audio24)
         self.latent = None
@@ -405,18 +442,21 @@ class AukEngine:
         audio, rate = read_audio(path)
         if settings["trim_reference_silence"]:
             audio = trim_silence(audio, rate)
-        full_seconds = len(audio) / rate
+        speech_seconds = speech_span(audio, rate)
         if not transcript:
             transcript = self._cached_transcript(path, audio, rate, language)
-        units = text_units(transcript)
-        bytes_per_second = units / full_seconds if units and full_seconds > 0.5 else None
+        transcript = normalize_auk_text(transcript, language)
+        # The reference speaker's pace relative to upstream's byte model (upstream scales
+        # the reference's speech span by the target/reference weighted-byte ratio).
+        reference_f5 = f5_seconds(transcript, language) if transcript else 0.0
+        pace = speech_seconds / reference_f5 if reference_f5 > 0.3 and speech_seconds > 0.5 else None
         audio = cut_at_pause(audio, rate, float(settings["max_reference_seconds"]))
         audio24 = resample(audio, rate, SAMPLE_RATE)
         audio24 = audio24[: len(audio24) // HOP * HOP]
         from indextts.auk.conditioning import to_encoder_rate
 
         audio16 = to_encoder_rate(audio, rate)
-        reference = PreparedReference(audio24, audio16, transcript, full_seconds, bytes_per_second, str(path))
+        reference = PreparedReference(audio24, audio16, transcript, speech_seconds, pace, str(path))
         self._reference_key, self._reference = key, reference
         return reference
 
@@ -459,22 +499,27 @@ class AukEngine:
 
     # ------------------------------------------------------------------ duration
 
-    def speech_rate(self, settings, reference: PreparedReference | None) -> float:
-        """Bytes of text per second of speech for the active voice."""
-        explicit = float(settings.get("speech_rate") or 0.0)
-        if explicit > 0:
-            return explicit
-        if reference is not None and reference.bytes_per_second:
-            return float(reference.bytes_per_second)
-        voice_rate = self._voice.get("bytes_per_second")
-        if voice_rate:
-            return float(voice_rate)
-        return DEFAULT_BYTES_PER_SECOND
+    def pace(self, reference: PreparedReference | None) -> tuple[float, str]:
+        """Speech time per unit of upstream's byte model for the active voice, and its source."""
+        if reference is not None and reference.pace:
+            return float(min(3.0, max(0.33, reference.pace))), "reference"
+        voice_pace = self._voice.get("pace")
+        if voice_pace:
+            return float(min(3.0, max(0.33, float(voice_pace)))), "trained voice"
+        return 1.0, "default"
 
-    def estimate_seconds(self, text, rate, *, edge_seconds=0.25, duration_factor=1.0, max_seconds=None) -> float:
-        seconds = text_units(text) / max(1.0, rate) * float(duration_factor) + float(edge_seconds)
-        limit = float(max_seconds or SEGMENT_SECONDS_LIMIT)
-        return float(min(max(0.6, seconds), limit))
+    @staticmethod
+    def estimate_seconds(text, language, pace, *, paced_by_reference=False, edge_seconds=0.0,
+                         duration_factor=1.0, max_seconds=None) -> float:
+        """Target length of one section, on the 50 Hz latent grid."""
+        seconds = f5_seconds(text, language) * float(pace)
+        if text_units(text) < SHORT_TEXT_BYTES:
+            # Upstream slows very short text to 0.3x; with a reference that leaves a long
+            # padded slot, so cloned short text keeps its pace with a one-second floor.
+            seconds = max(1.0, seconds) if paced_by_reference else seconds / SHORT_TEXT_SPEED
+        seconds = seconds * float(duration_factor) + float(edge_seconds)
+        seconds = min(max(0.4, seconds), float(max_seconds or SEGMENT_SECONDS_LIMIT))
+        return math.ceil(seconds * LATENT_RATE) / LATENT_RATE
 
     # ------------------------------------------------------------------ synthesis core
 
@@ -560,7 +605,7 @@ class AukEngine:
             if not spk_audio_prompt or not Path(spk_audio_prompt).is_file():
                 raise ValueError("Voice cloning requires reference audio. Choose Auto voice or Voice design to generate without it.")
             reference = self.prepare_reference(spk_audio_prompt, settings, language)
-        rate = self.speech_rate(settings, reference)
+        pace, pace_source = self.pace(reference)
         description = settings["voice_description"] if mode == "design" else self._voice.get("description", "")
         budget = SEGMENT_SECONDS_LIMIT - (reference.seconds if reference is not None else 0.0)
 
@@ -591,8 +636,9 @@ class AukEngine:
                 raise ValueError("Enter some text to generate speech.")
             plans.append(plan)
             factor = float(duration_factor)
-            estimated = [self.estimate_seconds(part, rate, edge_seconds=settings["edge_seconds"],
-                                               duration_factor=factor, max_seconds=budget) for part in speech[first:]]
+            estimated = [self.estimate_seconds(part, language, pace, paced_by_reference=pace_source == "reference",
+                                               edge_seconds=settings["edge_seconds"], duration_factor=factor,
+                                               max_seconds=budget) for part in speech[first:]]
             if target_duration_s and target_duration_mode == "natural":
                 fixed = sum(value for kind, value in plan if kind != "segment") / self.sampling_rate
                 scale = max(0.1, float(target_duration_s) - fixed) / max(1e-6, sum(estimated))
@@ -650,7 +696,8 @@ class AukEngine:
             "mean_duration_s": float(np.mean(durations)), "min_duration_s": min(durations),
             "max_duration_s": max(durations), "generation_time_s": time.perf_counter() - started,
             "model": self.model_id, "section_batch_size": batch_size,
-            "bytes_per_second": rate, "voice_mode": mode,
+            "pace": round(pace, 4), "pace_source": pace_source, "voice_mode": mode,
+            "section_seconds": [round(value, 2) for value in natural],
             "peak_vram_gb": torch.cuda.max_memory_allocated(self.device) / 1024**3 if cuda else 0.0,
             "protected_pauses": protected_by_text.get(0, []) if len(texts) == 1 else [],
         }
