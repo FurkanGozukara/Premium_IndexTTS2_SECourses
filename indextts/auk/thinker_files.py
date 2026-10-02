@@ -28,7 +28,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 FULL_FOLDER = "qwen2_5_omni_3b"
-SLIM_FOLDER = Path("quantized") / "AuK" / "qwen2_5_omni_thinker"
+# The slim folder's path inside the quantized-weights repository and under models/quantized.
+SLIM_REPO_FOLDER = "AuK/qwen2_5_omni_thinker"
+SLIM_FOLDER = Path("quantized") / SLIM_REPO_FOLDER
 # What Qwen2_5OmniProcessor reads: tokenizer, chat template, audio feature extractor
 # and the (unused) image processor settings that share preprocessor_config.json.
 PROCESSOR_FILES = ("added_tokens.json", "chat_template.json", "merges.txt", "preprocessor_config.json",

@@ -43,7 +43,9 @@ _CUDA_TURING_CACHE: dict[int, bool] = {}
 _INT8_DEVICE_NAMES: dict[int, str] = {}
 _INT8_KERNEL_CHOICES: dict[tuple[str, int, int, str], str] = {}
 _INT8_KERNEL_CACHE_LOADED = False
-_INT8_KERNEL_CACHE_VERSION = 1
+# 2: W8A8 is measured again after the M-alignment fix; version-1 probes fell back
+# to W8A16 whenever cuBLASLt rejected an unaligned M.
+_INT8_KERNEL_CACHE_VERSION = 2
 _INT8_KERNEL_CACHE_PATH = (
     Path(__file__).resolve().parents[2] / "models" / ".int8_kernel_cache.json"
 )
@@ -438,18 +440,12 @@ def _int8_mm_with_prepared_rhs(
     original_n: int,
 ) -> torch.Tensor:
     original_m = activation.shape[0]
-    if (
-        activation.device.type == "cuda"
-        and (
-            _cuda_device_is_turing(activation.device)
-            or rhs.shape[0] < 128
-        )
-    ):
-        # cuBLASLt has narrower shape coverage for tiny K, and Turing has
-        # stricter tensor-core alignment. M32 is accepted by both.
+    if activation.device.type == "cuda":
+        # cuBLASLt's int8 kernels accept only M that is a multiple of 32 on
+        # PyTorch 2.14 / CUDA 13 (Ampere and Turing alike; older builds took any
+        # M above 16). int32 accumulation is exact, so the zero rows change nothing.
         padded_m = _round_up(max(original_m, 32), 32)
     else:
-        # Current CUDA kernels accept arbitrary M once it is greater than 16.
         padded_m = max(original_m, 17)
     if activation.shape != (padded_m, rhs.shape[0]):
         padded = torch.zeros(

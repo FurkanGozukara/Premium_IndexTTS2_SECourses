@@ -152,6 +152,32 @@ def test_sharded_conversion_loads_and_matches_the_float_model(tmp_path: Path) ->
     assert relative < 0.03
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("rows", [17, 33, 257, 1994])
+def test_cuda_w8a8_accepts_unaligned_rows(rows: int) -> None:
+    # AuK's transformer sees M = 2 x (text + reference + target frames), rarely a
+    # multiple of 32; forced W8A8 must run and agree with W8A16.
+    from indextts.quant.convrot_int8 import _int8_gemm_supported
+
+    device = torch.device("cuda")
+    if not _int8_gemm_supported(device):
+        pytest.skip("torch._int_mm is unavailable")
+    generator = torch.Generator(device=device).manual_seed(rows)
+    layer = ConvRotInt8Linear(1536, 512, bias=True, group_size=256, device=device, dtype=torch.bfloat16)
+    layer.weight_int8.random_(-127, 128, generator=generator)
+    layer.weight_scale.uniform_(0.0002, 0.002, generator=generator)
+    layer.bias.data.normal_(generator=generator)
+    x = torch.randn((rows, 1536), device=device, dtype=torch.bfloat16, generator=generator)
+    with torch.inference_mode():
+        layer.kernel_mode = "w8a16"
+        w8a16 = layer(x)
+        layer.kernel_mode = "w8a8"
+        w8a8 = layer(x)
+    relative = float((w8a8.float() - w8a16.float()).norm() / w8a16.float().norm())
+    assert relative < 0.02
+
+
 def test_meta_initialized_model_loads_and_moves(tmp_path: Path) -> None:
     # AuK builds its INT8 transformer on the meta device and lets the checkpoint
     # supply every tensor; the never-filled W8A8 cache must not block .to().
