@@ -79,7 +79,8 @@ def build_auk_edit_tab(args: Any, registry: PresetRegistry) -> AukEditTab:
                     "recordings, piece by piece at pauses.")
         with gr.Row():
             with gr.Column(scale=1, min_width=380):
-                tab.source = gr.Audio(label="Source audio", type="filepath", sources=["upload", "microphone"])
+                tab.source = gr.Audio(label="Source audio", type="filepath", sources=["upload", "microphone"],
+                                      elem_id="auk-edit-source")
                 c["auk_edit.task"] = _register(registry, "auk_edit.task", gr.Dropdown(
                     choices=[(task.label, key) for key, task in TASKS.items()], value="enhance", label="Task"),
                     kind="choice", choices=list(TASKS))
@@ -135,7 +136,8 @@ def build_auk_edit_tab(args: Any, registry: PresetRegistry) -> AukEditTab:
                                                  info="Sets the length of content edits; blank transcribes the source once."),
                         "str")
             with gr.Column(scale=1, min_width=380):
-                tab.preview = gr.Textbox(label="Instruction sent to AuK", lines=3, interactive=False, buttons=["copy"])
+                tab.preview = gr.Textbox(value=render_instruction("enhance", {}), label="Instruction sent to AuK", lines=3,
+                                         interactive=False, buttons=["copy"], elem_id="auk-edit-instruction")
                 tab.notes = gr.Markdown("")
                 with gr.Row():
                     c["auk_edit.duration_mode"] = _register(registry, "auk_edit.duration_mode", gr.Radio(
