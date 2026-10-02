@@ -62,19 +62,32 @@ def ensure_model(model_dir, *, dit_variant="bf16", text_variant="bf16", progress
     """Download public weights on demand, retaining Hugging Face's resume cache."""
     from huggingface_hub import hf_hub_download, snapshot_download
 
+    from indextts.auk.thinker_files import SLIM_REPO_FOLDER, full_folder, is_complete, slim_folder
+
     root = Path(model_dir)
-    folder, qwen = root / "auk", root / "qwen2_5_omni_3b"
+    folder = root / "auk"
     if not all((folder / name).is_file() for name in ("config.yaml", "auk_base.safetensors", "vae.safetensors")):
         print(f">> Downloading public AuK model to {folder}", flush=True)
         if progress:
             progress(0, desc="Downloading AuK weights")
         snapshot_download(MODEL_REPO, local_dir=str(folder), allow_patterns=["*.safetensors", "config.yaml", "LICENSE"])
-    if not all((qwen / name).is_file() for name in ("config.json", "preprocessor_config.json", "tokenizer.json")) \
-            or not any(qwen.glob("*.safetensors")):
-        print(f">> Downloading the Qwen2.5-Omni-3B text and audio encoder to {qwen}", flush=True)
-        if progress:
-            progress(0, desc="Downloading the Qwen2.5-Omni-3B encoder")
-        snapshot_download(TEXT_ENCODER_REPO, local_dir=str(qwen))
+    # AuK runs only the Thinker (text model and audio tower): the slim folder (7.5 GB) gives
+    # bitwise-identical conditioning to the 12 GB public snapshot, which keeps working when present.
+    qwen = slim_folder(root)
+    if not is_complete(qwen):
+        if is_complete(full_folder(root)):
+            qwen = full_folder(root)
+        else:
+            print(f">> Downloading the Qwen2.5-Omni-3B Thinker (text and audio encoder, 7.5 GB) to {qwen}", flush=True)
+            if progress:
+                progress(0, desc="Downloading the Qwen2.5-Omni-3B Thinker encoder")
+            try:
+                snapshot_download(QUANT_REPO, local_dir=str(root / "quantized"), allow_patterns=[f"{SLIM_REPO_FOLDER}/*"])
+            except Exception as exc:  # the slim folder is unavailable: fall back to the public snapshot
+                print(f">> Slim Thinker download failed ({exc}); downloading the full Qwen2.5-Omni-3B snapshot", flush=True)
+            if not is_complete(qwen):
+                qwen = full_folder(root)
+                snapshot_download(TEXT_ENCODER_REPO, local_dir=str(qwen))
     quantized = {}
     for part, wanted in (("dit", dit_variant), ("text", text_variant)):
         if wanted != "int8_convrot":
@@ -264,19 +277,26 @@ class AukEngine:
               f"text encoder {self.runtime.auk_text_encoder_variant} ({self.text_residency})", flush=True)
         self.config = read_config(folder)
         text_device = self.device if self.text_residency == "gpu" else "cpu"
-        self.conditioner = QwenConditioner(qwen_dir, device=text_device, dtype=torch.bfloat16 if cuda else torch.float32,
+        int8_text = "text" in quantized
+        # The INT8 text model is quantized on the CPU and then moved, so the GPU never holds its
+        # BF16 weights; the loader keeps Qwen's float32 RoPE frequencies and pins W8A16 kernels.
+        self.conditioner = QwenConditioner(qwen_dir, device="cpu" if int8_text else text_device,
+                                           dtype=torch.bfloat16 if cuda else torch.float32,
                                            attn_implementation=self.runtime.attention_backend)
-        if "text" in quantized:
-            from indextts.quant.convrot_int8 import load_gpt_checkpoint
+        if int8_text:
+            from indextts.auk.thinker_files import load_int8_text_model
 
-            load_gpt_checkpoint(self.conditioner.model.model, str(quantized["text"]), device=text_device,
-                                dtype=torch.bfloat16, strict=True)
+            load_int8_text_model(self.conditioner.model.model, quantized["text"], device="cpu")
+            self.conditioner.to(text_device)
         self._text_offload = OffloadedModule(self.conditioner.model, self.device) if self.text_residency != "gpu" else None
         num_layers = self.conditioner.num_layers
         if "dit" in quantized:
             from indextts.auk.loader import build_int8_model
+            from indextts.quant.convrot_int8 import set_kernel_mode
 
             self.model = build_int8_model(self.config, quantized["dit"], device=self.device, num_text_layers=num_layers)
+            # W8A16 is faster than W8A8 for AuK's shapes (and never calls cuBLASLt's int8 GEMM).
+            set_kernel_mode(self.model, "w8a16")
         else:
             state = read_state(folder / "auk_base.safetensors")
             self.model = build_model(self.config, state, device=self.device, dtype=self.dtype, num_text_layers=num_layers)
