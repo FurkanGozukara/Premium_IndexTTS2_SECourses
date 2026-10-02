@@ -27,7 +27,6 @@ INDEX_ONLY = frozenset({
     "generation.segment_budget_scale_non_cjk", "generation.prevent_vram_accumulation",
     "generation.max_consecutive_silence", "generation.auto_retry_incomplete_speech",
     "generation.max_speech_retries", "generation.max_speech_split_depth",
-    "generation.apply_pronunciation_dictionary",
     "generation.do_sample", "generation.temperature", "generation.top_p", "generation.top_k",
     "generation.num_beams", "generation.repetition_penalty", "generation.repetition_window",
     "generation.length_penalty", "generation.max_mel_tokens",
@@ -57,6 +56,8 @@ GENERATION_PROFILED = frozenset({
     "generation.max_text_tokens_per_segment", "generation.auto_lora_max_tokens",
     "generation.auto_lora_reference", "generation.auto_lora_speaking_rate",
     "generation.speaking_rate", "generation.section_batch_size",
+    # Both engines read dictionary readings; whether they help depends on the model.
+    "generation.apply_pronunciation_dictionary",
 })
 # Hardware and the prepared dataset belong to the machine, not to a model.
 SHARED_ACROSS_MODELS = frozenset({"runtime.device", "training.dataset_dir", "training.device"})
@@ -137,7 +138,9 @@ def model_defaults(registry, model, tier="auto"):
             "runtime.blocks_to_swap": 0, "runtime.use_qwen_emo": False,
             "generation.max_text_tokens_per_segment": 120,
             "generation.latent_multiplier": 1.72,
-            "generation.apply_pronunciation_dictionary": False,
+            # Dictionary readings reach OmniVoice as CMU phones; with the "unseen" scope they raised
+            # the technical terms read correctly (round 3: 77 vs 75 % for a trained voice, 75 vs 72 % base).
+            "generation.apply_pronunciation_dictionary": True,
             "generation.auto_lora_emotion_reference": False,
             "generation.auto_lora_speaking_rate": False,
             "generation.auto_lora_max_tokens": False,

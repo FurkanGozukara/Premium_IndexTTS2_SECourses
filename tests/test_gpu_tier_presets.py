@@ -104,11 +104,22 @@ def test_persisted_runtime_only_overlays_a_preset_of_its_own_tier():
 
 
 @pytest.fixture(scope="module")
-def demo():
-    return build_app(SimpleNamespace(
-        model_dir="models", device="cpu", verbose=False, no_browser=True,
-        port=7861, host="127.0.0.1", share=False,
-    ))
+def demo(tmp_path_factory):
+    # A temporary preset folder: the test saves, deletes and loads presets, which must never touch
+    # the user's presets or their last-used bookmark.
+    from ui import app
+    from ui.presets_store import PresetStore
+
+    root = tmp_path_factory.mktemp("presets")
+    original = app.PresetStore
+    app.PresetStore = lambda registry, _root: PresetStore(registry, root, detect_tier=lambda: 32)
+    try:
+        return build_app(SimpleNamespace(
+            model_dir="models", device="cpu", verbose=False, no_browser=True,
+            port=7861, host="127.0.0.1", share=False,
+        ))
+    finally:
+        app.PresetStore = original
 
 
 def test_app_lists_the_tier_presets_first_and_builds_training_from_them(demo):

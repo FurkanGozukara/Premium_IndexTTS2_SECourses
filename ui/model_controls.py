@@ -168,8 +168,11 @@ def build_omnivoice_controls(registry):
         gr.Markdown("Clone a reference voice, design a voice with supported tags, or let OmniVoice choose. Reference audio works best at 3–10 seconds; an exact transcript avoids loading automatic transcription.")
         def register(name, component, **kwargs):
             return registry.register("omnivoice." + name, component, component.value, **kwargs)
-        quality = gr.Radio(["Max speed", "Balanced", "Max quality", "Custom"], value="Balanced",
-                           label="Sampling preset", info="16 / 32 / 64 diffusion steps with guidance 2. More steps do not guarantee better speech for every prompt.")
+        # Measured on held-out sentences (word errors, speaker and style similarity to the real recordings):
+        # 32 steps with guidance 2 scored best; 64 steps was slower and not better, 16 steps is about twice as fast.
+        quality = gr.Radio(["Fast", "Best quality", "64 steps", "Custom"], value="Best quality",
+                           label="Sampling preset", info="Best quality: 32 diffusion steps, guidance 2 (measured best). Fast: 16 steps, "
+                                                         "about twice as fast. 64 steps measured slower and not better.")
         with gr.Row():
             register("mode", gr.Dropdown(choices=[("Voice cloning", "clone"), ("Auto voice", "auto"), ("Voice design", "design")], value="clone", label="Voice mode"), kind="choice", choices=["clone", "auto", "design"])
             register("instruct", gr.Textbox(value="", label="Voice tags", placeholder="male, middle-aged, moderate pitch, british accent", info="Supported tags separated by commas; choose at most one gender, age, pitch and accent. Open the tag list below."), kind="str")
@@ -178,14 +181,14 @@ def build_omnivoice_controls(registry):
             gr.Markdown("**English:** " + ", ".join(sorted(tags._INSTRUCT_VALID_EN)) + "\n\n**Chinese:** " + "，".join(sorted(tags._INSTRUCT_VALID_ZH)))
         register("reference_text", gr.Textbox(value="", label="Reference transcript", lines=2, info="The exact words in the reference clip. Blank downloads and runs automatic transcription on demand."), kind="str")
         with gr.Row():
-            register("num_step", gr.Slider(4, 128, value=32, step=1, label="OmniVoice diffusion steps", info="32 is the official default. Lower values trade detail for speed."), kind="int", minimum=4, maximum=128)
-            register("guidance_scale", gr.Slider(0, 8, value=2.0, step=0.1, label="OmniVoice guidance", info="2.0 is the official default."), kind="float", minimum=0, maximum=8)
+            register("num_step", gr.Slider(4, 128, value=32, step=1, label="OmniVoice diffusion steps", info="32 is the official default and measured best. Lower values trade detail for speed."), kind="int", minimum=4, maximum=128)
+            register("guidance_scale", gr.Slider(0, 8, value=2.0, step=0.1, label="OmniVoice guidance", info="2.0 is the official default and measured best (1.5 and 3.0 were worse)."), kind="float", minimum=0, maximum=8)
         sampling = [registry["omnivoice.num_step"].component, registry["omnivoice.guidance_scale"].component]
         # The preset radio and the sliders mirror each other with plain arithmetic, in the browser.
         quality.input(None, [quality, *sampling], sampling, queue=False, api_name=False, show_progress="hidden",
-                      js="(preset, steps, guidance) => preset === 'Custom' ? [steps, guidance] : [{'Max speed': 16, 'Balanced': 32, 'Max quality': 64}[preset], 2]")
+                      js="(preset, steps, guidance) => preset === 'Custom' ? [steps, guidance] : [{'Fast': 16, 'Best quality': 32, '64 steps': 64}[preset], 2]")
         gr.on([control.change for control in sampling], None, sampling, quality, queue=False, api_name=False,
-              show_progress="hidden", js="(steps, guidance) => Number(guidance) === 2 ? ({16: 'Max speed', 32: 'Balanced', 64: 'Max quality'}[Number(steps)] || 'Custom') : 'Custom'")
+              show_progress="hidden", js="(steps, guidance) => Number(guidance) === 2 ? ({16: 'Fast', 32: 'Best quality', 64: '64 steps'}[Number(steps)] || 'Custom') : 'Custom'")
         with gr.Accordion("Advanced OmniVoice sampling", open=False):
             with gr.Row():
                 for name, label, default, low, high, step in (
@@ -224,11 +227,16 @@ def bind_model_controls(registry, generation, models, training, grid):
             add_model_class(block, "auk")
 
     method = registry["training.adapter_type"].component
+    # Full fine-tuning trains every one of these modules itself; the INT8 export applies to it alone.
     adapter_fields = [registry["training." + name].component for name in
-                      ("rank", "alpha", "dropout", "target_attention", "target_mlp", "train_mel_embed_head", "train_full_modules_fp32")]
+                      ("rank", "alpha", "dropout", "target_attention", "target_mlp", "train_mel_embed_head", "train_full_modules_fp32",
+                       "train_spk_proj", "train_emo_layers")]
     for field in adapter_fields:
         classes = field.elem_classes or []
         field.elem_classes = [*([classes] if isinstance(classes, str) else classes), "train-adapter-field"]
+    export_field = registry["training.export_int8"].component
+    classes = export_field.elem_classes or []
+    export_field.elem_classes = [*([classes] if isinstance(classes, str) else classes), "train-full-field"]
     method.change(None, method, None, js=METHOD_CLASS_JS, queue=False, show_progress="hidden", api_name=False)
 
     keys = [key for key in profiled_keys(registry.keys) if registry[key].component is not None and registry[key].preset]
@@ -247,7 +255,6 @@ def bind_model_controls(registry, generation, models, training, grid):
         from .grid_tab import _adapter_folders, latest_lora_folder
         from .training_tab import _resume_choices, adapter_rows
 
-        settings_model = model in SETTINGS_MODELS
         updates = {}
         for key, choices in (("runtime.lora_path", _lora_choices(model)), ("training.resume_from", _resume_choices(model))):
             value = values.get(key) or ""
@@ -257,7 +264,7 @@ def bind_model_controls(registry, generation, models, training, grid):
         if grid_value not in {path for _, path in folders}:
             grid_value = latest_lora_folder(model=model) or None
         updates["grid.adapter_dir"] = {"choices": folders, "value": grid_value}
-        methods = ["lora", "dora", "full"] if settings_model else ["lora", "dora"]
+        methods = ["lora", "dora", "full"]
         method_value = values.get("training.adapter_type") if values.get("training.adapter_type") in methods else "dora"
         updates["training.adapter_type"] = {"choices": methods, "value": method_value}
         rows, paths = adapter_rows(model)

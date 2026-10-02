@@ -311,6 +311,11 @@ def apply_lora(
 ) -> LoraHandle:
     """Load a LoRA / DoRA file and apply it without reloading any base weights."""
 
+    from indextts.quant.finetune_int8 import is_int8_finetune
+
+    if is_int8_finetune(path):
+        # The INT8 version of a fine-tuned model replaces the base weights; the engine loads it as its model.
+        raise ValueError("This is the INT8 version of a fine-tuned model, not an adapter; load it as the speech model.")
     loaded = load_lora(path)
     if loaded.adapter_type == "full" and float(strength) != 1.0:
         raise ValueError("Full fine-tuning checkpoints use strength 1.0.")

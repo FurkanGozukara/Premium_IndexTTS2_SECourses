@@ -81,9 +81,9 @@ def build_omnivoice_training_model(config):
 
 class OmniVoiceTrainer(LoraTrainer):
     def _prepare_reference(self):
-        from .evaluation_plan import audio_path, choose_training_reference
+        # The training reference and the exact transcript of the clip it was copied from.
         reference = super()._prepare_reference()
-        row = choose_training_reference(self.training_records, self.dataset_dir, typical=self.config.reference_typical)
+        row = getattr(self, "_reference_row", None)
         if reference and row:
             reference.with_suffix(".txt").write_text(str(row["text"]), encoding="utf-8")
         return reference
@@ -359,6 +359,7 @@ class OmniVoiceTrainer(LoraTrainer):
                 except Exception as exc:
                     self.log(f">> {label} failed but training weights are safe: {exc}")
                     message += f"; {label} failed: {exc}"
+            self._write_int8_finetune(recommended)
         self.write_status(phase=status,message=message,step=step,total_steps=total_steps,last_checkpoint=str(path),
                           last_sample=self.last_sample,sample_seed=self.resolved_sample_seed,
                           recommended_checkpoint=recommended,elapsed_s=time.perf_counter()-self.started_perf)

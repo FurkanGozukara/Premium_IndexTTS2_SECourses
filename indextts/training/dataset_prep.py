@@ -207,6 +207,9 @@ class DatasetPrepConfig:
             raise ValueError("max_clipping_ratio must be between zero and one")
         if not 0.0 < self.clipping_threshold <= 1.0:
             raise ValueError("clipping_threshold must be in (0, 1]")
+        if self.max_silence_ratio is not None and float(self.max_silence_ratio) == 0.0:
+            # 0 is the interface's blank field (Gradio renders blank as 0); a 0 limit would reject every clip.
+            self.max_silence_ratio = None
         if self.max_silence_ratio is not None and not 0.0 <= self.max_silence_ratio <= 1.0:
             raise ValueError("max_silence_ratio must be between zero and one")
         if not 0.0 < self.min_words_per_second <= self.max_words_per_second:

@@ -563,7 +563,7 @@ def build_dataset_tab(
                 min_peak = gr.Slider(-80, 0, value=-35, step=1, label="Minimum peak dBFS", info="Drops audio too quiet to train reliably.")
                 max_clip = gr.Number(value=0.001, minimum=0, maximum=1, step=0.0001, label="Maximum clipping ratio", info="0.001 allows at most 0.1% clipped samples.")
                 clip_threshold = gr.Number(value=0.999, minimum=0.5, maximum=1, step=0.001, label="Clipping threshold", info="Absolute normalized sample level counted as clipping.")
-                max_silence = gr.Number(value=None, minimum=0, maximum=1, step=0.01, label="Maximum silence ratio", info="Optional; blank disables whole-segment silence-ratio filtering.")
+                max_silence = gr.Number(value=None, minimum=0, maximum=1, step=0.01, label="Maximum silence ratio", info="Optional; 0 or blank disables whole-segment silence-ratio filtering.")
                 silence_db = gr.Slider(-80, -10, value=-40, step=1, label="Silence threshold dBFS", info="Frames below this level count as silence.")
                 silence_frame = gr.Slider(5, 200, value=20, step=5, label="Silence frame (ms)", info="20 ms gives stable silence estimates for speech.")
             min_edge_silence = gr.Slider(

@@ -35,7 +35,8 @@ DEFAULT_SEGMENTATION_MODE = "smart"
 # Without a dataset target the smart packer aims at this share of the budget, leaving room for
 # one more sentence to finish before the hard limit.
 SMART_TARGET_FRACTION = 0.85
-_PROTECTED_PATTERN = re.compile(r"<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>")
+# Pronunciation readings stay whole: IndexTTS's special-token spans and OmniVoice's bracketed CMU phones.
+_PROTECTED_PATTERN = re.compile(r"<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>|\[[A-Z]{1,2}[0-2]?(?: [A-Z]{1,2}[0-2]?)+\]")
 _PUNCTUATION_SPLIT = re.compile(r"(?<=[\u3001\u3002\uff01\uff0c\uff1a\uff1b\uff1f,.!?;:\n])")
 _CLAUSE_SPLIT = re.compile(r"(?<=[\u3001\u3002\uff01\uff0c\uff1a\uff1b\uff1f,.!?;:])")
 _LANG_PREFIX = re.compile(r"<\|([^|]+)\|>")

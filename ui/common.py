@@ -198,6 +198,7 @@ BUTTON_HUES: dict[str, tuple[str, str, str]] = {
     "olive":   ("#3f4f1f", "#6b8e23", "#b5cc4a"),
     "coral":   ("#9a3b2e", "#e0573e", "#ffa08a"),
     "mint":    ("#0f5132", "#2dbd8f", "#9ff3d3"),
+    "gold":    ("#713f12", "#ca8a04", "#fde047"),
 }
 BUTTON_COLORS = tuple(BUTTON_HUES)
 
@@ -763,7 +764,8 @@ body.tts-model-omnivoice .tts-only-indextts,
 body.tts-model-auk .tts-only-indextts,
 body:not(.tts-model-omnivoice) .tts-only-omnivoice,
 body:not(.tts-model-auk) .tts-only-auk,
-body.train-method-full .train-adapter-field { display: none !important; }
+body.train-method-full .train-adapter-field,
+body:not(.train-method-full) .train-full-field { display: none !important; }
 """
 
 
@@ -1171,6 +1173,12 @@ class LazyEngine:
             for key in ("lora_path", "lora_strength", "lora_merge_into_base"):
                 nested_runtime.pop(key, None)
             fingerprint_options["runtime"] = nested_runtime
+        # Adapters swap in place; the INT8 version of a fine-tuned model is the model, so it reloads.
+        from indextts.quant.finetune_int8 import is_int8_finetune
+
+        runtime_values = runtime_options.get("runtime") if isinstance(runtime_options.get("runtime"), Mapping) else runtime_options
+        if is_int8_finetune(runtime_values.get("lora_path")):
+            fingerprint_options["int8_finetune"] = os.path.abspath(str(runtime_values.get("lora_path")))
         fingerprint = json.dumps(fingerprint_options, sort_keys=True, default=str)
         with self._lock:
             self.raise_if_canceled()

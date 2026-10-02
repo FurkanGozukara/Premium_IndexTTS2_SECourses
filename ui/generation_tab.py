@@ -8,8 +8,10 @@ import hashlib
 import html
 import json
 import os
+import re
 from pathlib import Path
 import secrets
+from types import SimpleNamespace
 import shutil
 import subprocess
 import sys
@@ -17,6 +19,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from typing import Any, Mapping, Sequence
 
 import gradio as gr
@@ -63,6 +66,7 @@ from indextts.utils.pronunciation import (
     load_dictionary,
     merge_entries,
     normalize_entry,
+    omnivoice_readings,
     save_dictionary,
 )
 from indextts.utils.pause_tags import PauseChunk, TextChunk, describe_pauses, split_text_with_pauses
@@ -214,6 +218,10 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.max_mel_tokens": 1500,
     "generation.seed": -1,
     "generation.num_candidates": 1,
+    "generation.pick_best_candidate": False,
+    "generation.section_takes": 1,
+    "generation.audition_candidates": 6,
+    "generation.audition_sentences": 4,
     "generation.diffusion_steps": 25,
     "generation.inference_cfg_rate": 0.7,
     "generation.cfm_temperature": 1.0,
@@ -239,6 +247,7 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.save_used_audio": False,
     "generation.output_filename": "",
     "generation.save_as_mp3": False,
+    "generation.word_timestamps": False,
     "generation.mp3_bitrate": "256k",
     "generation.audio_tuning_preset": "bypass",
     "generation.tuning_low_cut_hz": None,
@@ -308,6 +317,7 @@ RUNNER_REQUEST_KEYS = frozenset(
         "language",
         "save_used_audio",
         "save_as_mp3",
+        "word_timestamps",
         "mp3_bitrate",
         "image_path",
         "infer_kwargs",
@@ -323,6 +333,8 @@ RUNNER_REQUEST_KEYS = frozenset(
         "decoder_adapter",
         "decoder_adapter_strength",
         "num_candidates",
+        "pick_best_candidate",
+        "section_takes",
         "audio_tuning_preset",
         "audio_tuning_overrides",
         "segment_budget_scale_non_cjk",
@@ -474,7 +486,8 @@ def build_generation_request(
         ("generation.tuning_deess", "deess"),
     ):
         item = _value(merged, ui_key)
-        if item not in (None, ""):
+        # 0 is a blank field as Gradio sends it once rendered: keep the preset's value (presets_store.coerce_value).
+        if item not in (None, "") and float(item) != 0.0:
             overrides[backend_key] = float(item)
 
     segmentation_mode = normalize_segmentation_mode(_value(merged, "generation.segmentation_mode"))
@@ -494,6 +507,7 @@ def build_generation_request(
         "language": str(language or ("AUTO" if settings_model else "EN")).upper(),
         "save_used_audio": bool(_value(merged, "generation.save_used_audio")),
         "save_as_mp3": bool(_value(merged, "generation.save_as_mp3")),
+        "word_timestamps": bool(_value(merged, "generation.word_timestamps")),
         "mp3_bitrate": str(_value(merged, "generation.mp3_bitrate")),
         "image_path": image_path,
         "infer_kwargs": infer_kwargs,
@@ -509,6 +523,8 @@ def build_generation_request(
         "decoder_adapter": decoder_adapter,
         "decoder_adapter_strength": decoder_adapter_strength,
         "num_candidates": int(_value(merged, "generation.num_candidates")),
+        "pick_best_candidate": bool(_value(merged, "generation.pick_best_candidate")),
+        "section_takes": int(_value(merged, "generation.section_takes") or 1),
         "audio_tuning_preset": str(_value(merged, "generation.audio_tuning_preset") or "bypass"),
         "audio_tuning_overrides": overrides,
         "segment_budget_scale_non_cjk": float(_value(merged, "generation.segment_budget_scale_non_cjk")),
@@ -805,6 +821,23 @@ def preview_segments(
             return [[0, "Caption error", str(exc), ""]], f"Caption error: {exc}"
     if not str(text or "").strip():
         return [], "0 sections"
+    # Sections show the words as written; the readings the model speaks are listed beside each section.
+    # Token counts use the text the model receives (OmniVoice: readings in its syntax, [D AO1 R AH0]).
+    readings = {}
+    for match in re.finditer(r"<([^|>\n]+)\|([^>\n]+)>", str(text)):
+        model_form = omnivoice_readings(match.group(0)) if model_id == "omnivoice" else match.group(0)
+        readings[model_form] = (match.group(1), " ".join(token for token in match.group(2).split() if token != "."))
+    if model_id == "omnivoice":
+        text = omnivoice_readings(str(text))
+
+    def shown(segment: str) -> tuple[str, list[str]]:
+        used = []
+        for model_form, (word, reading) in readings.items():
+            if model_form in segment:
+                segment = segment.replace(model_form, word)
+                used.append(f"{word} = {reading}")
+        return segment, used
+
     try:
         if model_id in _SETTINGS_TOKENIZERS:
             tokenizer = _SETTINGS_TOKENIZERS[model_id](str(Path(model_dir).resolve()))
@@ -843,11 +876,14 @@ def preview_segments(
                 continue
             section_index += 1
             row_index += 1
-            word_count = len(segment.split())
+            written, used = shown(segment)
+            word_count = len(written.split())
             details = f"{token_len(prefix + segment)} tokens · {word_count} words"
             if words_per_second and words_per_second > 0.0:
                 details += f" · about {word_count / float(words_per_second):.1f} s"
-            rows.append([row_index, "Text segment", segment, details])
+            if used:
+                details += " · reads " + ", ".join(used)
+            rows.append([row_index, "Text segment", written, details])
     pause_note = describe_pauses(text) if enable_pause_tags else "Pause tags disabled"
     mode_note = _SEGMENTATION_LABELS.get(mode, mode)
     if mode == "smart" and target_tokens:
@@ -1141,6 +1177,11 @@ def _resolve_lora_reference_path(
     source = Path(adapter_path).expanduser().resolve()
     adapter_dir = source.parent
     run_dir = adapter_dir.parent if adapter_dir.name.casefold() == "best" else adapter_dir
+    from indextts.training.reference_audition import audition_reference
+
+    chosen = audition_reference(source)  # a reference audition's winner, while the voice uses it
+    if chosen:
+        return chosen
     candidates: list[Path] = []
     if configured_reference:
         configured = Path(configured_reference).expanduser()
@@ -1426,11 +1467,12 @@ def _build_lora_choices(model_id: str = "indextts") -> list[tuple[str, str]]:
         if not checkpoint_matches_model(info, model_id):
             continue
         parent = source.parent.parent.name if source.parent.name.lower() == "best" else source.parent.name
-        adapter_type = {"dora": "DoRA", "full": "Full"}.get(str(info.get("adapter_type", "")).lower(), "LoRA")
-        label = (
-            f"{parent}/{source.stem}  ·  {adapter_type} r{int(info.get('rank', 0) or 0)}"
-            f"  ·  {int(info.get('steps', 0) or 0)} steps"
-        )
+        kind = str(info.get("adapter_type", "")).lower()
+        if kind == "full":
+            method = "Full fine-tune INT8 ConvRot" if info.get("quantized") else "Full fine-tune"
+        else:
+            method = f"{'DoRA' if kind == 'dora' else 'LoRA'} r{int(info.get('rank', 0) or 0)}"
+        label = f"{parent}/{source.stem}  ·  {method}  ·  {int(info.get('steps', 0) or 0)} steps"
         if source.parent.name.lower() == "best":
             label += "  [best - lowest validation loss]"
         choices.append((label, str(source)))
@@ -2074,6 +2116,36 @@ def auto_max_tokens_update(path: str | None, enabled: bool, budget_scale: float 
     return gr.skip() if value is None else gr.update(value=int(value))
 
 
+def automatic_reference_updates(
+    path: str,
+    current_reference: str | None,
+    auto_reference: bool,
+    reference_source: str | None = "empty",
+) -> tuple[Any, Any, Any, Any, str]:
+    """Show a voice's own reference in Reference Voice after it changed (a reference audition or its switch).
+
+    The rule choosing the voice follows (lora_selection_updates): a manually selected Reference Voice stays,
+    and nothing loads while auto-loading the LoRA / DoRA reference is off. Returns the updates for the audio
+    preview, the file box, the video preview and the reference source, and a sentence for the status.
+    """
+
+    skip = (gr.skip(), gr.skip(), gr.skip(), gr.skip())
+    recommended = _recommended_lora_reference(path)
+    if not recommended:
+        return (*skip, "")
+    if not auto_reference:
+        return (*skip, "Reference Voice was not changed because **Auto-load the LoRA / DoRA recommended reference audio** is off.")
+    if _existing_path(current_reference) and str(reference_source or "empty") not in _AUTO_REFERENCE_SOURCES:
+        return (*skip, "Your manually selected Reference Voice stays loaded; clear it to use this voice's reference.")
+    return (
+        gr.update(value=recommended, visible=True),
+        gr.update(value=recommended),
+        gr.update(value=None, visible=False),
+        "lora_auto",
+        f"Reference Voice now shows {Path(recommended).name}.",
+    )
+
+
 def lora_selection_updates(
     path: str,
     current_reference: str | None,
@@ -2290,10 +2362,25 @@ def _candidate_paths_from_state(value: Any) -> list[str]:
     return [str(path) for path in decoded if path]
 
 
+def _timestamp_note(timestamps: Mapping[str, Any] | None) -> str:
+    """Links to the word timestamps and subtitles written beside the audio."""
+
+    paths = dict((timestamps or {}).get("paths") or {})
+    if not paths:
+        return ""
+    labels = {"srt": "SRT subtitles", "vtt": "WebVTT subtitles", "json": "word timings (JSON)"}
+    links = " · ".join(
+        f"[{labels[kind]}](/gradio_api/file={urllib.parse.quote(Path(path).as_posix(), safe='/:')})"
+        for kind, path in paths.items() if kind in labels and Path(path).is_file()
+    )
+    return (f"**Word timestamps:** {int(timestamps.get('words') or 0)} words, "
+            f"{float(timestamps.get('coverage') or 0.0):.0%} matched by Whisper, {int(timestamps.get('cues') or 0)} cues. {links}")
+
+
 def _result_updates(result: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[Any, ...]:
     output = result.get("output_path")
     video = result.get("video_path")
-    caption = result.get("subtitle_status") or ""
+    caption = "\n\n".join(filter(None, [result.get("subtitle_status") or "", _timestamp_note(result.get("timestamps"))]))
     runtime_warning = str(result.get("runtime_warning") or "")
     status = "Generation complete."
     if runtime_warning:
@@ -2362,6 +2449,7 @@ def _generation_result_from_disk(task_folder: Path, metadata: Mapping[str, Any])
         **generation,
         "output_path": output,
         "video_path": outputs.get("final_video_path"),
+        "timestamps": outputs.get("word_timestamps"),
         "candidate_paths": candidates or ([output] if output else []),
         "runtime_warning": metadata.get("runtime_warning", ""),
     }
@@ -2954,8 +3042,9 @@ def build_generation_tab(
                 )
                 with gr.Accordion("🔤 Pronunciation check & dictionary", open=False) as pronunciation_panel:
                     gr.Markdown(
-                        "The engine reads `<word|PHONES>` annotations natively: ARPAbet phones with stress digits and dots between "
-                        "syllables, for example `<Qwen|K W EH1 N>`. **Check unknown words** lists the words in the text that the "
+                        "Both engines read `<word|PHONES>` annotations: ARPAbet phones with stress digits and dots between "
+                        "syllables, for example `<Qwen|K W EH1 N>`. IndexTTS reads them natively; for OmniVoice they become its "
+                        "CMU phone syntax (`[K W EH1 N]`), and Chinese pinyin readings (`<行|XING2>`) its tone markers. **Check unknown words** lists the words in the text that the "
                         "selected voice never spoke in training and the base model has no dictionary reading for, with a proposed "
                         "reading. **Add suggestions and save** stores the ones listed; edits in the dictionary table are saved as you "
                         "make them. Entries with scope `unseen` never override a word the voice learned from its recordings; `always` "
@@ -2994,7 +3083,6 @@ def build_generation_tab(
                         label="Pronunciation dictionary (pronunciations/dictionary.json)",
                         buttons=["fullscreen"],
                     )
-                tab.index_panels.append(pronunciation_panel)
                 _register(registry, "generation.apply_pronunciation_dictionary", apply_pronunciation, kind="bool")
 
             with gr.Column(scale=1, min_width=320):
@@ -3096,6 +3184,38 @@ def build_generation_tab(
             save_lora_rate = gr.Button("⏱️  Save speaking rate", elem_classes=btn("purple"), scale=1)
             pick_expressive = gr.Button("🎭  Pick expressive clip", elem_classes=btn("mint"), scale=1)
         tab.index_panels.append(pick_expressive)
+        with gr.Accordion("🎧 Reference audition: the clip this voice clones best from", open=False):
+            gr.Markdown(
+                "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
+                "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
+                "held-out sentences of the voice's training data with each candidate clip and keeps the clip whose takes "
+                "sound most like the speaker's own recordings of those sentences: speaker and style similarity decide, and "
+                "Whisper word errors keep a clip that causes slips out. It uses the current settings and the selected trained "
+                "voice, works for both speech models, and never changes the voice's original reference file.",
+                elem_classes=["section-note"],
+            )
+            with gr.Row():
+                audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
+                                                info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
+                audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
+                                               info="Held-out sentences rendered with every candidate; more sentences give a steadier verdict and take longer.")
+                audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
+                                           info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
+                                                "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "
+                                                "ticking again restores the winner.")
+            audition_run = gr.Button("🎧  Audition references", elem_classes=btn("gold"))
+            audition_status = gr.Markdown("", elem_classes=["section-note"])
+            from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
+
+            audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
+                                          max_height=320, label="Audition results")
+            audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
+        _register(registry, "generation.audition_candidates", audition_candidates, kind="int", minimum=2, maximum=12)
+        _register(registry, "generation.audition_sentences", audition_sentences, kind="int", minimum=2, maximum=8)
+        # Bound with the generation events, which own the packed request values (bind_generation_events).
+        tab.audition = SimpleNamespace(run=audition_run, candidates=audition_candidates,
+                                       sentences=audition_sentences, use=audition_use, status=audition_status,
+                                       table=audition_table, choice=audition_choice, lora=lora)
         registry.register("runtime.lora_path", lora, "", kind="str")
         registry.register("runtime.lora_strength", strength, 1.0, kind="float", minimum=0.0, maximum=2.0)
         registry.register("runtime.lora_merge_into_base", merge_lora, False, kind="bool")
@@ -3190,6 +3310,14 @@ def build_generation_tab(
             with gr.Row():
                 seed = gr.Number(value=-1, precision=0, label="Seed", info="-1 chooses a fresh random seed; reuse a shown seed for repeatability.")
                 candidates = gr.Slider(1, 8, value=1, step=1, label="Candidates", info="Generates consecutive seeded alternatives; each adds generation time.")
+                pick_best = gr.Checkbox(value=False, label="Keep the take Whisper hears best",
+                                        info="With 2 or more candidates, Whisper transcribes every take and the one with the fewest "
+                                             "word errors becomes the output (the others stay as candidates). Both speech models; "
+                                             "steadier pronunciation at the cost of the extra takes.")
+                section_takes = gr.Slider(1, 8, value=1, step=1, label="Takes per section (Whisper keeps the best)",
+                                          info="Renders each section up to this many times and keeps the take Whisper hears with the "
+                                               "fewest word errors; a take without errors ends the search. Whisper uses the speech "
+                                               "model's language (OmniVoice's Auto is read from the text). 1 = off. Both models.")
             for key, component, kind, minimum, maximum in (
                 ("generation.do_sample", do_sample, "bool", None, None),
                 ("generation.temperature", temperature, "float", 0.1, 2),
@@ -3202,6 +3330,8 @@ def build_generation_tab(
                 ("generation.max_mel_tokens", max_mel, "int", 50, 1815),
                 ("generation.seed", seed, "int", -1, 4294967295),
                 ("generation.num_candidates", candidates, "int", 1, 8),
+                ("generation.pick_best_candidate", pick_best, "bool", None, None),
+                ("generation.section_takes", section_takes, "int", 1, 8),
             ):
                 _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
 
@@ -3236,7 +3366,7 @@ def build_generation_tab(
                     info="1.0 is the model's natural pace; below 1.0 speaks slower, above 1.0 faster. A trained LoRA / DoRA can carry a calibrated value that matches the speaker's real pace.",
                 )
             with gr.Row():
-                target_duration = gr.Number(value=None, minimum=0.1, maximum=3600, step=0.1, label="Target duration (seconds)", info="Leave blank unless a whole-output duration target is needed.")
+                target_duration = gr.Number(value=None, minimum=0, maximum=3600, step=0.1, label="Target duration (seconds)", info="0 or blank: no whole-output duration target.")
                 target_mode = gr.Dropdown(choices=["off", "natural", "pad", "trim"], value="off", label="Target duration mode", info="Natural regenerates timing; pad/trim only adjust the assembled result.")
                 pause_tags = gr.Checkbox(value=True, label="Enable pause tags", info="Parses inline pause tags before tokenization.")
                 normalization = gr.Checkbox(value=True, label="Text normalization", info="Recommended: expands and normalizes text before phonetic processing.")
@@ -3295,19 +3425,26 @@ def build_generation_tab(
                 save_mp3 = gr.Checkbox(value=False, label="Save MP3", info="Converts the final output to MP3; WAV candidates remain available.")
                 bitrate = gr.Dropdown(choices=["128k", "192k", "256k", "320k"], value="256k", label="MP3 bitrate", info="256k is a strong quality/size balance for voice.")
             with gr.Row():
+                stamps = gr.Checkbox(value=False, label="Word timestamps and subtitles",
+                                     info="Saves <name>.srt, <name>.vtt and <name>.words.json beside the audio: Whisper's word timings "
+                                          "aligned to your text, for both speech models. Neither model reports timings itself; this adds "
+                                          "a few seconds per minute of speech.")
+            with gr.Row():
                 tuning = gr.Dropdown(choices=["bypass", "voice_clarity", "clear_narration", "deharsh", "warm", "normalize"], value="bypass", label="Audio tuning preset", info="Bypass preserves model audio exactly; other presets use FFmpeg post-processing.")
                 trim_ms = gr.Slider(0, 3000, value=0, step=10, label="Trim edge silence threshold (ms)", info="0 disables trimming; only edge silence at least this long is removed.")
             with gr.Accordion("Audio tuning overrides", open=False):
                 with gr.Row():
-                    low_cut = gr.Number(value=None, minimum=20, maximum=500, label="Low cut (Hz)", info="Optional high-pass cutoff; leave blank to use the preset.")
-                    high_cut = gr.Number(value=None, minimum=1000, maximum=24000, label="High cut (Hz)", info="Optional low-pass cutoff; leave blank to use the preset.")
-                    gain = gr.Number(value=None, minimum=-24, maximum=24, label="Gain (dB)", info="Optional final gain before limiting.")
-                    loudness = gr.Number(value=None, minimum=-30, maximum=-5, label="Loudness target (LUFS)", info="Optional integrated loudness normalization target.")
-                    deess = gr.Number(value=None, minimum=0, maximum=12, label="De-ess amount", info="Optional attenuation around sibilance frequencies.")
+                    # 0 (Gradio's rendering of a blank Number) keeps the preset's value; see presets_store.coerce_value.
+                    low_cut = gr.Number(value=None, minimum=0, maximum=500, label="Low cut (Hz)", info="Optional high-pass cutoff, 20 to 500; 0 or blank uses the preset.")
+                    high_cut = gr.Number(value=None, minimum=0, maximum=24000, label="High cut (Hz)", info="Optional low-pass cutoff, 1000 to 24000; 0 or blank uses the preset.")
+                    gain = gr.Number(value=None, minimum=-24, maximum=24, label="Gain (dB)", info="Optional final gain before limiting; 0 or blank uses the preset.")
+                    loudness = gr.Number(value=None, minimum=-30, maximum=0, label="Loudness target (LUFS)", info="Optional integrated loudness target, -30 to -5; 0 or blank uses the preset.")
+                    deess = gr.Number(value=None, minimum=0, maximum=12, label="De-ess amount", info="Optional attenuation around sibilance frequencies; 0 or blank uses the preset.")
             for key, component, kind, choices, minimum, maximum, nullable in (
                 ("generation.output_filename", filename, "str", None, None, None, False),
                 ("generation.save_used_audio", save_ref, "bool", None, None, None, False),
                 ("generation.save_as_mp3", save_mp3, "bool", None, None, None, False),
+                ("generation.word_timestamps", stamps, "bool", None, None, None, False),
                 ("generation.mp3_bitrate", bitrate, "choice", ["128k", "192k", "256k", "320k"], None, None, False),
                 ("generation.audio_tuning_preset", tuning, "choice", ["bypass", "voice_clarity", "clear_narration", "deharsh", "warm", "normalize"], None, None, False),
                 ("generation.trim_silence_ms_threshold", trim_ms, "int", None, 0, 3000, False),
@@ -4227,6 +4364,88 @@ def bind_generation_events(
         show_progress="hidden",
         stream_every=0.5,
     )
+
+    audition_box = values_payload_component()
+    auto_reference = registry["generation.auto_lora_reference"].component
+    # Everything that shows the Reference Voice, as choosing a voice updates it (_reference_updates).
+    shown_reference = [tab.prompt_audio, tab.reference_media, tab.reference_video, tab.reference_source]
+
+    def audition_references(lora_path: str, count: Any, sentences: Any, use_winner: bool, gathered: Any):
+        """Render held-out sentences with each candidate reference and keep the best (reference_audition)."""
+        from .reference_audition import run_reference_audition
+
+        values = dict(zip(tab.request_keys, prepare_gathered(tab.request_components, gathered)))
+        try:
+            for status, rows, chosen in run_reference_audition(
+                    values, str(lora_path or ""), candidate_count=int(count or 6), sentence_count=int(sentences or 4),
+                    use_winner=bool(use_winner), model_dir=model_dir, root=ROOT):
+                yield status, rows, chosen
+        except Exception as exc:
+            traceback.print_exc()
+            yield f"Reference audition failed: {exc}", [], None
+
+    def show_audition_winner(chosen: Any, lora_path: str, current: Any, auto_on: bool, source: Any, status: Any):
+        """A winner the audition put in use appears in Reference Voice by the rule choosing the voice follows."""
+        from indextts.training.reference_audition import run_dir_of
+
+        # Only while the audited voice is still selected.
+        if not chosen or not lora_path or Path(str(chosen)).parent.resolve() != run_dir_of(str(lora_path)).resolve():
+            return (gr.skip(),) * 5
+        *updates, note = automatic_reference_updates(str(lora_path or ""), current, bool(auto_on), source)
+        return (*updates, f"{status or ''} {note}".strip())
+
+    def use_audition_winner(lora_path: str, use_winner: bool, current: Any, auto_on: bool, source: Any):
+        """The checkbox switches the voice between its audition winner and its original reference."""
+        from indextts.training.reference_audition import set_choice_use
+
+        if not lora_path:
+            return ("Select a trained voice first.", *(gr.skip(),) * 4)
+        record = set_choice_use(lora_path, bool(use_winner))
+        if record is None:
+            return ("This voice has no audition yet; the setting applies to its first audition's winner.", *(gr.skip(),) * 4)
+        *updates, note = automatic_reference_updates(str(lora_path), current, bool(auto_on), source)
+        reference = _recommended_lora_reference(lora_path)
+        name = Path(reference).name if reference else "none"
+        if not record.get("reference"):
+            message = f"The last audition kept this voice's original reference ({name})."
+        elif use_winner:
+            message = f"This voice uses its audition winner ({name})."
+        else:
+            message = f"This voice uses its original reference ({name}); the audition stays saved."
+        return (f"{message} {note}".strip(), *updates)
+
+    def show_voice_audition(lora_path: str):
+        """The selected voice's saved audition: status, results and its Use-the-winner setting."""
+        from .reference_audition import audition_overview
+
+        return audition_overview(str(lora_path or ""))
+
+    audition = tab.audition
+    audition.run.click(
+        None, tab.request_components, audition_box, js=GATHER_VALUES_JS, queue=False, show_progress="hidden", api_name=False,
+    ).then(
+        audition_references,
+        inputs=[audition.lora, audition.candidates, audition.sentences, audition.use, audition_box],
+        outputs=[audition.status, audition.table, audition.choice],
+        api_name=False,
+        concurrency_limit=1,
+        concurrency_id="generation",
+        show_progress="minimal",
+    ).then(
+        # Read when the audition ends: a Reference Voice the user selected meanwhile stays.
+        show_audition_winner,
+        inputs=[audition.choice, audition.lora, tab.prompt_audio, auto_reference, tab.reference_source, audition.status],
+        outputs=[*shown_reference, audition.status],
+        queue=False,
+        show_progress="hidden",
+        api_name=False,
+    )
+    # A user's click only; programmatic updates come from the voice's saved audition below.
+    audition.use.input(use_audition_winner, [audition.lora, audition.use, tab.prompt_audio, auto_reference, tab.reference_source],
+                       [audition.status, *shown_reference], queue=False, api_name=False)
+    # Fast and idempotent, never deferred (see the adapter handlers in build_generation_tab).
+    audition.lora.change(show_voice_audition, audition.lora, [audition.status, audition.table, audition.use], queue=False,
+                         show_progress="hidden", api_name=False)
 
     # The documented API keeps its original signatures for programmatic callers
     # (the tutorial narration client resolves the reference, then generates with

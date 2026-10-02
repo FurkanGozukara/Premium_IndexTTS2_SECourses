@@ -23,6 +23,7 @@ from indextts.utils.subtitle_utils import (
     parse_subtitle_file,
     read_pcm16_wav,
     retime_audio_file_with_ffmpeg,
+    subtitle_cues_to_text,
     write_pcm16_wav,
 )
 from indextts.utils.task_output_utils import build_segment_output_path, write_metadata_file
@@ -58,6 +59,10 @@ def _ensure_selected_int8(
 ) -> str:
     if runtime.model_variant != "int8_convrot":
         return ""
+    from indextts.quant.finetune_int8 import is_int8_finetune
+
+    if is_int8_finetune(runtime.lora_path):
+        return ""  # the fine-tuned model's own INT8 file replaces the public INT8 GPT
 
     from indextts.runtime.progress import ProgressReporter
     from indextts.utils import model_downloads
@@ -490,6 +495,77 @@ def _emit_progress(progress_callback, value: float, desc: str) -> None:
     progress_callback(value, desc=desc)
 
 
+def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, text: str, language: str):
+    """Give the engine a Whisper judge for "Takes per section" (None when the option is off)."""
+
+    tts.section_takes, tts.take_judge = 1, None
+    if section_takes <= 1:
+        return None
+    from indextts.utils.take_selection import SectionTakeJudge
+
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    judge = SectionTakeJudge(language, text, device=device)
+    tts.section_takes, tts.take_judge = section_takes, judge
+    print(f">> Takes per section: up to {section_takes}; Whisper judges them in '{judge.language}'", flush=True)
+    return judge
+
+
+def _release_take_judge(tts: Any, judge: Any) -> None:
+    tts.section_takes, tts.take_judge = 1, None
+    if judge is not None:
+        judge.close()
+
+
+def _choose_best_candidate(request: Dict[str, Any], tts: Any, paths: list, text: str, language: str,
+                           metadata: Dict[str, Any]) -> int:
+    """Index of the candidate Whisper hears with the fewest word errors (0 keeps the first on any failure)."""
+
+    from indextts.utils.take_selection import best_take, candidate_word_errors
+
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        rows = candidate_word_errors(paths, text, language, device=device)
+    except Exception as exc:
+        print(f">> Best-take selection failed; keeping candidate 1: {exc}", flush=True)
+        return 0
+    chosen = best_take(rows)
+    print(">> Candidate word errors: " + ", ".join(
+        f"{os.path.basename(row['path'])} {100 * row['error_rate']:.1f}%" for row in rows)
+          + f" -> keeping {os.path.basename(rows[chosen]['path'])}", flush=True)
+    metadata["candidate_selection"] = {"rule": "fewest Whisper word errors", "chosen": os.path.basename(rows[chosen]["path"]),
+                                       "candidates": rows}
+    return chosen
+
+
+def _write_word_timestamps(request: Dict[str, Any], tts: Any, audio_path: str, cues: Any) -> Dict[str, Any]:
+    """Word timings and subtitles of the finished audio; a failure is reported, never fatal to the take."""
+
+    from indextts.utils.speech_timestamps import write_speech_timestamps
+
+    text = subtitle_cues_to_text(cues) if cues else str(request.get("text") or "")
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        result = write_speech_timestamps(audio_path, text, language=request.get("language"), device=device)
+    except Exception as exc:  # the audio is complete; timestamps are an extra
+        print(f">> Word timestamps failed: {exc}", flush=True)
+        return {"error": f"Word timestamps failed: {exc}"}
+    print(f">> Word timestamps: {result['words']} words ({result['coverage']:.0%} matched by Whisper), "
+          f"{result['cues']} subtitle cues -> {result['paths']['srt']}", flush=True)
+    return result
+
+
 def run_generation_request(
     request: Dict[str, Any],
     tts,
@@ -595,6 +671,7 @@ def run_generation_request(
     request_runtime = RuntimeConfig.from_dict(request.get("runtime"))
     infer_kwargs.setdefault("cfm_cache_length", request_runtime.cfm_cache_length)
     section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
+    section_takes = max(1, min(8, int(request.get("section_takes", 1) or 1)))
     latent_multiplier = float(infer_kwargs.pop("latent_multiplier", 1.72))
     infer_kwargs["duration_factor"] = latent_multiplier / 1.72
     infer_kwargs.pop("max_emotion_sum", None)
@@ -655,6 +732,8 @@ def run_generation_request(
             )
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
         subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
+        take_judge = _attach_take_judge(request, tts, section_takes,
+                                        subtitle_cues_to_text(subtitle_cues) if subtitle_cues else text, language)
 
         if subtitle_mode:
             if not subtitle_cues:
@@ -933,10 +1012,23 @@ def run_generation_request(
                 candidate_paths.append(candidate_path)
                 candidate_stats.append(dict(getattr(tts, "last_generation_stats", {})))
 
+            if request.get("pick_best_candidate") and len(candidate_paths) > 1:
+                check_cancellation()
+                _emit_progress(progress_callback, 0.95, "choosing the best take...")
+                chosen = _choose_best_candidate(request, tts, candidate_paths, text, language, metadata)
+                if chosen:
+                    # The chosen take becomes the output and the first candidate; the files keep their names.
+                    candidate_paths.insert(0, candidate_paths.pop(chosen))
+                    candidate_stats.insert(0, candidate_stats.pop(chosen))
             shutil.copy2(candidate_paths[0], output_path)
             output = output_path
-            print(">> Primary output uses candidate 1:", output)
+            print(f">> Primary output uses {os.path.basename(candidate_paths[0])}:", output)
 
+        if take_judge is not None:
+            metadata["section_takes"] = {"takes": section_takes, "language": take_judge.language,
+                                         "sections": list(take_judge.history)}
+            _release_take_judge(tts, take_judge)
+            take_judge = None
         check_cancellation()
         if save_used_audio and prompt:
             try:
@@ -995,6 +1087,14 @@ def run_generation_request(
                 task_layout["final_mp4_path"],
             )
 
+        timestamps = None
+        if request.get("word_timestamps"):
+            check_cancellation()
+            _emit_progress(progress_callback, 0.97, "word timestamps...")
+            timestamps = _write_word_timestamps(request, tts, output_path, subtitle_cues)
+            if timestamps.get("error"):
+                runtime_warning = " ".join(filter(None, [runtime_warning, timestamps["error"]]))
+
         check_cancellation()
         if save_as_mp3 and MP3_AVAILABLE:
             output = convert_wav_to_mp3(
@@ -1042,6 +1142,8 @@ def run_generation_request(
         metadata["processing"]["elapsed_seconds"] = round(processing_elapsed_seconds, 3)
         metadata["processing"]["elapsed_human"] = format_elapsed_duration(processing_elapsed_seconds)
         metadata["generation"] = primary_stats
+        if timestamps is not None:
+            metadata["outputs"]["word_timestamps"] = timestamps
         if runtime_warning:
             metadata["runtime_warning"] = runtime_warning
         write_metadata_file(metadata_path, metadata)
@@ -1083,8 +1185,10 @@ def run_generation_request(
             "candidate_seeds": primary_stats["candidate_seeds"],
             "raw_wav_path": abs_path_or_none(raw_output),
             "runtime_warning": runtime_warning,
+            "timestamps": timestamps,
         }
     except Exception as exc:
+        _release_take_judge(tts, locals().get("take_judge"))
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         metadata["status"] = "canceled" if "cancel" in str(exc).lower() else "failed"
         metadata["updated_at"] = current_timestamp()

@@ -18,6 +18,7 @@ import torch
 
 from indextts.runtime.vram_presets import RuntimeConfig
 from indextts.utils.pause_tags import PauseChunk, TextChunk, split_text_with_pauses
+from indextts.utils.pronunciation import omnivoice_readings
 from indextts.utils.text_segmentation import ends_sentence, split_text_by_tokens, normalize_sentence_whitespace
 from indextts.utils.audio_plan import assemble_audio_plan, trim_segment_silence, fit_target_samples
 
@@ -67,17 +68,27 @@ def normalize_omnivoice_text(text, language="auto"):
         + part[len(part.rstrip()):] for part in parts)
 
 
-def trained_voice_speed(adapter_path):
-    """Speed that sizes unprompted speech at a trained voice's own pace (1.0 for none)."""
+def calibrated_voice_speed(adapter_path):
+    """The speed calibrated for a trained voice without a reference (training writes it), or None."""
     if not adapter_path:
-        return 1.0
+        return None
     source = Path(adapter_path)
     run_dir = source.parent.parent if source.parent.name.lower() == "best" else source.parent
     try:
         value = float(json.loads((run_dir / "omnivoice_voice.json").read_text(encoding="utf-8"))["speed_without_reference"])
     except (OSError, ValueError, KeyError, TypeError):
-        return 1.0
-    return value if 0.5 <= value <= 2.0 else 1.0
+        return None
+    return value if 0.5 <= value <= 2.0 else None
+
+
+def trained_voice_speed(adapter_path):
+    """Speed that sizes unprompted speech at a trained voice's own pace (1.0 for none)."""
+    value = calibrated_voice_speed(adapter_path)
+    return 1.0 if value is None else value
+
+
+# OmniVoice's fallback pace for speech without a reference: this text is one second (25 audio tokens).
+_DEFAULT_PACE_TEXT, _DEFAULT_PACE_TOKENS = "Nice to meet you.", 25
 
 
 def validate_voice_settings(settings):
@@ -144,7 +155,14 @@ class OmniVoiceEngine:
         self.last_generation_stats = {}
         self._lora_path, self._lora_strength, self._lora_merged = "", 1.0, False
         self._voice_key, self._voice_prompt = None, None
-        folder, quant_path = ensure_model(model_dir, quantized=self.runtime.model_variant == "int8_convrot", progress=progress_callback)
+        from indextts.quant.finetune_int8 import is_int8_finetune
+
+        # The INT8 version of a full fine-tune is the model itself: it replaces the public INT8 transformer.
+        self._int8_finetune_path = os.path.abspath(self.runtime.lora_path) if is_int8_finetune(self.runtime.lora_path) else ""
+        if self._int8_finetune_path:
+            self.runtime.model_variant = "int8_convrot"
+        folder, quant_path = ensure_model(model_dir, quantized=self.runtime.model_variant == "int8_convrot" and not self._int8_finetune_path,
+                                          progress=progress_callback)
         print(f">> Loading OmniVoice | {self.device} | {dtype} | {self.runtime.model_variant}", flush=True)
         self.model = OmniVoice.from_pretrained(str(folder), device_map=self.device, dtype=dtype, load_asr=False)
         self.model.llm.config.use_cache = False
@@ -152,22 +170,47 @@ class OmniVoiceEngine:
         self.model.eval()
         if self.runtime.model_variant == "int8_convrot":
             from indextts.quant.convrot_int8 import load_gpt_checkpoint
+            from indextts.quant.finetune_int8 import OMNIVOICE_EXTRA_PREFIX
 
-            # The checkpoint contains only the transformer; tokenizer weights stay full precision.
-            load_gpt_checkpoint(self.model.llm, str(quant_path), device=self.device, dtype=dtype, strict=True)
+            # The checkpoint contains the transformer; tokenizer weights stay full precision. A fine-tuned model's
+            # file also carries its trained audio embeddings and heads (BF16, under the "omnivoice." prefix).
+            source = self._int8_finetune_path or str(quant_path)
+            load_gpt_checkpoint(self.model.llm, source, device=self.device, dtype=dtype, strict=True,
+                                skip_prefixes=(OMNIVOICE_EXTRA_PREFIX,))
+            if self._int8_finetune_path:
+                from safetensors import safe_open
+
+                with safe_open(source, framework="pt", device="cpu") as handle, torch.no_grad():
+                    for key in handle.keys():
+                        if key.startswith(OMNIVOICE_EXTRA_PREFIX):
+                            target = self.model.get_parameter(key[len(OMNIVOICE_EXTRA_PREFIX):])
+                            target.copy_(handle.get_tensor(key).to(device=target.device, dtype=target.dtype))
+                print(f">> INT8 ConvRot fine-tuned model: {source}", flush=True)
         self.set_lora(self.runtime.lora_path, self.runtime.lora_strength, merge_into_base=self.runtime.lora_merge_into_base)
 
     def set_lora(self, path, strength=1.0, *, merge_into_base=False, **_kwargs):
         from indextts.lora import apply_lora, inspect_lora, remove_lora, merge_lora_for_inference
 
         path = os.path.abspath(str(path)) if path else ""
+        finetuned = getattr(self, "_int8_finetune_path", "")
+        if finetuned or path.lower().endswith(".int8_convrot.safetensors"):
+            from indextts.quant.finetune_int8 import is_int8_finetune
+
+            if path != finetuned and (finetuned or is_int8_finetune(path)):
+                raise ValueError("An INT8 fine-tuned model is the speech model itself; reload the model to change to or from it.")
+            if path == finetuned:
+                self._lora_path, self._lora_strength, self._lora_merged = path, 1.0, False
+                self._voice_key, self._voice_prompt = None, None
+                self._unprompted_speed = trained_voice_speed(path)
+                self._pace_calibrated = calibrated_voice_speed(path) is not None
+                return
         if path:
             metadata = inspect_lora(path)
             base = str(metadata.get("base_model", ""))
             if "omnivoice" not in base.lower():
                 raise ValueError("This adapter belongs to IndexTTS. Select an OmniVoice adapter or clear the adapter selection.")
             if metadata.get("adapter_type") == "full" and self.runtime.model_variant != "bf16":
-                raise ValueError("Select BF16 before loading a full fine-tuning checkpoint.")
+                raise ValueError("Select BF16 before loading a full fine-tuning checkpoint, or choose its INT8 ConvRot version.")
         remove_lora(self.model)
         if path:
             apply_lora(self.model, path, strength=float(strength))
@@ -177,6 +220,31 @@ class OmniVoiceEngine:
         self.model.eval().requires_grad_(False)
         self._voice_key, self._voice_prompt = None, None
         self._unprompted_speed = trained_voice_speed(path)
+        self._pace_calibrated = calibrated_voice_speed(path) is not None
+
+    def _generation_speed(self, voice):
+        """Pace multiplier: a trained voice keeps its calibrated pace with or without a reference clip.
+
+        OmniVoice sizes cloned speech at the reference clip's own pace (audio tokens per text weight), so a
+        brisk or slow clip made every take brisk or slow (round 3: one 8-second clip gave 0.79 of the real
+        durations). With a calibrated voice the clip still sets timbre and style, and the pace becomes the one
+        calibrated for the voice; base-model cloning keeps the reference's pace.
+        """
+        calibrated = getattr(self, "_unprompted_speed", 1.0)
+        if voice is None:
+            return calibrated
+        if not getattr(self, "_pace_calibrated", False):
+            return 1.0
+        estimator = getattr(self.model, "duration_estimator", None)
+        try:
+            tokens = int(voice.ref_audio_tokens.shape[-1])
+            ref_weight = float(estimator.calculate_total_weight(voice.ref_text or ""))
+            default_weight = float(estimator.calculate_total_weight(_DEFAULT_PACE_TEXT))
+        except (AttributeError, TypeError, ValueError):
+            return 1.0
+        if tokens <= 0 or ref_weight <= 0 or default_weight <= 0:
+            return 1.0
+        return calibrated * (tokens / ref_weight) / (_DEFAULT_PACE_TOKENS / default_weight)
 
     def split_text_by_tokens(self, text, max_tokens, lang_prefix="", *, mode="budget", target_tokens=None):
         return split_text_by_tokens(text, max_tokens, capacity=2048,
@@ -280,7 +348,8 @@ class OmniVoiceEngine:
                 if isinstance(chunk, PauseChunk):
                     plan.append(("pause", round(chunk.duration_s * self.sampling_rate)))
                     continue
-                source = chunk.text.strip()
+                # Dictionary and hand-written <word|PHONES> readings in OmniVoice's own syntax.
+                source = omnivoice_readings(chunk.text).strip()
                 if segmentation_mode != "budget":
                     source = normalize_sentence_whitespace(source)
                 if text_normalization:
@@ -333,6 +402,29 @@ class OmniVoiceEngine:
             if on_text_complete:
                 on_text_complete(text_index, results[text_index])
         devices = [torch.device(self.device).index or 0] if str(self.device).startswith("cuda") else []
+
+        def synthesize(texts_, lengths_):
+            generated = self.model.generate(
+                text=texts_ if len(texts_) > 1 else texts_[0],
+                language=None if str(lang).lower() == "auto" else str(lang).lower(),
+                voice_clone_prompt=voice, instruct=(settings["instruct"] or None) if settings["mode"] != "auto" else None,
+                # A trained voice keeps its speaker's measured pace, with or without a reference.
+                speed=self._generation_speed(voice) / max(0.1, float(duration_factor)),
+                duration=lengths_ if len(texts_) > 1 else lengths_[0], normalize_text=False, **config)
+            if len(generated) != len(texts_):
+                raise RuntimeError("OmniVoice returned the wrong batch size.")
+            outputs = []
+            for audio in generated:
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if not len(audio) or not np.isfinite(audio).all():
+                    raise RuntimeError("OmniVoice returned empty or non-finite audio.")
+                outputs.append(trim_segment_silence(torch.from_numpy(audio).unsqueeze(0), self.sampling_rate,
+                                                    trim_silence_ms_threshold))
+            return outputs
+
+        # Takes per section: Whisper scores every take; up to this many renders of a section, the fewest errors win.
+        takes = max(1, int(getattr(self, "section_takes", 1) or 1))
+        judge = getattr(self, "take_judge", None) if takes > 1 else None
         try:
             with torch.inference_mode(), torch.random.fork_rng(devices=devices):
                 if seed is not None:
@@ -341,23 +433,19 @@ class OmniVoiceEngine:
                     batch_index, batch_step = start // batch_size, 0
                     batch = speech[start:start + batch_size]
                     lengths = target_lengths[start:start + batch_size]
-                    generated = self.model.generate(
-                        text=batch if len(batch) > 1 else batch[0],
-                        language=None if str(lang).lower() == "auto" else str(lang).lower(),
-                        voice_clone_prompt=voice, instruct=(settings["instruct"] or None) if settings["mode"] != "auto" else None,
-                        # Without a reference, a trained voice keeps its speaker's measured pace.
-                        speed=(1.0 if voice is not None else getattr(self, "_unprompted_speed", 1.0)) / max(0.1, float(duration_factor)),
-                        duration=lengths if len(batch) > 1 else lengths[0], normalize_text=False, **config)
-                    if len(generated) != len(batch):
-                        raise RuntimeError("OmniVoice returned the wrong batch size.")
-                    for offset, audio in enumerate(generated):
-                        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-                        if not len(audio) or not np.isfinite(audio).all():
-                            raise RuntimeError("OmniVoice returned empty or non-finite audio.")
-                        rendered[start + offset] = trim_segment_silence(torch.from_numpy(audio).unsqueeze(0),
-                            self.sampling_rate, trim_silence_ms_threshold)
-                        durations.append(rendered[start + offset].shape[-1] / self.sampling_rate)
-                        complete(owners[start + offset])
+                    for offset, take in enumerate(synthesize(batch, lengths)):
+                        index = start + offset
+                        if judge is not None:
+                            from indextts.utils.take_selection import keep_best_take
+
+                            take, rates, kept = keep_best_take(
+                                take, lambda i=index: synthesize([speech[i]], [target_lengths[i]])[0],
+                                lambda audio, i=index: judge.error_rate(speech[i], audio.squeeze(0).numpy(), self.sampling_rate),
+                                takes)
+                            judge.record(index, rates, kept)
+                        rendered[index] = take
+                        durations.append(take.shape[-1] / self.sampling_rate)
+                        complete(owners[index])
                     if self.progress_reporter:
                         self.progress_reporter.update(batch_index + 1, total=total,
                             desc=f"OmniVoice batch {batch_index + 1}/{total} complete")

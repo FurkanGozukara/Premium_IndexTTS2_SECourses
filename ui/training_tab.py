@@ -173,6 +173,10 @@ TRAINING_TIER_FIELDS = (
 )
 OMNI_CAPACITY_FIELDS = ("batch_size", "grad_accumulation", "train_mel_embed_head", "omni_batch_tokens", "learning_rate", "keep_last_n",
                         "auk_batch_frames")
+# IndexTTS full fine-tuning updates about 500 M GPT weights directly: a smaller learning rate than the adapters'
+# and the last three epoch checkpoints (about 1 GB each) beside the best one.
+INDEX_METHOD_VALUES = {"full": {"learning_rate": 1e-5, "keep_last_n": 3},
+                       "adapter": {"learning_rate": TRAIN_DEFAULTS["learning_rate"], "keep_last_n": TRAIN_DEFAULTS["keep_last_n"]}}
 _TRAINING_PATH_FIELDS = ("dataset_dir", "output_dir", "model_dir", "model_config", "resume_from", "sample_reference", "final_test_dataset")
 
 
@@ -274,8 +278,15 @@ def _training_tier_note(tier_value: str | None, device_value: str | None, model=
             return (f"**AuK: {tier} GB tier.** Full fine-tuning of the 1.5B transformer needs at least the "
                     f"{FULL_MIN_TIER} GB tier. Select LoRA / DoRA for this card.")
         return training_note(tier, method)
+    if method == "full" and int(tier) < 16:
+        return f"**IndexTTS: {tier} GB tier.** Full fine-tuning needs at least the 16 GB tier. Select LoRA / DoRA for this smaller card."
     prefix = "Detected GPU tier" if str(tier_value or "auto").strip().lower() in {"auto", "custom", ""} else "Selected GPU tier"
-    return f"**{prefix}: {tier} GB.** {preset_notes(tier)}"
+    note = f"**{prefix}: {tier} GB.** {preset_notes(tier)}"
+    if method == "full":
+        note += (" Full fine-tuning trains the GPT, its mel embedding and head and the speaker and emotion projections "
+                 "(about 500 M weights) with FP32 weights and optimizer state, without block swap; the reference "
+                 "encoders and text embedding stay frozen. Each checkpoint is about 1 GB.")
+    return note
 
 
 _NON_TRAINING_STATE_FOLDERS = frozenset({"analysis", "eval_jobs", "eval_job", ".sample_jobs", "samples"})
@@ -383,7 +394,9 @@ def _resume_choices(model: str | None = None) -> list[tuple[str, str]]:
 
 
 def _build_resume_choices(model: str | None = None) -> list[tuple[str, str]]:
-    return [("Start fresh", "")] + [(entry.relative_label, str(resolved_path(entry.path))) for entry in _adapter_entries(model)]
+    # INT8 versions of fine-tuned models are for generation; training resumes from the BF16 checkpoint.
+    return [("Start fresh", "")] + [(entry.relative_label, str(resolved_path(entry.path))) for entry in _adapter_entries(model)
+                                    if not entry.path.lower().endswith(".int8_convrot.safetensors")]
 
 
 def _dataset_choices() -> list[tuple[str, str]]:
@@ -1316,7 +1329,7 @@ def build_training_tab(
         with gr.Accordion("Training method", open=True):
             with gr.Row():
                 name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="Training run name", info="Safe output folder and final safetensors basename.")
-                adapter_type = gr.Dropdown(choices=["lora", "dora"], value=TRAIN_DEFAULTS["adapter_type"], allow_custom_value=True, label="Training method", info="LoRA and DoRA update adapters. OmniVoice also supports full fine-tuning.")
+                adapter_type = gr.Dropdown(choices=["lora", "dora", "full"], value=TRAIN_DEFAULTS["adapter_type"], allow_custom_value=True, label="Training method", info="LoRA and DoRA train small adapters. Full fine-tuning trains the speech model's own weights (16 GB tier or larger) and saves an INT8 ConvRot copy of the best checkpoint for generation.")
                 rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset.")
                 alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default equals rank for a scale of exactly one.")
                 dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="Regularizes training by randomly dropping adapter inputs. More dropout is not always better.")
@@ -1326,11 +1339,18 @@ def build_training_tab(
                 train_spk = gr.Checkbox(value=TRAIN_DEFAULTS["train_spk_proj"], label="Train speaker projection", info="Fully trains the small speaker projection module.")
                 train_emo = gr.Checkbox(value=TRAIN_DEFAULTS["train_emo_layers"], label="Train emotion layers", info="Advanced: trains small emotion modules in addition to LoRA / DoRA layers.")
                 train_mel = gr.Checkbox(value=TRAIN_DEFAULTS["train_mel_embed_head"], label="Train mel embedding head", info="Advanced: trains the mel token embedding/head modules.")
-            full_modules_fp32 = gr.Checkbox(
-                value=TRAIN_DEFAULTS["train_full_modules_fp32"],
-                label="Train speaker/extra modules in FP32",
-                info="Keeps small learning updates in the selected speaker, emotion, and mel modules. Turn off to use base precision and reduce memory use; CPU training still uses FP32. LoRA / DoRA weights stay in FP32 either way.",
-            )
+            with gr.Row():
+                full_modules_fp32 = gr.Checkbox(
+                    value=TRAIN_DEFAULTS["train_full_modules_fp32"],
+                    label="Train speaker/extra modules in FP32",
+                    info="Keeps small learning updates in the selected speaker, emotion, and mel modules. Turn off to use base precision and reduce memory use; CPU training still uses FP32. LoRA / DoRA weights stay in FP32 either way.",
+                )
+                export_int8 = gr.Checkbox(
+                    value=TRAIN_DEFAULTS["export_int8"],
+                    label="Save an INT8 ConvRot version after training",
+                    info="Full fine-tuning: converts the best (and the recommended) checkpoint into <name>.int8_convrot.safetensors beside it. "
+                         "Select that file in Voice Generation to run the fine-tuned model in INT8 (about half the memory).",
+                )
             for field_name, component, kind, choices, minimum, maximum in (
                 ("name", name, "str", None, None, None),
                 ("adapter_type", adapter_type, "choice", ["lora", "dora", "full"], None, None),
@@ -1342,6 +1362,7 @@ def build_training_tab(
                 ("train_emo_layers", train_emo, "bool", None, None, None),
                 ("train_mel_embed_head", train_mel, "bool", None, None, None),
                 ("train_full_modules_fp32", full_modules_fp32, "bool", None, None, None),
+                ("export_int8", export_int8, "bool", None, None, None),
             ):
                 _reg(registry, controls, field_name, component, kind=kind, choices=choices, minimum=minimum, maximum=maximum)
 
@@ -2182,7 +2203,12 @@ def build_training_tab(
     vram_tier.select(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
     apply_tier.click(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
     def apply_omni_method(tier_value, device_value, model_value, method_value):
-        return apply_training_tier(tier_value, device_value, model_value, method_value) if model_value in {"omnivoice", "auk"} else [gr.skip()] * (len(tier_outputs) + 1)
+        if model_value in {"omnivoice", "auk"}:
+            return apply_training_tier(tier_value, device_value, model_value, method_value)
+        # IndexTTS: the method sets its learning rate and checkpoint retention; the tier's memory settings stay.
+        values = INDEX_METHOD_VALUES["full" if method_value == "full" else "adapter"]
+        return (*[gr.skip()] * len(TRAINING_TIER_FIELDS), *[values.get(name, gr.skip()) for name in OMNI_CAPACITY_FIELDS],
+                _training_tier_note(tier_value, device_value, model_value, method_value))
     adapter_type.select(apply_omni_method, tier_inputs, [*tier_outputs, tier_note], queue=False, api_name=False)
     gr.on(
         [component.change for component in (vram_tier, device, adapter_type)],

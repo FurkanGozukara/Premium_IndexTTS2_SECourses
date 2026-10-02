@@ -109,6 +109,13 @@ def _move_non_block_modules(model: UnifiedVoice, device: torch.device) -> None:
                 transformer_child.to(device)
 
 
+# Full fine-tuning trains the language model that turns text into speech codes: the GPT, the mel embedding and
+# head, both position embeddings, the final norm and the speaker / emotion projections. The reference encoders
+# (conformers and perceivers) and the text embedding and head stay frozen, as they do for LoRA / DoRA.
+INDEX_FULL_MODULES = ("gpt", "mel_embedding", "mel_head", "mel_pos_embedding", "text_pos_embedding", "final_norm",
+                      "spk_emb_proj", "emovec_layer", "emo_layer")
+
+
 def _adapter_mapping(model: torch.nn.Module) -> dict[str, LoRAAdapter]:
     return {
         name: module
@@ -162,6 +169,8 @@ def build_training_model(
     model.requires_grad_(False)
 
     resume_file = load_lora(cfg.resume_from) if cfg.resume_from else None
+    if cfg.adapter_type == "full" or (resume_file is not None and resume_file.adapter_type == "full"):
+        return _build_full_training_model(cfg, model, resume_file, device, emit)
     if resume_file is not None:
         changes = []
         if cfg.rank != resume_file.rank:
@@ -256,6 +265,40 @@ def build_training_model(
     total = sum(parameter.numel() for parameter in model.parameters())
     emit(f">> trainable parameters: {trainable:,} / {total:,} ({100 * trainable / total:.3f}%)")
     return BuiltTrainingModel(model, adapters, full_modules, parameters, block_swap)
+
+
+def _build_full_training_model(cfg: TrainConfig, model: torch.nn.Module, resume_file: Any, device: torch.device,
+                               emit: Callable[[str], None]) -> BuiltTrainingModel:
+    """Full fine-tuning: no adapters; the language-model modules train with FP32 weights and optimizer state."""
+
+    if cfg.adapter_type != "full" or (resume_file is not None and resume_file.adapter_type != "full"):
+        raise ValueError("The resume checkpoint's training method differs from this run.")
+    if cfg.base_variant != "bf16":
+        raise ValueError("Full fine-tuning requires the BF16 base model.")
+    if cfg.blocks_to_swap > 0:
+        raise ValueError("Full fine-tuning keeps every GPT block resident; set block swap to 0 (16 GB or larger tier).")
+    if device.type == "cuda":
+        from indextts.runtime.vram_presets import auto_tier
+
+        if auto_tier(torch.cuda.get_device_properties(device).total_memory / 1024**3) < 16:
+            raise ValueError("IndexTTS full fine-tuning needs a GPU with at least 16 GB; choose LoRA / DoRA on this card.")
+    full_modules = {name: getattr(model, name) for name in INDEX_FULL_MODULES if isinstance(getattr(model, name, None), torch.nn.Module)}
+    # FP32 master weights: a BF16 copy would round away updates of this size.
+    for module in full_modules.values():
+        module.float()
+    if cfg.resume_from:
+        apply_lora(model, cfg.resume_from, strength=1.0)
+    parameters = trainable_parameters(model, {}, full_modules)
+    if cfg.gradient_checkpointing:
+        enable_gradient_checkpointing(model, True)
+    model.to(device)
+    model.train()
+    set_training_mode(model, True)
+    trainable = sum(parameter.numel() for parameter in parameters)
+    total = sum(parameter.numel() for parameter in model.parameters())
+    emit(f">> full fine-tuning: {', '.join(full_modules)} | FP32 weights and optimizer state")
+    emit(f">> trainable parameters: {trainable:,} / {total:,} ({100 * trainable / total:.3f}%)")
+    return BuiltTrainingModel(model, {}, full_modules, parameters, None)
 
 
 def _batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
@@ -565,6 +608,7 @@ class LoraTrainer:
         from .evaluation_plan import audio_path, choose_training_reference, describe_training_reference
         typical = bool(getattr(self.config, "reference_typical", True))
         row = choose_training_reference(self.training_records, self.dataset_dir, typical=typical)
+        self._reference_row = row  # OmniVoice saves this clip's transcript beside its copy
         if row is not None and typical and not getattr(self, "_reference_choice_logged", False):
             self._reference_choice_logged = True
             note = describe_training_reference(self.training_records, self.dataset_dir)
@@ -596,6 +640,36 @@ class LoraTrainer:
             self.log(">> " + message)
         except Exception as exc:
             self.log(f">> checkpoint averaging failed but training weights are safe: {exc}")
+
+    def _write_int8_finetune(self, recommended_checkpoint: str | None) -> None:
+        """INT8 ConvRot versions of the best and the recommended full fine-tune; never fails training."""
+
+        if self.config.adapter_type != "full" or not self.config.export_int8 or self.stop_path.exists():
+            return
+        from indextts.lora import inspect_lora
+        from indextts.quant.finetune_int8 import export_int8_finetune
+
+        sources: list[Path] = []
+        for candidate in (best_checkpoint_path(self.adapter_dir, self.config.name), recommended_checkpoint):
+            path = Path(candidate).resolve() if candidate else None
+            if (path is not None and path.is_file() and path not in sources
+                    and not path.name.lower().endswith(".int8_convrot.safetensors")):
+                sources.append(path)
+        for source in sources:
+            try:
+                if inspect_lora(source).get("adapter_type") != "full":
+                    continue
+                self.write_status(message=f"Saving the INT8 ConvRot version of {source.name}")
+                self.log(f">> saving the INT8 ConvRot version of {source.name} for generation")
+                report = export_int8_finetune(source, model_dir=self.config.model_dir, model_config=self.config.model_config,
+                                              device=self.config.device, progress=None)
+                self.log(f">> INT8 ConvRot version saved: {report['output']} ({report['output_bytes'] / 2**30:.2f} GB, "
+                         f"{report['quantized_layers']} layers, mean weight error {report['mean_relative_weight_error_pct']:.3f}%)")
+                self.write_status(int8_finetune=report["output"])
+            except Exception as exc:
+                self.log(f">> INT8 ConvRot export failed but the BF16 checkpoint is safe: {exc}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _write_automatic_analysis(self) -> tuple[str, str]:
         """Analyze saved metrics without allowing a reporting error to fail training."""
@@ -878,7 +952,8 @@ class LoraTrainer:
             code_source, gpt_checkpoint = "real", ""
         decoder_config = DecoderAdapterConfig(
             dataset_dir=config.dataset_dir, output_path=str(output_path), name=config.name, model_dir=config.model_dir,
-            model_config=config.model_config, device=config.device, adapter_type=config.adapter_type,
+            model_config=config.model_config, device=config.device,
+            adapter_type="dora" if config.adapter_type == "full" else config.adapter_type,
             rank=config.decoder_adapter_rank, alpha=config.decoder_adapter_alpha, epochs=config.decoder_adapter_epochs,
             learning_rate=config.decoder_adapter_learning_rate, val_fraction=config.val_fraction,
             val_split_mode=config.val_split_mode, seed=config.seed, max_codes=config.max_codes,
@@ -1469,10 +1544,11 @@ class LoraTrainer:
             self.log(f">> matched-sentence speaking-rate calibration failed but training is safe: {exc}")
 
     def _metadata(self, step: int, epochs: int, targets: list[str]) -> LoraMetadata:
+        full = self.config.adapter_type == "full"
         return LoraMetadata(
             adapter_type=self.config.adapter_type,
-            rank=self.config.rank,
-            alpha=self.config.alpha,
+            rank=0 if full else self.config.rank,
+            alpha=0.0 if full else self.config.alpha,
             dropout=self.config.dropout,
             target_modules=targets,
             base_variant=self.config.base_variant,
@@ -1832,10 +1908,11 @@ class LoraTrainer:
         self.reporter.set_stage("load model")
         built = build_training_model(config, log=self.log)
         # Resume metadata may have overridden these values in build_training_model.
-        first_adapter = next(iter(built.adapters.values()))
-        config.rank = first_adapter.rank
-        config.alpha = first_adapter.alpha
-        config.adapter_type = "dora" if first_adapter.use_dora else "lora"
+        first_adapter = next(iter(built.adapters.values()), None)
+        if first_adapter is not None:
+            config.rank = first_adapter.rank
+            config.alpha = first_adapter.alpha
+            config.adapter_type = "dora" if first_adapter.use_dora else "lora"
         # CLI runs need the same reproducible evaluation contract as UI jobs.
         atomic_write_json(self.adapter_dir / "train_config.json", config.to_dict())
         self._prepare_reference()
@@ -2546,6 +2623,7 @@ class LoraTrainer:
             self.log(f">> independent final test failed but training weights are safe: {exc}")
             self.write_status(phase=post_phase, message=post_message, recommended_checkpoint=recommended_checkpoint,
                               final_test_status="failed", final_test_message=str(exc))
+        self._write_int8_finetune(recommended_checkpoint)
         completed_checks = read_json_retry(self.status_path, {}) or {}
         failed_checks = [label for key, label in (
             ("speech_evaluation_status", "speech evaluation"), ("decoder_adapter_status", "decoder validation"),
