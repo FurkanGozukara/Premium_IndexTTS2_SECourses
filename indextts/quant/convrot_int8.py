@@ -932,6 +932,10 @@ class ConvRotInt8Linear(nn.Module):
                         else:
                             mode = "w8a16"
                     self._local_kernel_choices[local_key] = mode
+                    if "w8a8" not in self._local_kernel_choices.values():
+                        # The benchmark's padded W8A8 copy of the weights would
+                        # otherwise double this layer's INT8 memory under W8A16.
+                        self._invalidate_rhs(drop=True)
             if mode == "w8a8" and _int8_gemm_supported(x.device):
                 output = _int8_linear_fast_rotated(
                     x_2d,

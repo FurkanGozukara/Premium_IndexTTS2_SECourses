@@ -178,6 +178,28 @@ def test_cuda_w8a8_accepts_unaligned_rows(rows: int) -> None:
     assert relative < 0.02
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_kernel_choice_of_w8a16_releases_the_w8a8_weight_copy(monkeypatch) -> None:
+    from indextts.quant import convrot_int8
+
+    device = torch.device("cuda")
+    if not convrot_int8._int8_gemm_supported(device):
+        pytest.skip("torch._int_mm is unavailable")
+    monkeypatch.setattr(convrot_int8, "_cached_int8_kernel", lambda *args: None)
+    monkeypatch.setattr(convrot_int8, "_choose_int8_kernel", lambda *args: "w8a16")
+    layer = ConvRotInt8Linear(1536, 512, bias=False, group_size=256, device=device, dtype=torch.bfloat16)
+    layer.weight_int8.random_(-127, 128)
+    layer.weight_scale.fill_(0.001)
+    with torch.inference_mode():
+        layer(torch.randn((64, 1536), device=device, dtype=torch.bfloat16))
+    assert layer.weight_int8_rhs.numel() == 0
+    monkeypatch.setattr(convrot_int8, "_choose_int8_kernel", lambda *args: "w8a8")
+    with torch.inference_mode():
+        layer(torch.randn((600, 1536), device=device, dtype=torch.bfloat16))
+    assert layer.weight_int8_rhs.numel() > 0
+
+
 def test_meta_initialized_model_loads_and_moves(tmp_path: Path) -> None:
     # AuK builds its INT8 transformer on the meta device and lets the checkpoint
     # supply every tensor; the never-filled W8A8 cache must not block .to().
