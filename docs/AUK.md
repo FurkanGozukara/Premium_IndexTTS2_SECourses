@@ -10,7 +10,7 @@ Select **AuK** beside the app heading. [Tencent AuK](https://huggingface.co/tenc
 - **Duration:** AuK needs every section's length up front. The app follows upstream's prompt-enhancer byte model, scaled by the reference's (or trained voice's) measured pace. Sections default to 60 text tokens (about 15 s); a section that would not fit the 30 s context is split again rather than rushed.
 - **Sampling:** the official defaults are 32 Euler steps, guidance 2.0 and sway −1. The Max speed and Max quality choices select 16 and 64 steps. Loudness matching to the reference is on by default.
 
-Decoding was measured on the user's voice: 24 held-out sentences × 2 seeds, scored against real recordings of the same sentences (speaker and style similarity, Whisper word errors), with paired bootstrap intervals and a 72-sentence confirmation set.
+Decoding choices were compared on 24 held-out English sentences × 2 seeds, scored against real recordings of the same sentences (speaker and style similarity, Whisper word errors), with paired bootstrap intervals and a 72-sentence confirmation set.
 
 | Setting | Result |
 | --- | --- |

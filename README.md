@@ -1,6 +1,8 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 7.0 — IndexTTS 2.5 and OmniVoice.** Choose the speech model in the header. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember both profiles. Existing IndexTTS presets continue to work.
+**Version 7.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+
+AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
 OmniVoice supports reference voice cloning, voice design with supported tags, automatic voices, multilingual generation, BF16 and ConvRot INT8, and full/LoRA/DoRA fine-tuning. Public model files download on demand. See [OmniVoice setup, training and validation](docs/OMNIVOICE.md) for model-specific controls, measured limits and dependency notes. The rest of this guide documents the shared application and established IndexTTS controls.
 
@@ -10,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V7.1 AuK, the third speech model:** Tencent's AuK adds voice cloning, plain-language voice design, trained voices that speak without a reference, and an editing tab for content, pitch, speed, volume, emotion, accent, nonverbal and whisper edits, enhancement, restoration and separation. Measured VRAM presets cover 6 to 32 GB (BF16, ConvRot INT8, and an on-demand mode that keeps the text encoder and the transformer from sharing the GPU), and model switches are faster for every model.
 
 **V7.0 OmniVoice and a shared model interface:** choose IndexTTS 2.5 or OmniVoice in the header. Universal presets remember both profiles. OmniVoice adds automatic downloads, voice design, BF16/ConvRot INT8 inference and full/LoRA/DoRA training through the shared generation and evaluation workflows. Startup shows each loading stage.
 
@@ -708,7 +712,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v7.0 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v7.1 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 

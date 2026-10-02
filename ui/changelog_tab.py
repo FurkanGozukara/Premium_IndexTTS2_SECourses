@@ -7,6 +7,22 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v7.1",
+        "2026-10-03",
+        """
+### AuK: a third speech model with audio editing
+
+- **AuK (Tencent):** choose AuK in the header. Voice cloning (the reference is trimmed and cut at a pause to at most 15 seconds; a transcript only sets the pace, Whisper fills it in once otherwise), voice design from a plain description, and Auto voice, which lets a fine-tuned AuK voice speak without a reference with the pace and wording it was trained with. English and Chinese, 24 kHz output, with the shared pause tags, section batching, subtitles, word timestamps and WAV/MP3/MP4 export.
+- **AuK Audio Editing tab:** shown while AuK is selected. Replace, insert or remove words, change lyrics, pitch, speed, volume, emotion or timbre, remove an accent, add or remove nonverbal sounds, convert to and from whispering, enhance, restore, separate speakers or music, or write a custom instruction. The tab shows the exact instruction AuK receives and sets the output length by the task's own rule, the source length or a custom value; acoustic edits run on long recordings piece by piece.
+- **Measured defaults:** on held-out sentences scored against the speaker's real recordings, voice design uses upstream's canonical wording (word errors 14 % → 1.8 %), references up to 15 seconds improve speaker similarity, and sections of about 60 tokens use AuK's whole 30-second context and are split again instead of rushed. The official 32 steps, guidance 2 and sway −1 stay the defaults.
+- **Memory tiers from 6 GB:** BF16 at 16 GB and above (12.0 GiB measured peak), the ConvRot INT8 text encoder at 12 GB (8.7 GiB), INT8 everywhere at 10 GB (7.3 GiB), and on demand at 8 and 6 GB (5.1 and 4.6 GiB), where the text encoder and the transformer take turns on the GPU with bit-identical audio. INT8 quality measured within seed noise; INT8 is slower than BF16, so it is used only where BF16 does not fit. The INT8 and slim encoder files download from MonsterMMORPG/Wan_GGUF.
+- **AuK training:** full fine-tuning (32 GB tier), LoRA and DoRA on the shared dataset manifests, with AuK's own latent and conditioning caches, flow-matching validation, automatic checkpoint evaluation, speech comparison and the checkpoint grid. Full fine-tuning runs without gradient checkpointing (65 % faster at the same peak).
+- **Faster model switching for every model:** the page's hidden helpers now lead Gradio's layout, so its per-event status refresh walks a quarter less of the page; change-driven displays skip repeats of what they just showed.
+
+Model files download on first use. Restart after updating.
+""".strip(),
+    ),
+    (
         "v7.0",
         "2026-10-02",
         """

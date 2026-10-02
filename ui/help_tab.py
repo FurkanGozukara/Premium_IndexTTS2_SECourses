@@ -23,6 +23,12 @@ Choose **Voice cloning**, **Auto voice**, or **Voice design**. A transcript must
 
 In **Voice Training**, both speech models support full fine-tuning (16 GB tier or larger), LoRA and DoRA. Full fine-tuning uses the BF16 base with FP32 trainable weights and requires checkpoint strength 1; after training, the best and the recommended checkpoint are also saved as INT8 ConvRot versions (`<checkpoint>.int8_convrot.safetensors`), which load the fine-tuned model itself in INT8 when selected. LoRA and DoRA also support a frozen ConvRot INT8 base. Features are cached separately for each speech model. Validation uses fixed masked audio tokens; its loss and accuracy are not comparable to IndexTTS next-token metrics. The shared decoding sweep varies OmniVoice steps and guidance on development data before the frozen final test. IndexTTS's semantic-to-mel decoder adaptation is specific to IndexTTS.
 
+## AuK
+
+Choose **Voice cloning**, **Voice design** or **Auto voice**. Cloning trims the reference and cuts it at a pause to at most 15 seconds; the transcript only sets the speaking pace (blank: Whisper transcribes it once). Voice design takes a plain description of the voice. Auto voice lets a fine-tuned AuK voice speak without a reference; the base model then picks a random voice. AuK supports English and Chinese and needs each section's length up front, estimated from the text and the reference's pace; sections that would not fit its 30-second context are split again. The **AuK Audio Editing** tab, shown while AuK is selected, edits, restores and separates recordings and shows the exact instruction AuK receives.
+
+AuK memory tiers: BF16 from 16 GB, the INT8 text encoder at 12 GB, INT8 everywhere at 10 GB, and **on demand** at 8 and 6 GB, where the text encoder and the transformer take turns on the GPU. In **Voice Training**, AuK full fine-tuning needs the 32 GB tier; LoRA and DoRA fit every tier (INT8 base below 16 GB). Its validation reports a flow-matching loss that is not comparable to the other models'.
+
 Start with the detected memory tier. Text length, references and batch size affect actual VRAM; the benchmark can test every tier under an emulated allocation budget. Full fine-tuning needs more memory than adapters.
 
 ## Reference Audio
