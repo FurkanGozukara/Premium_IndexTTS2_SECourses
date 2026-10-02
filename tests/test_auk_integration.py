@@ -240,8 +240,9 @@ def test_auk_tier_presets_shrink_memory_with_the_card():
     assert (big.model_variant, big.auk_text_encoder_variant, big.auk_text_encoder_residency) == ("bf16", "bf16", "gpu")
     assert mid.auk_text_encoder_variant == "int8_convrot" and mid.model_variant == "bf16"
     assert ten.model_variant == "int8_convrot" and ten.auk_text_encoder_residency == "gpu"
-    # On demand the encoder and the transformer take turns, so the BF16 transformer fits again.
-    assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "bf16"
+    # On demand the encoder and the transformer take turns: the BF16 transformer fits 8 GB again.
+    assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "int8_convrot"
+    assert resolve_preset(8).model_variant == "bf16" and resolve_preset(8).auk_text_encoder_residency == "on_demand"
     assert resolve_training_preset(32, "full")["base_variant"] == "bf16"
     assert resolve_training_preset(32, "full")["gradient_checkpointing"] is False
     assert resolve_training_preset(8, "dora")["base_variant"] == "int8_convrot"
