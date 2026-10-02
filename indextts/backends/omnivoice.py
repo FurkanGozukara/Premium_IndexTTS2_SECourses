@@ -402,6 +402,29 @@ class OmniVoiceEngine:
             if on_text_complete:
                 on_text_complete(text_index, results[text_index])
         devices = [torch.device(self.device).index or 0] if str(self.device).startswith("cuda") else []
+
+        def synthesize(texts_, lengths_):
+            generated = self.model.generate(
+                text=texts_ if len(texts_) > 1 else texts_[0],
+                language=None if str(lang).lower() == "auto" else str(lang).lower(),
+                voice_clone_prompt=voice, instruct=(settings["instruct"] or None) if settings["mode"] != "auto" else None,
+                # A trained voice keeps its speaker's measured pace, with or without a reference.
+                speed=self._generation_speed(voice) / max(0.1, float(duration_factor)),
+                duration=lengths_ if len(texts_) > 1 else lengths_[0], normalize_text=False, **config)
+            if len(generated) != len(texts_):
+                raise RuntimeError("OmniVoice returned the wrong batch size.")
+            outputs = []
+            for audio in generated:
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if not len(audio) or not np.isfinite(audio).all():
+                    raise RuntimeError("OmniVoice returned empty or non-finite audio.")
+                outputs.append(trim_segment_silence(torch.from_numpy(audio).unsqueeze(0), self.sampling_rate,
+                                                    trim_silence_ms_threshold))
+            return outputs
+
+        # Takes per section: Whisper scores every take; up to this many renders of a section, the fewest errors win.
+        takes = max(1, int(getattr(self, "section_takes", 1) or 1))
+        judge = getattr(self, "take_judge", None) if takes > 1 else None
         try:
             with torch.inference_mode(), torch.random.fork_rng(devices=devices):
                 if seed is not None:
@@ -410,23 +433,19 @@ class OmniVoiceEngine:
                     batch_index, batch_step = start // batch_size, 0
                     batch = speech[start:start + batch_size]
                     lengths = target_lengths[start:start + batch_size]
-                    generated = self.model.generate(
-                        text=batch if len(batch) > 1 else batch[0],
-                        language=None if str(lang).lower() == "auto" else str(lang).lower(),
-                        voice_clone_prompt=voice, instruct=(settings["instruct"] or None) if settings["mode"] != "auto" else None,
-                        # A trained voice keeps its speaker's measured pace, with or without a reference.
-                        speed=self._generation_speed(voice) / max(0.1, float(duration_factor)),
-                        duration=lengths if len(batch) > 1 else lengths[0], normalize_text=False, **config)
-                    if len(generated) != len(batch):
-                        raise RuntimeError("OmniVoice returned the wrong batch size.")
-                    for offset, audio in enumerate(generated):
-                        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-                        if not len(audio) or not np.isfinite(audio).all():
-                            raise RuntimeError("OmniVoice returned empty or non-finite audio.")
-                        rendered[start + offset] = trim_segment_silence(torch.from_numpy(audio).unsqueeze(0),
-                            self.sampling_rate, trim_silence_ms_threshold)
-                        durations.append(rendered[start + offset].shape[-1] / self.sampling_rate)
-                        complete(owners[start + offset])
+                    for offset, take in enumerate(synthesize(batch, lengths)):
+                        index = start + offset
+                        if judge is not None:
+                            from indextts.utils.take_selection import keep_best_take
+
+                            take, rates, kept = keep_best_take(
+                                take, lambda i=index: synthesize([speech[i]], [target_lengths[i]])[0],
+                                lambda audio, i=index: judge.error_rate(speech[i], audio.squeeze(0).numpy(), self.sampling_rate),
+                                takes)
+                            judge.record(index, rates, kept)
+                        rendered[index] = take
+                        durations.append(take.shape[-1] / self.sampling_rate)
+                        complete(owners[index])
                     if self.progress_reporter:
                         self.progress_reporter.update(batch_index + 1, total=total,
                             desc=f"OmniVoice batch {batch_index + 1}/{total} complete")

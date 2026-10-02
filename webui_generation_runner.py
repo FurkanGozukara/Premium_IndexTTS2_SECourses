@@ -492,6 +492,31 @@ def _emit_progress(progress_callback, value: float, desc: str) -> None:
     progress_callback(value, desc=desc)
 
 
+def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, text: str, language: str):
+    """Give the engine a Whisper judge for "Takes per section" (None when the option is off)."""
+
+    tts.section_takes, tts.take_judge = 1, None
+    if section_takes <= 1:
+        return None
+    from indextts.utils.take_selection import SectionTakeJudge
+
+    device = str(getattr(tts, "device", "") or (request.get("runtime") or {}).get("device") or "cuda:0")
+    if device == "auto":
+        import torch
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    judge = SectionTakeJudge(language, text, device=device)
+    tts.section_takes, tts.take_judge = section_takes, judge
+    print(f">> Takes per section: up to {section_takes}; Whisper judges them in '{judge.language}'", flush=True)
+    return judge
+
+
+def _release_take_judge(tts: Any, judge: Any) -> None:
+    tts.section_takes, tts.take_judge = 1, None
+    if judge is not None:
+        judge.close()
+
+
 def _choose_best_candidate(request: Dict[str, Any], tts: Any, paths: list, text: str, language: str,
                            metadata: Dict[str, Any]) -> int:
     """Index of the candidate Whisper hears with the fewest word errors (0 keeps the first on any failure)."""
@@ -641,6 +666,7 @@ def run_generation_request(
     request_runtime = RuntimeConfig.from_dict(request.get("runtime"))
     infer_kwargs.setdefault("cfm_cache_length", request_runtime.cfm_cache_length)
     section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
+    section_takes = max(1, min(8, int(request.get("section_takes", 1) or 1)))
     latent_multiplier = float(infer_kwargs.pop("latent_multiplier", 1.72))
     infer_kwargs["duration_factor"] = latent_multiplier / 1.72
     infer_kwargs.pop("max_emotion_sum", None)
@@ -701,6 +727,8 @@ def run_generation_request(
             )
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
         subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
+        take_judge = _attach_take_judge(request, tts, section_takes,
+                                        subtitle_cues_to_text(subtitle_cues) if subtitle_cues else text, language)
 
         if subtitle_mode:
             if not subtitle_cues:
@@ -991,6 +1019,11 @@ def run_generation_request(
             output = output_path
             print(f">> Primary output uses {os.path.basename(candidate_paths[0])}:", output)
 
+        if take_judge is not None:
+            metadata["section_takes"] = {"takes": section_takes, "language": take_judge.language,
+                                         "sections": list(take_judge.history)}
+            _release_take_judge(tts, take_judge)
+            take_judge = None
         check_cancellation()
         if save_used_audio and prompt:
             try:
@@ -1150,6 +1183,7 @@ def run_generation_request(
             "timestamps": timestamps,
         }
     except Exception as exc:
+        _release_take_judge(tts, locals().get("take_judge"))
         processing_elapsed_seconds = time.perf_counter() - processing_started_perf
         metadata["status"] = "canceled" if "cancel" in str(exc).lower() else "failed"
         metadata["updated_at"] = current_timestamp()

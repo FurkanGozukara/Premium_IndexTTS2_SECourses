@@ -51,18 +51,70 @@ def written_words(text: str) -> list[str]:
     return [word for word in words if any(char.isalnum() for char in word)]
 
 
-def whisper_language(language: str | None) -> str | None:
-    """Whisper's code for an app language (``EN``, ``ZHEN``, OmniVoice codes); ``None`` lets Whisper detect it."""
+# App and OmniVoice language codes that Whisper names differently (mixed Chinese-English, ISO 639-3 members
+# of a macrolanguage Whisper knows).
+_WHISPER_ALIASES = {
+    "zhen": "zh", "zh-cn": "zh", "zh-tw": "zh", "cmn": "zh", "arb": "ar", "acm": "ar", "aeb": "ar", "afb": "ar",
+    "apc": "ar", "arq": "ar", "ars": "ar", "ary": "ar", "arz": "ar", "ayl": "ar", "pes": "fa", "prs": "fa", "zsm": "ms",
+    "khk": "mn", "ekk": "et", "lvs": "lv", "npi": "ne", "swh": "sw", "uzn": "uz", "azj": "az", "plt": "mg",
+    "nob": "no", "nno": "nn", "fil": "tl",
+}
+_IDENTIFIER = None
+
+
+def _whisper_languages() -> frozenset[str]:
+    from transformers.models.whisper.tokenization_whisper import LANGUAGES
+
+    return frozenset(LANGUAGES)
+
+
+def detect_text_language(text: str) -> str:
+    """The language of ``text`` among Whisper's languages, from the text itself (py3langid); English when unsure."""
+
+    global _IDENTIFIER
+    value = " ".join(written_words(text))
+    if not value:
+        return "en"
+    try:
+        if _IDENTIFIER is None:
+            from py3langid.langid import MODEL_DIR, MODEL_FILE, LanguageIdentifier
+
+            identifier = LanguageIdentifier.from_modelpath(MODEL_DIR / MODEL_FILE, norm_probs=True)
+            identifier.set_languages(sorted(set(identifier.nb_classes) & _whisper_languages()))
+            _IDENTIFIER = identifier
+        code, probability = _IDENTIFIER.classify(value)
+    except ImportError:
+        # Without the detector (an older install): the script decides, Latin script stays English.
+        if re.search(r"[\u3040-\u30ff]", value):
+            return "ja"
+        if re.search(r"[\uac00-\ud7a3]", value):
+            return "ko"
+        if _CJK_RE.search(value):
+            return "zh"
+        if re.search(r"[\u0600-\u06ff]", value):
+            return "ar"
+        if re.search(r"[\u0400-\u04ff]", value):
+            return "ru"
+        return "en"
+    # A word or two is not enough to tell languages apart.
+    return code if (len(value.split()) >= 3 or _CJK_RE.search(value)) and probability >= 0.5 else "en"
+
+
+def whisper_language(language: str | None, text: str = "") -> str:
+    """Whisper's language for a generation: the speech model's own language setting, never Whisper's detection.
+
+    OmniVoice's Auto (and a code Whisper lacks) resolves from the generated text itself, so Whisper always
+    transcribes in the language the speech was asked for.
+    """
 
     code = str(language or "").strip().lower()
-    if code in {"", "auto"}:
-        return None
-    code = {"zhen": "zh", "zh-cn": "zh", "cmn": "zh", "yue": "yue"}.get(code, code)
+    code = _WHISPER_ALIASES.get(code, code)
     try:
-        from transformers.models.whisper.tokenization_whisper import LANGUAGES
+        if code in _whisper_languages():
+            return code
     except ImportError:  # pragma: no cover - transformers is a dependency
-        return code
-    return code if code in LANGUAGES else None
+        return code or "en"
+    return detect_text_language(text)
 
 
 def align_words(text: str, recognized: Sequence[Any], duration_s: float) -> dict[str, Any]:
@@ -205,13 +257,13 @@ def write_speech_timestamps(audio_path: str | os.PathLike[str], text: str, *, la
             free = None
         # Whisper large-v3-turbo needs about 2 GB beside the loaded speech model; a full card falls back to the CPU.
         device = whisper_device_for_free_vram(device, free, required_gb=2.5)
-    code = whisper_language(language)
+    code = whisper_language(language, text)
     transcript = (transcriber or transcribe)(str(audio_path), language=code, device=device, progress_cb=progress)
     aligned = align_words(text, transcript.words, duration)
     cues = subtitle_cues(aligned["words"])
     paths = timestamp_paths(audio_path)
     payload = {"version": 1, "audio": str(Path(audio_path).resolve()), "duration_s": round(duration, 3),
-               "language": code or "auto", "aligner": ALIGNER, **aligned, "cues": cues,
+               "language": code, "aligner": ALIGNER, **aligned, "cues": cues,
                "recognized_text": getattr(transcript, "text", "")}
     _write(paths["json"], json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
     _write(paths["srt"], srt_text(cues))
@@ -220,5 +272,5 @@ def write_speech_timestamps(audio_path: str | os.PathLike[str], text: str, *, la
             "words": aligned["total_words"], "cues": len(cues)}
 
 
-__all__ = ["align_words", "srt_text", "subtitle_cues", "timestamp_paths", "vtt_text", "whisper_language",
-           "write_speech_timestamps", "written_words"]
+__all__ = ["align_words", "detect_text_language", "srt_text", "subtitle_cues", "timestamp_paths", "vtt_text",
+           "whisper_language", "write_speech_timestamps", "written_words"]

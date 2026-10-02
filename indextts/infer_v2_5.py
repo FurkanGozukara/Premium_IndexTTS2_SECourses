@@ -1759,7 +1759,8 @@ class IndexTTS2:
                 jobs.append((text_index, segment_index, token_tensor))
                 job_texts[text_index, segment_index] = segment_text
 
-        if len(jobs) < 2:
+        # Takes per section re-render single sections, which the micro-batched path cannot; render one at a time.
+        if len(jobs) < 2 or int(getattr(self, "section_takes", 1) or 1) > 1:
             kwargs.update({
                 "emo_audio_prompt": emo_audio_prompt,
                 "emo_alpha": emo_alpha,
@@ -2370,7 +2371,8 @@ class IndexTTS2:
                 gpt_gen_time += time.perf_counter() - m_start_time
                 return codes
 
-            with torch.no_grad():
+            def render_take():
+                nonlocal generated_code_tokens, s2mel_time, bigvgan_time
                 code_parts = self._complete_speech_codes(
                     segments[seg_idx], generate_codes(segments[seg_idx]), generate_codes,
                     max_mel_tokens=max_mel_tokens, recovery=recovery,
@@ -2383,7 +2385,6 @@ class IndexTTS2:
                         )[0]
                         for part in code_parts
                     ]
-                rendered_codes.append([part.detach().cpu() for part in code_parts])
                 wav, segment_s2mel_time, segment_vocoder_time = self._render_code_parts(
                     code_parts,
                     prompt_condition,
@@ -2398,6 +2399,24 @@ class IndexTTS2:
                 )
                 s2mel_time += segment_s2mel_time
                 bigvgan_time += segment_vocoder_time
+                return code_parts, wav
+
+            with torch.no_grad():
+                code_parts, wav = render_take()
+                # Takes per section: Whisper scores every take; up to this many renders, the fewest errors win.
+                # Without sampling every retake would be identical, so there is nothing to choose from.
+                takes = max(1, int(getattr(self, "section_takes", 1) or 1))
+                judge = getattr(self, "take_judge", None)
+                if takes > 1 and judge is not None and do_sample:
+                    from indextts.utils.take_selection import keep_best_take
+
+                    (code_parts, wav), rates, kept = keep_best_take(
+                        (code_parts, wav), render_take,
+                        lambda take: judge.error_rate(segments[seg_idx], (take[1].squeeze(0).float() / 32767.0).cpu().numpy(),
+                                                      sampling_rate),
+                        takes)
+                    judge.record(seg_idx, rates, kept)
+                rendered_codes.append([part.detach().cpu() for part in code_parts])
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 wavs.append(wav)

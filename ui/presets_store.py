@@ -212,6 +212,14 @@ def coerce_value(value: Any, spec: ControlSpec) -> Any:
     if kind == "bool":
         return _bool(value, bool(default))
     if kind in {"int", "float"}:
+        if spec.nullable:
+            # Optional numbers mean "not set" when blank. Gradio 6 shows a blank Number as 0 once it is rendered
+            # and then sends 0, so 0 is blank too; clamping it made a never-touched "High cut" a 1 kHz low-pass.
+            try:
+                if float(value) == 0.0:
+                    return None
+            except (TypeError, ValueError):
+                return None
         normalized = _number(value, default or 0, kind == "int")
         if spec.minimum is not None:
             normalized = max(normalized, spec.minimum)
