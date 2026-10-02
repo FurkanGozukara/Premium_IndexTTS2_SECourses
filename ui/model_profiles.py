@@ -76,7 +76,7 @@ def is_omnivoice_only(key):
 
 
 def is_auk_only(key):
-    return key.startswith("auk.") or key.startswith("training.auk_") or key in AUK_ONLY
+    return key.startswith(("auk.", "auk_edit.", "training.auk_")) or key in AUK_ONLY
 
 
 def is_model_only(key):

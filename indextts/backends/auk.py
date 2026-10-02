@@ -127,6 +127,20 @@ def cut_at_pause(audio: np.ndarray, sample_rate: int, max_seconds: float) -> np.
     return audio[: max(frame, cut)]
 
 
+def split_at_pauses(audio: np.ndarray, sample_rate: int, max_seconds: float) -> list[np.ndarray]:
+    """Cut long audio into pieces of at most ``max_seconds``, each ending at the quietest
+    point of its last 3 seconds (the same rule that shortens references)."""
+    pieces, rest = [], audio
+    limit = int(max_seconds * sample_rate)
+    while len(rest) > limit:
+        piece = cut_at_pause(rest, sample_rate, max_seconds)
+        pieces.append(piece)
+        rest = rest[len(piece):]
+    if len(rest):
+        pieces.append(rest)
+    return pieces
+
+
 def read_audio(path) -> tuple[np.ndarray, int]:
     """Mono float32 audio at its native rate; non-WAV containers go through librosa/FFmpeg."""
     try:
@@ -590,35 +604,89 @@ class AukEngine:
         }
         return results
 
-    def edit(self, source_path, instruction, *, gen_seconds=None, settings=None, seed=None):
-        """Run one AuK editing, enhancement or separation instruction on a source recording.
+    # Whisper conversion inputs: the paper normalizes them to -24 dBFS RMS (peak ceiling 0.95).
+    WHISPER_INPUT_RMS = 10 ** (-24 / 20)
+    EDIT_CHUNK_SECONDS = 24.0
 
-        ``gen_seconds`` None keeps the source length (upstream's default for same-length tasks).
+    def edit_audio(self, source, task_key, values=None, *, instruction=None, transcript="", duration_mode="auto",
+                   seconds=None, settings=None, seed=None, language="en"):
+        """Apply one AuK editing, enhancement or separation task to a recording.
+
+        ``source`` is a path or ``(audio, sample_rate)``. ``duration_mode``: "auto" (the
+        task's rule), "source" (the source length) or "custom" (``seconds``). Same-length
+        tasks on audio longer than a context run piece by piece, cut at pauses.
+        Returns ``(24000, int16 pcm)``.
         """
-        settings = {**GENERATION_DEFAULTS, **(settings or {}), "trim_reference_silence": False}
-        audio, rate = read_audio(source_path)
-        audio24 = resample(audio, rate, SAMPLE_RATE)
-        audio24 = audio24[: max(HOP, len(audio24) // HOP * HOP)]
         from indextts.auk.conditioning import to_encoder_rate
+        from indextts.auk.tasks import TASKS, render_instruction, target_seconds
 
-        reference = PreparedReference(audio24, to_encoder_rate(audio, rate), "", len(audio24) / SAMPLE_RATE, None, str(source_path))
-        seconds = float(gen_seconds) if gen_seconds else reference.seconds
-        seconds = min(max(0.3, seconds), 2 * MAX_CONTEXT_SECONDS)
-        base_seed = int(seed) if seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
+        task = TASKS[task_key]
+        values = dict(values or {})
+        settings = {**GENERATION_DEFAULTS, **(settings or {})}
+        instruction = str(instruction or "").strip() or render_instruction(task_key, values, language)
+        audio, rate = read_audio(source) if isinstance(source, (str, Path)) else (np.asarray(source[0], np.float32), int(source[1]))
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0 if audio.shape[0] <= 8 else -1)
+        full_seconds = len(audio) / rate
+        base_seconds = full_seconds
+        if task.trim:
+            base_seconds = speech_span(audio, rate)
+            audio = trim_silence(audio, rate)
+        if task_key in {"to_whisper", "from_whisper"}:
+            level = _rms(audio)
+            if level > 1e-6:
+                audio = audio * (self.WHISPER_INPUT_RMS / level)
+                peak = float(np.abs(audio).max())
+                if peak > 0.95:
+                    audio = audio * (0.95 / peak)
+        if duration_mode == "custom" and seconds:
+            target = float(seconds)
+        elif duration_mode == "source":
+            target = len(audio) / rate
+        else:
+            if task.duration == "content" and not transcript and str(settings.get("transcribe_source", True)) != "False":
+                transcript = self._transcribe_array(audio, rate, language)
+            target = target_seconds(task_key, values, base_seconds, full_seconds, transcript)
+        seed = int(seed) if seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
         started = time.perf_counter()
+        long_source = len(audio) / rate > MAX_CONTEXT_SECONDS
+        if long_source and not task.chunkable:
+            raise ValueError(f"{task.label} works on up to {MAX_CONTEXT_SECONDS:.0f} seconds of audio; trim the source first.")
+        pieces = split_at_pauses(audio, rate, self.EDIT_CHUNK_SECONDS) if long_source else [audio]
+        scale = target / max(1e-6, len(audio) / rate)
+        outputs = []
         devices = [torch.device(self.device).index or 0] if str(self.device).startswith("cuda") else []
         with torch.random.fork_rng(devices=devices):
-            torch.manual_seed(base_seed)
-            steps = max(1, int(settings["num_step"]))
+            torch.manual_seed(seed)
+            for index, piece in enumerate(pieces):
+                audio24 = resample(piece, rate, SAMPLE_RATE)
+                audio24 = audio24[: max(HOP, len(audio24) // HOP * HOP)]
+                reference = PreparedReference(audio24, to_encoder_rate(piece, rate), "", len(audio24) / SAMPLE_RATE,
+                                              None, "edit source")
+                piece_seconds = target if len(pieces) == 1 else len(piece) / rate * scale
 
-            def on_step(step, total):
-                if self.progress_reporter:
-                    self.progress_reporter.update(step, total=total, desc=f"AuK edit step {step}/{total}")
+                def on_step(step, total, index=index):
+                    if self.progress_reporter:
+                        self.progress_reporter.update(index * total + step, total=len(pieces) * total,
+                                                      desc=f"AuK edit, piece {index + 1}/{len(pieces)}, step {step}/{total}")
 
-            audio_out = self.generate_batch([instruction], [reference], [seconds], settings, [base_seed], on_step)[0]
-        self.last_generation_stats = {"model": self.model_id, "generation_time_s": time.perf_counter() - started,
-                                      "total_duration_s": audio_out.shape[-1] / SAMPLE_RATE, "steps": steps}
-        return SAMPLE_RATE, (audio_out.flatten().clamp(-1, 1) * 32767).round().to(torch.int16).numpy()
+                outputs.append(self.generate_batch([instruction], [reference], [min(2 * MAX_CONTEXT_SECONDS,
+                                                   max(0.3, piece_seconds))], settings, [seed + index], on_step)[0])
+        result = torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0]
+        self.last_generation_stats = {
+            "model": self.model_id, "task": task_key, "instruction": instruction, "pieces": len(pieces),
+            "generation_time_s": time.perf_counter() - started, "total_duration_s": result.shape[-1] / SAMPLE_RATE,
+            "target_seconds": round(target, 3), "source_seconds": round(full_seconds, 3), "transcript": transcript,
+        }
+        return SAMPLE_RATE, (result.flatten().clamp(-1, 1) * 32767).round().to(torch.int16).numpy()
+
+    def _transcribe_array(self, audio, rate, language) -> str:
+        from indextts.training.whisper_asr import transcribe
+
+        lang = str(language or "en").lower()
+        lang = lang if lang in {"en", "zh"} else "en"
+        return transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
+                          device=self.device if str(self.device).startswith("cuda") else "cpu").text.strip()
 
     def unload(self):
         self._reference = self._reference_key = None

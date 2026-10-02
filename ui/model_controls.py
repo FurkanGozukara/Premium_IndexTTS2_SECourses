@@ -26,8 +26,11 @@ HEAD_LABELS = {"indextts": "Train mel embedding head", "omnivoice": "Train audio
 # mounted tab or accordion show the right layout without a server round trip.
 MODEL_ONLY_CLASS = {"indextts": "tts-only-indextts", "omnivoice": "tts-only-omnivoice", "auk": "tts-only-auk"}
 # IndexTTS is the default layout (no class), so the page is right before the first event.
+# Leaving AuK while its editing tab is open returns to Voice Generation (the tab hides).
 MODEL_CLASS_JS = ("(model) => { for (const id of ['omnivoice', 'auk']) "
-                  "document.body.classList.toggle('tts-model-' + id, model === id); }")
+                  "document.body.classList.toggle('tts-model-' + id, model === id); "
+                  "if (model !== 'auk' && document.querySelector('button[data-tab-id=\"auk-editing\"].selected')) "
+                  "document.querySelector('button[data-tab-id=\"voice-generation\"]')?.click(); }")
 METHOD_CLASS_JS = "(method) => { document.body.classList.toggle('train-method-full', method === 'full'); }"
 
 

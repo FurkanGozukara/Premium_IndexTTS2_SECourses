@@ -23,6 +23,7 @@ from indextts.runtime.gpu import list_gpus
 from indextts.runtime.vram_presets import VRAM_TIERS, RuntimeConfig, auto_tier, describe, resolve_preset
 
 from .batch_tab import bind_batch_events, build_batch_tab
+from .auk_edit_tab import TASK_CLASS_JS, bind_auk_edit_events, build_auk_edit_tab, task_fields_css
 from .changelog_tab import build_changelog_tab
 from .common import (
     APP_CSS,
@@ -411,6 +412,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 print(f">> {label} ready in {time.perf_counter() - started:.2f}s", flush=True)
                 return result
             generation = build_panel("Voice Generation", build_generation_tab, load_hook=last_values_button.click)
+            auk_edit = build_panel("AuK Audio Editing", build_auk_edit_tab)
             batch = build_panel("Batch Generation", build_batch_tab, load_hook=last_values_button.click)
             dataset = build_panel("Dataset Preparation", build_dataset_tab, load_hook=last_values_button.click)
             training = build_panel("Voice Training", build_training_tab, load_hook=last_values_button.click)
@@ -423,6 +425,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         # Cross-tab events are wired only after every component exists.
         bind_generation_events(generation, options, registry)
         bind_batch_events(batch, generation, options, registry)
+        bind_auk_edit_events(auk_edit, generation, options, registry)
         bind_dataset_events(dataset, training)
         bind_training_events(training, generation, main_tabs)
         bind_grid_events(grid, training, generation, models, main_tabs)
@@ -430,6 +433,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         # mounted tabs and accordions need no server round trip of their own.
         after_model_values = bind_model_controls(registry, generation, models, training, grid)
         demo.load(None, registry["app.model"].component, None, js=MODEL_CLASS_JS)
+        demo.load(None, registry["auk_edit.task"].component, None, js=TASK_CLASS_JS)
 
         def loaded_last_values_notice() -> None:
             message = "Loaded the last run of every tab."
@@ -660,7 +664,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
     demo.preset_store = store
     demo.request_coverage = coverage
     demo.launch_theme = app_theme()
-    demo.launch_css = APP_CSS
+    demo.launch_css = APP_CSS + task_fields_css()
     demo.launch_head = APP_HEAD
     configure_request_guard(demo)
     demo.ui_tabs = {
