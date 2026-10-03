@@ -240,6 +240,10 @@ class AukTrainer(LoraTrainer):
         total_steps = int(min(config.max_steps or math.inf,
                               config.epochs * math.ceil(len(train_loader) / config.grad_accumulation)))
         self.write_status(phase="initializing", total_steps=total_steps, message="Loading AuK training weights")
+        if device.type == "cuda":
+            # Expandable segments keep the allocator from reserving far more than training uses
+            # (full fine-tuning: 26.6 instead of 28.4 GiB reserved), which decides whether it fits 32 GB.
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         built = build_auk_training_model(config)
         model = built.model
         optimizer = _optimizer(config, built.parameters)

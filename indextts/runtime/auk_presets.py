@@ -11,7 +11,7 @@ wherever it fits.
 
 from .vram_presets import RuntimeConfig, auto_tier
 
-LEARNING_RATE = {"full": 1e-5, "adapter": 1e-4}
+LEARNING_RATE = {"full": 2e-5, "adapter": 1e-4}
 FULL_MIN_TIER = 32
 
 # tier: (transformer variant, text encoder variant, text encoder residency, section batch hint)
@@ -45,19 +45,31 @@ def default_training_method(tier):
     return "full" if int(tier) >= FULL_MIN_TIER else "dora"
 
 
-# Latent frames per micro-batch by training tier (50 frames per second of target audio).
-_TRAINING_FRAMES = {6: 600, 8: 800, 10: 1000, 12: 1200, 16: 1600, 24: 2400, 32: 2700}
+# Adapter training by tier: latent frames per micro-batch (50 per second of audio), base precision and
+# gradient checkpointing. Measured peaks (RTX A6000, rank-32 DoRA, GiB reserved): 2,400 frames 18.4 without
+# checkpointing (1.06 updates/s) or 5.2 with it (0.56/s); 1,200 frames 12.3 without (1.11/s) or 4.6 with.
+_ADAPTER_TRAINING = {
+    6: (1200, "int8_convrot", True),
+    8: (2400, "bf16", True),
+    10: (2400, "bf16", True),
+    12: (2400, "bf16", True),
+    16: (1200, "bf16", False),
+    24: (2400, "bf16", False),
+    32: (2400, "bf16", False),
+}
+# Full fine-tuning (32 GB tier): fused AdamW with expandable allocator segments peaks at 26.5 GiB allocated,
+# 26.6 reserved, without checkpointing (foreach AdamW: 28.8 / 32.7, more than a 32 GB card holds).
+FULL_FRAMES = 2400
 UPDATE_FRAMES = 5400  # two upstream micro-batches per optimizer update (about 108 s of audio)
 
 
 def resolve_training_preset(tier, method="dora"):
-    """Memory and learning settings of one GPU tier and training method (provisional; see docs/AUK.md)."""
-    selected = max(key for key in _TRAINING_FRAMES if key <= max(6, int(tier)))
+    """Memory and learning settings of one GPU tier and training method (docs/AUK.md)."""
+    selected = max(key for key in _ADAPTER_TRAINING if key <= max(6, int(tier)))
     full = method == "full"
-    frames = _TRAINING_FRAMES[selected]
-    return {"base_variant": "bf16" if full or selected >= 16 else "int8_convrot", "base_dtype": "bf16",
-            # Full fine-tuning peaks in the optimizer step, so checkpointing would only cost speed (65 %).
-            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": not full,
+    frames, base, checkpointing = (FULL_FRAMES, "bf16", False) if full else _ADAPTER_TRAINING[selected]
+    return {"base_variant": base, "base_dtype": "bf16", "optimizer": "adamw_fused" if full else "adamw",
+            "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": checkpointing,
             "swap_ring_size": 2, "pin_swap_memory": False, "batch_size": 4, "auk_batch_frames": frames,
             "grad_accumulation": max(1, round(UPDATE_FRAMES / frames)),
             "learning_rate": LEARNING_RATE["full" if full else "adapter"], "keep_last_n": 2 if full else 0,

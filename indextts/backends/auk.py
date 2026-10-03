@@ -191,6 +191,13 @@ def _rms(audio) -> float:
     return float(np.sqrt(np.mean(array * array) + 1e-12)) if array.size else 0.0
 
 
+def _park_recognizer():
+    """The built-in Whisper keeps its weights on the GPU after a job; AuK's memory budget needs them back."""
+    from indextts.asr import park
+
+    park()
+
+
 PEAK_CEILING = 0.99
 
 
@@ -436,8 +443,11 @@ class AukEngine:
         lang = str(language or "auto").lower()
         lang = lang if lang in {"en", "zh"} else "en"
         print(f">> Transcribing reference {Path(path).name} once with Whisper (pace estimate)", flush=True)
-        transcript = transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
-                                device=self._whisper_device()).text.strip()
+        try:
+            transcript = transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
+                                    device=self._whisper_device()).text.strip()
+        finally:
+            _park_recognizer()
         try:
             REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             temporary = cached.with_suffix(f".{os.getpid()}.tmp")
@@ -795,8 +805,11 @@ class AukEngine:
 
         lang = str(language or "en").lower()
         lang = lang if lang in {"en", "zh"} else "en"
-        return transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
-                          device=self._whisper_device()).text.strip()
+        try:
+            return transcribe(resample(audio, rate, 16000), sr=16000, language=lang,
+                              device=self._whisper_device()).text.strip()
+        finally:
+            _park_recognizer()
 
     def _whisper_device(self) -> str:
         """Whisper runs beside AuK only where 3 GB stay free (on demand, both models step aside

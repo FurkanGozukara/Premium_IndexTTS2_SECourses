@@ -172,7 +172,7 @@ TRAINING_TIER_FIELDS = (
     "sample_min_free_vram_gb",
 )
 OMNI_CAPACITY_FIELDS = ("batch_size", "grad_accumulation", "train_mel_embed_head", "omni_batch_tokens", "learning_rate", "keep_last_n",
-                        "auk_batch_frames")
+                        "auk_batch_frames", "optimizer")
 # IndexTTS full fine-tuning updates about 500 M GPT weights directly: a smaller learning rate than the adapters'
 # and the last three epoch checkpoints (about 1 GB each) beside the best one.
 INDEX_METHOD_VALUES = {"full": {"learning_rate": 1e-5, "keep_last_n": 3},

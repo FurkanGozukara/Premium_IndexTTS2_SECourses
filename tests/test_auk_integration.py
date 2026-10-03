@@ -243,9 +243,13 @@ def test_auk_tier_presets_shrink_memory_with_the_card():
     # On demand the encoder and the transformer take turns: the BF16 transformer fits 8 GB again.
     assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "int8_convrot"
     assert resolve_preset(8).model_variant == "bf16" and resolve_preset(8).auk_text_encoder_residency == "on_demand"
-    assert resolve_training_preset(32, "full")["base_variant"] == "bf16"
-    assert resolve_training_preset(32, "full")["gradient_checkpointing"] is False
-    assert resolve_training_preset(8, "dora")["base_variant"] == "int8_convrot"
+    full = resolve_training_preset(32, "full")
+    assert (full["base_variant"], full["optimizer"], full["gradient_checkpointing"]) == ("bf16", "adamw_fused", False)
+    assert full["learning_rate"] == 2e-5
+    sixteen, eight, six = (resolve_training_preset(tier, "dora") for tier in (16, 8, 6))
+    assert (sixteen["auk_batch_frames"], sixteen["gradient_checkpointing"], sixteen["optimizer"]) == (1200, False, "adamw")
+    assert (eight["auk_batch_frames"], eight["gradient_checkpointing"], eight["base_variant"]) == (2400, True, "bf16")
+    assert (six["base_variant"], six["gradient_checkpointing"]) == ("int8_convrot", True)
 
 
 def test_cpu_token_table_lookup_is_exact():
