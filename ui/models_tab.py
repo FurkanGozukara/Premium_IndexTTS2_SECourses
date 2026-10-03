@@ -379,7 +379,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                     label="Qwen2.5-Omni encoder precision",
                     info="INT8 ConvRot keeps the encoder in about 4.5 GB instead of 7.5 GB.")
                 auk_text_residency = gr.Dropdown(
-                    choices=[("Keep on the GPU", "gpu"), ("Load for each encode", "on_demand")], value="gpu",
+                    choices=[("Keep on the GPU", "gpu"), ("On demand (takes turns with the transformer)", "on_demand")], value="gpu",
                     label="Encoder residency",
                     info="On demand waits in CPU memory and takes turns with the transformer on the GPU: "
                          "less VRAM, about a second more per section batch.")

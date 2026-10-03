@@ -4372,6 +4372,9 @@ def bind_generation_events(
         concurrency_id="generation",
         show_progress="hidden",
         stream_every=0.5,
+        # A click while this page's previous request is still finishing (a canceled run stops only after
+        # its model has loaded) runs right after it; Gradio's default dropped it without a word.
+        trigger_mode="always_last",
     )
 
     audition_box = values_payload_component()
