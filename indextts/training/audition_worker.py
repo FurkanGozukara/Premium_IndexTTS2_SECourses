@@ -121,6 +121,12 @@ def render_settings(config: Any, checkpoint: Path, language: str) -> tuple[dict[
             # Every staged clip carries its own transcript; a voice trained for Auto voice still clones here.
             settings = {name: value for name, value in infer[key].items() if name != "reference_text"}
             settings["mode"] = "clone"
+            if key == "auk":
+                # An AuK voice's samples may speak in Auto voice (guidance 1.5); cloning uses the clone preset's
+                # guidance, as Voice Generation does.
+                from indextts.auk.text import preset_guidance
+
+                settings["guidance_scale"] = preset_guidance("clone")
             infer[key] = settings
     grid_runtime = {"tts_model": model, "runtime": runtime.to_dict(), "model_dir": config.model_dir,
                     "cfg_path": config.model_config, "use_qwen_emo": False}
