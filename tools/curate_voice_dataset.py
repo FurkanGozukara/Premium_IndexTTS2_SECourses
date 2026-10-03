@@ -20,6 +20,7 @@ from indextts.training.dataset_quality import SpeakerVerifier, TimedTranscript, 
 from indextts.training.speech_metrics import lenient_units, transcript_metrics
 from indextts.training.media import measure_edge_silence
 from indextts.training.features import _load_audio_16k, _read_audio
+from indextts.asr import is_builtin_model
 from indextts.training.whisper_asr import _ensure_model, whisper_device_for_free_vram
 
 # Whisper accepts a short prompt of expected spellings, derived here from the
@@ -38,15 +39,31 @@ def transcript_prompt(topic_texts: list[str], vocabulary: list[str]) -> str:
 
 
 TRANSCRIPT_REASONS = frozenset({"transcript_disagreement", "transcript_boundary_mismatch"})
-# The fast turbo model spells technical vocabulary poorly. Measured on one
-# narration dataset, the full model recovered a third of the clips turbo had
-# rejected on transcript grounds while agreeing with an independent listener
-# more often, so rejected clips get a second opinion from it.
-DEFAULT_SECOND_OPINION_WHISPER = "openai/whisper-large-v3"
+# A second, different recognizer for clips rejected on transcript grounds: the audit
+# keeps a clip when either agrees with the transcript. The first recognizer is the
+# built-in Whisper large-v3 (INT8 ConvRot); turbo is the second, so the audit keeps
+# the two models it had (turbo first, full large-v3 as the second opinion, which
+# recovered a third of turbo's transcript rejections on one narration dataset).
+# On 152 held-out narration clips they made the same number of word errors
+# (3.5 %) on different words: their error counts differ on 46 of the clips.
+DEFAULT_SECOND_OPINION_WHISPER = "openai/whisper-large-v3-turbo"
+
+
+class BuiltinWhisper:
+    """The built-in Whisper (indextts.asr) in place of a transformers pipeline; its prompts stay text."""
+
+    def __init__(self, device: str):
+        self.device = device
 
 
 def transcribe_clip(pipe, waveform, language: str, beams: int, prompt_ids=None) -> str:
-    """Transcribe one 16 kHz clip with a transformers ASR pipeline."""
+    """Transcribe one 16 kHz clip with a transformers ASR pipeline or the built-in Whisper."""
+    if isinstance(pipe, BuiltinWhisper):
+        from indextts.asr import recognize
+
+        # The built-in Whisper decodes with its best-quality settings (beam size 5); --asr-beams is for pipelines.
+        return recognize((waveform.squeeze().numpy(), 16000), language=str(language or "EN"), device=pipe.device,
+                         initial_prompt=prompt_ids, words=False).text
     generate_kwargs = {"language": str(language or "EN").lower(), "task": "transcribe", "do_sample": False}
     if beams > 1:
         generate_kwargs["num_beams"] = beams
@@ -57,7 +74,7 @@ def transcribe_clip(pipe, waveform, language: str, beams: int, prompt_ids=None) 
     return str(result["text"]).strip()
 
 
-SECOND_OPINION_MIN_FREE_GB = 4.5
+SECOND_OPINION_MIN_FREE_GB = 2.5  # turbo in bf16 with its activations
 
 
 def _second_opinion_device(args) -> str:
@@ -77,7 +94,9 @@ def _second_opinion_device(args) -> str:
 
 
 def whisper_prompt_ids(pipe, prompt: str):
-    """Prompt ids for the pipeline's tokenizer, or None when unsupported or empty."""
+    """Prompt ids for the pipeline's tokenizer (the text itself for the built-in Whisper), or None when unsupported or empty."""
+    if isinstance(pipe, BuiltinWhisper):
+        return prompt.strip() or None
     get_prompt_ids = getattr(getattr(pipe, "tokenizer", None), "get_prompt_ids", None)
     if not prompt.strip() or get_prompt_ids is None:
         return None
@@ -108,7 +127,8 @@ def main() -> None:
     parser.add_argument("--min-window-similarity", type=float, default=0.60)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-dir", type=Path, default=Path("models"))
-    parser.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
+    parser.add_argument("--whisper", default="large-v3-int8-convrot",
+                        help="large-v3-int8-convrot is the built-in Whisper; another name loads that Transformers model")
     parser.add_argument("--no-asr-recheck", action="store_true", help="Disable fresh clip transcription when source-chunk ASR disagrees")
     parser.add_argument("--transcribe-all", action="store_true", help="Transcribe every voice-matched extracted clip")
     parser.add_argument("--check-boundary-words", action="store_true", help="Reject clips whose first or last two transcript words are missing, extra, or different in fresh clip ASR; the subtitles' own spellings of names and terms are accepted")
@@ -238,6 +258,8 @@ def run_curation(args: argparse.Namespace) -> None:
             if not reasons and (args.transcribe_all or args.check_boundary_words or (wer > args.max_wer and not args.no_asr_recheck)):
                 # Source chunk stitching can duplicate words at overlaps. Audit
                 # the actual extracted clip before discarding clean narration.
+                if asr_pipe is None and is_builtin_model(args.whisper):
+                    asr_pipe = BuiltinWhisper(args.device)
                 if asr_pipe is None:
                     from transformers import pipeline
                     asr_pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(args.whisper)),

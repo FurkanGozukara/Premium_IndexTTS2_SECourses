@@ -4,7 +4,7 @@
     "name": "10 GB GPU",
     "read_only": true,
     "scope": "system",
-    "version": 2
+    "version": 3
   },
   "values": {
     "app.model": "indextts",
@@ -498,7 +498,7 @@
     "dataset.trim_silence": true,
     "dataset.trim_top_db": 40.0,
     "dataset.whisper_device": "cuda:0",
-    "dataset.whisper_model": "openai/whisper-large-v3-turbo",
+    "dataset.whisper_model": "large-v3-int8-convrot",
     "generation.apply_emotion_bias": true,
     "generation.apply_pronunciation_dictionary": true,
     "generation.audio_tuning_preset": "bypass",

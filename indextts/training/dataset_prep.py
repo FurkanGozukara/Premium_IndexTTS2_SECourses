@@ -104,7 +104,7 @@ class DatasetPrepConfig:
     language: str = "EN"
     output_root: str = "datasets"
     subtitle_policy: str = "prefer_sidecar"
-    whisper_model: str = "openai/whisper-large-v3-turbo"
+    whisper_model: str = "large-v3-int8-convrot"
     whisper_device: str = "cuda:0"
     align_with_whisper: bool = False
     segmentation_mode: str = field(default_factory=_default_segmentation_mode)

@@ -18,7 +18,7 @@ CURATION_DEFAULTS = {
     "transcribe_all": True, "check_boundary_words": True, "min_edge_silence_ms": 30,
     "second_opinion": True, "device": "cuda:0",
 }
-SECOND_OPINION_WHISPER = "openai/whisper-large-v3"
+SECOND_OPINION_WHISPER = "openai/whisper-large-v3-turbo"
 
 
 def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "models") -> tuple[list[str], Path]:
@@ -58,7 +58,7 @@ def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "
     if test and output.with_name(output.name + "_test").exists():
         raise FileExistsError(output.with_name(output.name + "_test"))
     command = [sys.executable, "-u", str(ROOT / "tools/curate_voice_dataset.py"), str(source), str(output),
-               "--model-dir", model_dir, "--whisper", str((info.get("config") or {}).get("whisper_model", "openai/whisper-large-v3-turbo"))]
+               "--model-dir", model_dir, "--whisper", str((info.get("config") or {}).get("whisper_model", "large-v3-int8-convrot"))]
     for flag, items in (("--reference", refs), ("--validation-source", validation), ("--test-source", test)):
         for item in items:
             command.extend([flag, str(item)])
@@ -105,7 +105,7 @@ def build_curation_controls(registry: Any, existing: Any, dataset_path: Any, *, 
             register("min_edge_silence_ms", gr.Slider(0, 500, value=30, step=10, label="Audit minimum quiet edge (ms)"), "int", minimum=0, maximum=500)
         with gr.Row():
             register("second_opinion", gr.Checkbox(value=True, label="Second opinion for transcript rejections",
-                     info="Re-transcribes clips that failed only the transcript checks with the full whisper-large-v3 model and keeps them when it agrees with your transcript. Measured to recover about a third of such rejections; adds a few minutes and a 3 GB model download."), "bool")
+                     info="Re-transcribes clips that failed only the transcript checks with a second recognizer (whisper-large-v3-turbo; the first is the built-in Whisper large-v3) and keeps them when it agrees with your transcript. The two make different mistakes on technical words; adds a few minutes and a 1.6 GB model download."), "bool")
             register("device", gr.Textbox(value="cuda:0", label="Audit device"), "str")
         with gr.Row():
             start = gr.Button("🧪  Audit and create training dataset", variant="primary", elem_classes=btn("teal"))

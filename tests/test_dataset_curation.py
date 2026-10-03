@@ -23,6 +23,9 @@ def test_boundary_error_is_detected_even_when_overall_word_error_passes():
 
 def test_curation_checks_real_clip_edges_and_keeps_source_holdouts(tmp_path, monkeypatch):
     from tools import curate_voice_dataset as curate
+    # Importing the pipelines registers a fresh `transformers` module (processing_utils re-executes the package),
+    # so the module is patched after that import; patched before it, the run looked up the real pipeline.
+    import transformers.pipelines  # noqa: F401
     import transformers
     source = tmp_path / "prepared"
     source.mkdir()
@@ -107,6 +110,9 @@ def test_ui_audit_rejects_invalid_holdout_before_starting_worker(tmp_path):
 
 def test_second_opinion_recognizer_rescues_transcript_rejections_only(tmp_path, monkeypatch):
     from tools import curate_voice_dataset as curate
+    # Importing the pipelines registers a fresh `transformers` module (processing_utils re-executes the package),
+    # so the module is patched after that import; patched before it, the run looked up the real pipeline.
+    import transformers.pipelines  # noqa: F401
     import transformers
     source = tmp_path / "prepared"
     source.mkdir()
