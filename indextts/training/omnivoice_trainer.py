@@ -165,7 +165,9 @@ class OmniVoiceTrainer(LoraTrainer):
             self.log(f">> Automatic length: {config.epochs} epochs for {seconds / 3600:.1f} hours of training audio")
         total_steps = min(config.max_steps or math.inf, config.epochs * math.ceil(len(train_loader)/config.grad_accumulation))
         total_steps = int(total_steps)
-        self.write_status(phase="initializing", total_steps=total_steps, message="Loading OmniVoice training weights")
+        # The status file was first written before epochs 0 resolved; record the run's real length.
+        self.write_status(phase="initializing", total_steps=total_steps, total_epochs=config.epochs,
+                          message="Loading OmniVoice training weights")
         built = build_omnivoice_training_model(config)
         model = built.model
         optimizer = _optimizer(config, built.parameters)

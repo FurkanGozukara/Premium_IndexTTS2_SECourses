@@ -62,7 +62,7 @@
         "training.eps": 1e-08,
         "training.eval_include_base": true,
         "training.eval_strengths": "1.0",
-        "training.eval_timeout_s": 900.0,
+        "training.eval_timeout_s": 3600.0,
         "training.eval_train_subset": 48,
         "training.export_int8": true,
         "training.final_test_dataset": "",

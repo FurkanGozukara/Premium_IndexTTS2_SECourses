@@ -191,6 +191,8 @@ def auk_defaults(tier="auto"):
         # loss improves by 0.001-0.005 per epoch, so early stopping needs a finer threshold.
         "training.adapter_type": method, "training.epochs": 0, "training.max_steps": 0,
         "training.val_every_steps": 0, "training.early_stop_min_delta": 0.0005,
+        # Evaluating one full-size checkpoint takes about 110 s; 900 s cut a 13-checkpoint run short.
+        "training.eval_timeout_s": 3600.0,
         "training.rank": 32, "training.alpha": 64.0,
         "training.blocks_to_swap": 0, "training.num_workers": 2,
         "training.train_spk_proj": False, "training.train_emo_layers": False,

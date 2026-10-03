@@ -259,7 +259,9 @@ class AukTrainer(LoraTrainer):
             # full fine-tuning ran out of memory on a 48 GB card; with it the peak is about 36 GiB.
             config.gradient_checkpointing = True
             self.log(">> Full fine-tuning with reference prompts: gradient checkpointing on (about 36 GiB; 40 GB+ cards)")
-        self.write_status(phase="initializing", total_steps=total_steps, message="Loading AuK training weights")
+        # The status file was first written before epochs 0 resolved; record the run's real length.
+        self.write_status(phase="initializing", total_steps=total_steps, total_epochs=config.epochs,
+                          message="Loading AuK training weights")
         if device.type == "cuda":
             # Expandable segments keep the allocator from reserving far more than training uses
             # (full fine-tuning: 26.6 instead of 28.4 GiB reserved), which decides whether it fits 32 GB.

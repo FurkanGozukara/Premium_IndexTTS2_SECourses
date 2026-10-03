@@ -423,6 +423,7 @@ def test_auk_profile_sizes_runs_from_the_audio_and_validates_per_epoch():
     values = auk_defaults("32")
     assert values["training.epochs"] == 0 and values["training.val_every_steps"] == 0
     assert values["training.early_stop_min_delta"] == 0.0005
+    assert values["training.eval_timeout_s"] == 3600.0  # about 110 s per full-size checkpoint
 
 
 def test_speech_comparison_base_clones_beside_an_auto_voice(tmp_path):
