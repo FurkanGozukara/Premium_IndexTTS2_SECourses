@@ -1271,6 +1271,75 @@ class LoraTrainer:
             self.log(f">> decoding sweep did not complete: {reason}; the default decoding settings remain")
         self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
 
+    def _run_reference_audition(self, *, terminal_phase: str, terminal_message: str, recommended_checkpoint: str) -> None:
+        """Audition reference clips with the finished voice in a child process (``audition_worker``); the most
+        speaker-like clip becomes the voice's automatic reference, so nobody has to run the audition by hand."""
+        config = self.config
+        if not getattr(config, "reference_audition_enabled", True) or self.stop_path.exists():
+            reason = "canceled by user" if self.stop_path.exists() else "disabled"
+            self.write_status(reference_audition_status="skipped", reference_audition_message=reason)
+            self.log(f">> reference audition skipped: {reason}")
+            return
+        checkpoint = Path(recommended_checkpoint) if recommended_checkpoint else None
+        if checkpoint is None or not checkpoint.is_file():
+            # The speech comparison may prefer Base; the voice is still used through its best file.
+            checkpoint = self.best_path if self.best_path.is_file() else None
+        if checkpoint is None:
+            self.write_status(reference_audition_status="skipped", reference_audition_message="no trained checkpoint")
+            self.log(">> reference audition skipped: no trained checkpoint")
+            return
+        job_dir = self.adapter_dir / "analysis" / "reference_audition_job"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "stop.flag").unlink(missing_ok=True)
+        config_path = job_dir / "train_config.json"
+        atomic_write_json(config_path, config.to_dict())
+        self.write_status(phase="auditioning_references", reference_audition_status="running",
+                          reference_audition_message="Auditioning reference clips",
+                          message="Finding the clip this voice clones best from")
+        self.log(f">> starting the reference audition with {checkpoint.name}: {config.reference_audition_candidates} "
+                 f"clips and the current reference, finalists judged on {config.reference_audition_sentences} sentences")
+        process = subprocess.Popen([sys.executable, "-m", "indextts.training.audition_worker", "--config", str(config_path),
+                                    "--checkpoint", str(checkpoint), "--state-dir", str(job_dir)],
+                                   cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   start_new_session=os.name != "nt")
+
+        def pump() -> None:
+            if process.stdout is not None:
+                for line in iter(process.stdout.readline, ""):
+                    self.log(line.rstrip())
+        thread = threading.Thread(target=pump, daemon=True, name="reference-audition-log")
+        thread.start()
+        started = time.perf_counter()
+        failure = ""
+        while process.poll() is None:
+            child = read_json_retry(job_dir / "status.json", {}) or {}
+            self.write_status(phase="auditioning_references", message=str(child.get("message") or "Auditioning reference clips"))
+            if self.stop_path.exists() or time.perf_counter() - started > config.reference_audition_timeout_s:
+                failure = "canceled by user" if self.stop_path.exists() else "reference audition timeout"
+                (job_dir / "stop.flag").touch()
+                _kill_evaluation_worker(process)
+                break
+            time.sleep(0.5)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_evaluation_worker(process)
+            process.wait()
+        thread.join(timeout=2)
+        child = read_json_retry(job_dir / "status.json", {}) or {}
+        if process.returncode == 0 and not failure:
+            outcome = "complete" if child.get("phase") == "complete" else "skipped"
+            summary = str(child.get("message") or "")
+            self.write_status(reference_audition_status=outcome, reference_audition_message=summary)
+            self.log(f">> reference audition {outcome}: {summary}")
+        else:
+            reason = failure or str(child.get("message") or f"exit code {process.returncode}")
+            self.write_status(reference_audition_status="failed", reference_audition_message=reason)
+            self.log(f">> reference audition did not complete: {reason}; the voice keeps its training reference")
+        self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
+
     def _run_final_test_assessment(self, *, terminal_phase: str, terminal_message: str,
                                    recommended_checkpoint: str) -> None:
         """Final data measures a frozen deployment; it never selects any part of it."""
@@ -2623,11 +2692,19 @@ class LoraTrainer:
             self.log(f">> independent final test failed but training weights are safe: {exc}")
             self.write_status(phase=post_phase, message=post_message, recommended_checkpoint=recommended_checkpoint,
                               final_test_status="failed", final_test_message=str(exc))
+        try:
+            self._run_reference_audition(terminal_phase=post_phase, terminal_message=post_message,
+                                         recommended_checkpoint=recommended_checkpoint)
+        except Exception as exc:
+            self.log(f">> reference audition failed but training weights are safe: {exc}")
+            self.write_status(phase=post_phase, message=post_message, recommended_checkpoint=recommended_checkpoint,
+                              reference_audition_status="failed", reference_audition_message=str(exc))
         self._write_int8_finetune(recommended_checkpoint)
         completed_checks = read_json_retry(self.status_path, {}) or {}
         failed_checks = [label for key, label in (
             ("speech_evaluation_status", "speech evaluation"), ("decoder_adapter_status", "decoder validation"),
             ("decoding_sweep_status", "decoding sweep"), ("final_test_status", "final test"),
+            ("reference_audition_status", "reference audition"),
         ) if completed_checks.get(key) == "failed"]
         if failed_checks:
             terminal_message += "; automatic checks incomplete: " + ", ".join(failed_checks)

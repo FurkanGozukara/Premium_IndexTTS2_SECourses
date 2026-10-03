@@ -231,6 +231,13 @@ class TrainConfig:
     # benchmark for the selected checkpoint and save the winner for Voice Generation.
     decoding_sweep_enabled: bool = True
     decoding_sweep_timeout_s: float = 5400.0
+    # After the other automatic checks, audition reference clips with the finished voice and make the most
+    # speaker-like one its automatic reference (reference_audition, audition_worker): every candidate renders
+    # three held-out sentences, the current reference and three finalists render the rest.
+    reference_audition_enabled: bool = True
+    reference_audition_candidates: int = 12
+    reference_audition_sentences: int = 8
+    reference_audition_timeout_s: float = 3600.0
 
     seed: int = 42
     num_workers: int = 2
@@ -458,6 +465,11 @@ class TrainConfig:
         self.reference_typical = bool(self.reference_typical)
         self.decoding_sweep_enabled = bool(self.decoding_sweep_enabled)
         self.decoding_sweep_timeout_s = max(60.0, _finite_float(self.decoding_sweep_timeout_s, "decoding_sweep_timeout_s"))
+        self.reference_audition_enabled = bool(self.reference_audition_enabled)
+        self.reference_audition_candidates = min(30, max(2, int(self.reference_audition_candidates)))
+        self.reference_audition_sentences = min(16, max(2, int(self.reference_audition_sentences)))
+        self.reference_audition_timeout_s = max(60.0, _finite_float(self.reference_audition_timeout_s,
+                                                                    "reference_audition_timeout_s"))
         self.final_test_dataset = str(self.final_test_dataset or "").strip()
         for key, lower, upper in (("speech_eval_prompts", 0, 100),
                                   ("speech_eval_seeds", 1, 10),

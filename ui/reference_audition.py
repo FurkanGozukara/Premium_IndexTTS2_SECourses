@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 AUDITION_RENDER_FOLDER = "reference_audition"
-TABLE_HEADERS = ["Rank", "Clip", "Seconds", "Transcript", "Speaker similarity", "Style similarity", "Word errors",
-                 "Duration ratio", "Result"]
+TABLE_HEADERS = ["Rank", "Clip", "Seconds", "Transcript", "Takes", "Speaker similarity", "Style similarity",
+                 "Word errors", "Duration ratio", "Result"]
 
 
 def _sha(path: str | Path) -> str:
@@ -39,11 +39,11 @@ def _transcript_beside(path: str | Path) -> str:
 def table_rows(summary: list[dict[str, Any]]) -> list[list[Any]]:
     rows = []
     for rank, row in enumerate(summary, 1):
-        result = "winner" if row.get("winner") else ""
+        result = "winner" if row.get("winner") else ("screened out" if row.get("stage") == "screened out" else "")
         if row.get("current"):
             result = (result + ", current reference").strip(", ")
         rows.append([rank, row["label"], round(float(row.get("duration_s") or 0.0), 1), str(row.get("text") or "")[:90],
-                     row.get("similarity"), row.get("style"),
+                     row.get("takes"), row.get("similarity"), row.get("style"),
                      None if row.get("word_errors") is None else f"{100 * float(row['word_errors']):.1f} %",
                      row.get("duration_ratio"), result])
     return rows
@@ -51,13 +51,18 @@ def table_rows(summary: list[dict[str, Any]]) -> list[list[Any]]:
 
 def run_reference_audition(values: Mapping[str, Any], adapter_path: str, *, candidate_count: int, sentence_count: int,
                            use_winner: bool, model_dir: str, root: str | Path) -> Iterator[tuple[str, list[list[Any]], str | None]]:
-    """Yield ``(status markdown, result rows, winner reference or None)`` while the audition runs."""
+    """Yield ``(status markdown, result rows, winner reference or None)`` while the audition runs.
+
+    Every candidate renders ``sentence_count`` held-out sentences; the current reference and the finalists then
+    render ``CONFIRM_SENTENCES`` more (``reference_audition.audition_search``), all with the page's settings.
+    """
 
     from indextts.training.dataset_manifest import load_manifest
     from indextts.training.dataset_profile import dataset_dir_for_adapter
     from indextts.training.evaluation_plan import audio_path
-    from indextts.training.reference_audition import (audition_record, choose_candidates, choose_sentences, run_dir_of,
-                                                      save_choice, split_rows, summarize)
+    from indextts.training.reference_audition import (CONFIRM_SENTENCES, FINALISTS, audition_record, audition_search,
+                                                      choose_candidates, choose_sentences, run_dir_of, save_choice,
+                                                      split_rows)
     from webui_generation_runner import run_generation_request
 
     from .common import LAZY_ENGINE
@@ -91,15 +96,17 @@ def run_reference_audition(values: Mapping[str, Any], adapter_path: str, *, cand
                            "duration_s": float(row.get("duration_s") or 0.0), "current": False})
         if len(candidates) >= int(candidate_count) + (1 if current_path else 0):
             break
-    sentences = choose_sentences(Path(dataset_dir), validation, training, max(1, int(sentence_count)),
+    screen_count = max(1, int(sentence_count))
+    sentences = choose_sentences(Path(dataset_dir), validation, training, screen_count + CONFIRM_SENTENCES,
                                  exclude=[candidate["key"] for candidate in candidates])
     if len(candidates) < 2 or not sentences:
         yield "Not enough clean clips in this voice's dataset for an audition (it needs candidates of 6 to 16 seconds and held-out sentences of 5 to 14 seconds).", [], None
         return
+    screen, confirm = sentences[:screen_count], sentences[screen_count:]
     work = run_dir / "analysis" / AUDITION_RENDER_FOLDER
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
-    omnivoice = values.get("app.model") == "omnivoice"
+    model = values.get("app.model")
     settings = {**values, "generation.word_timestamps": False, "generation.section_takes": 1,
                 "generation.num_candidates": 1, "generation.pick_best_candidate": False, "generation.save_as_mp3": False,
                 "generation.audio_tuning_preset": "bypass", "generation.use_caption_timing": False,
@@ -107,60 +114,76 @@ def run_reference_audition(values: Mapping[str, Any], adapter_path: str, *, cand
     for key in ("generation.tuning_low_cut_hz", "generation.tuning_high_cut_hz", "generation.tuning_gain_db",
                 "generation.tuning_loudnorm_i", "generation.tuning_deess"):
         settings[key] = None
-    clips = []
-    total = len(candidates) * len(sentences)
     started = time.perf_counter()
-    for c_index, candidate in enumerate(candidates):
-        for s_index, sentence in enumerate(sentences):
-            done = c_index * len(sentences) + s_index
-            yield (f"Rendering {done + 1}/{total}: clip {c_index + 1}/{len(candidates)} ({candidate['label']}), "
-                   f"sentence {s_index + 1}/{len(sentences)} | {time.perf_counter() - started:.0f} s"), [], None
-            take = dict(settings, **{"generation.seed": 1000 + s_index})
-            if omnivoice:
-                take.update({"omnivoice.mode": "clone", "omnivoice.reference_text": candidate["text"]})
-            request = prepare_generation_request(take, prompt=candidate["audio"], text=str(sentence["text"]), subtitle_file=None,
-                                                 image_path=None, emotion_audio=None, model_dir=model_dir,
-                                                 output_root=work / f"clip_{c_index + 1:02d}")
-            with LAZY_ENGINE.in_use():
-                engine = LAZY_ENGINE.get(request["runtime"])
-                result = run_generation_request(request, engine)
-            clips.append({"audio": str(result["output_path"]), "reference": candidates[0]["audio"],
-                          "real_audio": str(audio_path(dataset_dir, sentence)), "text": str(sentence["text"]),
-                          "language": _metric_language(sentence, request),
-                          "candidate": candidate["key"]})
-    yield f"Measuring {len(clips)} takes against the speaker's recordings (speaker and style similarity, word errors)...", [], None
-    import torch
+    requests: list[Mapping[str, Any]] = []
 
-    if torch.cuda.is_available():
-        free = torch.cuda.mem_get_info()[0] / 1024**3
-        if free < 6.0:
-            LAZY_ENGINE.unload()  # the measuring models need the room; the voice reloads at the next generation
-    from indextts.training.speech_metrics import measure_clips
+    def render_stage(stage: str, stage_candidates, stage_sentences, first_seed: int):
+        takes = []
+        total = len(stage_candidates) * len(stage_sentences)
+        name = "screening" if stage == "screen" else "confirming the finalists"
+        for c_index, candidate in enumerate(stage_candidates):
+            for s_index, sentence in enumerate(stage_sentences):
+                done = c_index * len(stage_sentences) + s_index
+                yield (f"{name.capitalize()}: take {done + 1}/{total}, clip {c_index + 1}/{len(stage_candidates)} "
+                       f"({candidate['label']}), sentence {s_index + 1}/{len(stage_sentences)} | "
+                       f"{time.perf_counter() - started:.0f} s")
+                take = dict(settings, **{"generation.seed": first_seed + s_index})
+                if model == "omnivoice":
+                    take.update({"omnivoice.mode": "clone", "omnivoice.reference_text": candidate["text"]})
+                elif model == "auk":
+                    take.update({"auk.mode": "clone", "auk.reference_text": candidate["text"]})
+                request = prepare_generation_request(take, prompt=candidate["audio"], text=str(sentence["text"]),
+                                                     subtitle_file=None, image_path=None, emotion_audio=None,
+                                                     model_dir=model_dir, output_root=work / stage / f"{candidate['key']}")
+                requests.append(request)
+                with LAZY_ENGINE.in_use():
+                    engine = LAZY_ENGINE.get(request["runtime"])
+                    result = run_generation_request(request, engine)
+                takes.append({"candidate": candidate["key"], "sentence": sentence, "audio": str(result["output_path"])})
+        return takes
 
-    measured = measure_clips(clips, model_dir=model_dir, model_config=str(Path(model_dir) / "config.yaml"),
-                             device=str((request.get("runtime") or {}).get("device") or "cuda:0").replace("auto", "cuda:0"),
-                             output_dir=work, update=lambda *args: None, cancelled=lambda: False)
+    def measure(clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        import torch
+
+        from indextts.training.speech_metrics import measure_clips
+
+        if torch.cuda.is_available() and torch.cuda.mem_get_info()[0] / 1024**3 < 6.0:
+            LAZY_ENGINE.unload()  # the measuring models need the room; the voice reloads at the next take
+        device = str((requests[-1].get("runtime") or {}).get("device") or "cuda:0").replace("auto", "cuda:0")
+        stage = clips[0]["stage"] if clips else "stage"
+        return measure_clips(clips, model_dir=model_dir, model_config=str(Path(model_dir) / "config.yaml"), device=device,
+                             output_dir=work / f"{stage}_measurements", update=lambda *args: None, cancelled=lambda: False)
+
+    search = audition_search(candidates, screen, confirm, render_stage=render_stage, measure=measure,
+                             dataset_dir=dataset_dir, language=_metric_language(screen[0], {}), finalists=FINALISTS)
+    try:
+        while True:
+            yield next(search), [], None
+    except StopIteration as stop:
+        outcome = stop.value
     gc.collect()
-    summary = summarize(measured, candidates)
-    winner = next((row for row in summary if row.get("winner")), None)
-    report = {"audited_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "voice": str(adapter_path), "speech_model": values.get("app.model"),
-              "sentences": [{"id": str(row["id"]), "text": str(row["text"])} for row in sentences],
-              "candidates": summary}
+    summary, winner = outcome["summary"], outcome["winner"]
+    report = {"audited_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "voice": str(adapter_path), "speech_model": model,
+              "sentences": [{"id": str(row["id"]), "text": str(row["text"]), "stage": "screen"} for row in screen]
+              + [{"id": str(row["id"]), "text": str(row["text"]), "stage": "confirm"} for row in confirm],
+              "finalists": outcome["finalists"], "candidates": summary}
     record = save_choice(adapter_path, winner, report, use=use_winner) if winner else audition_record(adapter_path)
     rows_out = table_rows(summary)
     if winner is None:
         yield "No take could be measured; the voice keeps its reference.", rows_out, None
         return
+    finalists = sum(1 for row in summary if row.get("stage") == "final")
+    sentences_note = f"finalists judged on {len(screen) + len(confirm)} sentences" if confirm else f"{len(screen)} sentences"
     if winner.get("current"):
         message = (f"**The current reference stays the best clip** ({winner['label']}, speaker similarity "
-                   f"{winner['similarity']:.3f}); nothing changed.")
+                   f"{winner['similarity']:.3f}; {finalists} finalists, {sentences_note}); nothing changed.")
         yield message, rows_out, None
         return
     current = next((row for row in summary if row.get("current")), None)
     gain = f" against {current['similarity']:.3f} for the current reference" if current and current.get("similarity") is not None else ""
     chosen = str(run_dir / record["reference"]) if record and record.get("reference") else None
     message = (f"**Winner: {winner['label']}** (speaker similarity {winner['similarity']:.3f}{gain}, "
-               f"style {winner['style']:.3f}, word errors {100 * float(winner['word_errors'] or 0):.1f} %). ")
+               f"style {winner['style']:.3f}, word errors {100 * float(winner['word_errors'] or 0):.1f} %; {sentences_note}). ")
     message += ("It is now this voice's automatic reference; untick **Use the winner automatically** to go back "
                 "to the original." if use_winner and chosen else
                 "Saved beside the voice; tick **Use the winner automatically** to make it the voice's reference.")

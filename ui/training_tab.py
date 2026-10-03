@@ -1710,6 +1710,33 @@ def build_training_tab(
             _reg(registry, controls, "decoding_sweep_enabled", decoding_enabled, kind="bool")
             _reg(registry, controls, "decoding_sweep_timeout_s", decoding_timeout, kind="float", minimum=60, maximum=1000000)
 
+        with gr.Accordion("Automatic reference audition", open=False):
+            gr.Markdown(
+                "The clip a voice clones from decides how much it sounds like the speaker, and clips of the same speaker "
+                "differ a lot (similarities of 0.73 to 0.82 for one voice), which no rule of length, pitch or pace predicted. "
+                "After the other checks, the finished voice renders held-out sentences with many candidate clips; the current "
+                "reference and the most speaker-like finalists render more sentences with the same seeds, and the winner "
+                "becomes the voice's automatic reference. The training reference file is kept; the voice panel's "
+                "**Reference audition** shows the result and can switch back.",
+                elem_classes=["section-note"],
+            )
+            with gr.Row():
+                audition_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["reference_audition_enabled"],
+                                               label="Find the best reference after training",
+                                               info="Applies to every speech model; OmniVoice and AuK use the reference in Voice cloning mode.")
+                audition_candidates = gr.Slider(2, 30, value=TRAIN_DEFAULTS["reference_audition_candidates"], step=1,
+                                                label="Candidate clips",
+                                                info="Clean training clips near the speaker's typical pitch and pace; each is screened on 3 held-out sentences.")
+                audition_sentences = gr.Slider(2, 16, value=TRAIN_DEFAULTS["reference_audition_sentences"], step=1,
+                                               label="Sentences for the finalists",
+                                               info="The current reference and 3 finalists are compared on this many held-out sentences (the 3 screening ones included).")
+                audition_timeout = gr.Number(value=TRAIN_DEFAULTS["reference_audition_timeout_s"], minimum=60,
+                                             label="Reference audition timeout (s)")
+            _reg(registry, controls, "reference_audition_enabled", audition_enabled, kind="bool")
+            _reg(registry, controls, "reference_audition_candidates", audition_candidates, kind="int", minimum=2, maximum=30)
+            _reg(registry, controls, "reference_audition_sentences", audition_sentences, kind="int", minimum=2, maximum=16)
+            _reg(registry, controls, "reference_audition_timeout_s", audition_timeout, kind="float", minimum=60, maximum=1000000)
+
         with gr.Accordion("Sampling", open=False):
             with gr.Row():
                 sample_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["sample_enabled"], label="Generate training samples", info="Renders a short sample at the configured epoch interval.")

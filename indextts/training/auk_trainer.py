@@ -446,6 +446,12 @@ class AukTrainer(LoraTrainer):
                 except Exception as exc:
                     self.log(f">> final test failed but training weights are safe: {exc}")
                     message += f"; final test failed: {exc}"
+            try:
+                self._run_reference_audition(terminal_phase="post_training", terminal_message=message,
+                                             recommended_checkpoint=recommended)
+            except Exception as exc:
+                self.log(f">> reference audition failed but training weights are safe: {exc}")
+                message += f"; reference audition failed: {exc}"
         self.write_status(phase=status, message=message, step=step, total_steps=total_steps, last_checkpoint=str(path),
                           last_sample=self.last_sample, sample_seed=self.resolved_sample_seed,
                           recommended_checkpoint=recommended, elapsed_s=time.perf_counter() - self.started_perf)

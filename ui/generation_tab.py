@@ -3195,17 +3195,19 @@ def build_generation_tab(
             gr.Markdown(
                 "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
                 "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
-                "held-out sentences of the voice's training data with each candidate clip and keeps the clip whose takes "
-                "sound most like the speaker's own recordings of those sentences: speaker and style similarity decide, and "
-                "Whisper word errors keep a clip that causes slips out. It uses the current settings and the selected trained "
-                "voice, works for both speech models, and never changes the voice's original reference file.",
+                "held-out sentences of the voice's training data with each candidate clip, then the current reference and the "
+                "three most speaker-like finalists render four more with the same seeds, and the clip whose takes sound most "
+                "like the speaker's own recordings wins: speaker and style similarity decide, and Whisper word errors keep a "
+                "clip that causes slips out. Training runs it automatically when it finishes (**Automatic reference "
+                "audition** in Voice Training); this button runs it again with the current settings and the selected voice. "
+                "It works for every speech model and never changes the voice's original reference file.",
                 elem_classes=["section-note"],
             )
             with gr.Row():
                 audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
                                                 info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
                 audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
-                                               info="Held-out sentences rendered with every candidate; more sentences give a steadier verdict and take longer.")
+                                               info="Held-out sentences rendered with every candidate; the current reference and 3 finalists render 4 more before the winner is chosen.")
                 audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
                                            info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
                                                 "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "

@@ -465,6 +465,11 @@ def _request_for_cell(
         "target_duration_s": runner_extras.get("target_duration_s"),
         "target_duration_mode": str(runner_extras.get("target_duration_mode", "off")),
     }
+    # OmniVoice's and AuK's own settings (mode, steps, guidance) reach the engine through the request, as Voice
+    # Generation passes them; left in the runner extras they were dropped and every cell used the defaults.
+    for owner in ("omnivoice", "auk"):
+        if isinstance(runner_extras.get(owner), Mapping):
+            request[owner] = dict(runner_extras[owner])
     metadata = _metadata(metadata_path)
     metadata["inputs"] = {
         "text": cell.text,

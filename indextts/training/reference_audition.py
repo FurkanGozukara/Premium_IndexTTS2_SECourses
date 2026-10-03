@@ -8,6 +8,12 @@ sentences with each candidate clip and measures every take against the speaker's
 sentence (speaker and style similarity and Whisper word errors, the measurements of the training's speech
 evaluation). The candidate whose takes sound most like the speaker wins.
 
+The search has two stages (``audition_search``): every candidate renders the screening sentences, then the
+current reference and the most similar finalists render more sentences with the same seeds, and the winner is
+chosen on all of them. A clip that looked good on a few sentences by luck rarely survives the confirmation, and
+the many screened clips cost only the short first stage. Training runs it automatically after the voice is
+finished (``audition_worker``); the voice panel's button runs the same search with the page's settings.
+
 The voice's original reference file is never changed (accepted work may cite it). A winner is copied to
 ``<run>/<run>_audition_choice.<ext>`` with its transcript, and ``analysis/reference_audition.json`` records
 the audition; while its ``use`` flag is set, the voice's automatic reference is the winner.
@@ -21,7 +27,7 @@ import math
 import shutil
 import statistics
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Generator, Mapping, Sequence
 
 AUDITION_FILE = "reference_audition.json"
 CHOICE_STEM = "audition_choice"
@@ -29,6 +35,11 @@ CANDIDATE_SECONDS = (6.0, 16.0)
 SENTENCE_SECONDS = (5.0, 14.0)
 TYPICALITY_POOL = 60  # clean clips measured for typical pitch and pace before candidates are picked
 WER_GUARD = 0.05  # a winner may not have more than five points more word errors than the best candidate
+MARGIN = 0.005  # another clip replaces the current reference only when it is at least this much more similar
+FINALISTS = 3  # clips besides the current reference that the confirmation stage renders again
+SCREEN_SENTENCES = 3  # sentences every candidate renders in an automatic audition (the rest confirm)
+CONFIRM_SENTENCES = 4  # extra sentences for the finalists of an audition started from the voice panel
+FIRST_SEED = 1000
 
 
 def run_dir_of(adapter_path: str | Path) -> Path:
@@ -166,12 +177,91 @@ def summarize(measured: Sequence[Mapping[str, Any]], candidates: Sequence[Mappin
     winner = max(eligible, key=lambda row: (row["similarity"], row["style"] or 0.0))
     current = next((row for row in eligible if row["current"]), None)
     # Keep the voice's current reference unless another clip is clearly better.
-    if current is not None and current is not winner and winner["similarity"] - current["similarity"] < 0.005:
+    if current is not None and current is not winner and winner["similarity"] - current["similarity"] < MARGIN:
         winner = current
     for row in table:
         row["winner"] = row is winner
     table.sort(key=lambda row: (not row["winner"], -(row["similarity"] or -1.0)))
     return table
+
+
+def pick_finalists(summary: Sequence[Mapping[str, Any]], count: int = FINALISTS) -> list[str]:
+    """The current reference and the ``count`` most similar other clips within the word-error guard."""
+
+    scored = [row for row in summary if row.get("similarity") is not None]
+    if not scored:
+        return []
+    fewest = min(row.get("word_errors") or 0.0 for row in scored)
+    eligible = [row for row in scored if (row.get("word_errors") or 0.0) <= fewest + WER_GUARD and not row.get("current")]
+    eligible.sort(key=lambda row: (-row["similarity"], -(row.get("style") or 0.0), str(row["key"])))
+    keys = [str(row["key"]) for row in eligible[:max(1, int(count))]]
+    return [str(row["key"]) for row in summary if row.get("current")] + keys
+
+
+def sentence_language(sentence: Mapping[str, Any], fallback: str = "EN") -> str:
+    """A held-out sentence's language for word errors: its dataset language, else ``fallback``, else English."""
+
+    from .speech_metrics import LANGUAGES
+
+    for value in (sentence.get("language"), fallback):
+        code = str(value or "").strip().upper()
+        if code in LANGUAGES:
+            return code
+    return "EN"
+
+
+def take_clips(takes: Sequence[Mapping[str, Any]], candidates: Sequence[Mapping[str, Any]], dataset_dir: str | Path,
+               language: str = "EN") -> list[dict[str, Any]]:
+    """Rendered takes as ``measure_clips`` input: each against the speaker's own recording of its sentence."""
+
+    from .evaluation_plan import audio_path
+
+    by_key = {str(candidate["key"]): candidate for candidate in candidates}
+    return [{"audio": str(take["audio"]), "reference": str(by_key[str(take["candidate"])]["audio"]),
+             "real_audio": str(audio_path(dataset_dir, take["sentence"])), "text": str(take["sentence"]["text"]),
+             "language": sentence_language(take["sentence"], language), "candidate": str(take["candidate"]),
+             "sentence_id": str(take["sentence"]["id"]), "stage": str(take.get("stage") or "")}
+            for take in takes]
+
+
+RenderStage = Callable[[str, Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]], int],
+                       Generator[str, None, list[dict[str, Any]]]]
+
+
+def audition_search(candidates: Sequence[Mapping[str, Any]], screen: Sequence[Mapping[str, Any]],
+                    confirm: Sequence[Mapping[str, Any]], *, render_stage: RenderStage,
+                    measure: Callable[[list[dict[str, Any]]], list[dict[str, Any]]], dataset_dir: str | Path,
+                    language: str = "EN", finalists: int = FINALISTS) -> Generator[str, None, dict[str, Any]]:
+    """Screen every candidate, confirm the finalists on more sentences, and return the result.
+
+    ``render_stage(stage, candidates, sentences, first_seed)`` renders every candidate on every sentence (the
+    sentence at position i with seed ``first_seed + i``, the same for every clip), yields progress messages and
+    returns the takes (``candidate``, ``sentence``, ``audio``). ``measure`` is ``measure_clips``. Progress
+    messages are yielded; the return value holds the summary table (winner first, then the other finalists,
+    then the screened-out clips), the winner and every measured take.
+    """
+
+    takes = yield from render_stage("screen", candidates, screen, FIRST_SEED)
+    yield f"Measuring {len(takes)} screening takes against the speaker's recordings..."
+    measured = measure(take_clips([dict(take, stage="screen") for take in takes], candidates, dataset_dir, language))
+    screened = summarize(measured, candidates)
+    keys = pick_finalists(screened, finalists)
+    if not confirm or len(keys) < 2:
+        table = [dict(row, stage="final") for row in screened]
+        return {"summary": table, "winner": next((row for row in table if row.get("winner")), None),
+                "measured": measured, "finalists": keys}
+    chosen = [candidate for candidate in candidates if str(candidate["key"]) in keys]
+    yield (f"Confirming {len(chosen)} finalists ({', '.join(str(row['label']) for row in chosen)}) on "
+           f"{len(confirm)} more sentences...")
+    more = yield from render_stage("confirm", chosen, confirm, FIRST_SEED + len(screen))
+    yield f"Measuring {len(more)} confirmation takes..."
+    confirmed = measure(take_clips([dict(take, stage="confirm") for take in more], chosen, dataset_dir, language))
+    combined = [row for row in measured if str(row.get("candidate")) in keys] + confirmed
+    final = summarize(combined, chosen)
+    table = [dict(row, stage="final") for row in final] + [
+        dict(row, stage="screened out", winner=False) for row in screened if str(row["key"]) not in keys]
+    return {"summary": table, "winner": next((row for row in table if row.get("winner")), None),
+            "measured": measured + confirmed, "finalists": keys}
 
 
 def save_choice(adapter_path: str | Path, winner: Mapping[str, Any], report: Mapping[str, Any], *, use: bool) -> dict[str, Any]:
@@ -210,5 +300,6 @@ def set_choice_use(adapter_path: str | Path, use: bool) -> dict[str, Any] | None
     return record
 
 
-__all__ = ["AUDITION_FILE", "audition_record", "audition_reference", "choose_candidates", "choose_sentences",
-           "run_dir_of", "save_choice", "set_choice_use", "split_rows", "summarize"]
+__all__ = ["AUDITION_FILE", "audition_record", "audition_reference", "audition_search", "choose_candidates",
+           "choose_sentences", "pick_finalists", "run_dir_of", "save_choice", "sentence_language", "set_choice_use",
+           "split_rows", "summarize", "take_clips"]
