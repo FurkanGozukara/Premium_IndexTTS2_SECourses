@@ -353,8 +353,11 @@ class AukEngine:
                 if "full-module tensor" not in str(exc):
                     raise
                 remove_lora(self.model)
-                raise ValueError("This adapter fully trains input or output layers that the ConvRot INT8 transformer "
-                                 "quantizes. Select the BF16 transformer to use it.") from exc
+                # Adapters from builds before 7.1 trained these layers in the base's own precision.
+                other = "BF16" if self.runtime.model_variant != "bf16" else "ConvRot INT8"
+                raise ValueError("This adapter was trained by an earlier build with input and output layers stored "
+                                 f"for the other transformer precision. Select the {other} transformer to use it, "
+                                 "or train it again.") from exc
             if merge_into_base:
                 merge_lora_for_inference(self.model)
         self._lora_path, self._lora_strength, self._lora_merged = path, float(strength), bool(merge_into_base)
