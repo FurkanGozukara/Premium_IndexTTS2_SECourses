@@ -324,3 +324,24 @@ def test_pronunciation_markup_becomes_plain_text_for_auk():
     assert plain_readings("<行|XING2>人") == "行人"
     rows, _note = generation_tab.preview_segments("A <DoRA|D AO1 . R AH0> run.", "EN", 60, model_id="auk")
     assert rows[0][2] == "A DoRA run." and "reads" not in rows[0][3]
+
+
+def test_batches_carry_their_epoch_to_persistent_workers():
+    from indextts.training.auk_data import EpochTaggedBatches
+
+    class Sampler:
+        epoch = 0
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            return iter([[2, 0], [1]])
+
+        def __len__(self):
+            return 2
+
+    batches = EpochTaggedBatches(Sampler())
+    assert list(batches) == [[(0, 2), (0, 0)], [(0, 1)]] and len(batches) == 2
+    batches.set_epoch(3)
+    assert list(batches)[0] == [(3, 2), (3, 0)]

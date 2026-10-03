@@ -21,8 +21,8 @@ from torch.utils.data import DataLoader
 from indextts.lora import apply_lora, inject_adapters, trainable_parameters
 from indextts.lora.io import load_train_state, resume_state_path_for
 from indextts.runtime.progress import ProgressReporter
-from .auk_data import (AukDataset, VOICE_FILE, cache_auk_conditions, cache_auk_features, collate, flow_validation_loss,
-                       fuse, fusion_state, normalised_means, sample_latents, voice_record)
+from .auk_data import (AukDataset, EpochTaggedBatches, VOICE_FILE, cache_auk_conditions, cache_auk_features, collate,
+                       flow_validation_loss, fuse, fusion_state, normalised_means, sample_latents, voice_record)
 from .dataset import LengthBucketBatchSampler, TokenBudgetBatchSampler
 from .dataset_manifest import atomic_write_json
 from .early_stopping import EarlyStopping
@@ -220,8 +220,9 @@ class AukTrainer(LoraTrainer):
             sampler = LengthBucketBatchSampler(train_data.lengths, config.batch_size, seed=config.seed)
             val_sampler = None
         # Workers read the cached latents and reference audio ahead of the GPU (about 75 ms per micro-batch
-        # in the main process). They are recreated every epoch, so each copy sees the dataset's current epoch.
-        train_loader = DataLoader(train_data, batch_sampler=sampler, collate_fn=collate, num_workers=config.num_workers)
+        # in the main process) and stay for the whole run; each batch carries its epoch.
+        train_loader = DataLoader(train_data, batch_sampler=EpochTaggedBatches(sampler), collate_fn=collate,
+                                  num_workers=config.num_workers, persistent_workers=config.num_workers > 0)
         loader_args = {"collate_fn": collate, "num_workers": 0}
         val_loader = (DataLoader(val_data, batch_sampler=val_sampler, **loader_args) if val_sampler is not None
                       else DataLoader(val_data, batch_size=config.batch_size, shuffle=False, **loader_args))

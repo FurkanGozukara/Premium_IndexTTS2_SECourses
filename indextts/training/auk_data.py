@@ -301,6 +301,27 @@ def voice_record(records, description) -> dict | None:
             "clips": len(records), "speech_hours": round(speech / 3600, 3)}
 
 
+class EpochTaggedBatches:
+    """A batch sampler's batches as (epoch, index) pairs.
+
+    Data workers persist across epochs (starting them costs seconds on Windows); the
+    sampler's current epoch travels with every index instead of living in their copies.
+    """
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def set_epoch(self, epoch):
+        self.sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        epoch = int(getattr(self.sampler, "epoch", 0))
+        return ([(epoch, index) for index in batch] for batch in self.sampler)
+
+    def __len__(self):
+        return len(self.sampler)
+
+
 class AukDataset(Dataset):
     """Cached clips of one split; items carry their objective (no reference, or a reference prompt)."""
 
@@ -347,33 +368,36 @@ class AukDataset(Dataset):
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def _rng(self, row, purpose):
-        epoch = self.epoch if self.split == "train" else -1
+    def _rng(self, row, purpose, epoch=None):
+        epoch = (self.epoch if epoch is None else epoch) if self.split == "train" else -1
         digest = hashlib.sha256(f"{self.config.seed}:{epoch}:{purpose}:{row['id']}".encode()).digest()
         return random.Random(int.from_bytes(digest[:8], "big"))
 
-    def objective(self, index) -> str:
+    def objective(self, index, epoch=None) -> str:
         """"clone" (with a reference prompt) for ``auk_prompt_fraction`` of the clips, else "auto"."""
         fraction = float(self.config.auk_prompt_fraction)
         if fraction <= 0 or len(self.records) < 2:
             return "auto"
-        return "clone" if self._rng(self.records[index], "objective").random() < fraction else "auto"
+        return "clone" if self._rng(self.records[index], "objective", epoch).random() < fraction else "auto"
 
     def _stats(self, row):
         data = torch.load(self.root / row["cache"]["path"], map_location="cpu", weights_only=True)
         return data["mean"].float(), data["log_std"].float()
 
     def __getitem__(self, index):
+        # Training batches carry their epoch (EpochTaggedBatches), so data workers that live
+        # across epochs still draw each epoch's own objectives and reference crops.
+        epoch, index = index if isinstance(index, tuple) else (None, index)
         row = self.records[index]
         mean, log_std = self._stats(row)
-        item = {"id": row["id"], "mean": mean, "log_std": log_std, "objective": self.objective(index)}
+        item = {"id": row["id"], "mean": mean, "log_std": log_std, "objective": self.objective(index, epoch)}
         if item["objective"] == "auto":
             item["instruction"] = self.instructions[str(row["id"])]
             cond = self.conditions.get(str(row["id"]))
             if cond:
                 item["text"] = torch.load(self.root / cond, map_location="cpu", weights_only=True)["text"]
             return item
-        rng = self._rng(row, "reference")
+        rng = self._rng(row, "reference", epoch)
         partner = self.records[rng.randrange(len(self.records) - 1)]
         if partner["id"] == row["id"]:
             partner = self.records[-1]
