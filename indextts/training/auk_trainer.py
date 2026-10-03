@@ -36,13 +36,20 @@ ATTENTION_PROJECTIONS = ("to_qkv", "to_qkv_c", "to_out.0", "to_out_c")
 FEED_FORWARD_PROJECTIONS = ("linear_in", "linear_out")
 ADALN_PROJECTIONS = ("attn_norm.linear", "attn_norm_x.linear", "attn_norm_c.linear")
 # Small layers trained in full by "Train input and output layers" (a few million parameters).
-EDGE_MODULES = ("txt_proj", "txt_norm", "audio_embed", "time_embed", "norm_out", "proj_out")
+# Input and output layers outside the blocks. The ones the ConvRot INT8 transformer keeps in floating
+# point are trained fully; the ones it quantizes are adapted like the block projections, so an adapter
+# loads into the BF16 and the INT8 transformer alike.
+EDGE_MODULES = ("txt_norm", "audio_embed", "proj_out")
+EDGE_PROJECTIONS = ("txt_proj", "time_embed.time_mlp.0", "time_embed.time_mlp.2", "norm_out.linear")
 
 
-def adapter_targets(model, *, attention=True, feed_forward=True, adaln=True) -> list[str]:
+def adapter_targets(model, *, attention=True, feed_forward=True, adaln=True, edges=False) -> list[str]:
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear) and type(module).__name__ != "ConvRotInt8Linear":
+            continue
+        if edges and name.removeprefix("transformer.") in EDGE_PROJECTIONS:
+            targets.append(name)
             continue
         if not name.startswith(("transformer.transformer_blocks.", "transformer.single_transformer_blocks.")):
             continue
@@ -95,7 +102,7 @@ def build_auk_training_model(config) -> BuiltTrainingModel:
         modules = {"transformer": model.transformer}
     else:
         targets = adapter_targets(model, attention=config.target_attention, feed_forward=config.target_mlp,
-                                  adaln=config.auk_target_adaln)
+                                  adaln=config.auk_target_adaln, edges=config.train_mel_embed_head)
         adapters = inject_adapters(model, config.rank, config.alpha, config.dropout, config.adapter_type == "dora", targets)
         modules = {}
         if config.train_mel_embed_head:

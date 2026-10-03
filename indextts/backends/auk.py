@@ -347,7 +347,14 @@ class AukEngine:
             self._dit_offload.activate(False)
         remove_lora(self.model)
         if path:
-            apply_lora(self.model, path, strength=float(strength))
+            try:
+                apply_lora(self.model, path, strength=float(strength))
+            except KeyError as exc:
+                if "full-module tensor" not in str(exc):
+                    raise
+                remove_lora(self.model)
+                raise ValueError("This adapter fully trains input or output layers that the ConvRot INT8 transformer "
+                                 "quantizes. Select the BF16 transformer to use it.") from exc
             if merge_into_base:
                 merge_lora_for_inference(self.model)
         self._lora_path, self._lora_strength, self._lora_merged = path, float(strength), bool(merge_into_base)

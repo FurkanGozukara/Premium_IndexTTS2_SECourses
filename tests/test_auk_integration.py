@@ -345,3 +345,27 @@ def test_batches_carry_their_epoch_to_persistent_workers():
     assert list(batches) == [[(0, 2), (0, 0)], [(0, 1)]] and len(batches) == 2
     batches.set_epoch(3)
     assert list(batches)[0] == [(3, 2), (3, 0)]
+
+
+def test_fully_trained_edges_stay_float_in_the_int8_transformer():
+    import sys
+    from pathlib import Path
+
+    from indextts.auk.cfm import AukModel
+    from indextts.training.auk_trainer import EDGE_MODULES, EDGE_PROJECTIONS, adapter_targets
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from quantize_auk import dit_targets
+
+    arch = {"dim": 64, "heads": 2, "dim_head": 32, "ff_mult": 2, "text_hidden_dim": 32, "num_layers": 1,
+            "num_single_layers": 1}
+    model = AukModel(arch, latent_dim=8, num_text_layers=2)
+    quantized = set(dit_targets(list(model.state_dict())))
+    # An adapter must load into the BF16 and the INT8 transformer: fully trained modules are never quantized,
+    # and the quantized edge projections are adapted instead.
+    for name in EDGE_MODULES:
+        assert not any(key.startswith(f"transformer.{name}") for key in quantized), name
+    for name in EDGE_PROJECTIONS:
+        assert f"transformer.{name}" in quantized, name
+    with_edges = adapter_targets(model, edges=True)
+    assert set(with_edges) - set(adapter_targets(model)) == {f"transformer.{name}" for name in EDGE_PROJECTIONS}
