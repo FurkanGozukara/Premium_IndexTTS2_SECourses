@@ -22,6 +22,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn.functional as F
 
+from . import decode_attention as DA
 from . import kernels as K
 from .cuda_graph import CudaGraph
 
@@ -192,6 +193,10 @@ def _attention(q, k, v, causal: bool = False):
             # flash_attn_func's defaults: no dropout, scale 1/sqrt(head_dim), no window, no softcap
             return _FLASH_ATTN_FORWARD(q, k, v, 0.0, q.shape[-1] ** -0.5, causal, -1, -1, 0.0, None, False)[0]
         return flash_attn_func(q, k, v, causal=causal)
+    if not causal and DA.supported(q, k):
+        # A decode step's cross-attention (a few queries against the encoder frames): split-KV Triton kernels,
+        # about a sixth of the time PyTorch's general attention kernel took.
+        return DA.decode_attention(q, k, v)
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=causal)
     return out.transpose(1, 2)
 
@@ -217,10 +222,14 @@ def _kv_cache_attention(q, k_cache, v_cache, k, v, cache_seqlens, cache_batch_id
         k_cache[rows, :length] = k
         v_cache[rows, :length] = v
         return _attention(q, k, v, causal=True)
+    whole = cache_batch_idx is None and batch == k_cache.shape[0]
+    if whole and DA.supported(q, k_cache):
+        # Each row reads only its own cache length, as flash_attn_with_kvcache does.
+        DA.write_kv(k_cache, v_cache, k[:, 0], v[:, 0], cache_seqlens)
+        return DA.decode_attention(q, k_cache, v_cache, cache_seqlens, length_offset=1)
     positions = cache_seqlens.long()
     k_cache[rows, positions] = k[:, 0]
     v_cache[rows, positions] = v[:, 0]
-    whole = cache_batch_idx is None and batch == k_cache.shape[0]
     keys = k_cache if whole else k_cache[rows]
     values = v_cache if whole else v_cache[rows]
     mask = torch.arange(k_cache.shape[1], device=q.device)[None, :] <= positions[:, None]

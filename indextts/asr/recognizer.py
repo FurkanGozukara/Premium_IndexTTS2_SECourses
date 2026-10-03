@@ -15,6 +15,12 @@ known text (321 against 333 of 10,546; a lost final word in 3 takes and an extra
 and far fewer on 3-minute recordings, where turbo's 120-second chunks lost words at their joins (4.2 % against
 11.1 %, twice as fast).
 
+Speed: Whisper-WebUI runs the decoder's attention with flash-attn, which has no build for this app's PyTorch;
+PyTorch's own attention made a 30-second window take 885 ms against Whisper-WebUI's 397 ms. Split-KV Triton kernels
+for the decode steps (``convrot.decode_attention``) brought it to 365 ms. With both engines alternating on one RTX
+5090, 152 clips (29 minutes) took 36 s against Whisper-WebUI's 41 s and a 12-minute file 9.3 s against 10.5 s, with
+the same word errors as before.
+
 Between jobs the weights wait in RAM (``park``) so the speech models keep the VRAM; the next job moves them back
 in about a second. GPUs older than the RTX 30 series, a missing Triton or a card without room for it use the
 Transformers Whisper large-v3-turbo the app used before (on the CPU when the card is full).
