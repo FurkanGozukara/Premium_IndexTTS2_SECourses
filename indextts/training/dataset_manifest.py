@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -33,13 +34,18 @@ def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
 def write_manifest(path: str | Path, rows: Iterable[Mapping[str, Any]]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(dict(row), ensure_ascii=False, default=_json_default) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    replace_with_retry(temporary, destination)
+    # Each writer has its own temporary file: two trainings caching one dataset at once
+    # must not replace each other's half-written index.
+    temporary = destination.with_name(f"{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write(json.dumps(dict(row), ensure_ascii=False, default=_json_default) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_with_retry(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def append_manifest_row(handle: Any, row: Mapping[str, Any]) -> None:
