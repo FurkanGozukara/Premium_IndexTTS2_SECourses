@@ -96,6 +96,28 @@ def test_shared_pause_tags_are_not_spoken_and_output_is_24k(tmp_path):
     assert all(item["num_step"] == 32 for item in engine.model.calls)
 
 
+def test_long_text_threshold_never_exceeds_one_measured_pass():
+    from indextts.backends.omnivoice import MAX_SINGLE_PASS_S, OmniVoiceEngine
+
+    class Model(torch.nn.Module):
+        text_tokenizer = SimpleNamespace(encode=lambda text, **kwargs: text.split())
+
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return [np.zeros(2400, dtype=np.float32)]
+
+    engine = OmniVoiceEngine.__new__(OmniVoiceEngine)
+    engine.model, engine.device, engine.progress_reporter = Model(), "cpu", None
+    for requested, used in ((60.0, MAX_SINGLE_PASS_S), (20.0, 20.0)):  # an older preset's 60 s; a shorter choice
+        engine.infer("", "Test.", omnivoice={"mode": "auto", "audio_chunk_threshold": requested}, text_normalization=False)
+        assert engine.model.calls[-1]["audio_chunk_threshold"] == used
+    assert MAX_SINGLE_PASS_S == 30.0
+
+
 def test_full_checkpoint_roundtrip_and_restore(tmp_path):
     from indextts.lora import LoraMetadata, apply_lora, inspect_lora, remove_lora, save_lora
     model = torch.nn.Module()

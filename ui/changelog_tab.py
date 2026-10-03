@@ -20,6 +20,7 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - **Trained voices in Auto voice use guidance 1.5:** the sampling presets follow the voice mode (2 for cloning and design). On 72 held-out sentences, 1.5 raised speaker similarity by 0.006 and style similarity by 0.014 against 2, with unchanged word errors.
 - **Speech comparison of Auto-voice runs:** Base has no voice of its own, so it now clones the training reference while the checkpoints speak in Auto voice; before, Base spoke a generic trained-voice description and its regression guards measured nothing.
 - **Fixed:** a Generate click while a canceled generation was still stopping (it stops once its model has loaded) was dropped without a word; it now runs as soon as the canceled one ends.
+- **OmniVoice long-text threshold capped at 30 seconds:** one OmniVoice pass over a whole 36-second passage lost words (8.7 % word errors against 1.3 % with sections of about 12 seconds) and speaker likeness, so text estimated over 30 seconds is always split into upstream's long-text chunks. The slider stops at 30; older presets with a higher value use 30.
 - **Faster model switching for every model:** the page's hidden helpers now lead Gradio's layout, so its per-event status refresh walks a quarter less of the page; change-driven displays skip repeats of what they just showed.
 
 Model files download on first use. Restart after updating.

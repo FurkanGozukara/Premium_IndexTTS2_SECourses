@@ -37,6 +37,9 @@ GENERATION_DEFAULTS = {
     "postprocess_output": True, "audio_chunk_duration": 15.0,
     "audio_chunk_threshold": 30.0, "pad_duration": 0.1, "fade_duration": 0.1,
 }
+# Longest text upstream may render in one pass. A single pass over a whole 36 s passage lost words (8.7 % word errors
+# against 1.3 % with 12 s sections) and speaker likeness, so longer text always goes to upstream's long-text chunks.
+MAX_SINGLE_PASS_S = 30.0
 
 
 _NORMALIZER = None
@@ -357,6 +360,7 @@ class OmniVoiceEngine:
         if str(self.device).startswith("cuda"):
             torch.cuda.reset_peak_memory_stats(self.device)
         settings = {**GENERATION_DEFAULTS, **(omnivoice or {})}
+        settings["audio_chunk_threshold"] = min(float(settings["audio_chunk_threshold"]), MAX_SINGLE_PASS_S)
         validate_voice_settings(settings)
         if target_duration_mode not in {"off", "natural", "pad", "trim"}:
             raise ValueError("Unknown target duration mode")

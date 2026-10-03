@@ -205,7 +205,7 @@ def build_omnivoice_controls(registry):
                     ("position_temperature", "Position temperature", 5., 0, 20, .1),
                     ("class_temperature", "Class temperature", 0., 0, 5, .05),
                     ("audio_chunk_duration", "Long-text chunk (seconds)", 15., 3, 30, 1),
-                    ("audio_chunk_threshold", "Long-text threshold (seconds)", 30., 5, 60, 1),
+                    ("audio_chunk_threshold", "Long-text threshold (seconds)", 30., 5, 30, 1),
                     ("pad_duration", "Edge padding (seconds)", .1, 0, 1, .01),
                     ("fade_duration", "Edge fade (seconds)", .1, 0, 1, .01),
                 ):
