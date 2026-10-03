@@ -456,10 +456,9 @@ def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: 
     """
     lenient = frozenset(lenient_terms) if lenient_terms else None
     import torch
-    from transformers import pipeline
+    from indextts.asr import park, recognize
     from indextts.runtime import ProgressReporter
     from .features import FeatureCacheConfig, _FeatureModels, _load_audio_16k
-    from .whisper_asr import _ensure_model
     from .dataset_manifest import atomic_write_json
 
     requests = {}
@@ -500,27 +499,23 @@ def measure_clips(clips: list[dict[str, Any]], *, model_dir: str, model_config: 
         torch.cuda.empty_cache()
     if any(features[clip["reference"]]["invalid_audio"] for clip in clips):
         raise ValueError("A benchmark voice reference is empty, silent, or non-finite; choose a usable training reference")
-    whisper = "openai/whisper-large-v3-turbo"
-    pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(whisper)), device=device,
-                    dtype=torch.bfloat16 if device.startswith("cuda") and torch.cuda.is_bf16_supported() else torch.float32)
+    # The built-in Whisper (indextts.asr: large-v3 INT8 ConvRot, best-quality decoding) in each clip's language.
     transcripts = {}
-    for index, (path, language) in enumerate(sorted(requests), 1):
-        if cancelled():
-            raise InterruptedError("Speech evaluation canceled")
-        text = ""
-        if not features[path]["invalid_audio"]:
-            wave, _ = _load_audio_16k(Path(path))
-            result = pipe({"array": wave.squeeze().numpy(), "sampling_rate": 16000}, return_timestamps=True,
-                          generate_kwargs={"language": LANGUAGES[language], "task": "transcribe", "do_sample": False})
-            text = str(result["text"]).strip()
-        transcripts[(path, language)] = text
-        update("Transcribing evaluation audio", index, len(requests))
-        atomic_write_json(output_dir / "transcriptions.json", [
-            {"audio": p, "language": lang, "text": text} for (p, lang), text in transcripts.items()])
-    del pipe
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    try:
+        for index, (path, language) in enumerate(sorted(requests), 1):
+            if cancelled():
+                raise InterruptedError("Speech evaluation canceled")
+            text = ""
+            if not features[path]["invalid_audio"]:
+                wave, _ = _load_audio_16k(Path(path))
+                text = recognize((wave.squeeze().numpy(), 16000), language=LANGUAGES[language], device=device,
+                                 words=False).text
+            transcripts[(path, language)] = text
+            update("Transcribing evaluation audio", index, len(requests))
+            atomic_write_json(output_dir / "transcriptions.json", [
+                {"audio": p, "language": lang, "text": text} for (p, lang), text in transcripts.items()])
+    finally:
+        park()
     measured = []
     for clip in clips:
         feature, ref = features[clip["audio"]], features[clip["reference"]]

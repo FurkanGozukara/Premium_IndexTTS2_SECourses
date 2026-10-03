@@ -18,7 +18,8 @@ from indextts.utils.text_encoding import read_text_resilient
 from .subtitles import CaptionWord, Segment
 
 
-DEFAULT_WHISPER_MODEL = "openai/whisper-large-v3-turbo"
+# The built-in Whisper (``indextts.asr``: large-v3 INT8 ConvRot); any other name is a Transformers model.
+DEFAULT_WHISPER_MODEL = "large-v3-int8-convrot"
 _MODEL_ALIASES = {
     "large-v3-turbo": "openai/whisper-large-v3-turbo",
     "whisper-large-v3-turbo": "openai/whisper-large-v3-turbo",
@@ -51,6 +52,7 @@ class Transcript:
     words: list[Word]
     segments: list[TranscriptSegment]
     text: str
+    engine: str = ""
 
 
 @dataclass(frozen=True)
@@ -471,7 +473,38 @@ def transcribe(
     device: str = "cuda:0",
     progress_cb: Callable[..., Any] | Any | None = None,
 ) -> Transcript:
-    """Transcribe with lazy model loading and overlap-safe, word-level chunking."""
+    """Word-timed transcript: the built-in Whisper (``indextts.asr``) unless ``model_name`` names another model."""
+
+    from indextts.asr import is_builtin_model, recognize
+
+    if not is_builtin_model(model_name):
+        return _transformers_transcribe(audio_path_or_array, sr, language, model_name, device, progress_cb)
+    waveform, sample_rate = _read_input(audio_path_or_array, sr)
+    if waveform.size == 0:
+        return Transcript(words=[], segments=[], text="")
+    total = max(1, int(round(waveform.size / float(sample_rate))))
+
+    def progress(done_s: float, total_s: float) -> None:
+        _notify_progress(progress_cb, int(done_s), total, f"Whisper {done_s:.0f}/{total_s:.0f} s")
+
+    _notify_progress(progress_cb, 0, total, f"Whisper 0/{total} s")
+    result = recognize((waveform, sample_rate), language=language, device=device, progress=progress)
+    _notify_progress(progress_cb, total, total, "Whisper transcription complete")
+    transcript = _transcript_from_words(
+        [Word(text=word.text, start_s=word.start_s, end_s=word.end_s) for word in result.words])
+    transcript.engine = result.engine
+    return transcript
+
+
+def _transformers_transcribe(
+    audio_path_or_array: str | Path | np.ndarray,
+    sr: int = 24000,
+    language: str | None = "EN",
+    model_name: str = "openai/whisper-large-v3-turbo",
+    device: str = "cuda:0",
+    progress_cb: Callable[..., Any] | Any | None = None,
+) -> Transcript:
+    """Transcribe with a Transformers Whisper: lazy model loading and overlap-safe, word-level chunking."""
 
     import torch
     from transformers import pipeline
@@ -536,7 +569,9 @@ def transcribe(
         accepted.sort(key=lambda word: (word.start_s, word.end_s))
         _notify_progress(progress_cb, len(starts), len(starts), "Whisper transcription complete")
 
-        return _transcript_from_words(accepted)
+        transcript = _transcript_from_words(accepted)
+        transcript.engine = f"{_canonical_model_name(model_name)} (Transformers)"
+        return transcript
     finally:
         if pipe is not None:
             del pipe

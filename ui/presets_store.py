@@ -37,7 +37,9 @@ from .gpu_tier_presets import (
 
 
 PRESET_FORMAT = "indextts2_premium_universal"
-PRESET_VERSION = 2
+PRESET_VERSION = 3
+# Presets saved before version 3 stored the previous dataset Whisper default; they load the built-in Whisper.
+_LEGACY_WHISPER_DEFAULTS = frozenset({"openai/whisper-large-v3-turbo"})
 SYSTEM_PREFIX = "★ "
 
 
@@ -565,6 +567,9 @@ class PresetStore:
             if "app.model" in self.registry:
                 from .model_profiles import migrate_model_values
                 values = migrate_model_values(values)
+            version = (payload.get("_meta") or {}).get("version") if isinstance(payload.get("_meta"), Mapping) else None
+            if (not isinstance(version, int) or version < 3) and values.get("dataset.whisper_model") in _LEGACY_WHISPER_DEFAULTS:
+                values["dataset.whisper_model"] = "large-v3-int8-convrot"
             result = self.registry.coerce(values)
             self.set_last_used(requested)
             return result

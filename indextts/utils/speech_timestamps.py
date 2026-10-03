@@ -28,7 +28,6 @@ CJK_LINE_CHARS = 18
 MAX_CUE_S = 7.0
 MIN_CUE_S = 0.8
 MAX_GAP_S = 1.2
-ALIGNER = "openai/whisper-large-v3-turbo"
 
 
 def written_words(text: str) -> list[str]:
@@ -244,26 +243,25 @@ def write_speech_timestamps(audio_path: str | os.PathLike[str], text: str, *, la
 
     import soundfile as sf
 
-    from indextts.training.whisper_asr import transcribe, whisper_device_for_free_vram
+    from indextts.training.whisper_asr import transcribe
 
     info = sf.info(str(audio_path))
     duration = info.frames / float(info.samplerate) if info.samplerate else 0.0
-    if str(device).startswith("cuda"):
-        try:
-            import torch
-
-            free = torch.cuda.mem_get_info(torch.device(device))[0] / 1024**3 if torch.cuda.is_available() else None
-        except Exception:
-            free = None
-        # Whisper large-v3-turbo needs about 2 GB beside the loaded speech model; a full card falls back to the CPU.
-        device = whisper_device_for_free_vram(device, free, required_gb=2.5)
     code = whisper_language(language, text)
-    transcript = (transcriber or transcribe)(str(audio_path), language=code, device=device, progress_cb=progress)
+    # The built-in Whisper picks the device (the CPU recognizer when the card has no room beside the speech model)
+    # and goes back to RAM afterwards.
+    try:
+        transcript = (transcriber or transcribe)(str(audio_path), language=code, device=device, progress_cb=progress)
+    finally:
+        if transcriber is None:
+            from indextts.asr import park
+
+            park()
     aligned = align_words(text, transcript.words, duration)
     cues = subtitle_cues(aligned["words"])
     paths = timestamp_paths(audio_path)
     payload = {"version": 1, "audio": str(Path(audio_path).resolve()), "duration_s": round(duration, 3),
-               "language": code, "aligner": ALIGNER, **aligned, "cues": cues,
+               "language": code, "aligner": getattr(transcript, "engine", "") or "whisper", **aligned, "cues": cues,
                "recognized_text": getattr(transcript, "text", "")}
     _write(paths["json"], json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
     _write(paths["srt"], srt_text(cues))

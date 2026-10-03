@@ -8,7 +8,6 @@ the earlier candidate.
 
 from __future__ import annotations
 
-import gc
 import re
 from typing import Any, Callable, Sequence
 
@@ -28,32 +27,26 @@ def metric_language(language: str | None, text: str) -> str:
     return "EN"
 
 
-def _whisper(device: str) -> Callable[[str, str | None], str]:
-    import torch
-    from transformers import pipeline
+def _whisper(device: str) -> Callable[[Any, str], str]:
+    """The built-in Whisper (``indextts.asr``) as ``run(source, language) -> text``."""
 
-    from indextts.training.whisper_asr import _ensure_model, whisper_device_for_free_vram
-
-    if str(device).startswith("cuda"):
-        try:
-            free = torch.cuda.mem_get_info(torch.device(device))[0] / 1024**3 if torch.cuda.is_available() else None
-        except Exception:
-            free = None
-        device = whisper_device_for_free_vram(device, free, required_gb=2.5)
-    dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
-    pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model("openai/whisper-large-v3-turbo")),
-                    device=device, dtype=dtype, chunk_length_s=30)
+    from indextts.asr import recognize
 
     def run(source: Any, language: str) -> str:
         """Transcribe a file path or ``(samples, sample_rate)`` in the given language (never auto-detected)."""
-        options = {"task": "transcribe", "do_sample": False, "language": language}
         if isinstance(source, tuple):
             samples, rate = source
-            source = {"raw": np.asarray(samples, dtype=np.float32).reshape(-1), "sampling_rate": int(rate)}
-        return str(pipe(source, generate_kwargs=options)["text"]).strip()
+            source = (np.asarray(samples, dtype=np.float32).reshape(-1), int(rate))
+        return recognize(source, language=language, device=device, words=False).text
 
-    run.pipe = pipe  # type: ignore[attr-defined]
     return run
+
+
+def _release_whisper() -> None:
+    """The judging is over: the built-in Whisper's weights wait in RAM and the speech model keeps the VRAM."""
+    from indextts.asr import park
+
+    park()
 
 
 def candidate_word_errors(paths: Sequence[str], text: str, language: str | None, *, device: str = "cuda:0",
@@ -75,15 +68,7 @@ def candidate_word_errors(paths: Sequence[str], text: str, language: str | None,
             rows.append({"path": str(path), "error_rate": round(float(metrics["error_rate"]), 4), "heard": heard})
     finally:
         if transcriber is None:
-            del run
-            gc.collect()
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            _release_whisper()
     return rows
 
 
@@ -150,14 +135,7 @@ class SectionTakeJudge:
     def close(self) -> None:
         if self._owned and self._run is not None:
             self._run = None
-            gc.collect()
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            _release_whisper()
 
 
 def keep_best_take(first: Any, retake: Callable[[], Any], score: Callable[[Any], float], takes: int

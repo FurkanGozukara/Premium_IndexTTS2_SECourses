@@ -271,9 +271,10 @@ class OmniVoiceEngine:
     def _cached_prompt(self, path, settings):
         """The reference's audio tokens and transcript, reused across restarts.
 
-        A reference without a transcript is transcribed by OmniVoice's Whisper
-        model once; the prompt is then cached by audio content, so later runs
-        need neither the speech recognizer nor the audio tokenizer for it.
+        A reference without a transcript is transcribed once by the app's built-in
+        Whisper, after OmniVoice's own trimming and silence removal; the prompt is
+        then cached by audio content, so later runs need neither the speech
+        recognizer nor the audio tokenizer for it.
         """
         from omnivoice.models.omnivoice import VoiceClonePrompt
 
@@ -281,29 +282,27 @@ class OmniVoiceEngine:
         with open(path, "rb") as handle:
             for block in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(block)
+        transcribing = not settings["reference_text"]
+        # Transcripts made by OmniVoice's own turbo recognizer are redone once with the built-in Whisper.
         digest.update(json.dumps([settings["reference_text"], bool(settings["preprocess_prompt"]),
-                                  PROMPT_CACHE_VERSION]).encode("utf-8"))
+                                  PROMPT_CACHE_VERSION, *(["indextts.asr"] if transcribing else [])]).encode("utf-8"))
         cached = PROMPT_CACHE_DIR / f"{digest.hexdigest()[:32]}.pt"
         if cached.is_file():
             try:
                 return VoiceClonePrompt.load(str(cached))
             except Exception as exc:  # a damaged cache entry is rebuilt below
                 print(f">> OmniVoice reference cache ignored ({exc})", flush=True)
-        transcribing = not settings["reference_text"]
         if transcribing:
-            print(f">> Transcribing reference {Path(path).name} once with OmniVoice's Whisper model", flush=True)
+            print(f">> Transcribing reference {Path(path).name} once with the built-in Whisper", flush=True)
+            self._use_builtin_recognizer()
         try:
             with torch.inference_mode():
                 prompt = self.model.create_voice_clone_prompt(
                     ref_audio=str(path), ref_text=settings["reference_text"] or None,
                     preprocess_prompt=settings["preprocess_prompt"])
         finally:
-            if transcribing and getattr(self.model, "_asr_pipe", None) is not None:
-                # The recognizer is needed once per reference; release its VRAM.
-                self.model._asr_pipe = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            if transcribing:
+                self._release_recognizer()
         try:
             PROMPT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             temporary = cached.with_suffix(f".{os.getpid()}.tmp")
@@ -314,6 +313,28 @@ class OmniVoiceEngine:
         if transcribing:
             print(f">> Reference transcript: {prompt.ref_text}", flush=True)
         return prompt
+
+    def _use_builtin_recognizer(self):
+        """OmniVoice transcribes a reference without a transcript after trimming it (long references are cut at
+        their longest pause, silences removed); the built-in Whisper does that transcription. The reference's
+        language comes from its own audio: it can differ from the language of the speech that clones it.
+        """
+        from indextts.asr import recognize
+
+        device = str(self.device)
+
+        def transcribe(audio):
+            return recognize(audio, language=None, device=device, words=False).text
+
+        self.model.transcribe = transcribe
+        self.model._asr_pipe = "indextts.asr"  # OmniVoice loads its own recognizer while this is empty
+
+    def _release_recognizer(self):
+        from indextts.asr import park
+
+        self.model.__dict__.pop("transcribe", None)
+        self.model._asr_pipe = None
+        park()
 
     def _normalize_text(self, text, language):
         return normalize_omnivoice_text(text, language)

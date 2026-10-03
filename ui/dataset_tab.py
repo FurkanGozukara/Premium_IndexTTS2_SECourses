@@ -441,7 +441,7 @@ def build_dataset_tab(
         with gr.Accordion("Transcripts", open=False):
             with gr.Row():
                 subtitle_policy = gr.Dropdown(choices=["prefer_sidecar", "whisper_only", "sidecar_only"], value="prefer_sidecar", label="Transcript policy", info="Prefer sidecars, require supplied text, or ignore it. A Whisper-only selection here or in Segmentation mode uses ASR text.")
-                whisper_model = gr.Textbox(value="openai/whisper-large-v3-turbo", label="Whisper model", info="Hugging Face model id or local path used when transcription/alignment is needed.")
+                whisper_model = gr.Textbox(value="large-v3-int8-convrot", label="Whisper model", info="large-v3-int8-convrot is the built-in Whisper (INT8 ConvRot engine, downloaded on first use); a Hugging Face model id or local path runs through Transformers instead.")
                 whisper_device = gr.Textbox(value=device_default, label="Whisper device", info="CUDA device recommended for sentence alignment; CPU works but is much slower.")
             with gr.Row():
                 segmentation_mode = gr.Dropdown(choices=["auto", "sentence_aligned", "cue_boundaries", "whisper_only"], value=DATASET_DEFAULTS["segmentation_mode"], label="Segmentation mode", info="Sentence aligned uses supplied text with Whisper word times. Cue boundaries requires timed subtitles for long recordings; Whisper only ignores supplied text.")
