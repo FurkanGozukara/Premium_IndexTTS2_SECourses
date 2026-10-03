@@ -569,7 +569,7 @@ def _training_plan_markdown(
             token_batches = frame_budget_micro_batches(training_rows, int(batch_frames), seed)
         automatic = model in {"omnivoice", "auk"} and not int(epochs or 0)
         if automatic:
-            epochs = automatic_epochs(sum(float(row.get("duration_s") or 0.0) for row in training_rows))
+            epochs = automatic_epochs(sum(float(row.get("duration_s") or 0.0) for row in training_rows), model)
         plan = training_plan(
             len(record_ids),
             batch_size,
@@ -1267,7 +1267,9 @@ def build_training_tab(
             with gr.Row():
                 _reg(registry, controls, "auk_num_step", gr.Slider(4, 128, value=32, step=1, label="Sample flow steps"),
                      kind="int", minimum=4, maximum=128)
-                _reg(registry, controls, "auk_guidance_scale", gr.Slider(0, 6, value=2, step=.1, label="Sample guidance"),
+                _reg(registry, controls, "auk_guidance_scale", gr.Slider(
+                    0, 6, value=TRAIN_DEFAULTS["auk_guidance_scale"], step=.1, label="Sample guidance",
+                    info="Samples and the speech comparison speak in Auto voice by default: 1.5 measured best there."),
                      kind="float", minimum=0, maximum=6)
 
         with gr.Accordion("Training data fluency", open=True):
@@ -1376,7 +1378,7 @@ def build_training_tab(
             with gr.Row():
                 betas = gr.Textbox(value=TRAIN_BETAS_TEXT, label="Adam betas", info="Two comma-separated momentum coefficients; 0.9, 0.99 is recommended.")
                 eps = gr.Number(value=TRAIN_DEFAULTS["eps"], minimum=1e-12, maximum=0.1, label="Adam epsilon", info="Numerical stability term for Adam-family optimizers.")
-                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=0, maximum=10000, precision=0, label="Epochs", info="Maximum passes through this dataset. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset. OmniVoice: 0 sizes the run from the training audio (25 epochs for 14 hours, more for smaller datasets).")
+                epochs = gr.Number(value=TRAIN_DEFAULTS["epochs"], minimum=0, maximum=10000, precision=0, label="Epochs", info="Maximum passes through this dataset. Validation may stop the run earlier; no fixed epoch count is optimal for every dataset. OmniVoice and AuK: 0 sizes the run from the training audio (OmniVoice 25 epochs for 14 hours, AuK 4; more for smaller datasets).")
                 max_steps = gr.Number(value=TRAIN_DEFAULTS["max_steps"], minimum=0, precision=0, label="Maximum steps", info="0 derives steps from epochs; set 5 for a quick smoke run.")
                 batch_size = gr.Number(value=TRAIN_DEFAULTS["batch_size"], minimum=1, maximum=128, precision=0, label="Batch size", info="Clips per micro-batch. Larger batches need more memory and produce fewer updates per epoch.")
                 accumulation = gr.Number(value=TRAIN_DEFAULTS["grad_accumulation"], minimum=1, maximum=128, precision=0, label="Gradient accumulation", info="Micro-batches combined into one optimizer update. Check the displayed update budget after changing it.")

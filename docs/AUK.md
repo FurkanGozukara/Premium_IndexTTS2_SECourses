@@ -8,7 +8,7 @@ Select **AuK** beside the app heading. [Tencent AuK](https://huggingface.co/tenc
 - **Voice design:** describe the voice in plain words, for example *a calm middle-aged man with a deep, warm voice*. English and Chinese only.
 - **Auto voice:** a fine-tuned AuK voice speaks without a reference, with the description and pace it was trained with (stored beside the checkpoint). The base model picks a random voice.
 - **Duration:** AuK needs every section's length up front. The app follows upstream's prompt-enhancer byte model, scaled by the reference's (or trained voice's) measured pace. Sections default to 60 text tokens (about 15 s); a section that would not fit the 30 s context is split again rather than rushed.
-- **Sampling:** the official defaults are 32 Euler steps, guidance 2.0 and sway −1. The Max speed and Max quality choices select 16 and 64 steps. Loudness matching to the reference is on by default.
+- **Sampling:** the official defaults are 32 Euler steps, guidance 2.0 and sway −1. The Max speed and Max quality choices select 16 and 64 steps. In Auto voice the presets use guidance 1.5, which measured best for trained voices (see Training). Loudness matching to the reference is on by default.
 
 Decoding choices were compared on 24 held-out English sentences × 2 seeds, scored against real recordings of the same sentences (speaker and style similarity, Whisper word errors), with paired bootstrap intervals and a 72-sentence confirmation set.
 
@@ -49,7 +49,24 @@ Training uses the prepared manifest dataset. AuK caches VAE posteriors and the f
 
 Measured on an RTX A6000 at 2,400 frames per micro-batch: full fine-tuning peaks at 28.75 GiB with or without gradient checkpointing (the optimizer step dominates), 26.8 GiB with fused AdamW, and runs 65 % faster without it (2.41 updates/s). DoRA r32 needs 17.6 GiB without checkpointing (1.06/s) or 4.7 GiB with it (0.56/s); LoRA r32 10.9 GiB (1.72/s). Reference-prompt objectives load the Qwen encoder beside the model and need checkpointing.
 
-Validation reports AuK's flow-matching loss on held-out clips with fixed noise at flow times 0.0–0.9; it is not comparable to the other models' losses and is not a speech-quality guarantee. Checkpoint evaluation, the speech comparison against real recordings and the checkpoint grid work as for the other models.
+Validation reports AuK's flow-matching loss on held-out clips with fixed noise at flow times 0.0–0.9, once per epoch, in 1,200-frame batches on every tier so runs compare; it is not comparable to the other models' losses and is not a speech-quality guarantee. Checkpoint evaluation, the speech comparison against real recordings and the checkpoint grid work as for the other models. For a voice trained for Auto voice, Base clones the training reference in the speech comparison (it has no voice of its own) while the checkpoints speak in Auto voice.
+
+### Training study
+
+One speaker, 14.3 hours of training audio (4,163 clips) and 234 held-out clips from 3 recordings, trained with the app's trainer on RTX A6000 cards. The decisive measure renders 24 held-out sentences × 2 seeds per checkpoint and scores them against the speaker's real recordings of the same sentences (speaker and style similarity, Whisper word errors; paired bootstrap intervals; winners confirmed on 72 further sentences). The speaker's own recordings score 2.2 % word errors with this recognizer.
+
+| Question | Result | Default |
+| --- | --- | --- |
+| Full fine-tuning vs adapters | Full beat DoRA r32 (speaker +0.023 at epoch 4, style +0.014 at epoch 8). DoRA r32 beat LoRA r32 slightly (speaker +0.008); LoRA is 1.6× faster and lighter. Rank 128 = rank 32; adaLN adapters on = off. | Full on 32 GB; DoRA r32 below |
+| Learning rate | Full: 2e-5 best (1e-5 and 5e-6 never better, 5e-6 lower style; 4e-5 equal but 7.2 % word errors after epoch 1). Adapters: 1e-4. | 2e-5 / 1e-4 |
+| Epochs | 14.3 h: a 4-epoch cosine run equalled an 8-epoch one (speaker −0.005 / 0.000, not resolved). A 2.6-hour subset rose to speaker 0.820–0.825 at epochs 10–12 of 24 and slipped after (epoch 24 vs 12: −0.014). | Epochs 0: 4 × √(14 h / training hours), 3–30 |
+| EMA 0.999 | Worse at a peak (epoch 4: speaker and style −0.019), better in a dip, equal to the raw weights at the end of the cosine schedule; costs 5.7 GiB. | Off |
+| Averaging the last 2 epochs | +0.003, 0.000 and −0.006 speaker on three runs. | Off |
+| Reference-prompt fraction 0.3 | Hurt both modes (Auto voice speaker −0.009 and +1.46 points word errors; cloning style −0.039). | 0 (Auto voice) |
+| Guidance in Auto voice | 1.5 vs 2.0: speaker +0.006, style +0.014 on the 72 fresh sentences, word errors −0.5 (not resolved). 1.0–1.25 more style with slightly more errors; 2.5 and 3.0 worse. | 1.5 |
+| Instruction wording of trained voices | The original trained-voice wording stays (stored per voice). | — |
+
+A fine-tuned voice in Auto voice against the base model cloning an 8.97 s reference: speaker similarity +0.034 (resolved), word errors +1.2 points. One validation pass takes 100–250 s (as long as about 250 full-fine-tuning updates), and the held-out flow loss improves by only 0.001–0.005 per epoch, so AuK validates once per epoch and its early stopping uses a 0.0005 threshold. Full fine-tuning keeps its resumable state (about 18 GB) for the final and interrupted files only. An unmerged DoRA renders 1.5× slower than a full checkpoint.
 
 ## Upstream and community findings
 

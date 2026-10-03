@@ -43,7 +43,7 @@ HOP = SAMPLE_RATE // LATENT_RATE  # 480 samples per latent frame
 from indextts.auk.text import (  # noqa: F401  (re-exported for callers of the engine module)
     CLONE_TEMPLATE, DESIGN_TEMPLATE, DESIGN_TEMPLATE_ZH, GENERATION_DEFAULTS, SECONDS_PER_BYTE, SHORT_TEXT_BYTES,
     SHORT_TEXT_SPEED, TRAINED_VOICE_DESCRIPTION, build_instruction, detect_language, f5_seconds, normalize_auk_text,
-    quote_text, text_units, trained_voice, validate_voice_settings, voice_template,
+    preset_guidance, quote_text, text_units, trained_voice, validate_voice_settings, voice_template,
 )
 
 SEGMENT_SECONDS_LIMIT = MAX_CONTEXT_SECONDS
@@ -592,6 +592,8 @@ class AukEngine:
         if cuda:
             torch.cuda.reset_peak_memory_stats(self.device)
         settings = {**GENERATION_DEFAULTS, **(auk or {})}
+        if "guidance_scale" not in (auk or {}):
+            settings["guidance_scale"] = preset_guidance(settings["mode"])  # a request without its own guidance
         validate_voice_settings(settings)
         if target_duration_mode not in {"off", "natural", "pad", "trim"}:
             raise ValueError("Unknown target duration mode")

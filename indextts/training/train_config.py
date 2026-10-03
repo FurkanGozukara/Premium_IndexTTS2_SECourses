@@ -45,7 +45,7 @@ class TrainConfig:
     auk_target_adaln: bool = True
     auk_batch_frames: int = 0
     auk_num_step: int = 32
-    auk_guidance_scale: float = 2.0
+    auk_guidance_scale: float = 1.5  # samples speak in Auto voice by default, measured best at 1.5
     auk_normalize_text: bool = True
 
     adapter_type: str = "dora"

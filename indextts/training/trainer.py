@@ -1684,7 +1684,9 @@ class LoraTrainer:
         ema_loss: float | None,
         moving_losses: deque[float],
         keep: bool = False,
+        train_state: bool | None = None,
     ) -> Path:
+        """Save a checkpoint; ``train_state`` False skips its resumable state (None: the configured rule)."""
         destination.parent.mkdir(parents=True, exist_ok=True)
         periodic_checkpoint = any(
             destination.stem.startswith(f"{self.config.name}_{kind}_")
@@ -1701,7 +1703,7 @@ class LoraTrainer:
             dtype=_dtype(self.config.save_dtype),
         )
         self._save_ema_sibling(destination, built, step=step, epochs_completed=epochs_completed)
-        if self.config.save_train_state and (
+        if train_state is not False and self.config.save_train_state and (
             self.config.epoch_train_state or not periodic_checkpoint
         ):
             state = self._train_state(

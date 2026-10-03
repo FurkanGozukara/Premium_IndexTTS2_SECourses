@@ -43,6 +43,21 @@ EDGE_MODULES = ("txt_norm", "audio_embed", "proj_out")
 EDGE_PROJECTIONS = ("txt_proj", "time_embed.time_mlp.0", "time_embed.time_mlp.2", "norm_out.linear")
 
 
+# Latent frames per validation batch on every tier (inference only, so it fits the smallest tier).
+VALIDATION_FRAMES = 1200
+
+
+def run_updates(sampler, epochs, grad_accumulation):
+    """Optimizer updates of a whole run, counted epoch by epoch: token-budget batches change slightly between
+    epochs, so the last epoch then ends exactly on the last update (and saves its epoch file)."""
+    total = 0
+    for epoch in range(max(0, int(epochs))):
+        sampler.set_epoch(epoch)
+        total += math.ceil(len(sampler) / max(1, int(grad_accumulation)))
+    sampler.set_epoch(0)
+    return total
+
+
 def adapter_targets(model, *, attention=True, feed_forward=True, adaln=True, edges=False) -> list[str]:
     targets = []
     for name, module in model.named_modules():
@@ -222,7 +237,8 @@ class AukTrainer(LoraTrainer):
             build_final_test_plan(config, train_data.records, val_data.records, self.adapter_dir)
         if config.auk_batch_frames:
             sampler = TokenBudgetBatchSampler(train_data.lengths, config.auk_batch_frames, seed=config.seed)
-            val_sampler = TokenBudgetBatchSampler(val_data.lengths, config.auk_batch_frames, shuffle=False, seed=config.seed)
+            # One validation budget for every tier, so held-out losses of runs with different micro-batches compare.
+            val_sampler = TokenBudgetBatchSampler(val_data.lengths, VALIDATION_FRAMES, shuffle=False, seed=config.seed)
         else:
             sampler = LengthBucketBatchSampler(train_data.lengths, config.batch_size, seed=config.seed)
             val_sampler = None
@@ -235,10 +251,14 @@ class AukTrainer(LoraTrainer):
                       else DataLoader(val_data, batch_size=config.batch_size, shuffle=False, **loader_args))
         if not config.epochs:
             seconds = sum(float(row.get("duration_s") or 0.0) for row in train_data.records)
-            config.epochs = automatic_epochs(seconds)
+            config.epochs = automatic_epochs(seconds, "auk")
             self.log(f">> Automatic length: {config.epochs} epochs for {seconds / 3600:.1f} hours of training audio")
-        total_steps = int(min(config.max_steps or math.inf,
-                              config.epochs * math.ceil(len(train_loader) / config.grad_accumulation)))
+        total_steps = int(min(config.max_steps or math.inf, run_updates(sampler, config.epochs, config.grad_accumulation)))
+        if config.adapter_type == "full" and config.auk_prompt_fraction > 0 and not config.gradient_checkpointing:
+            # Reference prompts keep the Qwen encoder resident and lengthen the sequences: without checkpointing
+            # full fine-tuning ran out of memory on a 48 GB card; with it the peak is about 36 GiB.
+            config.gradient_checkpointing = True
+            self.log(">> Full fine-tuning with reference prompts: gradient checkpointing on (about 36 GiB; 40 GB+ cards)")
         self.write_status(phase="initializing", total_steps=total_steps, message="Loading AuK training weights")
         if device.type == "cuda":
             # Expandable segments keep the allocator from reserving far more than training uses
@@ -282,10 +302,13 @@ class AukTrainer(LoraTrainer):
             torch.cuda.reset_peak_memory_stats(device)
 
         def save(path, epoch, batch):
+            # Full fine-tuning's resumable state (FP32 weights and Adam moments, about 18 GB) is written for the
+            # final and interrupted files only, not for every new best checkpoint.
+            state_rule = False if config.adapter_type == "full" and path == self.best_path else None
             return self.save_checkpoint(path, built, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
                 step=step, epochs_completed=epoch, next_epoch=epoch_index, next_batch=batch,
                 dataset_fingerprint=train_data.fingerprint, best_val_loss=self.early_stopping.best_loss,
-                ema_loss=sum(moving) / len(moving) if moving else None, moving_losses=moving)
+                ema_loss=sum(moving) / len(moving) if moving else None, moving_losses=moving, train_state=state_rule)
 
         def validate(epoch):
             nonlocal val_loss, early

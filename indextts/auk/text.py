@@ -29,6 +29,17 @@ GENERATION_DEFAULTS = {
     "max_reference_seconds": 15.0, "trim_reference_silence": True,
     "edge_seconds": 0.0, "match_loudness": True,
 }
+# Guidance per voice mode. Cloning and voice design keep the official 2.0; a fine-tuned voice in Auto voice
+# spoke best at 1.5 (October 2026 study, 72 held-out sentences: speaker +0.006, style +0.014 against 2.0, word
+# errors unchanged; 1.0-1.25 more style with more word errors, 2.5 and 3.0 worse).
+AUTO_VOICE_GUIDANCE = 1.5
+
+
+def preset_guidance(mode: str) -> float:
+    """The sampling presets' guidance for a voice mode."""
+    return AUTO_VOICE_GUIDANCE if mode == "auto" else GENERATION_DEFAULTS["guidance_scale"]
+
+
 VOICE_MODES = ("clone", "design", "auto")
 LANGUAGES = (("Auto", "AUTO"), ("English", "EN"), ("Chinese", "ZH"))
 

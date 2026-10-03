@@ -385,3 +385,54 @@ def test_takes_over_full_scale_are_scaled_not_clipped():
     assert torch.allclose(limited / limited.abs().max(), loud / loud.abs().max())
     quiet = torch.tensor([[0.2, -0.4]])
     assert torch.equal(_limit_peak(quiet), quiet)
+
+
+def test_auk_automatic_epochs_follow_the_training_study():
+    from indextts.training.plan import automatic_epochs
+
+    assert automatic_epochs(14.3 * 3600, "auk") == 4
+    assert automatic_epochs(2.6 * 3600, "auk") == 9
+    assert automatic_epochs(3600, "auk") == 15
+    assert automatic_epochs(60, "auk") == 30 and automatic_epochs(500 * 3600, "auk") == 3
+    assert automatic_epochs(14 * 3600) == 25  # OmniVoice keeps its own rule
+
+
+def test_auk_run_length_counts_every_epochs_batches():
+    from indextts.training.auk_trainer import run_updates
+    from indextts.training.dataset import TokenBudgetBatchSampler
+
+    lengths = [40 + (index * 37) % 900 for index in range(300)]
+    sampler = TokenBudgetBatchSampler(lengths, 2400, seed=7)
+    counts = []
+    for epoch in range(6):
+        sampler.set_epoch(epoch)
+        counts.append(math.ceil(len(sampler) / 2))
+    assert run_updates(sampler, 6, 2) == sum(counts) and sampler.epoch == 0
+
+
+def test_auto_voice_presets_use_guidance_one_and_a_half():
+    from indextts.auk.text import preset_guidance
+
+    assert preset_guidance("auto") == 1.5
+    assert preset_guidance("clone") == preset_guidance("design") == 2.0
+
+
+def test_auk_profile_sizes_runs_from_the_audio_and_validates_per_epoch():
+    from ui.model_profiles import auk_defaults
+
+    values = auk_defaults("32")
+    assert values["training.epochs"] == 0 and values["training.val_every_steps"] == 0
+    assert values["training.early_stop_min_delta"] == 0.0005
+
+
+def test_speech_comparison_base_clones_beside_an_auto_voice(tmp_path):
+    from indextts.training.sampling import auk_base_clone
+
+    reference = tmp_path / "voice_reference.wav"
+    reference.write_bytes(b"")
+    reference.with_suffix(".txt").write_text("The words of the reference.\n", encoding="utf-8")
+    infer = {"auk": {"mode": "auto", "num_step": 32, "guidance_scale": 1.5}, "section_batch_size": 1}
+    base = auk_base_clone(infer, reference)
+    assert base["auk"] == {"mode": "clone", "num_step": 32, "guidance_scale": 2.0,
+                           "reference_text": "The words of the reference."}
+    assert infer["auk"]["mode"] == "auto" and base["section_batch_size"] == 1

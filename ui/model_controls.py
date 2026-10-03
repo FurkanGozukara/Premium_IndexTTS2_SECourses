@@ -98,7 +98,7 @@ AUK_DESCRIPTION_EXAMPLES = (
 
 
 def build_auk_controls(registry):
-    from indextts.auk.text import GENERATION_DEFAULTS as AUK
+    from indextts.auk.text import AUTO_VOICE_GUIDANCE, GENERATION_DEFAULTS as AUK
 
     with gr.Accordion("AuK · voice and generation", open=True, elem_classes=[MODEL_ONLY_CLASS["auk"]]) as panel:
         gr.Markdown("Clone a reference voice, describe a new voice, or let a trained AuK voice speak without a "
@@ -122,22 +122,30 @@ def build_auk_controls(registry):
                                               info="Words spoken in the reference; used only to match its pace. "
                                                    "Blank transcribes the reference once with Whisper."), kind="str")
         quality = gr.Radio([*AUK_SAMPLING_PRESETS, "Custom"], value="Balanced", label="Sampling preset",
-                           info="16 / 32 / 64 flow steps with guidance 2. 32 is the official setting.")
+                           info="16 / 32 / 64 flow steps with guidance 2, or 1.5 in Auto voice (measured best for "
+                                "trained voices). 32 is the official setting.")
         with gr.Row():
             register("num_step", gr.Slider(4, 128, value=AUK["num_step"], step=1, label="AuK flow steps",
                                            info="32 is the official default; fewer steps are faster."),
                      kind="int", minimum=4, maximum=128)
             register("guidance_scale", gr.Slider(0, 6, value=AUK["guidance_scale"], step=0.1, label="AuK guidance (CFG)",
-                                                 info="2.0 is the official default."),
+                                                 info="2.0 is the official default; trained voices in Auto voice 1.5."),
                      kind="float", minimum=0, maximum=6)
         sampling = [registry["auk.num_step"].component, registry["auk.guidance_scale"].component]
+        mode = registry["auk.mode"].component
         presets_js = "{" + ", ".join(f"'{name}': {steps}" for name, steps in AUK_SAMPLING_PRESETS.items()) + "}"
         steps_js = "{" + ", ".join(f"{steps}: '{name}'" for name, steps in AUK_SAMPLING_PRESETS.items()) + "}"
-        quality.input(None, [quality, *sampling], sampling, queue=False, api_name=False, show_progress="hidden",
-                      js=f"(preset, steps, guidance) => preset === 'Custom' ? [steps, guidance] : [{presets_js}[preset], 2]")
-        gr.on([control.change for control in sampling], None, sampling, quality, queue=False, api_name=False,
+        guidance_js = f"(mode === 'auto' ? {AUTO_VOICE_GUIDANCE} : {AUK['guidance_scale']})"
+        # A preset's guidance follows the voice mode the user picks; Custom keeps the user's own values, and a
+        # loaded preset keeps its saved guidance (only user input re-applies the preset).
+        preset_js = (f"(preset, steps, guidance, mode) => preset === 'Custom' ? [steps, guidance] "
+                     f": [{presets_js}[preset], {guidance_js}]")
+        for trigger in (quality, mode):
+            trigger.input(None, [quality, *sampling, mode], sampling, queue=False, api_name=False,
+                          show_progress="hidden", js=preset_js)
+        gr.on([control.change for control in sampling], None, [*sampling, mode], quality, queue=False, api_name=False,
               show_progress="hidden",
-              js=f"(steps, guidance) => Number(guidance) === 2 ? ({steps_js}[Number(steps)] || 'Custom') : 'Custom'")
+              js=f"(steps, guidance, mode) => Number(guidance) === {guidance_js} ? ({steps_js}[Number(steps)] || 'Custom') : 'Custom'")
         with gr.Accordion("Advanced AuK sampling", open=False):
             with gr.Row():
                 register("sway_coef", gr.Slider(-1, 1, value=AUK["sway_coef"], step=0.05, label="Sway sampling",

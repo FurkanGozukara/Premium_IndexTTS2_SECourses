@@ -186,7 +186,11 @@ def auk_defaults(tier="auto"):
         "generation.auto_lora_max_tokens": False,
         "generation.section_batch_size": 1,
         "training.tts_model": "auk", "training.name": "auk_voice",
-        "training.adapter_type": method, "training.max_steps": 0,
+        # Training study (docs/AUK.md): epochs 0 sizes the run from the audio (4 epochs for 14 hours). One
+        # validation pass takes as long as about 250 updates, so AuK validates once per epoch; its held-out flow
+        # loss improves by 0.001-0.005 per epoch, so early stopping needs a finer threshold.
+        "training.adapter_type": method, "training.epochs": 0, "training.max_steps": 0,
+        "training.val_every_steps": 0, "training.early_stop_min_delta": 0.0005,
         "training.rank": 32, "training.alpha": 64.0,
         "training.blocks_to_swap": 0, "training.num_workers": 2,
         "training.train_spk_proj": False, "training.train_emo_layers": False,

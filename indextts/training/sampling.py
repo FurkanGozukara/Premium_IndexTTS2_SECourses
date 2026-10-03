@@ -100,6 +100,18 @@ def _sample_language(config: TrainConfig) -> str:
     return language if language in _SAMPLE_LANGUAGES else "EN"
 
 
+def auk_base_clone(infer, reference) -> dict:
+    """Base (no adapter) settings beside a voice trained for Auto voice: Base has no voice of its own, so it
+    clones the training reference at the official guidance and the comparison still measures the speaker."""
+    from indextts.auk.text import preset_guidance
+
+    settings = {**infer["auk"], "mode": "clone", "guidance_scale": preset_guidance("clone")}
+    transcript = Path(reference).with_suffix(".txt")
+    if transcript.is_file():
+        settings["reference_text"] = transcript.read_text(encoding="utf-8-sig").strip()
+    return {**infer, "auk": settings}
+
+
 def auk_request_settings(config, reference=None) -> dict:
     """AuK generation settings for training samples and the speech comparison: a voice trained without
     reference prompts speaks in Auto voice mode, otherwise it clones the training reference."""

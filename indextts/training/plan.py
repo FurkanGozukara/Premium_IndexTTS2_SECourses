@@ -173,18 +173,22 @@ def training_plan(
 AUTO_EPOCHS_REFERENCE_HOURS = 14.0
 
 
-def automatic_epochs(training_seconds: float) -> int:
-    """OmniVoice training length for ``epochs = 0``: more epochs for less audio.
+def automatic_epochs(training_seconds: float, model: str = "omnivoice") -> int:
+    """Training length for ``epochs = 0``: more epochs for less audio, growing with the square root of the shortfall.
 
-    Round-2 experiments (one voice, 8192-token updates): 14 hours of training
-    audio was best after about 25 epochs; a 2-hour subset still improved until
-    about epoch 55 and was clearly better at 75 epochs than at 25. The count
-    grows with the square root of the shortfall, clamped to 10-100 epochs;
-    validation early stopping and the best checkpoint guard the rest.
+    OmniVoice, round-2 experiments (one voice, 8192-token updates): 14 hours of training audio was best after
+    about 25 epochs; a 2-hour subset still improved until about epoch 55 and was clearly better at 75 epochs
+    than at 25 (clamped to 10-100 epochs). AuK, October 2026 study (docs/AUK.md): with 14.3 hours a 4-epoch
+    cosine run equalled an 8-epoch one, and a 2.6-hour subset peaked at epochs 10-12 of 24 and slipped after
+    (4 epochs for 14 hours, 9 for 2.6, 15 for one hour; clamped to 3-30). Validation and the best checkpoint
+    guard the rest.
     """
 
     hours = max(float(training_seconds) / 3600.0, 1e-6)
-    return int(min(100, max(10, round(25 * math.sqrt(AUTO_EPOCHS_REFERENCE_HOURS / hours)))))
+    shortfall = math.sqrt(AUTO_EPOCHS_REFERENCE_HOURS / hours)
+    if model == "auk":
+        return int(min(30, max(3, round(4 * shortfall))))
+    return int(min(100, max(10, round(25 * shortfall))))
 
 
 def token_budget_micro_batches(rows: Sequence[Mapping[str, Any]], max_tokens: int, seed: int = 42) -> int:

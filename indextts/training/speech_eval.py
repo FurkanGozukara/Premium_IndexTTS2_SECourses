@@ -388,6 +388,8 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     # compares GPT checkpoints without it; deployment is assessed separately.
     runtime.decoder_adapter = "none"
     infer = _benchmark_infer_kwargs(config)
+    # An AuK voice trained for Auto voice speaks without a reference; Base clones the group's training reference.
+    auk_auto = getattr(config, "tts_model", "indextts") == "auk" and (infer.get("auk") or {}).get("mode") == "auto"
     # Development renders every candidate the way Voice Generation deploys it by default: Base with the
     # language defaults, the run's adapters with their profile's token target, pauses, expressive clip and
     # calibrated pace, all at the GPU tier's beams and diffusion steps. Every checkpoint of one run shares
@@ -417,7 +419,7 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
         # the selected adapter's decoder, speaking rate, or tuned decoding knobs.
         if final_test:
             batches = [[row] for row in candidates]
-        elif deployment:
+        elif deployment or auk_auto:
             batches = [rows for rows in ([row for row in candidates if not row["path"]], [row for row in candidates if row["path"]]) if rows]
         else:
             batches = [candidates]
@@ -434,9 +436,12 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
                 selected_infer = dict(infer)
             if not candidate["path"]:
                 selected_runtime["decoder_adapter"] = "none"
+                if auk_auto:
+                    from .sampling import auk_base_clone
+                    selected_infer = auk_base_clone(selected_infer, group["reference"])
             if final_test:
                 grid_name = f"{group['id']}_candidate_{index}"
-            elif deployment:
+            elif deployment or auk_auto:
                 grid_name = f"{group['id']}_{'adapters' if candidate['path'] else 'base'}"
             else:
                 grid_name = group["id"]
