@@ -191,6 +191,16 @@ def _rms(audio) -> float:
     return float(np.sqrt(np.mean(array * array) + 1e-12)) if array.size else 0.0
 
 
+PEAK_CEILING = 0.99
+
+
+def _limit_peak(audio: torch.Tensor, ceiling: float = PEAK_CEILING) -> torch.Tensor:
+    """Scale a take down when it would exceed full scale: a restored or louder take keeps its
+    shape instead of being hard-clipped by the 16-bit conversion."""
+    peak = float(audio.abs().max()) if audio.numel() else 0.0
+    return audio * (ceiling / peak) if peak > ceiling else audio
+
+
 class OffloadedModule:
     """Keep a frozen module in pinned CPU memory and lend it to the GPU while it runs.
 
@@ -681,8 +691,8 @@ class AukEngine:
                                              settings, seeds, progress=on_step, conditioning=prefetched.get(start))
                 for offset, audio in enumerate(audios):
                     if settings.get("match_loudness") and reference is not None and reference.rms > 1e-4:
-                        gain = min(4.0, reference.rms / max(1e-4, _rms(audio)))
-                        audio = (audio * gain).clamp(-1, 1)
+                        audio = audio * min(4.0, reference.rms / max(1e-4, _rms(audio)))
+                    audio = _limit_peak(audio)
                     rendered[start + offset] = trim_segment_silence(audio, self.sampling_rate, trim_silence_ms_threshold)
                     durations.append(rendered[start + offset].shape[-1] / self.sampling_rate)
                     complete(owners[start + offset])
@@ -772,7 +782,7 @@ class AukEngine:
                 outputs.append(self.generate_batch([instruction], [reference], [min(2 * MAX_CONTEXT_SECONDS,
                                                    max(0.3, piece_seconds))], settings, [seed + index], on_step,
                                                    conditioning=encoded[index])[0])
-        result = torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0]
+        result = _limit_peak(torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0])
         self.last_generation_stats = {
             "model": self.model_id, "task": task_key, "instruction": instruction, "pieces": len(pieces),
             "generation_time_s": time.perf_counter() - started, "total_duration_s": result.shape[-1] / SAMPLE_RATE,

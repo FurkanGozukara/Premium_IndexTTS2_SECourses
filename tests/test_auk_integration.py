@@ -369,3 +369,15 @@ def test_fully_trained_edges_stay_float_in_the_int8_transformer():
         assert f"transformer.{name}" in quantized, name
     with_edges = adapter_targets(model, edges=True)
     assert set(with_edges) - set(adapter_targets(model)) == {f"transformer.{name}" for name in EDGE_PROJECTIONS}
+
+
+def test_takes_over_full_scale_are_scaled_not_clipped():
+    import torch
+    from indextts.backends.auk import PEAK_CEILING, _limit_peak
+
+    loud = torch.tensor([[0.5, -1.8, 0.9]])
+    limited = _limit_peak(loud)
+    assert torch.allclose(limited.abs().max(), torch.tensor(PEAK_CEILING))
+    assert torch.allclose(limited / limited.abs().max(), loud / loud.abs().max())
+    quiet = torch.tensor([[0.2, -0.4]])
+    assert torch.equal(_limit_peak(quiet), quiet)
