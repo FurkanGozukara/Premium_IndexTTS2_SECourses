@@ -73,7 +73,7 @@
         "training.fluency_max_hesitations": -1,
         "training.fluency_max_long_hesitations": -1,
         "training.fluency_max_pause_percent": 100.0,
-        "training.grad_accumulation": 9,
+        "training.grad_accumulation": 4,
         "training.gradient_checkpointing": true,
         "training.keep_last_n": 0,
         "training.learning_rate": 0.0001,
