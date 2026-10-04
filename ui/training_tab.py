@@ -412,7 +412,7 @@ def _dataset_summary(path: str | None) -> str:
     return (
         f"**{root.name}** | {info.get('segment_count', 0)} segments | "
         f"{float(info.get('total_duration_minutes', 0.0) or 0.0):.2f} minutes | "
-        f"features **{'cached' if cache_index.is_file() else 'not cached'}**"
+        f"features **{'cached' if cache_index.is_file() else 'not cached yet (Start training caches them first)'}**"
     )
 
 
@@ -835,6 +835,10 @@ def _dashboard_fragments(root: Path) -> dict[str, Any]:
         "vram_total_gb": _training_vram_total(root),
         "desc": f"epoch {status.get('epoch', 0)}/{status.get('total_epochs', 0)}",
     }
+    if phase == "caching":
+        # Feature caching before the first update (every speech model) reports through the run's progress file.
+        payload = read_json(root / "progress.json", {}) or {"fraction": 0.0, "completed": 0, "total": None}
+        payload["desc"] = str(status.get("message") or payload.get("desc") or "caching training features")
     if phase == "evaluating":
         evaluation_progress = read_json(root / "analysis" / "eval_job" / "progress.json", {}) or {}
         payload = dict(evaluation_progress) or {"fraction": 0.0, "completed": 0, "total": None}
@@ -869,6 +873,7 @@ def _dashboard_fragments(root: Path) -> dict[str, Any]:
             "desc": str(child.get("message") or status.get("message") or "adapting the voice decoder"),
         }
     titles = {
+        "caching": "Caching training features",
         "post_training": "Automatic quality checks in progress",
         "evaluating": "Evaluating checkpoints",
         "evaluating_speech": "Comparing generated speech",
@@ -1994,8 +1999,6 @@ def build_training_tab(
             dataset_root = Path(config.dataset_dir)
             if not (dataset_root / "manifest.jsonl").is_file():
                 raise ValueError(f"Dataset manifest not found: {dataset_root}")
-            if config.tts_model == "indextts" and not (dataset_root / "cache" / "index.jsonl").is_file():
-                raise ValueError("Dataset features are not cached. Use 'Cache features now' in Dataset Preparation first.")
             adapter_dir = Path(config.output_dir) / config.name
             from indextts.training.run_guard import ensure_run_destination
             ensure_run_destination(config)

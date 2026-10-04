@@ -275,7 +275,7 @@ def test_training_dataset_refresh_recomputes_cache_status(tmp_path, monkeypatch)
     monkeypatch.setattr("ui.training_tab._dataset_choices", lambda: [])
 
     _, before = _refresh_dataset_updates(str(dataset))
-    assert before.endswith("features **not cached**")
+    assert before.endswith("features **not cached yet (Start training caches them first)**")
     (dataset / "cache").mkdir()
     (dataset / "cache" / "index.jsonl").write_text("", encoding="utf-8")
     _, after = _refresh_dataset_updates(str(dataset))

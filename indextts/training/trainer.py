@@ -2819,6 +2819,50 @@ def _format_eta(seconds: float) -> str:
     return f"{secs}s"
 
 
+def cache_features_before_training(config: TrainConfig, state_dir: str | Path | None) -> bool:
+    """Cache an IndexTTS dataset's training features when it has none, in the training process.
+
+    OmniVoice and AuK cache inside their trainers; IndexTTS needs the cache before the trainer is built
+    (a fluency-filtered view links the cached files), so Start training caches first instead of failing.
+    Returns True when the run should go on; False when Stop was pressed during caching.
+    """
+
+    dataset = Path(config.dataset_dir).expanduser().resolve()
+    if (dataset / "cache" / "index.jsonl").is_file():
+        return True
+    from .features import FeatureCacheConfig, cache_dataset_features, feature_batch_size_for_free_vram
+
+    state = Path(state_dir).expanduser().resolve() if state_dir else None
+    started = time.perf_counter()
+
+    def status(**values: Any) -> None:
+        if state is not None:
+            atomic_write_json(state / "status.json", {
+                "step": 0, "total_steps": 0, "epoch": 0, "total_epochs": int(config.epochs), "eta_s": None,
+                "elapsed_s": time.perf_counter() - started, "updated_at": time.time(), **values,
+            })
+
+    status(phase="caching", message="Caching training features (first training on this dataset)")
+    free_gb = None
+    if str(config.device).startswith("cuda"):
+        try:
+            free_gb = gpu_free_gb(int(str(config.device).split(":", 1)[1]) if ":" in str(config.device) else 0)
+        except (RuntimeError, TypeError, ValueError):
+            free_gb = None
+    cache = FeatureCacheConfig(dataset_dir=str(dataset), model_dir=config.model_dir, model_config=config.model_config,
+                               device=config.device, max_codes=config.max_codes, max_text_tokens=config.max_text_tokens)
+    cache.batch_size = feature_batch_size_for_free_vram(free_gb, requested=cache.batch_size)
+    reporter = ProgressReporter("segments", progress_file=state / "progress.json") if state is not None else None
+    stop_path = state / "stop.flag" if state is not None else None
+    summary = cache_dataset_features(cache, reporter=reporter,
+                                     cancel_callback=(lambda *_: stop_path.exists()) if stop_path is not None else None)
+    if summary.cancelled:
+        status(phase="stopped", message="Stopped during feature caching")
+        return False
+    print(f">> Training features cached for {dataset.name} in {time.perf_counter() - started:.1f}s", flush=True)
+    return True
+
+
 def run_training(
     config: TrainConfig | Mapping[str, Any],
     *,
@@ -2832,6 +2876,8 @@ def run_training(
     if config.tts_model == "auk":
         from .auk_trainer import AukTrainer
         return AukTrainer(config, state_dir=state_dir, reporter=reporter).run()
+    if not cache_features_before_training(config, state_dir):
+        return TrainingResult("stopped", 0, 0, 0, str(state_dir or ""), "", None, None, None, 0, 0, 0.0)
     return LoraTrainer(config, state_dir=state_dir, reporter=reporter).run()
 
 
