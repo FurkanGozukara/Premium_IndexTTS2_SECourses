@@ -167,7 +167,8 @@ def _build_adapter_folders(root: str | Path = ROOT / "loras", model: str | None 
             }.get(saved_type, "LoRA / DoRA")
             rank = int(metadata.get("rank") or 0)
             steps = int(metadata.get("steps") or 0)
-            label = f"{folder.name}  |  {adapter_type} r{rank}  |  {steps} steps"
+            kind = "Full fine-tune" if saved_type == "full" else f"{adapter_type} r{rank}"
+            label = f"{folder.name}  |  {kind}  |  {steps} steps"
         except Exception:
             label = folder.name
         choices.append((label, str(folder)))

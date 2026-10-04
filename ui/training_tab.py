@@ -2250,7 +2250,9 @@ def build_training_tab(
             if info["adapter_type"] != "full" and abs(float(info["alpha"]) - float(current_alpha)) > 1e-6:
                 warnings.append(f"alpha mismatch: checkpoint {info['alpha']} vs UI {current_alpha}")
             note = " | **Warning:** " + "; ".join(warnings) if warnings else " | Settings match."
-            return f"{str(info['adapter_type']).upper()} rank {info['rank']} alpha {info['alpha']} | {info.get('steps', 0)} steps{note}"
+            kind = ("Full fine-tune" if info["adapter_type"] == "full"
+                    else f"{str(info['adapter_type']).upper()} rank {info['rank']} alpha {info['alpha']}")
+            return f"{kind} | {info.get('steps', 0)} steps{note}"
         except Exception as exc:
             return f"Resume inspection failed: {exc}"
 
