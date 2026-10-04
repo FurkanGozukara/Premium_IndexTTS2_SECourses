@@ -126,3 +126,11 @@ def test_dictionary_round_trip_and_rows(tmp_path: Path) -> None:
 def test_cmu_lookup_is_case_insensitive() -> None:
     assert pron.lookup_word("Comfy") == ["K", "AH1", "M", "F", "IY0"]
     assert pron.lookup_word("qwen") is None
+
+
+def test_hyphenated_compounds_of_known_words_need_no_reading():
+    from indextts.utils.pronunciation import check_text
+
+    flagged = [row["word"] for row in check_text("We fine-tune a text-to-speech model, then test Mixtral-style chat.")]
+    assert "fine-tune" not in flagged and "text-to-speech" not in flagged
+    assert "Mixtral-style" in flagged  # one unknown part keeps the compound on the list

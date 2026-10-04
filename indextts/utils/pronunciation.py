@@ -462,6 +462,12 @@ def check_text(
 
     known = {str(word).casefold() for word in known_words}
     lexicon = {entry.word.casefold(): entry for entry in entries}
+
+    def covered(part: str) -> bool:
+        forms = _base_forms(part)
+        return (any(form in lexicon or form in known for form in forms)
+                or (not any(char.isdigit() for char in part) and any(lookup_word(form) for form in forms)))
+
     rows: list[dict[str, Any]] = []
     for word in candidate_words(text):
         forms = _base_forms(word)
@@ -469,6 +475,10 @@ def check_text(
         seen = any(form in known for form in forms)
         in_cmu = any(lookup_word(form) for form in forms) if not any(char.isdigit() for char in word) else False
         if entry is not None or seen or in_cmu:
+            continue
+        # A hyphenated compound of known words (fine-tune, text-to-speech) is read part by part.
+        parts = [part for part in re.split(r"[-‐‑]", word) if part]
+        if len(parts) > 1 and all(part.isdigit() or covered(part) for part in parts):
             continue
         fragments = 0
         if token_len is not None:
