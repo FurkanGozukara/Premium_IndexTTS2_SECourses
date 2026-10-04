@@ -352,7 +352,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
         with gr.Accordion("Model Variant & Compute", open=True):
             with gr.Row():
                 variant = gr.Dropdown(choices=["bf16", "int8_convrot"], value="bf16", label="Model variant", info="BF16 gives the official quality path; INT8 ConvRot reduces transformer weight memory.")
-                dtype = gr.Dropdown(choices=["bf16", "fp16", "fp32"], value="bf16", label="GPT dtype", info="BF16 is recommended on modern NVIDIA GPUs; FP32 is the CPU-compatible fallback.")
+                dtype = gr.Dropdown(choices=["bf16", "fp16", "fp32"], value="bf16", label="Model dtype", info="IndexTTS's GPT, the OmniVoice and AuK transformers. BF16 is recommended on modern NVIDIA GPUs; FP32 is the CPU-compatible fallback.")
                 attention = gr.Dropdown(choices=["sdpa", "flash_attention_2", "eager"], value="sdpa", label="Attention backend", info="SDPA is the compatible default; FlashAttention 2 requires its optional package.")
                 use_accel = gr.Checkbox(value=False, label="Use acceleration engine", info="Enables the optional CUDA-graph/flash-attention path; use beams=1.")
                 use_qwen = gr.Checkbox(value=True, label="Enable emotion-text model", info="Required for Emotion text mode; on-demand residency keeps startup lazy.")

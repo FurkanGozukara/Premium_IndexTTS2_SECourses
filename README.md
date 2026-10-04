@@ -1520,7 +1520,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **GPT model variant** - `runtime.model_variant`. BF16 gives the official quality path; INT8 ConvRot reduces GPT weight memory. *(default "bf16"; choices "bf16", "int8_convrot")*
 
-**GPT dtype** - `runtime.gpt_dtype`. BF16 is recommended on modern NVIDIA GPUs; FP32 is the CPU-compatible fallback. *(default "bf16"; choices "bf16", "fp16", "fp32")*
+**Model dtype** - `runtime.gpt_dtype`. IndexTTS's GPT, the OmniVoice and AuK transformers. BF16 is recommended on modern NVIDIA GPUs; FP32 is the CPU-compatible fallback. *(default "bf16"; choices "bf16", "fp16", "fp32")*
 
 **Attention backend** - `runtime.attention_backend`. SDPA is the compatible default; FlashAttention 2 requires its optional package. *(default "sdpa"; choices "sdpa", "flash_attention_2", "eager")*
 
