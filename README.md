@@ -132,7 +132,7 @@ The header controls reusable settings; the tab row separates generation, batch w
 
 *Figure 1. The first screen is a working console, not a landing page: reference and text are on the left and center, while run controls, progress, results, and logs stay on the right. **Open / close all sections** is the fastest way to expose or collapse advanced controls.*
 
-At startup, earlier result panels stay clean. **Load last values** restores the most recently saved values across every tab. A system preset is marked with a star and is read-only; a user preset can be created, overwritten, loaded, or deleted. **Reset** returns the registered controls to the GPU VRAM preset detected for this card without deleting model files or generated outputs.
+At startup, earlier result panels stay clean. **Load last values** shows the last run of every tab again: its result, progress and log. A system preset is marked with a star and is read-only; a user preset can be created, overwritten, loaded, or deleted. **Reset** returns the registered controls to the GPU VRAM preset detected for this card without deleting model files or generated outputs.
 
 - Voice Generation: one script, one reference workflow, optional candidates and media output.
 - Batch Generation: many TXT or caption jobs (SRT, VTT, SBV, ASS/SSA, SUB, LRC, TTML/DFXP, SAMI, JSON, TSV) with shared or per-file references.
