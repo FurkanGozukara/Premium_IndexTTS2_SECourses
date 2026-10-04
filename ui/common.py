@@ -790,14 +790,31 @@ def format_exception(prefix: str, exc: BaseException) -> str:
     return message
 
 
+_TAIL_BYTES = 512 * 1024
+
+
 def tail_text(path: str | os.PathLike[str] | None, lines: int = 60) -> str:
+    """The last ``lines`` lines of a log as a console shows them.
+
+    Progress bars redraw one line with carriage returns; text mode would turn every redraw into a line of
+    its own and fill the live log with them, so only each line's last state is kept. Only the end of a
+    large log is read.
+    """
     if not path:
         return ""
     try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-            return "".join(handle.readlines()[-max(1, int(lines)):]).rstrip()
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _TAIL_BYTES))
+            data = handle.read()
     except OSError:
         return ""
+    text = data.decode("utf-8", errors="replace")
+    if size > _TAIL_BYTES:
+        text = text.split("\n", 1)[-1]  # the first line was cut by the seek
+    shown = [line.rstrip("\r").rsplit("\r", 1)[-1] for line in text.split("\n")]
+    return "\n".join(shown[-max(1, int(lines)):]).rstrip()
 
 
 def read_json(path: str | os.PathLike[str] | None, default: Any = None) -> Any:
