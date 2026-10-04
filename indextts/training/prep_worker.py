@@ -181,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
+    # transformers imports torchao, whose enum registrations print PyTorch's register_constant()
+    # deprecation warning in every worker log unless this shim is installed first (the app does it at start).
+    from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+    install_native_enum_pytree_compatibility()
     args = build_parser().parse_args(argv)
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -209,11 +214,12 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         return 0
-    except Exception:
+    except Exception as exc:
         detail = traceback.format_exc()
         (state_dir / "error.txt").write_text(detail, encoding="utf-8")
         reporter.log(detail.rstrip())
-        reporter.mark_finished("error", "Dataset preparation failed; see error.txt")
+        # The progress card shows this message: name the cause instead of pointing at a file in a state folder.
+        reporter.mark_finished("error", f"Dataset preparation failed: {exc}")
         elapsed = time.monotonic() - reporter.started
         segments = int(reporter._last.get("segment_count", 0) or 0)
         audio_seconds = float(reporter._last.get("total_audio_seconds", 0.0) or 0.0)

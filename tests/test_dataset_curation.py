@@ -96,7 +96,11 @@ def test_ui_audit_rejects_invalid_holdout_before_starting_worker(tmp_path):
                                                 {"id": "1", "source_media": "validation.flac"}])
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"placeholder")
-    values = {**CURATION_DEFAULTS, "references": str(reference), "validation_sources": "missing"}
+    values = {**CURATION_DEFAULTS, "references": str(reference)}
+    # A blank holdout names the recordings the user can enter (their stems appear nowhere else in the page).
+    with pytest.raises(ValueError, match="available: train, validation"):
+        curation_command(str(dataset), values)
+    values["validation_sources"] = "missing"
     with pytest.raises(ValueError, match="Unknown source recordings"):
         curation_command(str(dataset), values)
     assert not (tmp_path / "voice_curated").exists()

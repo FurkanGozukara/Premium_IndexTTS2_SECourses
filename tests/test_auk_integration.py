@@ -61,6 +61,48 @@ def test_switch_roundtrip_keeps_each_models_profile_and_auk_only_values():
     assert index_again["generation.speaking_rate"] == 1.05
 
 
+def test_gpu_tier_presets_carry_the_auk_training_micro_batch(tmp_path):
+    # The AuK-only frame budget is one value outside the model profiles; every tier preset stored 0 (fixed
+    # four-clip batches) while the tier note promised the measured 1,200-2,400 frames.
+    from types import SimpleNamespace
+
+    from indextts.runtime.auk_presets import resolve_training_preset
+    from ui.app import build_app
+
+    demo = build_app(SimpleNamespace(device="cpu", model_dir=str(tmp_path / "models")))
+    store = demo.preset_store
+    for tier in (6, 8, 16, 32):
+        values = store.tier_preset_values(tier)
+        method = values["app.profiles"]["auk"]["training.adapter_type"]
+        assert values["training.auk_batch_frames"] == resolve_training_preset(tier, method)["auk_batch_frames"] > 0
+    # AuK writes no INT8 version of a full fine-tune (its trainer exports none, its engine loads none): the option
+    # was shown and checked for AuK and silently did nothing, so it is hidden while AuK is selected.
+    from ui.common import MODEL_VISIBILITY_CSS
+
+    export = demo.preset_registry["training.export_int8"].component
+    assert "tts-hide-auk" in export.elem_classes and "body.tts-model-auk .tts-hide-auk" in MODEL_VISIBILITY_CSS
+
+
+def test_a_refused_model_switch_says_why_on_the_page(tmp_path, monkeypatch):
+    # The switch is an unqueued event: gr.Warning only reached Python's warnings (silenced by the launcher), so
+    # while a job ran the dropdown snapped back to the running model without a word. The refusal is now written
+    # to the header's preset status line.
+    from types import SimpleNamespace
+
+    from ui import model_controls
+    from ui.app import build_app
+
+    demo = build_app(SimpleNamespace(device="cpu", model_dir=str(tmp_path / "models")))
+    switch = next(fn for fn in demo.fns.values() if fn.api_name == "select_speech_model")
+    status = next(block for block in switch.outputs if getattr(block, "elem_classes", None) == ["preset-status"])
+    monkeypatch.setattr(model_controls.LAZY_ENGINE, "_busy", 1)
+    request = SimpleNamespace(session_hash="busy-session")
+    states = [None] * (len(switch.inputs) - 4)
+    result = switch.fn("auk", {}, {"_active": "indextts"}, {}, request, *states)
+    assert len(result) == len(switch.outputs)
+    assert result[0] == "indextts" and model_controls.SWITCH_BUSY_MESSAGE in result[switch.outputs.index(status)]
+
+
 def test_auk_only_keys_are_never_profiled():
     keys = ["runtime.auk_text_encoder_variant", "runtime.auk_text_encoder_residency", "auk.mode",
             "auk_edit.task", "training.auk_prompt_fraction", "runtime.lora_path"]
@@ -244,7 +286,8 @@ def test_auk_tier_presets_shrink_memory_with_the_card():
     assert small.auk_text_encoder_residency == "on_demand" and small.model_variant == "int8_convrot"
     assert resolve_preset(8).model_variant == "bf16" and resolve_preset(8).auk_text_encoder_residency == "on_demand"
     full = resolve_training_preset(32, "full")
-    assert (full["base_variant"], full["optimizer"], full["gradient_checkpointing"]) == ("bf16", "adamw_fused", False)
+    # Without checkpointing full fine-tuning peaked at 32.2 GiB on a 32 GB RTX 5090 and spilled into shared memory.
+    assert (full["base_variant"], full["optimizer"], full["gradient_checkpointing"]) == ("bf16", "adamw_fused", True)
     assert full["learning_rate"] == 2e-5
     sixteen, eight, six = (resolve_training_preset(tier, "dora") for tier in (16, 8, 6))
     assert (sixteen["auk_batch_frames"], sixteen["gradient_checkpointing"], sixteen["optimizer"]) == (1200, False, "adamw")

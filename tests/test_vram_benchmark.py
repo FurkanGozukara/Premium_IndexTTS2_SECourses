@@ -121,7 +121,8 @@ def test_idle_wait_obeys_custom_deadline_and_reports_actual_threshold(monkeypatc
 
     monkeypatch.setattr(benchmark.time, "sleep", sleep)
     monkeypatch.setattr(benchmark, "_query_idle_memory", lambda _: _memory())
-    with pytest.raises(TimeoutError, match=r"exceeded 7s:.*idle limit 3.20 GiB"):
+    monkeypatch.setattr(benchmark, "_query_utilization", lambda _: 95.0)
+    with pytest.raises(TimeoutError, match=r"exceeded 7s:.*idle limit 3.20 GiB.*95 % busy"):
         benchmark._wait_for_idle(7)
     assert sleeps == [5.0, 2.0]
     assert "0.0s remaining" in capsys.readouterr().out
@@ -131,6 +132,7 @@ def test_idle_wait_resumes_when_busy_gpu_becomes_idle(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setattr(benchmark.time, "sleep", lambda _: None)
     monkeypatch.setattr(benchmark, "_query_idle_memory", Mock(side_effect=[_memory(4), _memory(2)]))
+    monkeypatch.setattr(benchmark, "_query_utilization", lambda _: 95.0)
     assert benchmark._wait_for_idle(30)["used_gb"] == 2
 
 
@@ -159,3 +161,53 @@ def test_all_tiers_forward_idle_timeout_and_visible_device(monkeypatch, tmp_path
         command = call.args[0]
         assert command[command.index("--idle-timeout") + 1] == "7.0"
         assert call.kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "GPU-selected"
+
+
+def _desktop(used=5.5, free=26.3):
+    # A 4K desktop: the compositor, a browser and an emulator keep 5.5 GiB while nothing computes.
+    return dict(device_id="0", physical_index="0", total_gb=31.8, free_gb=free,
+                used_gb=used, reserved_gb=0.4, usage_source="memory.used")
+
+
+def test_quiet_gpu_holding_desktop_memory_passes_when_the_run_fits(monkeypatch, capsys):
+    # The 10 % baseline (3.18 GiB here) alone kept the benchmark from ever starting on a 4K desktop.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(benchmark, "_query_idle_memory", lambda _: _desktop())
+    monkeypatch.setattr(benchmark, "_query_utilization", lambda _: 7.0)
+    result = benchmark._wait_for_idle(0)
+    assert result["utilization_pct"] == 7.0 and result["required_free_gb"] == benchmark.FIT_CHECK_PEAK_GB
+    assert "the GPU is quiet (7 % busy)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("utilization,free,need,message", [
+    (7.0, 8.0, None, "leave less than 12.0 GiB free"),     # quiet, but the run does not fit beside the others
+    (60.0, 26.3, None, "60 % busy"),                        # another workload computes
+    (None, 26.3, None, "utilization unavailable"),          # unknown utilization keeps the memory rule
+    (7.0, 26.3, 30.0, "leave less than 30.0 GiB free"),    # an emulated 32 GB tier needs its whole cap
+])
+def test_busy_or_full_gpu_keeps_waiting(monkeypatch, utilization, free, need, message):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(benchmark, "_query_idle_memory", lambda _: _desktop(free=free))
+    monkeypatch.setattr(benchmark, "_query_utilization", lambda _: utilization)
+    with pytest.raises(TimeoutError, match=message):
+        benchmark._wait_for_idle(0, need_gb=need)
+
+
+@pytest.mark.parametrize("flags,need", [([], 12.0), (["--emulate"], 30.0)])
+def test_run_requests_its_own_memory_need(monkeypatch, tmp_path, flags, need):
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+    monkeypatch.setattr(benchmark, "_resolve_reference_audio", lambda _: tmp_path / "reference.wav")
+    wait = Mock(side_effect=TimeoutError("busy"))
+    monkeypatch.setattr(benchmark, "_wait_for_idle", wait)
+    benchmark.run_one(_parser().parse_args(["--child", "--tier", "32", "--idle-timeout", "0", *flags]))
+    assert wait.call_args.kwargs["need_gb"] == need
+
+
+def test_utilization_is_the_highest_reading_or_unknown(monkeypatch):
+    monkeypatch.setattr(benchmark.time, "sleep", lambda _: None)
+    monkeypatch.setattr(benchmark.subprocess, "run", Mock(side_effect=[_smi("7"), _smi("15"), _smi("3")]))
+    assert benchmark._query_utilization("0") == 15.0
+    monkeypatch.setattr(benchmark.subprocess, "run", Mock(side_effect=[_smi("7"), _smi("[N/A]")]))
+    assert benchmark._query_utilization("0") is None
+    monkeypatch.setattr(benchmark.subprocess, "run", Mock(side_effect=OSError("no nvidia-smi")))
+    assert benchmark._query_utilization("0") is None

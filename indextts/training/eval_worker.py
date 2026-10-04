@@ -76,6 +76,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
+    # transformers imports torchao, whose enum registrations print PyTorch's register_constant()
+    # deprecation warning in every worker log unless this shim is installed first (the app does it at start).
+    from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+    install_native_enum_pytree_compatibility()
     args = parse_args(argv)
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)

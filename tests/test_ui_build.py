@@ -308,3 +308,152 @@ def test_confirmation_events_pass_a_real_boolean_to_backend_handlers():
     button_labels = {item["props"].get("value") for item in demo.config["components"] if item["type"] == "button"}
     assert {"🛑  Yes, cancel generation", "▶️  Keep generating", "🛑  Yes, cancel grid", "▶️  Keep rendering grid"}.issubset(button_labels)
     assert {"🛑 Confirm training stop", "▶️ Keep training"}.issubset(button_labels)
+
+
+def test_number_fields_accept_their_values_so_arrow_keys_do_not_jump():
+    # An <input type="number"> is valid only at minimum + k * step. Fractional training fields kept Gradio's
+    # step of 1, so one ArrowUp (or a wheel tick over a focused field) snapped them to the nearest step:
+    # Learning rate 0.00004 became 1e-8 and Adam epsilon 1e-8 would have become 0.1.
+    from decimal import Decimal
+    from pathlib import Path
+
+    import gradio as gr
+
+    args = SimpleNamespace(model_dir="models", device="cpu", verbose=False, no_browser=True, port=7861,
+                           host="127.0.0.1", share=False)
+    demo = build_app(args)
+    keys = {id(spec.component): spec.key for spec in demo.preset_registry.specs if spec.component is not None}
+    presets = [json.loads(path.read_text(encoding="utf-8"))["values"]
+               for path in sorted((Path(__file__).resolve().parents[1] / "presets" / "system").glob("*.json"))]
+    assert presets
+    misfits = []
+    for block in demo.blocks.values():
+        if not isinstance(block, gr.Number) or block.precision == 0:
+            continue
+        base, step = Decimal(str(block.minimum or 0)), Decimal(str(block.step))
+        for value in [block.value, *(preset.get(keys.get(id(block), "")) for preset in presets)]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and (Decimal(str(value)) - base) % step:
+                misfits.append((block.label, value, block.step))
+    assert not misfits
+
+
+def test_training_stop_confirmation_opens_right_under_the_stop_button():
+    # Appended at the end of the tab, the Stop / Force stop confirmation opened about 2,900 px below Stop,
+    # off screen: a click on Stop seemed to do nothing and the run trained to the end.
+    import gradio as gr
+
+    args = SimpleNamespace(model_dir="models", device="cpu", verbose=False, no_browser=True, port=7861,
+                           host="127.0.0.1", share=False)
+    demo = build_app(args)
+    buttons = [block for block in demo.blocks.values() if isinstance(block, gr.Button)]
+    stop = next(button for button in buttons if "⏹" in str(button.value))
+    confirm = next(button for button in buttons if "Confirm training stop" in str(button.value))
+    siblings = stop.parent.parent.children
+    between = siblings[siblings.index(stop.parent) + 1:siblings.index(confirm.parent.parent)]
+    assert all(isinstance(block, gr.State) for block in between)
+
+
+def test_resume_list_offers_the_checkpoints_of_a_run_that_just_stopped():
+    # Resume from was filled only when the page opened: after Stop it did not offer the interrupted checkpoint
+    # the run continues from until Refresh resume list was pressed.
+    import gradio as gr
+
+    args = SimpleNamespace(model_dir="models", device="cpu", verbose=False, no_browser=True, port=7861,
+                           host="127.0.0.1", share=False)
+    demo = build_app(args)
+    fns = demo.fns if isinstance(demo.fns, dict) else dict(enumerate(demo.fns))
+    resume = next(block for block in demo.blocks.values() if isinstance(block, gr.Dropdown) and block.label == "Resume from")
+    button = next(block for block in demo.blocks.values() if isinstance(block, gr.Button) and "Start training" in str(block.value))
+    chain = {key for key, fn in fns.items() if (button._id, "click") in [tuple(target) for target in fn.targets]}
+    assert chain
+    while True:  # every step that follows the Start click (the browser gather, the run, what runs after it)
+        following = {key for key, fn in fns.items() if fn.trigger_after in chain} - chain
+        if not following:
+            break
+        chain |= following
+    assert any(resume in fns[key].outputs for key in chain)
+
+
+# Runs the page script from APP_HEAD in Node with a minimal fake DOM and reports what a keydown did.
+_KEYDOWN_HARNESS = r"""
+const vm = require('node:vm');
+const script = require('node:fs').readFileSync(0, 'utf8');
+const listeners = [];
+const dispatched = [];
+const option = {
+  hasAttribute: (name) => name === 'data-index',
+  dispatchEvent: (event) => { dispatched.push({ type: event.type, bubbles: event.bubbles }); return true; },
+};
+const storage = {};
+const window = {
+  location: { href: 'http://127.0.0.1:7860/?__theme=dark' },
+  history: { replaceState() {} },
+  localStorage: {
+    getItem: (key) => storage[key] ?? null,
+    setItem: (key, value) => { storage[key] = String(value); },
+    removeItem: (key) => { delete storage[key]; },
+  },
+  addEventListener: (type, fn, capture) => listeners.push({ type, fn, capture }),
+};
+const document = {
+  body: { classList: { toggle() {} } },
+  addEventListener() {},
+  getElementById: (id) => (id === 'c9-options-option-2' ? option : null),
+};
+function MouseEvent(type, init) { this.type = type; Object.assign(this, init); }
+vm.runInNewContext(script, { window, document, URL, MouseEvent, Object, JSON, Date, Promise, setTimeout });
+const results = [];
+for (const c of JSON.parse(process.argv[1])) {
+  dispatched.length = 0;
+  const attributes = { role: 'combobox', 'aria-expanded': c.expanded, 'aria-activedescendant': c.active };
+  const flags = { prevented: false, stopped: false };
+  const event = {
+    key: c.key, shiftKey: !!c.shift, altKey: false, ctrlKey: false, metaKey: false, isComposing: false,
+    target: { getAttribute: (name) => attributes[name] ?? null },
+    preventDefault: () => { flags.prevented = true; },
+    stopImmediatePropagation: () => { flags.stopped = true; },
+  };
+  for (const l of listeners) { if (l.type === 'keydown') { l.fn(event); } }
+  results.push({ capture: listeners.filter((l) => l.type === 'keydown').map((l) => l.capture), dispatched: [...dispatched], ...flags });
+}
+process.stdout.write(JSON.stringify(results));
+"""
+
+
+def _page_keydowns(cases):
+    import re
+    import shutil
+    import subprocess
+    import sys
+
+    import pytest
+
+    from ui.common import APP_HEAD
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed")
+    script = re.search(r"<script>(.*)</script>", APP_HEAD, re.S).group(1)
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    done = subprocess.run([node, "-e", _KEYDOWN_HARNESS, json.dumps(cases)], input=script, capture_output=True,
+                          text=True, encoding="utf-8", timeout=60, creationflags=flags)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_enter_on_an_open_dropdown_picks_the_highlighted_option_like_a_click():
+    # Gradio 6.29 fires a dropdown's select event only for a mouse pick, so Enter after the arrow keys changed
+    # the value without running any .select listener: the LoRA / DoRA, reference library, VRAM tier, training
+    # method, fluency filter and saved grid dropdowns showed a choice that was never applied.
+    picked, closed, shifted, other_key, nothing_active = _page_keydowns([
+        {"key": "Enter", "expanded": "true", "active": "c9-options-option-2"},
+        {"key": "Enter", "expanded": "false", "active": None},
+        {"key": "Enter", "expanded": "true", "active": "c9-options-option-2", "shift": True},
+        {"key": "ArrowDown", "expanded": "true", "active": "c9-options-option-2"},
+        {"key": "Enter", "expanded": "true", "active": None},
+    ])
+    assert picked["capture"] == [True]  # runs before Gradio's own Enter handling
+    assert picked["dispatched"] == [{"type": "mousedown", "bubbles": True}]
+    assert picked["prevented"] and picked["stopped"]
+    for untouched in (closed, shifted, other_key, nothing_active):
+        assert untouched["dispatched"] == [] and not untouched["prevented"] and not untouched["stopped"]

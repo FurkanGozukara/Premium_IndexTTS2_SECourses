@@ -216,6 +216,45 @@ def test_middle_best_detects_sustained_overfit_and_round_trips(
     assert load_training_analysis(adapter).best_epoch == 2
 
 
+def test_a_finished_training_preselects_its_grid_without_switching_tabs(tmp_path: Path, monkeypatch) -> None:
+    # The start event lasts until the post-training pipeline ends (up to an hour); its hand-off switched the page
+    # to the Checkpoint Grid wherever the user was working. It now only preselects the run.
+    from types import SimpleNamespace
+
+    import gradio as gr
+
+    from ui import grid_tab
+    from ui.app import build_app
+
+    demo = build_app(SimpleNamespace(device="cpu", model_dir=str(tmp_path / "models")))
+    handoff = next(fn for fn in demo.fns.values() if fn.name == "preselect_finished_run")
+    tabs = next(block for block in handoff.outputs if isinstance(block, gr.Tabs))
+    run = tmp_path / "loras" / "voice"
+    run.mkdir(parents=True)
+    monkeypatch.setattr(grid_tab, "_adapter_folders", lambda model=None: [("voice", str(run))])
+    monkeypatch.setattr(grid_tab, "adapter_selection_updates", lambda *args: [gr.skip()] * (len(handoff.outputs) - 2))
+    result = handoff.fn(str(run), "", "")
+    assert result[handoff.outputs.index(tabs)] == gr.skip()
+    assert result[0]["value"] == str(run.resolve())
+
+
+def test_both_epoch_charts_colour_every_analysis_series(tmp_path: Path) -> None:
+    # The Checkpoint Grid chart mapped colours to "validation (improving)/(overfitting)" while the frame writes
+    # "validation" and "validation (regression)": its validation line had no stroke and was not drawn.
+    from types import SimpleNamespace
+
+    import gradio as gr
+
+    from ui.app import build_app
+
+    demo = build_app(SimpleNamespace(device="cpu", model_dir=str(tmp_path / "models")))
+    charts = [block for block in demo.blocks.values()
+              if isinstance(block, gr.LinePlot) and getattr(block, "colors_in_legend", None) == list(ANALYSIS_SERIES)]
+    assert len(charts) == 2
+    for chart in charts:
+        assert set(chart.color_map) == set(ANALYSIS_SERIES)
+
+
 @pytest.mark.parametrize(
     ("validation", "expected"),
     [

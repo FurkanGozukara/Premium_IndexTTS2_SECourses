@@ -497,6 +497,17 @@ def calibrate_grid_speaking_rates(
     return "\n".join(lines), message
 
 
+def _another_runs_reference(path_text: str, adapter_dir: str | Path) -> bool:
+    """A voice another training run saved (``loras/<run>/<run>_reference.wav``), not one chosen for this grid."""
+    try:
+        path = Path(path_text).expanduser().resolve()
+        run = Path(adapter_dir).expanduser().resolve()
+        loras = (ROOT / "loras").resolve()
+    except (OSError, ValueError):
+        return False
+    return path.name.lower().endswith("_reference.wav") and loras in path.parents and run not in path.parents
+
+
 def adapter_selection_updates(
     adapter_dir: str | None, current_references: str = "", current_texts: str = "",
 ) -> tuple[Any, ...]:
@@ -504,7 +515,12 @@ def adapter_selection_updates(
     context = _adapter_context(adapter_dir)
     # Keep comparison inputs stable across adapters. Fill an empty form from
     # the run, while the explicit stored-reference button can replace a voice.
-    references = gr.skip() if str(current_references or "").strip() else context["reference"]
+    # A form holding only the voice another run saved (filled in when that run was shown, as after its
+    # training) takes this run's voice: kept, every checkpoint of this run cloned the earlier run's speaker.
+    entered = parse_multiline_paths(str(current_references or ""))
+    replace = not entered or (bool(adapter_dir) and bool(context["reference"])
+                              and all(_another_runs_reference(item, adapter_dir) for item in entered))
+    references = context["reference"] if replace else gr.skip()
     text_value = str(current_texts or "").strip()
     texts = gr.skip() if text_value and text_value != GRID_DEFAULTS["grid.texts"].strip() else context["texts"]
     return (
@@ -900,10 +916,12 @@ def build_grid_tab(
                 x_axis_format="d",
                 y_title="loss",
                 colors_in_legend=list(ANALYSIS_SERIES),
+                # The keys must be the series names analysis_epoch_frame writes (ANALYSIS_SERIES): with the
+                # former "validation (improving)" keys the validation line had no colour and was not drawn.
                 color_map={
                     "train loss": "#6b7280",
-                    "validation (improving)": "#1ca881",
-                    "validation (overfitting)": "#df345b",
+                    "validation": "#1ca881",
+                    "validation (regression)": "#df345b",
                 },
             )
             tab.summary = gr.Markdown(initial_payload["summary"])
@@ -1439,11 +1457,19 @@ def build_grid_config_from_ui(
             "emo_alpha": float(grid_values["grid.emotion_weight"]),
         }
     )
+    references = parse_multiline_paths(str(grid_values["grid.references"]))
+    if not references:
+        # Nothing entered: compare with the run's own reference, as "Use LoRA / DoRA reference" would fill in
+        # (a run opened on page load never filled the field, and the grid stopped with a validation error).
+        stored = _adapter_context(adapter_dir)["reference"]
+        references = [stored] if stored else []
+        if stored:
+            print(f">> Grid references were empty; using the run's reference {Path(stored).name}", flush=True)
     return GridConfig(
         adapter_dir=adapter_dir,
         checkpoints=checkpoints,
         strengths=_parse_strengths(str(grid_values["grid.strengths"])),
-        references=parse_multiline_paths(str(grid_values["grid.references"])),
+        references=references,
         texts=[
             line.strip()
             for line in str(grid_values["grid.texts"]).splitlines()
@@ -1490,7 +1516,8 @@ def bind_grid_events(
             strengths = _parse_strengths(strengths_text)
         except Exception:
             strengths = [1.0]
-        references_count = len(parse_multiline_paths(references_text))
+        # An empty list uses the run's own reference when the grid starts (build_grid_config_from_ui).
+        references_count = len(parse_multiline_paths(references_text)) or 1
         texts_count = len([line for line in str(texts_text or "").splitlines() if line.strip()])
         adapter_rows = sum(bool((mapping.get(item) or {}).get("path")) for item in selected or [])
         base_rows = sum(not bool((mapping.get(item) or {}).get("path")) for item in selected or [])
@@ -1620,14 +1647,18 @@ def bind_grid_events(
         output_root.mkdir(parents=True, exist_ok=True)
         name = f"{Path(adapter_dir).name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         state_dir = output_root / name
-        config = build_grid_config_from_ui(
-            mapping,
-            grid_values,
-            generation_values,
-            model_dir=tab.model_dir,
-            output_root=output_root,
-            grid_name=name,
-        )
+        try:
+            config = build_grid_config_from_ui(
+                mapping,
+                grid_values,
+                generation_values,
+                model_dir=tab.model_dir,
+                output_root=output_root,
+                grid_name=name,
+            )
+        except ValueError as exc:
+            # Missing or invalid grid inputs: say which on the page instead of an "Error" badge and a traceback.
+            raise gr.Error(f"Cannot start the grid: {exc}") from exc
         state_dir.mkdir(parents=True, exist_ok=False)
         config_path = write_json_atomic(state_dir / "config.json", config.to_dict())
         write_json_atomic(
@@ -1727,8 +1758,17 @@ def bind_grid_events(
             queue=False,
         )
         if getattr(training, "start_event", None) is not None:
+            def preselect_finished_run(state_value: str, current_references: str, current_texts: str):
+                # The start event lasts until the whole post-training pipeline ends (up to an hour), so the
+                # finished run is preselected in the grid without switching tabs: the page used to jump to the
+                # Checkpoint Grid wherever the user was working. "Compare in grid" opens it.
+                if not state_value:
+                    return (gr.skip(),) * (2 + len(tab.selection_outputs))
+                adapter, _tabs, *updates = compare_training_run(state_value, current_references, current_texts)
+                return (adapter, gr.skip(), *updates)
+
             training.start_event.then(
-                compare_training_run,
+                preselect_finished_run,
                 [training.state_dir, tab.controls["grid.references"], tab.controls["grid.texts"]],
                 [tab.adapter, main_tabs, *tab.selection_outputs],
                 queue=False,

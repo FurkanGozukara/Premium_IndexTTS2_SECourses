@@ -63,6 +63,7 @@ from indextts.utils.pronunciation import (
     default_dictionary_path,
     dictionary_rows,
     entries_from_rows,
+    indextts_readings,
     load_dictionary,
     merge_entries,
     normalize_entry,
@@ -834,7 +835,7 @@ def preview_segments(
     readings = {}
     for match in re.finditer(r"<([^|>\n]+)\|([^>\n]+)>", str(text)):
         model_form = (omnivoice_readings(match.group(0)) if model_id == "omnivoice" else
-                      plain_readings(match.group(0)) if model_id == "auk" else match.group(0))
+                      plain_readings(match.group(0)) if model_id == "auk" else indextts_readings(match.group(0)))
         if model_id == "auk" and model_form == match.group(1):
             continue  # AuK has no phoneme input: the written word stays as it is
         readings[model_form] = (match.group(1), " ".join(token for token in match.group(2).split() if token != "."))
@@ -842,6 +843,9 @@ def preview_segments(
         text = omnivoice_readings(str(text))
     elif model_id == "auk":
         text = plain_readings(str(text))
+    else:
+        # IndexTTS splits its special-token form: the dots of "D AO1 . R AH0" would end a sentence in the raw form.
+        text = indextts_readings(str(text))
 
     def shown(segment: str) -> tuple[str, list[str]]:
         used = []
@@ -4185,22 +4189,24 @@ def build_generation_tab(
     def load_caption(*items: Any):
         path = resolve_path_value(items[4])
         if not path:
+            # Removing the captions turns cue timing off: without a caption file it has nothing to time, and
+            # generating the remaining text would otherwise stop with "no caption file is selected".
             rows, count = update_preview(*items)
-            return gr.skip(), "", rows, count
+            return gr.skip(), "", rows, count, False
         try:
             cues = parse_subtitle_file(path)
             text_value = subtitle_cues_to_text(cues)
             rows, count = update_preview(text_value, *items[1:])
             status = f"Loaded {len(cues)} {get_subtitle_format_label(path)} cue(s); timeline ends at {format_srt_timestamp(cues[-1].end_ms) if cues else '00:00:00.000'}."
-            return text_value, status, rows, count
+            return text_value, status, rows, count, gr.skip()
         except Exception as exc:
             gr.Warning(f"Caption load failed: {exc}")
-            return gr.skip(), f"Caption load failed: {exc}", [[0, "Caption error", str(exc), ""]], "Caption error"
+            return gr.skip(), f"Caption load failed: {exc}", [[0, "Caption error", str(exc), ""]], "Caption error", gr.skip()
 
     tab.subtitle_file.change(
         load_caption,
         preview_inputs,
-        [tab.text, caption_load_status, segment_preview, preview_count],
+        [tab.text, caption_load_status, segment_preview, preview_count, caption_timing],
         queue=False,
     )
     open_outputs.click(lambda: open_folder(ROOT / "outputs"), outputs=tab.status, queue=False)

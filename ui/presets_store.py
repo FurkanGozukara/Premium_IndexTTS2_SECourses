@@ -484,8 +484,11 @@ class PresetStore:
             for model in ("omnivoice", "auk"):
                 defaults = model_defaults(self.registry, model, tier)
                 values["app.profiles"][model] = {key: defaults[key] for key in profiled_keys(defaults)}
-            # AuK's own encoder settings are single values; the tier chooses them too.
-            for key in ("runtime.auk_text_encoder_variant", "runtime.auk_text_encoder_residency"):
+            # AuK's own encoder settings and its training micro-batch (latent frames, measured per tier) are single
+            # values; the tier chooses them too. Without the frames every tier stored 0, so AuK trained fixed batches
+            # of 4 clips (up to 3,200 frames) instead of the 1,200-2,400 its tier note promises and was measured at.
+            for key in ("runtime.auk_text_encoder_variant", "runtime.auk_text_encoder_residency",
+                        "training.auk_batch_frames"):
                 if key in self.registry:
                     values[key] = defaults[key]
             if DEFAULT_MODEL != "indextts":

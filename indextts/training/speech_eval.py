@@ -897,6 +897,11 @@ def main() -> int:
     from indextts.utils.console_encoding import configure_console_output
     from .train_config import TrainConfig
     configure_console_output()
+    # transformers imports torchao, whose enum registrations print PyTorch's register_constant()
+    # deprecation warning in every worker log unless this shim is installed first (the app does it at start).
+    from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+    install_native_enum_pytree_compatibility()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--state-dir", required=True)

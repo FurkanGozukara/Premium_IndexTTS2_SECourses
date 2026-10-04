@@ -368,6 +368,11 @@ def _reference_text(path: Path, rows: Sequence[Mapping[str, Any]], dataset_dir: 
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # transformers imports torchao, whose enum registrations print PyTorch's register_constant()
+    # deprecation warning in every worker log unless this shim is installed first (the app does it at start).
+    from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+    install_native_enum_pytree_compatibility()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)

@@ -141,10 +141,13 @@ def test_upload_event_uses_all_current_preview_settings(tmp_path, monkeypatch):
                     "2\n00:00:04,000 --> 00:00:06,000\nThen read another one.\n", encoding="utf-8")
     for mode, label in (("smart", "Smart sentences, aiming at 30"), ("sentence", "Every sentence"), ("budget", "Token budget")):
         inputs = ["old script", "EN", 120, False, str(path), True, 0.72, True, "voice", mode, 1.0]
-        loaded, status, rows, note = upload.fn(*inputs)
+        loaded, status, rows, note, timing = upload.fn(*inputs)
         assert "Loaded 2 SRT cue(s)" in status and label in note
         assert "speech reads" in rows[0][2] and "about" in rows[0][3]
         assert (rows, note) == preview.fn(loaded, *inputs[1:])
+        # Loading captions leaves the cue-timing choice alone; removing them turns it off, because
+        # generating the remaining text with it on stops with "no caption file is selected".
+        assert timing is not False and timing is not True
         inputs[0], inputs[4] = loaded, None
         cleared = upload.fn(*inputs)
-        assert cleared[2:] == (rows, note)
+        assert cleared[2:4] == (rows, note) and cleared[4] is False

@@ -88,7 +88,7 @@ def _run_fake_benchmark(
 
     monkeypatch.setattr(benchmark, "ROOT", tmp_path)
     monkeypatch.setattr(benchmark, "_resolve_reference_audio", lambda _: tmp_path / "reference.wav")
-    monkeypatch.setattr(benchmark, "_wait_for_idle", lambda _: {"used_gb": 0.0})
+    monkeypatch.setattr(benchmark, "_wait_for_idle", lambda *_args, **_kwargs: {"used_gb": 0.0})
     monkeypatch.setattr(benchmark, "memory_stats", memory_stats)
     monkeypatch.setitem(sys.modules, "indextts.infer_v2_5", SimpleNamespace(IndexTTS2=FakeTTS))
     monkeypatch.setitem(sys.modules, "librosa", SimpleNamespace(get_duration=lambda **_: 2.5))

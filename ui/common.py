@@ -113,6 +113,23 @@ APP_HEAD = """
       }, 0);
     });
   };
+  // Gradio 6.29 sends a dropdown's "select" event only for a mouse pick; Enter after the arrow keys
+  // or a typed filter sets the value without it, so every .select listener (LoRA / DoRA, reference
+  // library, VRAM tiers, training method, fluency filter, saved grids) ignored keyboard users and the
+  // page showed a choice that was never applied. Enter on an open dropdown now picks the highlighted
+  // option exactly as a click does.
+  window.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) { return; }
+    var input = event.target;
+    if (!input || !input.getAttribute || input.getAttribute("role") !== "combobox"
+        || input.getAttribute("aria-expanded") !== "true") { return; }
+    var id = input.getAttribute("aria-activedescendant");
+    var option = id ? document.getElementById(id) : null;
+    if (!option || !option.hasAttribute("data-index")) { return; }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    option.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
+  }, true);
   // The app launches with Gradio's run history off. Histories saved by earlier
   // launches (each launch has a new app id) can never be opened again, yet they
   // filled this address's storage quota; remove them.
@@ -765,6 +782,7 @@ body.tts-model-omnivoice .tts-only-indextts,
 body.tts-model-auk .tts-only-indextts,
 body:not(.tts-model-omnivoice) .tts-only-omnivoice,
 body:not(.tts-model-auk) .tts-only-auk,
+body.tts-model-auk .tts-hide-auk,
 body.train-method-full .train-adapter-field,
 body:not(.train-method-full) .train-full-field { display: none !important; }
 """

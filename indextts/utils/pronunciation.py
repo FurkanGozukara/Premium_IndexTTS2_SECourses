@@ -597,6 +597,31 @@ def omnivoice_readings(text: str) -> str:
     return _ANNOTATION_RE.sub(replace, str(text or ""))
 
 
+_HIRAGANA_RE = re.compile(r"^[\u3040-\u309F]+$")
+_KATAKANA_RE = re.compile(r"^[\u30A0-\u30FF]+$")
+_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def indextts_readings(text: str) -> str:
+    """Write ``<word|reading>`` annotations the way the IndexTTS engine reads them.
+
+    The same conversion as ``indextts.infer_v2_5.apply_pronunciation_annotations``, without importing the
+    engine: a kana reading replaces the word, any other reading becomes an upper-case special-token span
+    (``<DoRA|D AO1 . R AH0>`` -> ``<|SPECIAL_TOKEN_1|>D AO1 . R AH0<|SPECIAL_TOKEN_1|>``; a Chinese word uses
+    SPECIAL_TOKEN_2). The section preview splits this form, which the segmenter never cuts, so it shows the
+    sections the engine renders (the syllable dots of a raw annotation looked like sentence ends).
+    """
+
+    def replace(match: re.Match) -> str:
+        word, reading = match.group(1), match.group(2).upper()
+        if _HIRAGANA_RE.fullmatch(reading) or _KATAKANA_RE.fullmatch(reading):
+            return f" {reading} "
+        token = "SPECIAL_TOKEN_2" if _HAN_RE.search(word) else "SPECIAL_TOKEN_1"
+        return f"<|{token}|>{reading}<|{token}|>"
+
+    return _ANNOTATION_RE.sub(replace, str(text or ""))
+
+
 def plain_readings(text: str) -> str:
     """Write ``<word|reading>`` annotations for a model that reads plain text only (AuK).
 
@@ -684,6 +709,7 @@ __all__ = [
     "default_dictionary_path",
     "dictionary_rows",
     "entries_from_rows",
+    "indextts_readings",
     "is_phoneme_string",
     "letters_to_sound",
     "load_dictionary",

@@ -16,6 +16,12 @@ from indextts.utils.console_encoding import configure_console_output
 
 
 ROOT = Path(__file__).resolve().parent
+# On first use the CUDA driver prepares each GPU kernel module (it unpacks PyTorch's and the CUDA libraries' kernels
+# and compiles cuFFT's for an RTX 5090) and keeps the result in a per-user cache that every CUDA program shares, 1 GB
+# by default. One IndexTTS generation alone needs about 1.3 GB, so entries kept being evicted and every new process
+# (the first generation, each batch item, every training worker) spent about 15 s preparing them again: the first
+# generation after a start took 22 s instead of 8 s. The app keeps its own cache at the driver's 4 GiB maximum.
+CUDA_JIT_CACHE_MAX_BYTES = 4 * 1024 ** 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,11 +49,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_cuda_jit_cache(model_dir: Path) -> None:
+    """Point the driver's JIT cache at the model folder before CUDA starts; values the user set win."""
+    if "CUDA_CACHE_PATH" not in os.environ:
+        cache = model_dir / "cuda_jit_cache"
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+        except OSError:  # an unwritable model folder keeps the driver's shared cache
+            return
+        os.environ["CUDA_CACHE_PATH"] = str(cache)
+    os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(CUDA_JIT_CACHE_MAX_BYTES))
+
+
 def configure_environment(args: argparse.Namespace) -> None:
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     args.model_dir = str(Path(args.model_dir).expanduser().resolve())
+    configure_cuda_jit_cache(Path(args.model_dir))
 
 
 def create_demo(args: argparse.Namespace):

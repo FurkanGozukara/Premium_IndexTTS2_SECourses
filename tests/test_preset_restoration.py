@@ -16,7 +16,31 @@ def build_demo(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(app, "load_persisted_runtime", lambda: None)
     monkeypatch.setattr(app, "_runtime_summary", lambda *args, **kwargs: None)
+    # These tests compare every stored value; the datasets prepared in this installation must not change them.
+    monkeypatch.setattr(app, "existing_training_dataset", lambda values: dict(values))
     return lambda: app.build_app(SimpleNamespace(model_dir="models", device="cpu"))
+
+
+def test_a_missing_preset_dataset_gives_way_to_the_newest_prepared_one(tmp_path, monkeypatch):
+    # The GPU tier presets carry the default datasets/voice_dataset: after every restart the Training tab
+    # opened on that missing folder ("Select a dataset to see the training plan") beside prepared datasets.
+    import os
+
+    from ui import training_tab
+
+    older, newer = tmp_path / "a_voice", tmp_path / "b_voice_audited"
+    for stamp, folder in enumerate((newer, older)):
+        folder.mkdir()
+        (folder / "dataset_info.json").write_text("{}", encoding="utf-8")
+        os.utime(folder / "dataset_info.json", (2000 - stamp, 2000 - stamp))
+    monkeypatch.setattr(training_tab, "_dataset_choices", lambda: [("a", str(older)), ("b", str(newer))])
+    assert training_tab.existing_training_dataset({"training.dataset_dir": "datasets/voice_dataset", "x": 1}) == {
+        "training.dataset_dir": str(newer), "x": 1}
+    kept = {"training.dataset_dir": str(older)}
+    assert training_tab.existing_training_dataset(kept) == kept
+    monkeypatch.setattr(training_tab, "_dataset_choices", lambda: [])
+    missing = {"training.dataset_dir": "datasets/voice_dataset"}
+    assert training_tab.existing_training_dataset(missing) == missing
 
 
 def handler(demo, name):

@@ -427,3 +427,30 @@ def test_batch_start_says_when_items_are_fitted_to_a_target_duration():
     note = _target_duration_note({"generation.target_duration_mode": "natural", "generation.target_duration_s": 25.0})
     assert "25 s target duration (natural)" in note and "Segmentation & Timing" in note
 
+
+def test_canceled_batch_reports_the_items_that_finished(tmp_path, monkeypatch):
+    # The item the cancel stopped has a row too: "Batch canceled after 2/3 items" read as two finished items
+    # when only the first one finished.
+    files = []
+    for name in ("one", "two", "three"):
+        path = tmp_path / f"{name}.txt"
+        path.write_text(f"Item {name}.", encoding="utf-8")
+        files.append(str(path))
+    reference = tmp_path / "reference.wav"
+    reference.touch()
+    calls = []
+
+    def poll(request, *_args):
+        calls.append(request)
+        if len(calls) == 2:
+            batch._BATCH_CANCEL.set()
+            raise batch._BatchCanceled("Batch canceled by user")
+        yield {"fraction": 0.5}, "synthetic progress"
+        return {"output_path": "synthetic.wav", "audio_seconds": 1.0}
+
+    monkeypatch.setattr(batch, "_poll_batch_item", poll)
+    events = _bound_events(tmp_path, monkeypatch)
+    updates = list(_run_batch(events, files, reference))
+
+    assert [row[1] for row in updates[-1][3]] == ["Complete", "Canceled"]
+    assert any("Batch canceled: 1/3 items complete." in str(value) for value in updates[-1])

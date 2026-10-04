@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 8.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 1.0 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -12,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V1.0 Fixes from a complete fresh-install test (version numbers restart at 1.0 with the new name; 1.0 follows 8.1):** the first generation after a start is about 15 seconds faster because the app keeps its own GPU kernel cache, keyboard choices in dropdowns apply like clicks, training Stop opens its confirmation under the button and Resume from lists the stopped run at once, fractional training fields no longer jump on an arrow key, dictionary words no longer count as word errors in take quality, the Checkpoint Grid uses the selected run's own reference, AuK full fine-tuning on 32 GB no longer spills past the card, and the VRAM benchmark runs on a 4K desktop.
 
 **V8.1 Fresh installs, ready-to-use voices and smoother use:** new installations generate again (the installers keep torch, torchvision and torchaudio on one CUDA 13 build; existing installations repair themselves on the next update), an IndexTTS voice's preset after training carries its calibrated speaking rate and decoding, IndexTTS training caches its features by itself, the voice and transcript audit no longer stops at its first transcript rejection, the chosen speech model stays selected after a reload, and a smaller training tier switches full fine-tuning to DoRA. Logs show each progress bar once.
 
@@ -759,7 +761,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v8.1 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.0 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 

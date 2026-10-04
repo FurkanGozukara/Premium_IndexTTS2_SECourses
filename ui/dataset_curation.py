@@ -50,7 +50,9 @@ def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "
     test = [Path(value).stem for value in parse_multiline_paths(str(values["test_sources"]))]
     available = {Path(row["source_media"]).stem for row in rows}
     if not validation:
-        raise ValueError("Reserve at least one source recording for validation")
+        # Name the choices: the field takes source filename stems, which the user has not seen anywhere yet.
+        raise ValueError("Reserve at least one source recording for validation: enter its filename stem in "
+                         f"Validation source recordings (available: {', '.join(sorted(available))})")
     if set(validation) & set(test):
         raise ValueError("Validation and final-test sources must differ")
     unknown = (set(validation) | set(test)) - available

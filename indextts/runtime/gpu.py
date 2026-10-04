@@ -179,6 +179,40 @@ def list_gpus() -> list[GpuInfo]:
     return _torch_gpus() or _smi_gpus()
 
 
+def device_wide_free_gb() -> dict[str, float]:
+    """Free memory of every physical GPU as nvidia-smi reports it, keyed by UUID without the ``GPU-`` prefix.
+
+    Under Windows (WDDM) ``torch.cuda.mem_get_info`` leaves other processes out: while a training worker held
+    15 GB, the app still read 30.3 of 31.8 GB free. nvidia-smi counts every process. Empty when it is missing.
+    """
+
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return {}
+    try:
+        completed = subprocess.run([executable, "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+                                   check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, float] = {}
+    for row in csv.reader(StringIO(completed.stdout if completed.returncode == 0 else "")):
+        try:
+            result[row[0].strip().lower().removeprefix("gpu-")] = float(row[1].strip()) / 1024.0
+        except (IndexError, ValueError):
+            continue
+    return result
+
+
+def visible_gpu_uuid(index: int) -> str:
+    """UUID (without ``GPU-``) of a CUDA-visible device, or "" when torch cannot tell."""
+
+    try:
+        return str(torch.cuda.get_device_properties(int(index)).uuid).strip().lower().removeprefix("gpu-")
+    except (AttributeError, RuntimeError, AssertionError, ValueError):
+        return ""
+
+
 def _device_index(device: int | str | torch.device | None) -> int:
     if isinstance(device, int):
         return device
@@ -283,9 +317,11 @@ __all__ = [
     "emulated_cap_gb",
     "emulated_gpu_gb",
     "device_from_string",
+    "device_wide_free_gb",
     "format_gb",
     "gpu_free_gb",
     "gpu_total_gb",
     "list_gpus",
     "memory_stats",
+    "visible_gpu_uuid",
 ]

@@ -57,8 +57,12 @@ _ADAPTER_TRAINING = {
     24: (2400, "bf16", False),
     32: (2400, "bf16", False),
 }
-# Full fine-tuning (32 GB tier): fused AdamW with expandable allocator segments peaks at 26.5 GiB allocated,
-# 26.6 reserved, without checkpointing (foreach AdamW: 28.8 / 32.7, more than a 32 GB card holds).
+# Full fine-tuning (32 GB tier): fused AdamW with expandable allocator segments peaked at 26.5 GiB allocated,
+# 26.6 reserved, without checkpointing on an RTX A6000 (foreach AdamW: 28.8 / 32.7). On an RTX 5090 under
+# Windows (no expandable segments) a 2,400-frame tutorial dataset peaked at 32.2 GiB allocated without
+# checkpointing: the card spilled into shared memory and trained at 0.02-0.1 updates/s. With checkpointing it
+# peaks at 26.4 GiB allocated, 27.1 reserved, at 2.1-2.3 updates/s with identical losses (2026-10-04), so the
+# full profile checkpoints.
 FULL_FRAMES = 2400
 UPDATE_FRAMES = 5400  # two upstream micro-batches per optimizer update (about 108 s of audio)
 
@@ -67,7 +71,7 @@ def resolve_training_preset(tier, method="dora"):
     """Memory and learning settings of one GPU tier and training method (docs/AUK.md)."""
     selected = max(key for key in _ADAPTER_TRAINING if key <= max(6, int(tier)))
     full = method == "full"
-    frames, base, checkpointing = (FULL_FRAMES, "bf16", False) if full else _ADAPTER_TRAINING[selected]
+    frames, base, checkpointing = (FULL_FRAMES, "bf16", True) if full else _ADAPTER_TRAINING[selected]
     return {"base_variant": base, "base_dtype": "bf16", "optimizer": "adamw_fused" if full else "adamw",
             "mixed_precision": "bf16", "blocks_to_swap": 0, "gradient_checkpointing": checkpointing,
             "swap_ring_size": 2, "pin_swap_memory": False, "batch_size": 4, "auk_batch_frames": frames,

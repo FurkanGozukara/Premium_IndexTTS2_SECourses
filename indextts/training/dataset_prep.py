@@ -998,6 +998,37 @@ def _base_row(
     return row
 
 
+# Everything a preparation writes into its dataset folder. A folder holding only these names, without a completed
+# dataset_info.json, is what a canceled or failed preparation left behind.
+_PREPARATION_ENTRIES = frozenset({
+    MANIFEST_FILENAME, DATASET_INFO_FILENAME, PREVIEW_FILENAME, "segments", "reference_candidates", "whisper",
+    "boundary_rejections.jsonl", "sentence_rejections.jsonl",
+})
+
+
+def unfinished_preparation(output_dir: str | Path) -> bool:
+    """True when ``output_dir`` holds only an interrupted preparation's work files.
+
+    Canceling a preparation left ``manifest.jsonl`` and ``segments/`` behind, and preparing the same name again
+    stopped with "Dataset already exists; pass overwrite=True". Such a folder is rebuilt (its Whisper cache is
+    kept); a completed dataset, or a folder with anything else in it, still needs **Overwrite dataset**.
+    """
+
+    folder = Path(output_dir)
+    try:
+        names = {entry.name for entry in folder.iterdir()}
+    except OSError:
+        return False
+    if not names or not names <= _PREPARATION_ENTRIES:
+        return False
+    info_path = folder / DATASET_INFO_FILENAME
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8-sig")) if info_path.is_file() else {}
+    except (OSError, ValueError):
+        info = {}
+    return str((info or {}).get("status", "")).strip().lower() != "complete"
+
+
 def run_dataset_prep(
     config: DatasetPrepConfig,
     reporter: Any = None,
@@ -1011,11 +1042,13 @@ def run_dataset_prep(
     manifest_path = output_dir / MANIFEST_FILENAME
     info_path = output_dir / DATASET_INFO_FILENAME
     preview_path = output_dir / PREVIEW_FILENAME
-    if manifest_path.exists() and not config.overwrite:
+    rebuild = bool(config.overwrite) or (manifest_path.exists() and unfinished_preparation(output_dir))
+    if manifest_path.exists() and not rebuild:
         raise FileExistsError(
-            f"Dataset already exists at {output_dir}; pass overwrite=True to rebuild its manifest"
+            f"Dataset already exists at {output_dir}; choose a new dataset name or tick Overwrite dataset "
+            "to rebuild it"
         )
-    if config.overwrite:
+    if rebuild:
         for generated_name in ("segments", "reference_candidates"):
             generated_path = output_dir / generated_name
             if generated_path.is_dir():

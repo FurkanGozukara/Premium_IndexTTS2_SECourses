@@ -268,6 +268,11 @@ class AukEngine:
     model_id = "auk"
 
     def __init__(self, model_dir="models", runtime=None, progress_callback=None):
+        from indextts.utils.torch_compat import install_native_enum_pytree_compatibility
+
+        # Loading the Qwen2.5-Omni Thinker imports torchao through transformers; as for OmniVoice, keep its enum
+        # registrations from printing PyTorch's register_constant deprecation warnings in every worker log.
+        install_native_enum_pytree_compatibility()
         from indextts.auk.conditioning import QwenConditioner
         from indextts.auk.loader import build_model, build_vae, read_config, read_state
 

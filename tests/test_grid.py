@@ -62,6 +62,29 @@ def test_changing_adapters_preserves_comparison_text_and_reference(monkeypatch):
     assert defaults[7:9] == ("suggested.wav", "Suggested sample.")
 
 
+def test_a_voice_saved_by_another_run_follows_the_selected_run(tmp_path, monkeypatch):
+    # Compare in grid (and the preselection after training) kept the reference of the run shown before, so the
+    # checkpoints of voice B were rendered cloning voice A. References the user entered still stay.
+    import gradio as gr
+    import ui.grid_tab as grid_ui
+
+    monkeypatch.setattr(grid_ui, "ROOT", tmp_path)
+    first, second = tmp_path / "loras" / "voice_a", tmp_path / "loras" / "voice_b"
+    for folder in (first, second):
+        folder.mkdir(parents=True)
+        _wav(folder / f"{folder.name}_reference.wav")
+    monkeypatch.setattr(grid_ui, "_adapter_context", lambda path: {
+        "info": "run", "reference": str((Path(path) / f"{Path(path).name}_reference.wav").resolve()), "texts": "Sample.",
+    })
+    switched = grid_ui.adapter_selection_updates(str(second), str(first / "voice_a_reference.wav"), "Sample.")
+    assert switched[7] == str((second / "voice_b_reference.wav").resolve())
+    chosen = tmp_path / "my_clip.wav"
+    _wav(chosen)
+    kept = grid_ui.adapter_selection_updates(str(second), "\n".join([str(first / "voice_a_reference.wav"), str(chosen)]),
+                                             "Sample.")
+    assert kept[7] == gr.skip()
+
+
 def test_dynamic_checkpoint_ids_survive_gradio_component_reconstruction():
     from ui.grid_tab import CheckpointCheckboxGroup
     original = CheckpointCheckboxGroup(choices=[("Base", "base")])
@@ -452,6 +475,18 @@ def test_frontend_grid_config_carries_full_generation_request(tmp_path: Path) ->
     cell = build_grid_cells(config)[0]
     cell.seed = 1234
     request = grid_module._request_for_cell(config, cell, tmp_path / "request_grid")
+    # No reference entered: the grid compares with the run's own reference instead of stopping with
+    # "add at least one reference audio path" (a run opened on page load never filled the field).
+    import ui.grid_tab as grid_ui
+
+    stored = tmp_path / "voice" / "voice_reference.wav"
+    _wav(stored)
+    empty = build_grid_config_from_ui(
+        {"base": {"label": BASE_CHECKPOINT_LABEL, "path": ""}}, {**grid_values, "grid.references": ""},
+        generation_values, model_dir=str(tmp_path / "models"), output_root=tmp_path / "outputs" / "grids",
+        grid_name="frontend_grid_auto_reference",
+    )
+    assert empty.references == [str(stored.resolve())] == [grid_ui._adapter_context(str(tmp_path / "voice"))["reference"]]
     assert request["cfm_temperature"] == pytest.approx(0.37)
     assert request["segment_budget_scale_non_cjk"] == pytest.approx(1.25)
     assert request["reuse_spk_cond_for_emo"] is False

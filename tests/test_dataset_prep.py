@@ -85,6 +85,35 @@ def test_import_presegmented_metadata_without_recutting(tmp_path: Path) -> None:
     assert row["duration_s"] == pytest.approx(2.0, abs=2 / output_rate)
 
 
+def test_a_canceled_preparation_does_not_block_its_dataset_name(tmp_path: Path) -> None:
+    # Canceling left manifest.jsonl and segments/; preparing the same name again stopped with "Dataset already
+    # exists". Only a completed dataset, or a folder with other files, still needs Overwrite dataset.
+    from indextts.training.dataset_prep import unfinished_preparation
+
+    source = tmp_path / "import_source"
+    source.mkdir()
+    rate = 22050
+    tone = 0.03 * np.sin(2 * np.pi * 200 * np.arange(rate * 2, dtype=np.float32) / rate)
+    sf.write(source / "clip.wav", tone, rate, subtype="PCM_16")
+    (source / "metadata.csv").write_text("clip.wav|A clean imported sentence.|Speaker A\n", encoding="utf-8")
+    dataset = tmp_path / "rerun"
+    (dataset / "segments").mkdir(parents=True)
+    (dataset / "manifest.jsonl").write_text("", encoding="utf-8")
+    (dataset / "segments" / "stale.wav").write_bytes(b"partial")
+    assert unfinished_preparation(dataset)
+    config = DatasetPrepConfig(name="rerun", inputs=[str(source)], output_root=str(tmp_path), min_s=1.5,
+                               export_reference_candidates=0)
+    assert run_dataset_prep(config).segment_count == 1
+    assert not (dataset / "segments" / "stale.wav").exists()
+    assert not unfinished_preparation(dataset)
+    with pytest.raises(FileExistsError, match="Overwrite dataset"):
+        run_dataset_prep(config)
+    (dataset / "dataset_info.json").write_text(json.dumps({"status": "cancelled"}), encoding="utf-8")
+    assert unfinished_preparation(dataset)
+    (dataset / "notes.txt").write_text("mine", encoding="utf-8")
+    assert not unfinished_preparation(dataset)  # someone else's files: never rebuilt without Overwrite
+
+
 class _RecordingReporter:
     def __init__(self) -> None:
         self.logs: list[str] = []

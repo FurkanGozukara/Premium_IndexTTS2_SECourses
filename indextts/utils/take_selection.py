@@ -74,6 +74,39 @@ def candidate_word_errors(paths: Sequence[str], text: str, language: str | None,
 
 # Readings the engines speak but no recognizer writes: IndexTTS special-token phone spans, OmniVoice brackets.
 _READING_SPANS = re.compile(r"<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>|\[[^\[\]\n]*\]")
+_SPECIAL_TOKEN = re.compile(r"<\|SPECIAL_TOKEN_\d+\|>")
+# The <word|reading> annotations of the text the user wrote (the pronunciation dictionary writes the same form).
+_ANNOTATION = re.compile(r"<([^|>\n]+)\|([^>\n]+)>")
+
+
+def reading_key(reading: str) -> str:
+    """A reading as both engines write it, for matching: upper case, single spaces, no syllable dots."""
+
+    return " ".join(token for token in str(reading).upper().split() if token != ".")
+
+
+def written_readings(text: str) -> dict[str, str]:
+    """The written word of every ``<word|reading>`` annotation in the text, keyed by ``reading_key``."""
+
+    words: dict[str, str] = {}
+    for match in _ANNOTATION.finditer(str(text or "")):
+        words.setdefault(reading_key(match.group(2)), match.group(1).strip())
+    return words
+
+
+def section_reference(section_text: str, words: Mapping[str, str] | None = None) -> str:
+    """A section's text as Whisper should hear it: every phone reading the engine speaks becomes the written word
+    of its annotation (``words``, from ``written_readings``); readings without one, and tags such as [laughter],
+    are left out."""
+
+    def replace(match: re.Match) -> str:
+        span = _SPECIAL_TOKEN.sub(" ", match.group(0)).strip()
+        if span.startswith("[") and span.endswith("]"):
+            span = span[1:-1]
+        word = (words or {}).get(reading_key(span))
+        return f" {word} " if word else " "
+
+    return " ".join(_READING_SPANS.sub(replace, str(section_text)).split())
 
 
 class SectionTakeJudge:
@@ -81,8 +114,11 @@ class SectionTakeJudge:
 
     Whisper loads on the first take it scores, transcribes in the generation's language (``whisper_language``:
     the speech model's setting, OmniVoice's Auto resolved from the text) and stays loaded until ``close``.
-    A section's reference is its own text without phone readings, so a word spoken from a reading costs every
-    take of that section the same and the comparison between its takes stays fair.
+    A section's reference is its own text with every phone reading written as the word it reads (from the
+    ``<word|reading>`` annotations of ``text``; rare words forgive close spellings), so a take that speaks the
+    reading right has no word error. Leaving the readings out made every take of such a section count the
+    spoken word as an extra one ("<xformers|...> and <SageAttention|...>." scored 400 % on every take): each
+    section with a dictionary word rendered all its takes and never counted as free of word errors.
 
     With ``rule="similar"`` the judge also measures how much each take sounds like the voice
     (``voice_similarity``: the trained voice's clips, else the reference clip) and the engine keeps the most
@@ -97,6 +133,7 @@ class SectionTakeJudge:
 
         self.language = whisper_language(language, text)
         self.scoring = {"zh": "ZH", "yue": "ZH", "ja": "JA"}.get(self.language, "EN")
+        self.readings = written_readings(text)
         self.device = device
         self._run = transcriber
         self._owned = transcriber is None
@@ -149,7 +186,7 @@ class SectionTakeJudge:
     def error_rate(self, section_text: str, samples: Any, sample_rate: int) -> float:
         from indextts.training.speech_metrics import transcript_metrics
 
-        reference = " ".join(_READING_SPANS.sub(" ", str(section_text)).split())
+        reference = section_reference(section_text, self.readings)
         if not any(char.isalnum() for char in reference):
             return 0.0
         if self._run is None:

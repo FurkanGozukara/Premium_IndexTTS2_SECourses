@@ -31,6 +31,13 @@ TEXT = (
     "comes from explaining a difficult idea in language that anyone can understand without rushing."
 )
 DEFAULT_IDLE_TIMEOUT_S = 1800.0
+# A quiet GPU may still hold the desktop's memory: on a 4K desktop the compositor alone kept 4.4 GB of a 32 GB
+# card, above the 10 % idle baseline, so the benchmark could never start. Such a GPU passes while its utilization
+# stays at or below this and it still offers the memory the run needs.
+QUIET_UTILIZATION_PCT = 20.0
+# The largest measured generation peak (AuK BF16 transformer and encoder, section batch 8: 12.0 GiB, docs/AUK.md).
+# The short UI check (1 beam, 60 text tokens, batch 1) needs no more; a smaller tier no more than its allocator cap.
+FIT_CHECK_PEAK_GB = 12.0
 
 
 def _non_negative_seconds(value: str) -> float:
@@ -161,10 +168,32 @@ def _query_idle_memory(device_id: str) -> dict[str, Any]:
     raise RuntimeError(f"Cannot verify idle GPU {device_id}: {detail}")
 
 
-def _wait_for_idle(timeout_s: float = DEFAULT_IDLE_TIMEOUT_S) -> dict[str, Any]:
+def _query_utilization(device_id: str, readings: int = 3, interval_s: float = 0.5) -> float | None:
+    """Highest GPU utilization (%) over a few driver readings; None when the driver does not report it."""
+    values = []
+    for index in range(readings):
+        if index:
+            time.sleep(interval_s)
+        try:
+            completed = subprocess.run(
+                ["nvidia-smi", "--id", device_id, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5.0, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            value = _memory_value(completed.stdout) if completed.returncode == 0 else None
+        except Exception:
+            value = None
+        if value is None:
+            return None
+        values.append(value)
+    return max(values) if values else None
+
+
+def _wait_for_idle(timeout_s: float = DEFAULT_IDLE_TIMEOUT_S, need_gb: float | None = None) -> dict[str, Any]:
     # Query the driver before Torch creates this process's CUDA context; otherwise
     # the context itself looks like roughly 1.5 GB of unrelated GPU use on WDDM.
     timeout_s = _non_negative_seconds(str(timeout_s))
+    required_free_gb = FIT_CHECK_PEAK_GB if need_gb is None else float(need_gb)
     device_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",", 1)[0].strip()
     if not device_id or device_id == "-1":
         raise RuntimeError("The VRAM benchmark requires a CUDA-visible GPU; CUDA_VISIBLE_DEVICES disables it")
@@ -190,11 +219,27 @@ def _wait_for_idle(timeout_s: float = DEFAULT_IDLE_TIMEOUT_S) -> dict[str, Any]:
         if used <= idle_limit_gb:
             print(f">> Idle check passed after {elapsed:.1f}s: {detail}.", flush=True)
             return {**snapshot, "idle_limit_gb": idle_limit_gb, "waited_s": elapsed, "timeout_s": timeout_s}
+        # Memory other programs keep is fine while nothing computes and the run still fits beside it.
+        utilization = _query_utilization(device_id)
+        elapsed = time.monotonic() - started
+        remaining = max(0.0, timeout_s - elapsed)
+        if utilization is not None and utilization <= QUIET_UTILIZATION_PCT and free_gb >= required_free_gb:
+            print(f">> Idle check passed after {elapsed:.1f}s: {detail}; other programs keep that memory, but the GPU "
+                  f"is quiet ({utilization:.0f} % busy) and {free_gb:.2f} GiB are free (this run needs "
+                  f"{required_free_gb:.2f}).", flush=True)
+            return {**snapshot, "idle_limit_gb": idle_limit_gb, "utilization_pct": utilization,
+                    "required_free_gb": required_free_gb, "waited_s": elapsed, "timeout_s": timeout_s}
+        busy = "utilization unavailable" if utilization is None else f"{utilization:.0f} % busy"
         if reported_at is None or elapsed - reported_at >= 10.0 or remaining == 0:
-            print(f">> Waiting for idle {detail}; {elapsed:.1f}s elapsed, {remaining:.1f}s remaining.", flush=True)
+            print(f">> Waiting for idle {detail}; {busy}, this run needs {required_free_gb:.2f} GiB free; "
+                  f"{elapsed:.1f}s elapsed, {remaining:.1f}s remaining.", flush=True)
             reported_at = elapsed
         if elapsed >= timeout_s:
-            raise TimeoutError(f"GPU idle wait exceeded {timeout_s:g}s: {detail}")
+            # Usually other programs: browsers playing video, emulators, games or another model keep the GPU busy.
+            raise TimeoutError(f"GPU idle wait exceeded {timeout_s:g}s: {detail}; {busy}. Other programs keep the GPU "
+                               f"busy (above {QUIET_UTILIZATION_PCT:.0f} %) or leave less than {required_free_gb:.1f} "
+                               "GiB free; close GPU-heavy programs (browsers playing video, emulators, games) or "
+                               "unload models in other apps, then run it again.")
         time.sleep(min(5.0, remaining))
 
 
@@ -259,7 +304,10 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
         reference_audio = _resolve_reference_audio(args.reference) if model_id == "indextts" or args.reference else None
         result["reference_audio"] = str(reference_audio)
 
-        result["idle_check"] = _wait_for_idle(args.idle_timeout_s)
+        # An emulated tier needs its whole allocator cap; otherwise the run peaks at FIT_CHECK_PEAK_GB at most.
+        cap_gb = max(0.5, args.tier - config.vram_reserve_gb)
+        result["idle_check"] = _wait_for_idle(args.idle_timeout_s,
+                                              need_gb=cap_gb if args.emulate else min(cap_gb, FIT_CHECK_PEAK_GB))
 
         import librosa
         import torch

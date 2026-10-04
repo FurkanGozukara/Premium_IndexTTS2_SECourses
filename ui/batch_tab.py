@@ -698,7 +698,8 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             audio_seconds = sum(float(row[2] or 0.0) for row in rows if row[1] == "Complete")
             rtf = elapsed / audio_seconds if audio_seconds > 0 else 0.0
             if _BATCH_CANCEL.is_set():
-                message = f"Batch canceled after {len(rows)}/{len(items)} items."
+                # The rows include the item the cancel stopped: "after 2/3 items" read as two finished items.
+                message = f"Batch canceled: {complete}/{len(items)} items complete."
                 title = "Batch canceled"
             else:
                 message = f"Batch finished: {complete}/{len(items)} complete in {elapsed:.1f}s."

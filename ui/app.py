@@ -70,7 +70,7 @@ from .model_controls import MODEL_CLASS_JS, bind_model_controls
 from .model_profiles import DEFAULT_MODEL, capture_profile, switch_profile
 from indextts.backends import MODEL_CHOICES
 from .request_guard import configure_request_guard
-from .training_tab import LIVE_TRAINING_JS, bind_training_events, build_training_tab
+from .training_tab import LIVE_TRAINING_JS, bind_training_events, build_training_tab, existing_training_dataset
 
 
 LAST_REGISTRY: PresetRegistry | None = None
@@ -434,7 +434,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
         bind_grid_events(grid, training, generation, models, main_tabs)
         # Model visibility is a body class the stylesheet reads, so lazily
         # mounted tabs and accordions need no server round trip of their own.
-        after_model_values = bind_model_controls(registry, generation, models, training, grid)
+        after_model_values = bind_model_controls(registry, generation, models, training, grid, status=preset_status)
         demo.load(None, registry["app.model"].component, None, js=MODEL_CLASS_JS)
         demo.load(None, registry["auk_edit.task"].component, None, js=TASK_CLASS_JS)
 
@@ -443,9 +443,10 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             print(">> " + message, flush=True)
             gr.Info(message)
 
+        # Queued on purpose: gr.Info reaches the page only from a queued event (an unqueued one has no event id,
+        # and the notice went to Python's warnings instead). The event has no inputs or outputs to refresh.
         last_values_button.click(
             loaded_last_values_notice,
-            queue=False,
             show_progress="hidden",
             api_name="load_last_values",
         )
@@ -482,7 +483,7 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 system_preset=store.is_system(clean),
                 detected_tier=store.detected_tier,
             )
-            values = capture_profile(values)
+            values = existing_training_dataset(capture_profile(values))
             if store.is_system(clean) and current_model and current_model != values["app.model"]:
                 values = switch_profile(registry, current_model, values)
             scope = "read-only GPU VRAM" if store.is_system(clean) else "user"

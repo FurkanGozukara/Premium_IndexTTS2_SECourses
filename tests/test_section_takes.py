@@ -37,6 +37,22 @@ def test_judge_uses_the_generation_language_and_ignores_phone_readings():
     assert judge.history == [{"section": 0, "error_rates": [0.1, 0.0], "kept": 1}]
 
 
+def test_judge_scores_dictionary_readings_as_their_written_words():
+    # The engines speak a dictionary word from its reading (an IndexTTS special-token span, OmniVoice brackets)
+    # and Whisper writes the word. Leaving the reading out of the reference made every take of
+    # "<xformers|...> and <SageAttention|...>." score 400 %, so such sections rendered all their takes.
+    text = ("We deploy it using <xformers|EH1 K S . F AO1 R . M ER0 Z> and "
+            "<SageAttention|S EY1 JH . AH0 . T EH1 N . SH AH0 N>.")
+    heard = SectionTakeJudge("EN", text, device="cpu", transcriber=lambda source, language: "X formers and Sage Attention.")
+    index_section = ("<|SPECIAL_TOKEN_1|>EH1 K S . F AO1 R . M ER0 Z<|SPECIAL_TOKEN_1|> and "
+                     "<|SPECIAL_TOKEN_1|>S EY1 JH . AH0 . T EH1 N . SH AH0 N<|SPECIAL_TOKEN_1|>.")
+    omni_section = "[EH1 K S F AO1 R M ER0 Z] and [S EY1 JH AH0 T EH1 N SH AH0 N]."
+    assert heard.error_rate(index_section, np.zeros(10), 24000) == 0.0
+    assert heard.error_rate(omni_section, np.zeros(10), 24000) == 0.0
+    dropped = SectionTakeJudge("EN", text, device="cpu", transcriber=lambda source, language: "and.")
+    assert dropped.error_rate(index_section, np.zeros(10), 24000) > 0.5  # a word the take left out still counts
+
+
 def test_omnivoice_retakes_a_section_until_whisper_hears_it_right():
     from indextts.backends.omnivoice import OmniVoiceEngine
 

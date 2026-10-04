@@ -59,6 +59,20 @@ def test_preview_reports_mode_words_and_seconds(tmp_path: Path) -> None:
     assert rows[1][1] == "Pause" and "kept exactly" in rows[1][3] and "Token budget" in note
 
 
+def test_preview_never_splits_inside_an_indextts_reading(tmp_path: Path) -> None:
+    # The syllable dots of "<DoRA|D AO1 . R AH0>" looked like sentence ends: the preview cut the annotation in
+    # two ("... and <DoRA|D AO1 ." / "R AH0> adapters ..."), while the engine splits its special-token form.
+    text = ("We fine-tune ExLlamaV3 and <DoRA|D AO1 . R AH0> adapters with Gradio, then deploy the TTS voice on "
+            "RunPod using <xformers|EH1 K S . F AO1 R . M ER0 Z> and <SageAttention|S EY1 JH . AH0 . T EH1 N . SH AH0 N>.")
+    for mode in ("smart", "sentence", "budget"):
+        rows, note = preview_segments(text, "EN", 60, segmentation_mode=mode, model_dir=str(tmp_path))
+        shown = " ".join(row[2] for row in rows)
+        assert "AO1" not in shown and "SPECIAL_TOKEN" not in shown and "<" not in shown, (mode, shown)
+        assert all(word in shown for word in ("DoRA", "xformers", "SageAttention")), (mode, shown)
+    rows, _ = preview_segments(text, "EN", 300, segmentation_mode="smart", model_dir=str(tmp_path))
+    assert len(rows) == 1 and "reads DoRA = D AO1 R AH0" in rows[0][3]
+
+
 def test_inert_silence_control_hides_for_the_2_5_codec(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text("version: 2.5\n", encoding="utf-8")
     assert codec_has_silence_runs(str(tmp_path)) is False

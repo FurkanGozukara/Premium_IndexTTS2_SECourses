@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 import gradio as gr
 
 from indextts.quant.convrot_int8 import describe_checkpoint, is_int8_convrot_checkpoint
-from indextts.runtime.gpu import list_gpus
+from indextts.runtime.gpu import device_wide_free_gb, list_gpus, visible_gpu_uuid
 from indextts.runtime.vram_presets import (
     RuntimeConfig,
     auto_tier,
@@ -166,10 +166,17 @@ def runtime_registry_values(config: RuntimeConfig | Mapping[str, Any]) -> dict[s
 
 
 def _gpu_rows() -> list[list[Any]]:
-    return [
-        [f"cuda:{gpu.index}", gpu.name, round(gpu.total_gb, 2), round(gpu.free_gb, 2), "Yes" if gpu.is_default else ""]
-        for gpu in list_gpus()
-    ]
+    # Windows' CUDA free memory ignores other processes (a training worker, another app): show the lower of it
+    # and nvidia-smi's device-wide figure.
+    device_free = device_wide_free_gb()
+    rows = []
+    for gpu in list_gpus():
+        free = gpu.free_gb
+        shared = device_free.get(visible_gpu_uuid(gpu.index))
+        if shared is not None:
+            free = min(free, shared)
+        rows.append([f"cuda:{gpu.index}", gpu.name, round(gpu.total_gb, 2), round(free, 2), "Yes" if gpu.is_default else ""])
+    return rows
 
 
 def _gpu_total(device: str | None) -> float:
@@ -601,17 +608,26 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             print(">> " + message, flush=True)
 
         try:
+            # Name the part each model quantizes (only IndexTTS has a GPT; AuK also gets its text encoder).
+            extra = ""
             if model_id == "omnivoice":
                 from indextts.backends.omnivoice import ensure_model
                 _, path = ensure_model(model_dir, quantized=True, progress=progress)
+                part = "INT8 transformer"
             elif model_id == "auk":
                 from indextts.backends.auk import ensure_model
                 _, _, files = ensure_model(model_dir, dit_variant="int8_convrot", text_variant="int8_convrot", progress=progress)
-                path = files["dit"]
+                path, part = files["dit"], "INT8 transformer"
+                if files.get("text"):
+                    encoder = describe_checkpoint(files["text"])
+                    extra = (f"; INT8 text encoder: `{files['text']}` "
+                             f"({encoder.get('quantized_layers', 0)} quantized layers)")
             else:
                 path = ensure_int8_gpt(model_dir, callback)
+                part = "INT8 GPT"
             info = describe_checkpoint(path)
-            message = f"INT8 GPT ready: `{path}` ({info.get('quantized_layers', 0)} quantized layers) in {time.perf_counter() - started:.1f}s."
+            message = (f"{part} ready: `{path}` ({info.get('quantized_layers', 0)} quantized layers){extra} "
+                       f"in {time.perf_counter() - started:.1f}s.")
             print(">> " + message, flush=True)
             return message, _model_status_rows(model_dir, model_id)
         except Exception as exc:

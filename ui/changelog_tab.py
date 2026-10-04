@@ -7,6 +7,27 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.0",
+        "2026-10-04",
+        """
+### Version 1.0: fixes from a complete test of a fresh installation
+
+Version numbers restart at 1.0 with the app's new name; 1.0 follows 8.1.
+
+- **Faster first generation after every start:** the app keeps its own GPU kernel cache (`models/cuda_jit_cache`, up to 4 GB). The driver's shared cache was too small for the app, so every new process (the first generation, each batch item in subprocess mode, every training worker) spent about 15 seconds preparing GPU kernels again; the first generation after a start took 22 seconds instead of 8. The cache fills during the first few starts.
+- **Keyboard choices in dropdowns apply:** choosing an option with the arrow keys or a typed filter and Enter now works like a click; LoRA / DoRA, the reference library, the Universal preset, the VRAM tiers, the training method, the fluency filter and saved grids used to show such a choice without applying it.
+- **Training Stop is where you click:** the stop and force-stop confirmation opens right under the buttons (it opened at the end of the long tab, out of view, and the run kept training), and **Resume from** lists the stopped run's checkpoint as soon as the run ends.
+- **Training number fields keep their values:** fractional settings such as the learning rate, Adam epsilon, weight decay, loss weights, early-stop and probe thresholds and the decoder and sample settings step in fitting increments; one arrow key used to turn a learning rate of 0.00004 into 1e-8.
+- **Take quality with dictionary words:** a section containing a dictionary reading (DoRA, xformers, SageAttention and similar) is scored against the word Whisper hears, so a correct take no longer counts as a word error and no extra takes are rendered for it; the live section preview splits annotated text exactly as IndexTTS does.
+- **Checkpoint Grid:** an empty reference field uses the run's own reference, a run handed over by Compare in grid or after training brings its own reference instead of keeping the previous run's, invalid inputs say what is wrong, the loss chart draws the validation line again, and a finished training no longer switches the page to the grid.
+- **AuK:** full fine-tuning on the 32 GB tier uses gradient checkpointing (2.1 to 2.7 updates per second instead of 0.1 or less once it spilled past the card), the GPU tier presets carry AuK's batch frames, and the INT8 export option is hidden for AuK, which cannot use it.
+- **VRAM benchmark on a busy desktop:** it waits only while the GPU computes or lacks memory for the run; a 4K desktop's compositor alone exceeded the old limit, so the benchmark never started.
+- **Smaller fixes:** removing the caption file turns caption cue timing off; canceling a dataset preparation no longer blocks preparing the same name again and its card shows the actual error; the Training tab opens on a prepared dataset instead of a missing preset folder; a refused model switch says why; free GPU memory in Models & Performance counts other programs; the audit lists the recordings to reserve for validation; Load last values shows its notice; the batch cancel summary counts finished items; INT8 download messages name the parts they saved; AuK worker logs no longer repeat PyTorch deprecation warnings.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v8.1",
         "2026-10-04",
         """

@@ -216,8 +216,16 @@ def build_omnivoice_controls(registry):
     return panel
 
 
-def bind_model_controls(registry, generation, models, training, grid):
-    """Wire the header model selector; return a hook that refreshes model-filtered lists."""
+SWITCH_BUSY_MESSAGE = "Wait for the current job to finish or cancel it before switching models."
+
+
+def bind_model_controls(registry, generation, models, training, grid, status=None):
+    """Wire the header model selector; return a hook that refreshes model-filtered lists.
+
+    ``status`` is a visible Markdown that receives the refusal while a job runs: the switch is an unqueued event,
+    where ``gr.Warning`` only reaches Python's warnings (silenced by the launcher), so the dropdown snapped back to
+    the running model without a word.
+    """
 
     selector = registry["app.model"].component
     profiles = registry["app.profiles"].component
@@ -330,13 +338,19 @@ def bind_model_controls(registry, generation, models, training, grid):
                   **dict(zip(list_keys, shown_lists))}
         session = str(getattr(request, "session_hash", "") or "")
         unchanged = [gr.skip(), gr.skip(), {}, gr.skip(), *[gr.skip()] * (len(state_keys) + len(list_keys) + len(extra_outputs))]
+        if status is not None:
+            unchanged.append(gr.skip())
         with active_lock:
             previous = active_by_session.get(session) or (profile_state or {}).get("_active", "indextts")
             if target == previous:
                 return unchanged
             if LAZY_ENGINE.busy or any(job.running for job in PROCESS_MANAGER._jobs.values()):
-                gr.Warning("Wait for the current job to finish or cancel it before switching models.")
-                return [previous, *unchanged[1:]]
+                gr.Warning(SWITCH_BUSY_MESSAGE)
+                print(">> " + SWITCH_BUSY_MESSAGE, flush=True)
+                refused = [previous, *unchanged[1:]]
+                if status is not None:
+                    refused[-1] = f"**{SWITCH_BUSY_MESSAGE}**"
+                return refused
             active_by_session[session] = target
         restored = switch_profile(registry, target, {**values, "app.model": previous, "app.profiles": profile_state or {}})
         # Not every listed control is profiled (the grid folder is chosen per session).
@@ -347,8 +361,9 @@ def bind_model_controls(registry, generation, models, training, grid):
         print(f">> Active speech model: {target}; restored its settings, weights load on first generation", flush=True)
         payload = values_payload(browser_keys, {key: restored[key] for key in browser_keys
                                                 if key not in lists and restored[key] != values.get(key)})
-        return [gr.skip(), restored["app.profiles"], payload, sent, *[restored[key] for key in state_keys],
-                *(lists[key] for key in list_keys), *tail]
+        result = [gr.skip(), restored["app.profiles"], payload, sent, *[restored[key] for key in state_keys],
+                  *(lists[key] for key in list_keys), *tail]
+        return [*result, gr.skip()] if status is not None else result
 
     # The browser gathers the profiled values and applies the returned ones
     # (common.APPLY_VALUES_JS), so the switch adds only a handful of components
@@ -356,7 +371,8 @@ def bind_model_controls(registry, generation, models, training, grid):
     switch_event = apply_values(
         gather_values(selector.select, browser_components, switch_box, trigger_mode="always_last").then(
             switch, [selector, switch_box, profiles, sent_lists, *state_components, *list_components],
-            [selector, profiles, switch_box, sent_lists, *state_components, *list_components, *extra_outputs],
+            [selector, profiles, switch_box, sent_lists, *state_components, *list_components, *extra_outputs,
+             *([status] if status is not None else [])],
             queue=False, api_name="select_speech_model", show_progress="hidden"),
         switch_box, browser_components)
     # Displays that depend on the model itself. They follow the switch rather than
