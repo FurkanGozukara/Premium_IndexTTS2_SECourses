@@ -164,6 +164,19 @@ def _item_generation_values(
     return values
 
 
+def _target_duration_note(generation_values: dict[str, Any]) -> str:
+    """A whole-output target duration set in Voice Generation fits every batch item to it: say so."""
+    mode = str(generation_values.get("generation.target_duration_mode") or "off").strip().lower()
+    try:
+        seconds = float(generation_values.get("generation.target_duration_s") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if mode == "off" or seconds <= 0:
+        return ""
+    return (f"Every item is fitted to the {seconds:g} s target duration ({mode}) set in Voice Generation > "
+            "Segmentation & Timing; clear it there to keep each item's natural length.")
+
+
 def _batch_timer(running: bool) -> gr.Timer:
     """Keep polling off while the connected aggregate generator owns the card."""
 
@@ -573,9 +586,12 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
             if not subprocess_mode:
                 LAZY_ENGINE.reset_cancel(task_id=run_id)
             print(f">> Batch started | {len(items)} items | {execution}", flush=True)
+            duration_note = _target_duration_note(generation_values)
+            if duration_note:
+                print(">> " + duration_note, flush=True)
             yield emit(
                 progress_panel_html({"fraction": 0, "completed": 0, "total": len(items), "desc": "Starting"}, title="Batch generation"),
-                f"Starting {len(items)} items...",
+                f"Starting {len(items)} items..." + (f" {duration_note}" if duration_note else ""),
                 rows,
                 "",
                 running=True,

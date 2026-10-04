@@ -417,3 +417,13 @@ def test_late_cancel_does_not_relabel_completed_inprocess_audio(tmp_path, monkey
             break
     assert result["output_path"] == "completed.wav"
     assert json.loads(Path(request["metadata_path"]).read_text())["status"] == "completed"
+
+
+def test_batch_start_says_when_items_are_fitted_to_a_target_duration():
+    from ui.batch_tab import _target_duration_note
+
+    assert _target_duration_note({"generation.target_duration_mode": "off", "generation.target_duration_s": 25}) == ""
+    assert _target_duration_note({"generation.target_duration_mode": "natural", "generation.target_duration_s": None}) == ""
+    note = _target_duration_note({"generation.target_duration_mode": "natural", "generation.target_duration_s": 25.0})
+    assert "25 s target duration (natural)" in note and "Segmentation & Timing" in note
+
