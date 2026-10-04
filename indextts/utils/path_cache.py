@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 from pathlib import Path
+from typing import Any
 import threading
 import time
 
@@ -30,7 +31,7 @@ def resolved_path(path: str | os.PathLike[str]) -> Path:
 # there, so walking them made every adapter list take most of a second.
 RUN_ARTIFACT_DIRS = frozenset({"analysis", "samples", ".sample_jobs", "eval_jobs", "eval_job", "__pycache__"})
 _TREE_TTL_S = 2.0
-_TREE_CACHE: dict[str, tuple[float, int | None, tuple[Path, ...], dict[str, tuple[int, int]]]] = {}
+_TREE_CACHE: dict[str, tuple[float, Any, tuple[Path, ...], dict[str, tuple[int, int]]]] = {}
 _TREE_LOCK = threading.Lock()
 
 
@@ -90,7 +91,10 @@ def tree_files(root: str | os.PathLike[str]) -> tuple[Path, ...]:
 
     top = os.fspath(root)
     try:
-        modified = os.stat(top).st_mtime_ns
+        # The names of the run folders join the folder's own time: NTFS does not always
+        # update a folder's modification time when a subfolder is created in it (a new
+        # run folder went unseen for the whole two seconds), while listing it is one call.
+        modified = (os.stat(top).st_mtime_ns, frozenset(os.listdir(top)))
     except OSError:
         modified = None
     with _TREE_LOCK:
