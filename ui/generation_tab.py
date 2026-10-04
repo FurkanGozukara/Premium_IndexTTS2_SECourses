@@ -1748,12 +1748,15 @@ def adapter_panel_html(
     """The Voice LoRA / DoRA panel: identity, speaking rate, line-length rules, pauses, decoder and decoding."""
 
     esc = html.escape
+    # A full fine-tune has no rank, alpha or adapter targets: it is the model's own weights.
+    full = str(info.get("adapter_type") or "").lower() == "full"
     chips = [
-        f"rank {esc(str(info.get('rank', '?')))} · alpha {esc(str(info.get('alpha', '?')))}",
+        *([] if full else [f"rank {esc(str(info.get('rank', '?')))} · alpha {esc(str(info.get('alpha', '?')))}"]),
         f"{int(info.get('steps', 0) or 0)} steps",
         f"dataset {esc(str(info.get('dataset') or 'not recorded'))}",
         f"{esc(str(info.get('date') or 'date not recorded')[:19])}",
-        f"{len(info.get('targets') or [])} targets · {float(info.get('size_mb', 0.0) or 0.0):.2f} MB",
+        (f"{float(info.get('size_mb', 0.0) or 0.0):.2f} MB" if full
+         else f"{len(info.get('targets') or [])} targets · {float(info.get('size_mb', 0.0) or 0.0):.2f} MB"),
     ]
     head = (
         f'<div class="adapter-head"><b>{esc(str(info.get("adapter_type", "adapter")).upper())}</b>'

@@ -2307,7 +2307,8 @@ def build_training_tab(
             path = paths[int(index)]
             info = inspect_lora(path)
             detail = (
-                f"**{Path(path).stem}** | {str(info['adapter_type']).upper()} rank {info['rank']} alpha {info['alpha']} | "
+                f"**{Path(path).stem}** | {str(info['adapter_type']).upper()}"
+                + ("" if info['adapter_type'] == "full" else f" rank {info['rank']} alpha {info['alpha']}") + " | "
                 f"{info.get('steps', 0)} steps | dataset {info.get('dataset') or 'unknown'} | {info.get('size_mb', 0):.2f} MB  \n"
                 f"`{path}`"
             )
