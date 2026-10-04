@@ -136,7 +136,7 @@ def system_preset(tier: int | None, presets_root: Path) -> Path | None:
 
 def compose_preset(base: Mapping[str, Any], *, voice_path: str, model: str = "omnivoice",
                    speaking_rate: float | None = None, pauses: Sequence[int] | None = None,
-                   takes: Sequence[Any] | None = None) -> dict[str, Any]:
+                   takes: Sequence[Any] | None = None, decoding: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Preset values: ``base`` (a universal preset's values) with ``model`` active and the trained voice's settings."""
     count, rule, checks = takes or trained_takes(model)
     # app.profiles: each model's own values plus "_active", the model whose values are at the top level.
@@ -162,10 +162,17 @@ def compose_preset(base: Mapping[str, Any], *, voice_path: str, model: str = "om
         settings.update({"generation.auto_lora_speaking_rate": False,
                          "generation.speaking_rate": float(speaking_rate or NARRATION_RATE[model])})
     else:
-        # IndexTTS: the voice's calibrated pace and decoding, section length, pauses and expressive clip apply when
-        # the voice loads.
+        # IndexTTS: section length, pauses and the expressive clip follow the voice at generation. A preset load keeps
+        # its stored speaking rate and decoding (the voice's automatic values apply only when it is chosen by hand), so
+        # the calibrated rate and the decoding its sweep adopted are written into the preset itself.
         settings.update({"generation.auto_lora_speaking_rate": True, "generation.auto_lora_max_tokens": True,
                          "generation.auto_lora_pauses": True, "generation.auto_lora_emotion_reference": True})
+        if speaking_rate:
+            settings["generation.speaking_rate"] = round(float(speaking_rate), 3)
+        if decoding and "temperature" in decoding:
+            settings.update({"generation.temperature": float(decoding["temperature"]),
+                             "generation.inference_cfg_rate": float(decoding["inference_cfg_rate"]),
+                             "generation.num_beams": int(decoding["num_beams"])})
     if pauses:
         settings.update({"generation.auto_lora_pauses": True, "generation.sentence_pause_ms": int(pauses[0]),
                          "generation.max_pause_ms": int(pauses[1])})
@@ -238,7 +245,14 @@ def run_voice_preset(config_path: str | Path, checkpoint: str | Path, state_dir:
     embedder = SpeakerEmbedder(config.model_dir, device)
     centroid = build_centroid(checkpoint, embedder, datasets_root=dataset_dir.parent)
     embedder.close()
-    rate, ratio, measured, reference = None, None, [], None
+    rate, ratio, measured, reference, decoding = None, None, [], None, None
+    if model not in CLONING_MODELS:
+        from .decoding_sweep import load_decoding_settings
+        from .speaking_rate import load_speaking_rate
+
+        report = load_speaking_rate(checkpoint)
+        rate = float(report.recommended_speaking_rate) if report is not None and report.recommended_speaking_rate else None
+        decoding = load_decoding_settings(checkpoint)
     if model in CLONING_MODELS:
         pace = _pace_check(config, checkpoint, run_dir, dataset_dir, state, status, cancelled)
         if pace is None:
@@ -259,7 +273,7 @@ def run_voice_preset(config_path: str | Path, checkpoint: str | Path, state_dir:
     base = json.loads(base_path.read_text(encoding="utf-8-sig"))["values"]
     takes = trained_takes(model, tier)
     values = compose_preset(base, voice_path=str(checkpoint), model=model, speaking_rate=rate, pauses=pauses,
-                            takes=takes)
+                            takes=takes, decoding=decoding)
     generated = {"voice": str(checkpoint), "speech_model": model, "reference": str(reference or ""),
                  "speaking_rate": rate, "pace_ratio": ratio, "takes": list(takes), "base_preset": base_path.stem,
                  "sentences": len(measured), "centroid_clips": len((centroid or {}).get("clips") or [])}
@@ -270,7 +284,10 @@ def run_voice_preset(config_path: str | Path, checkpoint: str | Path, state_dir:
     rule = (f"keeps the most similar of {takes[0]} without word errors" if takes[1] == "similar"
             else f"renders up to {takes[0]} takes and keeps the first without word errors")
     if model not in CLONING_MODELS:
-        speech = "the voice's calibrated speaking rate and decoding"
+        speech = (f"the voice's calibrated speaking rate {rate:.3f}" if rate else "speaking rate 1.0 (no calibration)")
+        if decoding and "temperature" in decoding:
+            speech += (f", temperature {decoding['temperature']:g}, guidance {decoding['inference_cfg_rate']:g} and "
+                       f"{decoding['num_beams']} beams from its decoding sweep")
     elif ratio is None:
         speech = f"Voice cloning at speaking rate {rate:.2f}"
     else:

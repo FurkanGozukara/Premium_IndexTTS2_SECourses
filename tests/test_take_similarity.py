@@ -279,6 +279,11 @@ def test_auk_and_indextts_presets_after_training():
     assert index["app.model"] == "indextts" and index["generation.speaking_rate"] == 0.95  # the profile's rate
     assert index["generation.auto_lora_speaking_rate"] is True and index["generation.auto_lora_max_tokens"] is True
     assert "omnivoice.mode" not in index and index["app.profiles"]["indextts"]["runtime.lora_path"] == "i.safetensors"
+    # A preset load keeps stored values, so the calibrated pace and the sweep's decoding are written into it.
+    calibrated = compose_preset(base, voice_path="i.safetensors", model="indextts", takes=(5, "errors", 5), speaking_rate=0.8351,
+                                decoding={"temperature": 0.8, "inference_cfg_rate": 0.5, "num_beams": 4})
+    assert calibrated["generation.speaking_rate"] == 0.835 and calibrated["app.profiles"]["indextts"]["generation.speaking_rate"] == 0.835
+    assert (calibrated["generation.temperature"], calibrated["generation.inference_cfg_rate"], calibrated["generation.num_beams"]) == (0.8, 0.5, 4)
     assert preset_name("V", "auk", (10, "similar", 5)) == "V_Clone_Best_of_10"
     assert preset_name("V", "indextts", (5, "errors", 5)) == "V_Takes_5"
     assert preset_name("V", "indextts", (10, "similar", 5)) == "V_Best_of_10"
