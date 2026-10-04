@@ -9,7 +9,7 @@ the earlier candidate.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -83,10 +83,16 @@ class SectionTakeJudge:
     the speech model's setting, OmniVoice's Auto resolved from the text) and stays loaded until ``close``.
     A section's reference is its own text without phone readings, so a word spoken from a reading costs every
     take of that section the same and the comparison between its takes stays fair.
+
+    With ``rule="similar"`` the judge also measures how much each take sounds like the voice
+    (``voice_similarity``: the trained voice's clips, else the reference clip) and the engine keeps the most
+    similar take without word errors (``keep_most_similar_take``), checking at most ``checks`` takes.
     """
 
     def __init__(self, language: str | None, text: str, *, device: str = "cuda:0",
-                 transcriber: Callable[[Any, str], str] | None = None) -> None:
+                 transcriber: Callable[[Any, str], str] | None = None, rule: str = "errors", checks: int = 5,
+                 voice: str | None = None, reference: str | None = None, model_dir: str = "models",
+                 embedder: Callable[[Any, int], Any] | None = None) -> None:
         from .speech_timestamps import whisper_language
 
         self.language = whisper_language(language, text)
@@ -95,6 +101,50 @@ class SectionTakeJudge:
         self._run = transcriber
         self._owned = transcriber is None
         self.history: list[dict[str, Any]] = []
+        self.rule = "similar" if str(rule or "").strip().lower() == "similar" else "errors"
+        self.checks = max(1, min(8, int(checks or 5)))
+        self._voice, self._reference, self._model_dir = voice or None, reference or None, model_dir
+        self._embed = embedder
+        self._embed_owned = embedder is None
+        self._target: Any = None
+        self._target_ready = False
+        self.target_source = ""
+
+    def _embedder(self) -> Callable[[Any, int], Any]:
+        if self._embed is None:
+            from .voice_similarity import SpeakerEmbedder
+
+            self._embed = SpeakerEmbedder(self._model_dir, self.device)
+        return self._embed
+
+    def _similarity_target(self) -> Any:
+        if not self._target_ready:
+            self._target_ready = True
+            try:
+                from .voice_similarity import voice_target
+
+                self._target, self.target_source = voice_target(self._voice, self._embedder(),
+                                                                reference=self._reference)
+            except Exception as exc:  # no CAMPPlus weights or an unreadable dataset: fall back to word errors
+                print(f">> Takes per section: voice similarity unavailable ({exc})", flush=True)
+                self._target, self.target_source = None, ""
+            if self._target is None and self.rule == "similar":
+                print(">> Takes per section: nothing to compare the voice with; keeping the fewest word errors",
+                      flush=True)
+        return self._target
+
+    def compares_voices(self) -> bool:
+        """True when the most-similar rule is on and there is a voice to compare takes with."""
+        return self.rule == "similar" and self._similarity_target() is not None
+
+    def similarity(self, samples: Any, sample_rate: int) -> float:
+        import numpy as np
+
+        target = self._similarity_target()
+        if target is None:
+            return 0.0
+        return round(float(np.dot(np.asarray(self._embedder()(samples, sample_rate)).reshape(-1),
+                                  np.asarray(target).reshape(-1))), 4)
 
     def error_rate(self, section_text: str, samples: Any, sample_rate: int) -> float:
         from indextts.training.speech_metrics import transcript_metrics
@@ -132,10 +182,26 @@ class SectionTakeJudge:
         summary = ", ".join(f"take {index + 1} {100 * rate:.1f}%" for index, rate in enumerate(rates))
         print(f">> Section {section + 1}: {summary} -> kept take {kept + 1}", flush=True)
 
+    def record_similar(self, section: int, outcome: Mapping[str, Any]) -> None:
+        similarities = [float(value) for value in outcome["similarities"]]
+        checked = [dict(item) for item in outcome["checked"]]
+        kept = int(outcome["kept"])
+        self.history.append({"section": int(section), "rule": "similar", "similarities": similarities,
+                             "checked": checked, "kept": kept})
+        summary = ", ".join(f"take {item['take'] + 1} ({similarities[item['take']]:.3f}) "
+                            f"{100 * float(item['error_rate']):.1f}%" for item in checked)
+        print(f">> Section {section + 1}: {len(similarities)} takes, most similar first: {summary} "
+              f"-> kept take {kept + 1}", flush=True)
+
     def close(self) -> None:
         if self._owned and self._run is not None:
             self._run = None
             _release_whisper()
+        if self._embed_owned and self._embed is not None:
+            closer = getattr(self._embed, "close", None)
+            self._embed = None
+            if closer:
+                closer()
 
 
 def keep_best_take(first: Any, retake: Callable[[], Any], score: Callable[[Any], float], takes: int
@@ -152,10 +218,33 @@ def keep_best_take(first: Any, retake: Callable[[], Any], score: Callable[[Any],
     return best, rates, kept
 
 
+def keep_most_similar_take(first: Any, render_more: Callable[[int], Sequence[Any]],
+                           similarity: Callable[[Any], float], score: Callable[[Any], float], renders: int,
+                           checks: int = 5) -> tuple[Any, dict[str, Any]]:
+    """``renders`` takes of one section, most speaker-like first: Whisper checks up to ``checks`` of them in that
+    order and the first without a word error wins, else the fewest errors (ties: the more similar take).
+
+    ``render_more(n)`` returns ``n`` further takes (an engine may render them as one batch). On a 139-line narration
+    ten cloned takes with five checks scored best on likeness, delivery style and word errors (October 2026).
+    """
+
+    takes = [first, *render_more(max(0, int(renders) - 1))] if int(renders) > 1 else [first]
+    similarities = [float(similarity(take)) for take in takes]
+    order = sorted(range(len(takes)), key=lambda index: (-similarities[index], index))
+    checked: list[dict[str, Any]] = []
+    for index in order[:max(1, int(checks))]:
+        checked.append({"take": index, "error_rate": float(score(takes[index]))})
+        if checked[-1]["error_rate"] <= 0.0:
+            break
+    kept = min(checked, key=lambda item: (item["error_rate"], order.index(item["take"])))["take"]
+    return takes[kept], {"similarities": similarities, "checked": checked, "kept": kept}
+
+
 def best_take(rows: Sequence[dict[str, Any]]) -> int:
     """Index of the take with the fewest word errors; the first of equals."""
 
     return min(range(len(rows)), key=lambda index: (float(rows[index]["error_rate"]), index)) if rows else 0
 
 
-__all__ = ["SectionTakeJudge", "best_take", "candidate_word_errors", "keep_best_take", "metric_language"]
+__all__ = ["SectionTakeJudge", "best_take", "candidate_word_errors", "keep_best_take", "keep_most_similar_take",
+           "metric_language"]

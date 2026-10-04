@@ -495,8 +495,12 @@ def _emit_progress(progress_callback, value: float, desc: str) -> None:
     progress_callback(value, desc=desc)
 
 
-def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, text: str, language: str):
-    """Give the engine a Whisper judge for "Takes per section" (None when the option is off)."""
+def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, text: str, language: str, *,
+                       rule: str = "errors", checks: int = 5):
+    """Give the engine a Whisper judge for "Takes per section" (None when the option is off).
+
+    With the "similar" rule the judge also compares every take with the selected voice (its training clips, else
+    the reference clip) and Whisper checks the most similar ones first."""
 
     tts.section_takes, tts.take_judge = 1, None
     if section_takes <= 1:
@@ -508,9 +512,16 @@ def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, te
         import torch
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    judge = SectionTakeJudge(language, text, device=device)
+    voice = str(request.get("lora_path") or "") or None
+    model_dir = str(getattr(tts, "model_dir", "") or (request.get("runtime") or {}).get("model_dir") or "models")
+    judge = SectionTakeJudge(language, text, device=device, rule=rule, checks=checks, voice=voice,
+                             reference=str(request.get("prompt") or "") or None, model_dir=model_dir)
     tts.section_takes, tts.take_judge = section_takes, judge
-    print(f">> Takes per section: up to {section_takes}; Whisper judges them in '{judge.language}'", flush=True)
+    if judge.rule == "similar":
+        print(f">> Takes per section: {section_takes} renders, Whisper checks up to {checks} of the most similar "
+              f"in '{judge.language}'", flush=True)
+    else:
+        print(f">> Takes per section: up to {section_takes}; Whisper judges them in '{judge.language}'", flush=True)
     return judge
 
 
@@ -671,7 +682,9 @@ def run_generation_request(
     request_runtime = RuntimeConfig.from_dict(request.get("runtime"))
     infer_kwargs.setdefault("cfm_cache_length", request_runtime.cfm_cache_length)
     section_batch_size = max(1, int(infer_kwargs.pop("section_batch_size", 1)))
-    section_takes = max(1, min(8, int(request.get("section_takes", 1) or 1)))
+    section_takes = max(1, min(16, int(request.get("section_takes", 1) or 1)))
+    section_take_rule = str(request.get("section_take_rule") or "errors")
+    section_take_checks = max(1, min(8, int(request.get("section_take_checks") or 5)))
     latent_multiplier = float(infer_kwargs.pop("latent_multiplier", 1.72))
     infer_kwargs["duration_factor"] = latent_multiplier / 1.72
     infer_kwargs.pop("max_emotion_sum", None)
@@ -733,7 +746,8 @@ def run_generation_request(
         subtitle_cues = parse_subtitle_file(subtitle_file) if subtitle_mode else []
         subtitle_render_units = build_subtitle_render_units(subtitle_cues) if subtitle_mode else []
         take_judge = _attach_take_judge(request, tts, section_takes,
-                                        subtitle_cues_to_text(subtitle_cues) if subtitle_cues else text, language)
+                                        subtitle_cues_to_text(subtitle_cues) if subtitle_cues else text, language,
+                                        rule=section_take_rule, checks=section_take_checks)
 
         if subtitle_mode:
             if not subtitle_cues:
@@ -1026,6 +1040,9 @@ def run_generation_request(
 
         if take_judge is not None:
             metadata["section_takes"] = {"takes": section_takes, "language": take_judge.language,
+                                         "rule": "similar" if take_judge.rule == "similar" and take_judge.target_source
+                                         else "errors", "checks": take_judge.checks,
+                                         "compared_with": take_judge.target_source,
                                          "sections": list(take_judge.history)}
             _release_take_judge(tts, take_judge)
             take_judge = None

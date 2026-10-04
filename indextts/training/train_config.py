@@ -238,6 +238,12 @@ class TrainConfig:
     reference_audition_candidates: int = 12
     reference_audition_sentences: int = 8
     reference_audition_timeout_s: float = 3600.0
+    # Then an OmniVoice voice gets a ready-to-use cloning preset (voice_preset): its likeness centroid, its cloned
+    # pace against the speaker's own recordings of held-out sentences, and Takes per section keeping the most
+    # similar of 10 renders without word errors.
+    voice_preset_enabled: bool = True
+    voice_preset_sentences: int = 16
+    voice_preset_timeout_s: float = 3600.0
 
     seed: int = 42
     num_workers: int = 2
@@ -470,6 +476,9 @@ class TrainConfig:
         self.reference_audition_sentences = min(16, max(2, int(self.reference_audition_sentences)))
         self.reference_audition_timeout_s = max(60.0, _finite_float(self.reference_audition_timeout_s,
                                                                     "reference_audition_timeout_s"))
+        self.voice_preset_enabled = bool(self.voice_preset_enabled)
+        self.voice_preset_sentences = min(40, max(4, int(self.voice_preset_sentences)))
+        self.voice_preset_timeout_s = max(60.0, _finite_float(self.voice_preset_timeout_s, "voice_preset_timeout_s"))
         self.final_test_dataset = str(self.final_test_dataset or "").strip()
         for key, lower, upper in (("speech_eval_prompts", 0, 100),
                                   ("speech_eval_seeds", 1, 10),

@@ -448,8 +448,17 @@ class OmniVoiceEngine:
             return outputs
 
         # Takes per section: Whisper scores every take; up to this many renders of a section, the fewest errors win.
+        # With the most-similar rule every take is rendered (the extra ones in batches), ranked by likeness to the
+        # voice, and Whisper checks the most similar ones in order.
         takes = max(1, int(getattr(self, "section_takes", 1) or 1))
         judge = getattr(self, "take_judge", None) if takes > 1 else None
+
+        def render_more(index, count):
+            more = []
+            for begin in range(0, count, batch_size):
+                size = min(batch_size, count - begin)
+                more.extend(synthesize([speech[index]] * size, [target_lengths[index]] * size))
+            return more
         try:
             with torch.inference_mode(), torch.random.fork_rng(devices=devices):
                 if seed is not None:
@@ -460,7 +469,16 @@ class OmniVoiceEngine:
                     lengths = target_lengths[start:start + batch_size]
                     for offset, take in enumerate(synthesize(batch, lengths)):
                         index = start + offset
-                        if judge is not None:
+                        if judge is not None and getattr(judge, "compares_voices", lambda: False)():
+                            from indextts.utils.take_selection import keep_most_similar_take
+
+                            take, outcome = keep_most_similar_take(
+                                take, lambda count, i=index: render_more(i, count),
+                                lambda audio: judge.similarity(audio.squeeze(0).numpy(), self.sampling_rate),
+                                lambda audio, i=index: judge.error_rate(speech[i], audio.squeeze(0).numpy(), self.sampling_rate),
+                                takes, judge.checks)
+                            judge.record_similar(index, outcome)
+                        elif judge is not None:
                             from indextts.utils.take_selection import keep_best_take
 
                             take, rates, kept = keep_best_take(

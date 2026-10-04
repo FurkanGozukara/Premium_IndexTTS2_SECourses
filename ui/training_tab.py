@@ -1738,6 +1738,21 @@ def build_training_tab(
             _reg(registry, controls, "reference_audition_candidates", audition_candidates, kind="int", minimum=2, maximum=30)
             _reg(registry, controls, "reference_audition_sentences", audition_sentences, kind="int", minimum=2, maximum=16)
             _reg(registry, controls, "reference_audition_timeout_s", audition_timeout, kind="float", minimum=60, maximum=1000000)
+            with gr.Row():
+                preset_enabled = gr.Checkbox(value=TRAIN_DEFAULTS["voice_preset_enabled"],
+                                             label="Build a cloning preset after training",
+                                             info="OmniVoice: saves the user preset <voice>_Clone_Best_of_10, with Voice cloning "
+                                                  "from the audition's reference, the speaker's own pace (measured on held-out "
+                                                  "sentences) and Takes per section keeping the most similar of 10 without word errors.")
+                preset_sentences = gr.Slider(4, 40, value=TRAIN_DEFAULTS["voice_preset_sentences"], step=1,
+                                             label="Pace sentences",
+                                             info="Held-out sentences rendered once each in Voice cloning and compared with the "
+                                                  "speaker's recordings of them.")
+                preset_timeout = gr.Number(value=TRAIN_DEFAULTS["voice_preset_timeout_s"], minimum=60,
+                                           label="Cloning preset timeout (s)")
+            _reg(registry, controls, "voice_preset_enabled", preset_enabled, kind="bool")
+            _reg(registry, controls, "voice_preset_sentences", preset_sentences, kind="int", minimum=4, maximum=40)
+            _reg(registry, controls, "voice_preset_timeout_s", preset_timeout, kind="float", minimum=60, maximum=1000000)
 
         with gr.Accordion("Sampling", open=False):
             with gr.Row():

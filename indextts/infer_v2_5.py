@@ -2410,7 +2410,20 @@ class IndexTTS2:
                 # Without sampling every retake would be identical, so there is nothing to choose from.
                 takes = max(1, int(getattr(self, "section_takes", 1) or 1))
                 judge = getattr(self, "take_judge", None)
-                if takes > 1 and judge is not None and do_sample:
+                if takes > 1 and judge is not None and do_sample and getattr(judge, "compares_voices", lambda: False)():
+                    # Most-similar rule: render every take, rank by likeness to the voice, Whisper checks in order.
+                    from indextts.utils.take_selection import keep_most_similar_take
+
+                    def take_samples(take):
+                        return (take[1].squeeze(0).float() / 32767.0).cpu().numpy()
+
+                    (code_parts, wav), outcome = keep_most_similar_take(
+                        (code_parts, wav), lambda count: [render_take() for _ in range(count)],
+                        lambda take: judge.similarity(take_samples(take), sampling_rate),
+                        lambda take: judge.error_rate(segments[seg_idx], take_samples(take), sampling_rate),
+                        takes, judge.checks)
+                    judge.record_similar(seg_idx, outcome)
+                elif takes > 1 and judge is not None and do_sample:
                     from indextts.utils.take_selection import keep_best_take
 
                     (code_parts, wav), rates, kept = keep_best_take(

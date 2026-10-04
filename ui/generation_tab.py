@@ -221,6 +221,8 @@ GENERATION_DEFAULTS: dict[str, Any] = {
     "generation.num_candidates": 1,
     "generation.pick_best_candidate": False,
     "generation.section_takes": 1,
+    "generation.section_take_rule": "errors",
+    "generation.section_take_checks": 5,
     "generation.audition_candidates": 6,
     "generation.audition_sentences": 4,
     "generation.diffusion_steps": 25,
@@ -336,6 +338,8 @@ RUNNER_REQUEST_KEYS = frozenset(
         "num_candidates",
         "pick_best_candidate",
         "section_takes",
+        "section_take_rule",
+        "section_take_checks",
         "audio_tuning_preset",
         "audio_tuning_overrides",
         "segment_budget_scale_non_cjk",
@@ -526,6 +530,8 @@ def build_generation_request(
         "num_candidates": int(_value(merged, "generation.num_candidates")),
         "pick_best_candidate": bool(_value(merged, "generation.pick_best_candidate")),
         "section_takes": int(_value(merged, "generation.section_takes") or 1),
+        "section_take_rule": "similar" if _value(merged, "generation.section_take_rule") == "similar" else "errors",
+        "section_take_checks": int(_value(merged, "generation.section_take_checks") or 5),
         "audio_tuning_preset": str(_value(merged, "generation.audio_tuning_preset") or "bypass"),
         "audio_tuning_overrides": overrides,
         "segment_budget_scale_non_cjk": float(_value(merged, "generation.segment_budget_scale_non_cjk")),
@@ -3323,10 +3329,21 @@ def build_generation_tab(
                                         info="With 2 or more candidates, Whisper transcribes every take and the one with the fewest "
                                              "word errors becomes the output (the others stay as candidates). Both speech models; "
                                              "steadier pronunciation at the cost of the extra takes.")
-                section_takes = gr.Slider(1, 8, value=1, step=1, label="Takes per section (Whisper keeps the best)",
+                section_takes = gr.Slider(1, 16, value=1, step=1, label="Takes per section (Whisper keeps the best)",
                                           info="Renders each section up to this many times and keeps the take Whisper hears with the "
                                                "fewest word errors; a take without errors ends the search. Whisper uses the speech "
                                                "model's language (OmniVoice's Auto is read from the text). 1 = off. Both models.")
+            with gr.Row():
+                take_rule = gr.Dropdown(choices=[("Fewest word errors", "errors"),
+                                                 ("Most similar without word errors", "similar")],
+                                        value="errors", label="Keep which take",
+                                        info="Most similar: every take is rendered, ranked by how much it sounds like the voice "
+                                             "(its training clips, else the reference clip) and Whisper checks the most similar "
+                                             "ones in order; the first without a word error wins. 10 takes and 5 checks scored "
+                                             "best with a cloned OmniVoice voice.")
+                take_checks = gr.Slider(1, 8, value=5, step=1, label="Whisper checks (most similar first)",
+                                        info="With Most similar: at most this many takes are transcribed; if all have word "
+                                             "errors, the fewest errors win (ties go to the more similar take).")
             for key, component, kind, minimum, maximum in (
                 ("generation.do_sample", do_sample, "bool", None, None),
                 ("generation.temperature", temperature, "float", 0.1, 2),
@@ -3340,9 +3357,11 @@ def build_generation_tab(
                 ("generation.seed", seed, "int", -1, 4294967295),
                 ("generation.num_candidates", candidates, "int", 1, 8),
                 ("generation.pick_best_candidate", pick_best, "bool", None, None),
-                ("generation.section_takes", section_takes, "int", 1, 8),
+                ("generation.section_takes", section_takes, "int", 1, 16),
+                ("generation.section_take_checks", take_checks, "int", 1, 8),
             ):
                 _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
+            _register(registry, "generation.section_take_rule", take_rule, kind="choice", choices=["errors", "similar"])
 
         with gr.Accordion("Diffusion / CFM", open=False) as diffusion_panel:
             tab.index_panels.append(diffusion_panel)
