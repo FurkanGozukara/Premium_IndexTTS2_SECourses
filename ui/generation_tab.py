@@ -3049,6 +3049,8 @@ def build_generation_tab(
                     type="array",
                     interactive=False,
                     wrap=True,
+                    # Fixed shares keep Details on screen; long section text wraps inside its column.
+                    column_widths=["7%", "17%", "50%", "26%"],
                     max_height=300,
                     label="Live section preview",
                     buttons=["fullscreen"],
@@ -3080,6 +3082,7 @@ def build_generation_tab(
                         type="array",
                         interactive=False,
                         wrap=True,
+                        column_widths=["16%", "26%", "12%", "22%", "12%", "12%"],
                         max_height=220,
                         label="Words without a known reading",
                         buttons=["fullscreen"],
