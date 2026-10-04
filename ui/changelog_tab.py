@@ -7,6 +7,26 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v8.1",
+        "2026-10-04",
+        """
+### Fresh installs, ready-to-use voices after training, and smoother everyday use
+
+- **Fresh installations generate again:** OmniVoice's own package points the installer at a CUDA 12.8 build of torchaudio, which cannot load beside the CUDA 13 PyTorch, so no speech model could generate on a new Windows installation (on Linux the installer could even pick PyTorch 2.11). The installers now keep torch, torchvision and torchaudio on the same CUDA 13 build, and an existing installation repairs itself the next time Windows_Install_or_Update.bat runs.
+- **The preset after training is ready to use:** an IndexTTS voice's preset now carries its calibrated speaking rate and the decoding its sweep adopted; before, it spoke at rate 1.0 with the tier's decoding (about 20 % faster than the speaker it was trained on). A preset a training saves appears in the Universal preset list without reloading the page.
+- **IndexTTS training caches the features itself:** Start training on a dataset without a feature cache caches it first, as OmniVoice and AuK already did; **Cache features now** still runs it ahead of time.
+- **Voice and transcript audit fixed:** it stopped at its first transcript rejection with an error; an audit that failed or was stopped no longer blocks its dataset name.
+- **Your speech model stays selected:** after a page reload or a restart on a GPU VRAM preset, the app opens on the model you used last instead of OmniVoice.
+- **Training on smaller cards:** a GPU VRAM preset too small for full fine-tuning (AuK below 32 GB, IndexTTS and OmniVoice below 16 GB) switches the method to DoRA with that tier's settings; the dashboard shows the reference audition and the preset step with their own progress.
+- **Take quality:** Voice design and Auto voice no longer rank takes by likeness to the unused reference clip; they keep the fewest word errors, and trained voices compare their own clips.
+- **Pronunciation check:** hyphenated compounds of known words (fine-tune, text-to-speech) are no longer listed, and words with digits are read part by part (ExLlamaV3: "ex llama V 3" instead of eight spelled letters).
+- **Cleaner logs:** live logs and worker logs show each progress bar once, in its last state.
+- **Smaller fixes:** the cancel confirmation opens only while a generation runs and closes when it ends; the live section preview keeps its Details column on screen; Batch Generation says when a target duration fits every item to the same length; Windows paths in status messages keep their backslashes; full fine-tunes are labeled as such; AuK's run summary reports its own synthesis time; the dtype control is labeled Model dtype.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v8.0",
         "2026-10-04",
         """

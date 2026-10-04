@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 8.0 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 8.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -12,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V8.1 Fresh installs, ready-to-use voices and smoother use:** new installations generate again (the installers keep torch, torchvision and torchaudio on one CUDA 13 build; existing installations repair themselves on the next update), an IndexTTS voice's preset after training carries its calibrated speaking rate and decoding, IndexTTS training caches its features by itself, the voice and transcript audit no longer stops at its first transcript rejection, the chosen speech model stays selected after a reload, and a smaller training tier switches full fine-tuning to DoRA. Logs show each progress bar once.
 
 **V8.0 Take quality and ready-to-use voices:** a **Take quality** section under the live log renders several takes per section and keeps the one that sounds most like the voice without a word error (all three models, zero-shot cloning included), and the GPU presets switch it on per model: on 60 lines of zero-shot cloning, word errors fell from 0.65 to 0.20 % with OmniVoice and from 0.91 to 0.35 % with IndexTTS. Every training now ends with a ready-to-use preset for the new voice, a new installation opens on OmniVoice, and OmniVoice never renders more than 30 seconds in one pass.
 
@@ -757,7 +759,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v8.0 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v8.1 through v4.0 release notes, including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
