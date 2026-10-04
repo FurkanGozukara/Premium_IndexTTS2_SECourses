@@ -21,7 +21,7 @@ CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
 - **Take quality:** Voice design and Auto voice no longer rank takes by likeness to the unused reference clip; they keep the fewest word errors, and trained voices compare their own clips.
 - **Pronunciation check:** hyphenated compounds of known words (fine-tune, text-to-speech) are no longer listed, and words with digits are read part by part (ExLlamaV3: "ex llama V 3" instead of eight spelled letters).
 - **Cleaner logs:** live logs and worker logs show each progress bar once, in its last state.
-- **Smaller fixes:** the cancel confirmation opens only while a generation runs and closes when it ends; the live section preview keeps its Details column on screen; Batch Generation says when a target duration fits every item to the same length; Windows paths in status messages keep their backslashes; full fine-tunes are labeled as such; AuK's run summary reports its own synthesis time; the dtype control is labeled Model dtype.
+- **Smaller fixes:** the cancel confirmation opens only while a generation runs and closes when it ends; the live section preview keeps its Details column on screen; Batch Generation says when a target duration fits every item to the same length; Windows paths in status messages keep their backslashes; full fine-tunes are labeled as such; AuK's run summary reports its own synthesis time; the dtype control is labeled Model dtype; the segment duration chart of Dataset Preparation draws its bars again; every table keeps all of its columns in view and its headers on whole words; a training run started a moment ago appears in the lists and the live dashboard at once.
 
 Restart after updating.
 """.strip(),
