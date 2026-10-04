@@ -54,6 +54,7 @@ from indextts.runtime import (
 from indextts.runtime.vram_presets import VRAM_TIERS
 from indextts.utils import model_downloads
 from indextts.utils.atomic_json import read_json_retry
+from indextts.utils.progress_lines import collapse_progress_lines
 from indextts.version import APP_VERSION
 
 from .dataset import LengthBucketBatchSampler, LoraTrainDataset, collate
@@ -806,7 +807,7 @@ class LoraTrainer:
         def pump() -> None:
             if process.stdout is None:
                 return
-            for line in iter(process.stdout.readline, ""):
+            for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                 if line:
                     self.log(line.rstrip())
 
@@ -887,7 +888,7 @@ class LoraTrainer:
                                    start_new_session=os.name != "nt")
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="speech-evaluation-log")
         thread.start()
@@ -974,7 +975,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="decoder-adaptation-log")
         thread.start()
@@ -1163,7 +1164,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="decoder-test-log")
         thread.start()
@@ -1229,7 +1230,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="decoding-sweep-log")
         thread.start()
@@ -1307,7 +1308,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="reference-audition-log")
         thread.start()
@@ -1377,7 +1378,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="voice-preset-log")
         thread.start()
@@ -1445,7 +1446,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="final-test-log")
         thread.start()
@@ -1530,7 +1531,7 @@ class LoraTrainer:
 
         def pump() -> None:
             if process.stdout is not None:
-                for line in iter(process.stdout.readline, ""):
+                for line in collapse_progress_lines(iter(process.stdout.readline, "")):
                     self.log(line.rstrip())
         thread = threading.Thread(target=pump, daemon=True, name="epoch-probe-log")
         thread.start()

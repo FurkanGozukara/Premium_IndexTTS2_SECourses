@@ -30,6 +30,7 @@ from gradio.context import get_blocks_context, get_render_context, set_render_co
 from indextts.runtime.progress import format_duration, format_rate, read_progress_file
 from indextts.utils.atomic_json import read_json_retry
 from indextts.utils.atomic_json import write_json_atomic as _write_json_atomic
+from indextts.utils.progress_lines import collapse_progress_lines
 from indextts.runtime.vram_presets import RuntimeConfig
 from indextts.version import APP_VERSION
 
@@ -1108,7 +1109,7 @@ class ProcessManager:
             with job.log_path.open("a", encoding="utf-8", newline="\n") as handle:
                 stream = job.process.stdout
                 if stream is not None:
-                    for line in iter(stream.readline, ""):
+                    for line in collapse_progress_lines(iter(stream.readline, "")):
                         if not line:
                             break
                         print(line.rstrip(), flush=True)
