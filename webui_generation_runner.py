@@ -1174,8 +1174,10 @@ def run_generation_request(
             f">> seed={primary_stats['seed']} | segments={primary_stats['segments_count']} | "
             f"audio={primary_stats['audio_seconds']:.3f}s | RTF={primary_stats['rtf']:.4f}"
         )
-        if primary_stats.get("model") == "omnivoice":
-            print(f">> OmniVoice synthesis={primary_stats.get('generation_time_s', 0):.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB")
+        if primary_stats.get("model") in {"omnivoice", "auk"}:
+            # The GPT / s2mel / vocoder split is IndexTTS's; the other models report one synthesis time.
+            name = {"omnivoice": "OmniVoice", "auk": "AuK"}[primary_stats["model"]]
+            print(f">> {name} synthesis={primary_stats.get('generation_time_s', 0):.3f}s | peak VRAM={primary_stats['peak_vram_gb']:.3f} GB")
         else:
             print(
                 f">> GPT={primary_stats['gpt_time']:.3f}s | s2mel={primary_stats['s2mel_time']:.3f}s | "

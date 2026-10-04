@@ -591,6 +591,9 @@ class AukEngine:
         cuda = str(self.device).startswith("cuda")
         if cuda:
             torch.cuda.reset_peak_memory_stats(self.device)
+        if self.progress_reporter is not None:
+            # AuK's progress counts flow-matching steps of every section batch, not sections.
+            self.progress_reporter.label = "flow steps"
         settings = {**GENERATION_DEFAULTS, **(auk or {})}
         if "guidance_scale" not in (auk or {}):
             settings["guidance_scale"] = preset_guidance(settings["mode"])  # a request without its own guidance
