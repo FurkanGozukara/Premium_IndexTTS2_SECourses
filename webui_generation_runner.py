@@ -513,9 +513,13 @@ def _attach_take_judge(request: Dict[str, Any], tts: Any, section_takes: int, te
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
     voice = str(request.get("lora_path") or "") or None
+    # Voice design and Auto voice never hear the reference clip, so likeness to it would steer the takes toward an
+    # unrelated speaker: they compare a trained voice's clips, or keep the fewest word errors without one.
+    mode = str((request.get("auk") or {}).get("mode") or (request.get("omnivoice") or {}).get("mode") or "clone")
+    reference = (str(request.get("prompt") or "") or None) if mode == "clone" else None
     model_dir = str(getattr(tts, "model_dir", "") or (request.get("runtime") or {}).get("model_dir") or "models")
     judge = SectionTakeJudge(language, text, device=device, rule=rule, checks=checks, voice=voice,
-                             reference=str(request.get("prompt") or "") or None, model_dir=model_dir)
+                             reference=reference, model_dir=model_dir)
     tts.section_takes, tts.take_judge = section_takes, judge
     if judge.rule == "similar":
         print(f">> Takes per section: {section_takes} renders, Whisper checks up to {checks} of the most similar "
