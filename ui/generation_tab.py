@@ -3055,9 +3055,10 @@ def build_generation_tab(
                 )
                 with gr.Accordion("🔤 Pronunciation check & dictionary", open=False) as pronunciation_panel:
                     gr.Markdown(
-                        "Both engines read `<word|PHONES>` annotations: ARPAbet phones with stress digits and dots between "
+                        "IndexTTS and OmniVoice read `<word|PHONES>` annotations: ARPAbet phones with stress digits and dots between "
                         "syllables, for example `<Qwen|K W EH1 N>`. IndexTTS reads them natively; for OmniVoice they become its "
-                        "CMU phone syntax (`[K W EH1 N]`), and Chinese pinyin readings (`<行|XING2>`) its tone markers. **Check unknown words** lists the words in the text that the "
+                        "CMU phone syntax (`[K W EH1 N]`), and Chinese pinyin readings (`<行|XING2>`) its tone markers. AuK speaks "
+                        "the written word of a phone reading; respellings apply to every model. **Check unknown words** lists the words in the text that the "
                         "selected voice never spoke in training and the base model has no dictionary reading for, with a proposed "
                         "reading. **Add suggestions and save** stores the ones listed; edits in the dictionary table are saved as you "
                         "make them. Entries with scope `unseen` never override a word the voice learned from its recordings; `always` "
@@ -3467,7 +3468,7 @@ def build_generation_tab(
             with gr.Row():
                 stamps = gr.Checkbox(value=False, label="Word timestamps and subtitles",
                                      info="Saves <name>.srt, <name>.vtt and <name>.words.json beside the audio: Whisper's word timings "
-                                          "aligned to your text, for both speech models. Neither model reports timings itself; this adds "
+                                          "aligned to your text, for every speech model. No model reports timings itself; this adds "
                                           "a few seconds per minute of speech.")
             with gr.Row():
                 tuning = gr.Dropdown(choices=["bypass", "voice_clarity", "clear_narration", "deharsh", "warm", "normalize"], value="bypass", label="Audio tuning preset", info="Bypass preserves model audio exactly; other presets use FFmpeg post-processing.")
