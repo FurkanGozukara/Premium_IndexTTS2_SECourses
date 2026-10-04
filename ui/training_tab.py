@@ -1995,6 +1995,8 @@ def build_training_tab(
                 headers=["Name", "Type", "Rank", "Alpha", "Steps", "Dataset", "Date", "Size MB", "Path"],
                 datatype=["str", "str", "number", "number", "number", "str", "str", "number", "str"],
                 value=manager_rows, type="array", interactive=False, wrap=True,
+                # Without widths the paths pushed past the table edge and broke "Alpha" and "Steps".
+                column_widths=["16%", "6%", "6%", "6%", "6%", "13%", "16%", "7%", "24%"],
                 label="LoRA / DoRA files", max_height=380, buttons=["fullscreen", "copy"], elem_classes=["manager-table"],
             )
             manager_details = gr.Markdown("Select a LoRA / DoRA row for details.")

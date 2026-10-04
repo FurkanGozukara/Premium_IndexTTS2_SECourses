@@ -3204,6 +3204,7 @@ def build_generation_tab(
             from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
 
             audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
+                                          column_widths=["5%", "14%", "7%", "30%", "6%", "8%", "8%", "7%", "7%", "8%"],
                                           max_height=320, label="Audition results")
             audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
         gr.Markdown("### Voice LoRA / DoRA")
@@ -3542,6 +3543,8 @@ def build_generation_tab(
             headers=["Task", "Created", "Status", "Audio", "Folder"],
             datatype=["str", "str", "str", "str", "str"],
             value=[], type="array", interactive=False, wrap=True,
+            # Without widths the audio paths pushed the Folder column past the table edge.
+            column_widths=["7%", "20%", "10%", "33%", "30%"],
             label="Recent outputs (last 10)", max_height=300, buttons=["fullscreen"],
         )
         recent_audio = gr.State("")
