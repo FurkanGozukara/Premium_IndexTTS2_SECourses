@@ -286,6 +286,9 @@ def run_curation(args: argparse.Namespace) -> None:
                 # Only transcript checks failed: a stronger recognizer decides
                 # whether the recording says what the transcript says.
                 if second_pipe is None:
+                    # Imported here too: with the built-in Whisper as the first recognizer the import above
+                    # never runs, and the name would be an unbound local of this function.
+                    from transformers import pipeline
                     second_device = _second_opinion_device(args)
                     print(f">> second-opinion Whisper {second_opinion_model} on {second_device}", flush=True)
                     second_pipe = pipeline("automatic-speech-recognition", model=str(_ensure_model(second_opinion_model)),

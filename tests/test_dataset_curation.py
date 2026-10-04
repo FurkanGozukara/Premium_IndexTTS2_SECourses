@@ -168,3 +168,50 @@ def test_second_opinion_recognizer_rescues_transcript_rejections_only(tmp_path, 
     assert loaded == ["primary-model", "second-model"]  # the stronger model loads only when a clip needs it
     summary = json.loads((args.output / "quality_summary.json").read_text())
     assert summary["second_opinion_checks"] == 2 and summary["clips_recovered_by_second_opinion"] == 1
+
+
+def test_second_opinion_runs_after_the_builtin_whisper(tmp_path, monkeypatch):
+    """With the built-in Whisper first, the transformers import of the second opinion still happens (it was an
+    unbound local: the audit failed at the first transcript rejection)."""
+    from types import SimpleNamespace
+    from tools import curate_voice_dataset as curate
+    import transformers.pipelines  # noqa: F401
+    import transformers
+    import indextts.asr
+    from indextts.asr.recognizer import BUILTIN_MODEL
+    source = tmp_path / "prepared"
+    source.mkdir()
+    sr = 24000
+    waveform = np.sin(2 * np.pi * 220 * np.arange(sr * 2) / sr).astype(np.float32) * .1
+    waveform[:sr // 10] = waveform[-sr // 10:] = 0
+    reference = tmp_path / "reference.wav"
+    sf.write(reference, waveform, sr)
+    texts = ["Install SwarmUI on RunPod with the update file today.", "This separate validation sentence has a complete ending."]
+    rows = []
+    for index, (text, topic) in enumerate(zip(texts, ["train", "validation"])):
+        sf.write(source / f"clip_{index}.wav", waveform, sr)
+        rows.append({"id": str(index), "audio": f"clip_{index}.wav", "text": text, "duration_s": 2.0, "source_media": topic + ".flac",
+                     "source_start_s": 0, "source_end_s": 2, "speaker": "Speaker", "language": "EN"})
+    write_manifest(source / "manifest.jsonl", rows)
+
+    class Verifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def score(self, path):
+            return {"speaker_similarity": .95, "speaker_window_min": .9, "speaker_window_mean": .93, "speaker_windows": [.9, .96], "duration_s": 2}
+
+    primary = iter(["install swarm ui on rumpod with the update file to they", texts[1]])
+    monkeypatch.setattr(indextts.asr, "recognize", lambda *a, **k: SimpleNamespace(text=next(primary)))
+    monkeypatch.setattr(transformers, "pipeline", lambda *a, **k: (lambda *x, **y: {"text": texts[0]}))
+    monkeypatch.setattr(curate, "SpeakerVerifier", Verifier)
+    monkeypatch.setattr(curate, "_ensure_model", lambda model: model)
+    monkeypatch.setattr(curate, "_load_audio_16k", lambda path: (torch.zeros(1, 32000), 2.0))
+    args = Namespace(dataset=source, output=tmp_path / "curated", reference=[str(reference)], validation_source=["validation"],
+                     test_source=[], max_wer=.15, min_speaker_similarity=.7, min_window_similarity=.6, device="cpu",
+                     model_dir=tmp_path, whisper=BUILTIN_MODEL, no_asr_recheck=False, transcribe_all=True,
+                     check_boundary_words=True, min_edge_silence_ms=30, state_dir=tmp_path / "state", second_opinion_whisper="second-model")
+    curate.run_curation(args)
+    audit = load_manifest(args.output / "quality_audit.jsonl")
+    assert audit[0]["asr_model"] == "second_opinion" and audit[0]["reasons"] == []
+    assert [row["id"] for row in load_manifest(args.output)] == ["0", "1"]
