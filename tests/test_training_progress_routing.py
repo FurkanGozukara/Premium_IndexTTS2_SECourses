@@ -166,3 +166,16 @@ def test_post_training_transition_does_not_show_an_old_gate_or_optimizer(dashboa
     payload, title, updates = _poll(dashboard)
     assert payload == {"fraction": 0.0, "completed": 0, "total": None, "desc": "preparing next check"}
     assert title == "Automatic quality checks in progress" and "finished gate" not in updates[0]
+
+
+@pytest.mark.parametrize("phase,job,title", [
+    ("auditioning_references", "reference_audition_job", "Auditioning reference clips"),
+    ("building_voice_preset", "voice_preset_job", "Building the voice's ready-to-use preset"),
+])
+def test_audition_and_preset_phases_show_their_own_jobs(dashboard, phase, job, title):
+    _status(dashboard, phase=phase, gate=None, message="reference audition: Measuring 39 screening takes")
+    _write(dashboard.root / "analysis" / job / "progress.json", {"fraction": 0.5, "completed": 20, "total": 40, "desc": "voice / ref 4"})
+    payload, actual_title, updates = _poll(dashboard)
+    assert actual_title == title and (payload["completed"], payload["total"]) == (20, 40)
+    assert payload["desc"] == "reference audition: Measuring 39 screening takes"
+

@@ -850,6 +850,11 @@ def _dashboard_fragments(root: Path) -> dict[str, Any]:
         # Feature caching before the first update (every speech model) reports through the run's progress file.
         payload = read_json(root / "progress.json", {}) or {"fraction": 0.0, "completed": 0, "total": None}
         payload["desc"] = str(status.get("message") or payload.get("desc") or "caching training features")
+    if phase in {"auditioning_references", "building_voice_preset"}:
+        # The reference audition and the preset after training run as child jobs with their own progress files.
+        job = "reference_audition_job" if phase == "auditioning_references" else "voice_preset_job"
+        payload = read_json(root / "analysis" / job / "progress.json", {}) or {"fraction": 0.0, "completed": 0, "total": None}
+        payload["desc"] = str(status.get("message") or payload.get("desc") or phase.replace("_", " "))
     if phase == "evaluating":
         evaluation_progress = read_json(root / "analysis" / "eval_job" / "progress.json", {}) or {}
         payload = dict(evaluation_progress) or {"fraction": 0.0, "completed": 0, "total": None}
@@ -885,6 +890,9 @@ def _dashboard_fragments(root: Path) -> dict[str, Any]:
         }
     titles = {
         "caching": "Caching training features",
+        "validating": "Validating on held-out clips",
+        "auditioning_references": "Auditioning reference clips",
+        "building_voice_preset": "Building the voice's ready-to-use preset",
         "post_training": "Automatic quality checks in progress",
         "evaluating": "Evaluating checkpoints",
         "evaluating_speech": "Comparing generated speech",
