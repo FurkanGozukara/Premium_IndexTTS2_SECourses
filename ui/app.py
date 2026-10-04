@@ -508,6 +508,13 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             return ui_load(*load_values(requested, current_model=current_model))
 
         # A dropdown pick uses select: Gradio 6.29 also dispatches input when the list loses focus.
+        def current_preset_choices():
+            # Presets written outside this page (the preset after training, another tab) appear when the list opens.
+            return gr.update(choices=store.list_presets())
+
+        preset_dropdown.focus(current_preset_choices, None, preset_dropdown, queue=False, show_progress="hidden",
+                              api_name=False)
+
         for trigger in (load_button.click, preset_dropdown.select):
             preset_ui_event(trigger(load_selected, [preset_dropdown, registry["app.model"].component], ui_outputs,
                                     queue=False, show_progress="hidden", api_name=False))
