@@ -975,10 +975,10 @@ def open_folder(path: str | os.PathLike[str]) -> str:
             subprocess.Popen(["open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        message = f"Opened {folder}"
+        message = f"Opened `{folder}`"
     except Exception as exc:
-        message = f"Could not open {folder}: {exc}"
-    print(message, flush=True)
+        message = f"Could not open `{folder}`: {exc}"
+    print(message.replace("`", ""), flush=True)
     return message
 
 

@@ -489,10 +489,10 @@ def calibrate_grid_speaking_rates(
         )
     message = (
         f"Saved speaking rate {selected_report.recommended_speaking_rate:.3f} from "
-        f"{selected_label} to {saved_path} using "
+        f"{selected_label} to `{saved_path}` using "
         f"{speaking_rate_method_label(selected_report.method)}."
     )
-    print(">> " + message, flush=True)
+    print(">> " + message.replace("`", ""), flush=True)
     return "\n".join(lines), message
 
 

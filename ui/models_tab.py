@@ -559,9 +559,9 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
                 detail = " Models remain lazy and are not loaded by Apply."
             message = (
                 f"Applied {cfg.device} | {cfg.model_variant}/{cfg.gpt_dtype} | tier {cfg.vram_tier}."
-                f" Saved to {saved_path}.{detail}"
+                f" Saved to `{saved_path}`.{detail}"
             )
-            print(">> " + message, flush=True)
+            print(">> " + message.replace("`", ""), flush=True)
             return message, _estimate_html(cfg, _gpu_total(cfg.device), options.get("tts_model", "indextts"))
         except Exception as exc:
             traceback.print_exc()
@@ -611,7 +611,7 @@ def build_models_tab(args: Any, registry: PresetRegistry) -> ModelsTab:
             else:
                 path = ensure_int8_gpt(model_dir, callback)
             info = describe_checkpoint(path)
-            message = f"INT8 GPT ready: {path} ({info.get('quantized_layers', 0)} quantized layers) in {time.perf_counter() - started:.1f}s."
+            message = f"INT8 GPT ready: `{path}` ({info.get('quantized_layers', 0)} quantized layers) in {time.perf_counter() - started:.1f}s."
             print(">> " + message, flush=True)
             return message, _model_status_rows(model_dir, model_id)
         except Exception as exc:
