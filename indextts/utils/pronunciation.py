@@ -381,17 +381,27 @@ def suggest_pronunciation(word: str) -> Suggestion | None:
     if any(char.isdigit() for char in clean):
         # Letters are spelled out, digits (and version numbers such as 2.2) are left for the
         # engine's number normalizer, which reads them as "sixteen" or "two point two".
+        # A camel-case run is read part by part (ExLlamaV3: "ex llama V 3", not eight spelled letters);
+        # only acronyms and short pieces are spelled, and a long unknown part stays as written.
         pieces = _LETTER_DIGIT_RE.findall(clean)
         spoken: list[str] = []
+        guessed = False
         for piece in pieces:
             if piece[0].isdigit():
                 spoken.append(piece)
-            elif lookup_word(piece):
-                spoken.append(piece.lower())
-            else:
-                spoken.append(" ".join(piece.upper()))
+                continue
+            for part in (_CAMEL_RE.findall(piece) if not lookup_word(piece) else []) or [piece]:
+                if part.isupper() and (len(part) == 1 or not lookup_word(part)):
+                    spoken.append(" ".join(part))
+                elif lookup_word(part):
+                    spoken.append(part.lower())
+                elif len(part) <= 3:
+                    spoken.append(" ".join(part.upper()))
+                else:
+                    spoken.append(part)
+                    guessed = True
         reading = " ".join(spoken)
-        return Suggestion(clean, reading, KIND_RESPELLING, "letters and numbers", "medium")
+        return Suggestion(clean, reading, KIND_RESPELLING, "letters and numbers", "low" if guessed else "medium")
     camel = _CAMEL_RE.findall(clean.replace("-", " ").replace("'", "")) if any(char.isupper() for char in clean[1:]) else [clean]
     pieces = [piece for piece in camel if piece] or [clean]
     phones: list[str] = []

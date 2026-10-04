@@ -1653,13 +1653,13 @@ def save_dictionary_rows(table_rows: Any) -> tuple[list[list[Any]], str]:
     except OSError as exc:
         return dictionary_rows(entries), f"The dictionary was not saved: {exc}"
     _DICTIONARY_CACHE.clear()
-    return dictionary_rows(entries), f"Saved {len(entries)} entrie(s) to `{path}`."
+    return dictionary_rows(entries), f"Saved {len(entries)} {'entry' if len(entries) == 1 else 'entries'} to `{path}`."
 
 
 def reload_dictionary_rows() -> tuple[list[list[Any]], str]:
     _DICTIONARY_CACHE.clear()
     entries = pronunciation_entries()
-    return dictionary_rows(entries), f"Loaded {len(entries)} entrie(s) from `{pronunciation_dictionary_path()}`."
+    return dictionary_rows(entries), f"Loaded {len(entries)} {'entry' if len(entries) == 1 else 'entries'} from `{pronunciation_dictionary_path()}`."
 
 
 def _lora_reference(path: str | None) -> str | None:

@@ -134,3 +134,13 @@ def test_hyphenated_compounds_of_known_words_need_no_reading():
     flagged = [row["word"] for row in check_text("We fine-tune a text-to-speech model, then test Mixtral-style chat.")]
     assert "fine-tune" not in flagged and "text-to-speech" not in flagged
     assert "Mixtral-style" in flagged  # one unknown part keeps the compound on the list
+
+
+def test_words_with_digits_read_camel_case_parts():
+    from indextts.utils.pronunciation import suggest_pronunciation
+
+    assert suggest_pronunciation("ExLlamaV3").pronunciation == "ex llama V 3"
+    assert suggest_pronunciation("RTX5090").pronunciation == "R T X 5090"
+    assert suggest_pronunciation("fp16").pronunciation == "F P 16"
+    unknown = suggest_pronunciation("Qwen3")  # an unknown long part stays as written, low confidence
+    assert (unknown.pronunciation, unknown.confidence) == ("Qwen 3", "low")
