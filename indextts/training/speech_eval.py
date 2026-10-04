@@ -635,7 +635,7 @@ def render_benchmark_rows(config: Any, plan: dict[str, Any], *, run_dir: Path, c
     for group in plan["groups"]:
         if hashlib.sha256(Path(group["reference"]).read_bytes()).hexdigest() != group["reference_sha256"]:
             raise ValueError("The frozen training reference has changed")
-        update(f"{message} for {group['speaker']} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]))
+        update(f"{message} for {group['speaker'] or 'the voice'} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]))
         grid_config = GridConfig(adapter_dir=str(run_dir), checkpoints=[GridCheckpoint(label, checkpoint)],
                                  references=[group["reference"]], texts=[p["text"] for p in group["prompts"]],
                                  language=group["language"], seeds=plan["seeds"], seed=plan["seeds"][0],
