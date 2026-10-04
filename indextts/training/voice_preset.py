@@ -267,7 +267,8 @@ def run_voice_preset(config_path: str | Path, checkpoint: str | Path, state_dir:
     report = {"created_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "preset": str(path), **generated,
               "pace": measured, "elapsed_s": round(time.perf_counter() - started, 1)}
     atomic_write_json(run_dir / "analysis" / REPORT_FILE, report)
-    rule = "most similar of" if takes[1] == "similar" else "fewest word errors of up to"
+    rule = (f"keeps the most similar of {takes[0]} without word errors" if takes[1] == "similar"
+            else f"renders up to {takes[0]} takes and keeps the first without word errors")
     if model not in CLONING_MODELS:
         speech = "the voice's calibrated speaking rate and decoding"
     elif ratio is None:
@@ -277,7 +278,7 @@ def run_voice_preset(config_path: str | Path, checkpoint: str | Path, state_dir:
                   f"{abs(ratio - 1) * 100:.0f} % {'longer' if ratio > 1 else 'shorter'} than the speaker's on "
                   f"{len(measured)} held-out sentences, "
                   + ("within 10 %)" if abs(ratio - 1) <= PACE_TOLERANCE else "corrected)"))
-    status(f"saved preset {path.stem}: {speech}; Takes per section keeps the {rule} {takes[0]} without word errors",
+    status(f"saved preset {path.stem}: {speech}; Takes per section {rule}",
            phase="complete", preset=str(path), speaking_rate=rate)
     return report
 
