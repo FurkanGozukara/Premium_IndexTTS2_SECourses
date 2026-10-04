@@ -3085,7 +3085,9 @@ def build_generation_tab(
                         type="array",
                         interactive=False,
                         wrap=True,
-                        column_widths=["16%", "26%", "12%", "22%", "12%", "12%"],
+                        # Wide enough for every header word and kind on one line in the middle column
+                        # (720 px at a 1600 px window); narrower cells broke words such as "Confidence".
+                        column_widths=["15%", "24%", "14%", "18%", "15%", "14%"],
                         max_height=220,
                         label="Words without a known reading",
                         buttons=["fullscreen"],
@@ -3099,6 +3101,8 @@ def build_generation_tab(
                         type="array",
                         interactive=True,
                         wrap=True,
+                        # Without widths the readings pushed the Source column out of view.
+                        column_widths=["18%", "34%", "15%", "16%", "17%"],
                         max_height=280,
                         label="Pronunciation dictionary (pronunciations/dictionary.json)",
                         buttons=["fullscreen"],
