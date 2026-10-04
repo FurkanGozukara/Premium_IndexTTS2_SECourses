@@ -182,7 +182,9 @@ def test_build_app_constructs_all_tabs_without_loading_models(tmp_path):
         assert registry_defaults[key] == config_defaults[field_name]
         for preset_path in demo.preset_store.system_dir.glob("*.json"):
             preset_values = json.loads(preset_path.read_text(encoding="utf-8"))["values"]
-            assert preset_values[key] == config_defaults[field_name]
+            # Tier presets open on OmniVoice; IndexTTS's values are its saved profile.
+            indextts = preset_values["app.profiles"]["indextts"]
+            assert indextts.get(key, preset_values[key]) == config_defaults[field_name]
     assert registry_defaults["generation.speaking_rate"] == 1.0
     assert registry_defaults["generation.auto_lora_speaking_rate"] is True
     assert registry_defaults["grid.speaking_rate"] == 1.0

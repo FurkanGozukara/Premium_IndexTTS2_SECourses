@@ -684,6 +684,31 @@ class AukEngine:
                                             [reference] * len(instructions[start:start + batch_size])) for start in starts])
             prefetched = dict(zip(starts, encoded))
         devices = [torch.device(self.device).index or 0] if cuda else []
+        # Takes per section, as in the other speech models: fewest word errors, or the most similar take of all
+        # renders without word errors (the extra takes render in batches with their own seeds).
+        takes = max(1, int(getattr(self, "section_takes", 1) or 1))
+        judge = getattr(self, "take_judge", None) if takes > 1 else None
+        retakes = [0]
+
+        def finish(audio):
+            if settings.get("match_loudness") and reference is not None and reference.rms > 1e-4:
+                audio = audio * min(4.0, reference.rms / max(1e-4, _rms(audio)))
+            return trim_segment_silence(_limit_peak(audio), self.sampling_rate, trim_silence_ms_threshold)
+
+        def render_more(index, count):
+            more = []
+            for begin in range(0, count, batch_size):
+                size = min(batch_size, count - begin)
+                more_seeds = [(base_seed + 7919 * index + 104729 * (retakes[0] + offset + 1)) % (2**31 - 1)
+                              for offset in range(size)]
+                retakes[0] += size
+                more.extend(finish(audio) for audio in self.generate_batch(
+                    [instructions[index]] * size, [reference] * size, [natural[index]] * size, settings, more_seeds))
+            return more
+
+        def samples(audio):
+            return audio.detach().float().cpu().numpy().reshape(-1)
+
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(base_seed)
             for start in range(0, len(speech), batch_size):
@@ -702,12 +727,28 @@ class AukEngine:
                 audios = self.generate_batch(instructions[start:stop], [reference] * (stop - start), natural[start:stop],
                                              settings, seeds, progress=on_step, conditioning=prefetched.get(start))
                 for offset, audio in enumerate(audios):
-                    if settings.get("match_loudness") and reference is not None and reference.rms > 1e-4:
-                        audio = audio * min(4.0, reference.rms / max(1e-4, _rms(audio)))
-                    audio = _limit_peak(audio)
-                    rendered[start + offset] = trim_segment_silence(audio, self.sampling_rate, trim_silence_ms_threshold)
-                    durations.append(rendered[start + offset].shape[-1] / self.sampling_rate)
-                    complete(owners[start + offset])
+                    index = start + offset
+                    take = finish(audio)
+                    if judge is not None and getattr(judge, "compares_voices", lambda: False)():
+                        from indextts.utils.take_selection import keep_most_similar_take
+
+                        take, outcome = keep_most_similar_take(
+                            take, lambda count, i=index: render_more(i, count),
+                            lambda candidate: judge.similarity(samples(candidate), self.sampling_rate),
+                            lambda candidate, i=index: judge.error_rate(speech[i], samples(candidate), self.sampling_rate),
+                            takes, judge.checks)
+                        judge.record_similar(index, outcome)
+                    elif judge is not None:
+                        from indextts.utils.take_selection import keep_best_take
+
+                        take, rates, kept = keep_best_take(
+                            take, lambda i=index: render_more(i, 1)[0],
+                            lambda candidate, i=index: judge.error_rate(speech[i], samples(candidate), self.sampling_rate),
+                            takes)
+                        judge.record(index, rates, kept)
+                    rendered[index] = take
+                    durations.append(rendered[index].shape[-1] / self.sampling_rate)
+                    complete(owners[index])
         self.last_generation_stats = {
             "segment_count": len(speech), "segments_count": len(speech),
             "total_duration_s": sum(len(result[1]) for result in results) / self.sampling_rate,

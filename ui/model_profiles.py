@@ -51,11 +51,17 @@ TRAINING_INDEX_ONLY = frozenset({
     "training.num_workers",
 })
 
+# A fresh install opens on OmniVoice (user decision, October 4, 2026). Presets saved before the speech-model
+# selector existed carry no model and stay IndexTTS presets (migrate_model_values).
+DEFAULT_MODEL = "omnivoice"
+
 # Shared generation controls with model-specific good values.
 GENERATION_PROFILED = frozenset({
     "generation.max_text_tokens_per_segment", "generation.auto_lora_max_tokens",
     "generation.auto_lora_reference", "generation.auto_lora_speaking_rate",
     "generation.speaking_rate", "generation.section_batch_size",
+    # Takes per section: each model has its own measured cost and benefit.
+    "generation.section_takes", "generation.section_take_rule", "generation.section_take_checks",
     # Both engines read dictionary readings; whether they help depends on the model.
     "generation.apply_pronunciation_dictionary",
 })
@@ -92,6 +98,8 @@ def migrate_model_values(values):
     Missing keys of any other kind take the registry defaults on coercion.
     """
     result = dict(values)
+    # Without a model the preset predates the selector: an IndexTTS preset, whatever the default model is now.
+    result.setdefault("app.model", "indextts")
     if "omnivoice.language" not in result:
         profiles = result.get("app.profiles") or {}
         source = result if result.get("app.model") == "omnivoice" else profiles.get("omnivoice") or {}
@@ -124,6 +132,9 @@ def capture_profile(values):
     profiles["_active"] = model
     result["app.model"], result["app.profiles"] = model, profiles
     return result
+
+
+from indextts.utils.take_selection import take_preset_values  # noqa: E402
 
 
 def model_defaults(registry, model, tier="auto"):
@@ -161,8 +172,10 @@ def model_defaults(registry, model, tier="auto"):
         })
         result.update({"training." + key: value for key, value in resolve_training_preset(cfg.vram_tier, method).items()})
         result["training.vram_tier"] = cfg.vram_tier
+        result.update(take_preset_values("omnivoice", cfg.vram_tier))
     elif model == "auk":
         result.update(auk_defaults(tier))
+        result.update(take_preset_values("auk", result.get("runtime.vram_tier", tier)))
     result["app.model"] = model
     return result
 

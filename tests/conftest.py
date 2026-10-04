@@ -31,3 +31,16 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip_gpu)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_presets(tmp_path_factory):
+    """Trainings in tests end with the preset step (indextts.training.voice_preset); it must not write user presets."""
+    folder = tmp_path_factory.mktemp("presets")
+    previous = os.environ.get("INDEXTTS_PRESETS_DIR")
+    os.environ["INDEXTTS_PRESETS_DIR"] = str(folder)
+    yield folder
+    if previous is None:
+        os.environ.pop("INDEXTTS_PRESETS_DIR", None)
+    else:
+        os.environ["INDEXTTS_PRESETS_DIR"] = previous

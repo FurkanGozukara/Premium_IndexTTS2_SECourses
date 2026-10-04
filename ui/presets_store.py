@@ -475,8 +475,9 @@ class PresetStore:
         values = self.registry.defaults()
         values.update(tier_registry_overrides(tier))
         if "app.model" in self.registry:
-            from .model_profiles import capture_profile, model_defaults, profiled_keys
-            values = capture_profile(values)
+            from .model_profiles import DEFAULT_MODEL, capture_profile, model_defaults, profiled_keys, switch_profile
+            # The shared defaults and tier overrides are IndexTTS's profile; every other model gets its own.
+            values = capture_profile({**values, "app.model": "indextts", "app.profiles": {"_active": "indextts"}})
             for model in ("omnivoice", "auk"):
                 defaults = model_defaults(self.registry, model, tier)
                 values["app.profiles"][model] = {key: defaults[key] for key in profiled_keys(defaults)}
@@ -484,6 +485,8 @@ class PresetStore:
             for key in ("runtime.auk_text_encoder_variant", "runtime.auk_text_encoder_residency"):
                 if key in self.registry:
                     values[key] = defaults[key]
+            if DEFAULT_MODEL != "indextts":
+                values = switch_profile(self.registry, DEFAULT_MODEL, values)
         return self.registry.coerce(values)
 
     def retire_legacy_system_presets(self) -> list[str]:

@@ -135,7 +135,13 @@ def test_app_lists_the_tier_presets_first_and_builds_training_from_them(demo):
     assert listed[:7] == names[:7]
     assert store.default_preset_name() in {tiers.tier_preset_name(tier) for tier in VRAM_TIERS}
 
-    values = store.load("6 GB GPU")
+    # A fresh install opens on OmniVoice; the tier preset keeps IndexTTS's own profile for the switch.
+    from ui.model_profiles import switch_profile
+
+    fresh = store.load("6 GB GPU")
+    assert fresh["app.model"] == "omnivoice" and fresh["app.profiles"]["_active"] == "omnivoice"
+    assert fresh["generation.max_text_tokens_per_segment"] == 120
+    values = switch_profile(demo.preset_registry, "indextts", fresh)
     config = train_config_from_values(values)
     assert config.vram_tier == "6"
     assert config.blocks_to_swap == 22 and config.swap_ring_size == 1

@@ -67,7 +67,7 @@ from .models_tab import (
 from .gpu_tier_presets import tier_preset_name
 from .presets_store import PresetRegistry, PresetStore, SYSTEM_PREFIX
 from .model_controls import MODEL_CLASS_JS, bind_model_controls
-from .model_profiles import capture_profile, switch_profile
+from .model_profiles import DEFAULT_MODEL, capture_profile, switch_profile
 from indextts.backends import MODEL_CHOICES
 from .request_guard import configure_request_guard
 from .training_tab import LIVE_TRAINING_JS, bind_training_events, build_training_tab
@@ -337,16 +337,16 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
                 container=False,
             )
             registry.register("app.model", gr.Dropdown(
-                choices=MODEL_CHOICES, value="indextts", label="Speech model",
+                choices=MODEL_CHOICES, value=DEFAULT_MODEL, label="Speech model",
                 info="Separate saved settings.", min_width=200, scale=0,
                 elem_id="speech-model-selector",
-            ), "indextts", kind="choice", choices=[key for _, key in MODEL_CHOICES])
+            ), DEFAULT_MODEL, kind="choice", choices=[key for _, key in MODEL_CHOICES])
             # The model's panels follow a body class (ui/model_controls.py). Gradio runs
             # an event's listeners one after another, so this one is registered first.
             speech_model = registry["app.model"].component
             speech_model.change(None, speech_model, None, js=MODEL_CLASS_JS, queue=False, show_progress="hidden",
                                 api_name=False)
-            registry.register("app.profiles", gr.State({"_active": "indextts"}), {"_active": "indextts"}, kind="dict")
+            registry.register("app.profiles", gr.State({"_active": DEFAULT_MODEL}), {"_active": DEFAULT_MODEL}, kind="dict")
             with gr.Row(elem_classes=["header-actions"], scale=0):
                 last_values_button = gr.Button(
                     "🕘  Load last values",

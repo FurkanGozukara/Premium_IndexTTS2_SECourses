@@ -115,6 +115,10 @@ def tier_registry_overrides(tier: int | str | float) -> dict[str, Any]:
             "grid.max_text_tokens_per_segment": generation["max_text_tokens_per_segment"],
         }
     )
+    # IndexTTS's takes per section (the other models' come with their profiles, ui.model_profiles.model_defaults).
+    from indextts.utils.take_selection import take_preset_values
+
+    values.update(take_preset_values("indextts", resolved))
     # Training samples, the speech benchmark and the decoding sweep keep their
     # measured defaults (3 beams, 25 steps) on every tier, so comparisons between
     # runs and releases stay comparable.

@@ -238,9 +238,9 @@ class TrainConfig:
     reference_audition_candidates: int = 12
     reference_audition_sentences: int = 8
     reference_audition_timeout_s: float = 3600.0
-    # Then an OmniVoice voice gets a ready-to-use cloning preset (voice_preset): its likeness centroid, its cloned
-    # pace against the speaker's own recordings of held-out sentences, and Takes per section keeping the most
-    # similar of 10 renders without word errors.
+    # Then the voice gets a ready-to-use user preset (voice_preset, every speech model): its likeness centroid, the
+    # cloned pace against the speaker's own recordings of held-out sentences (OmniVoice, AuK) and the model's takes
+    # per section for trained voices.
     voice_preset_enabled: bool = True
     voice_preset_sentences: int = 16
     voice_preset_timeout_s: float = 3600.0

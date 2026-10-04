@@ -3126,6 +3126,71 @@ def build_generation_tab(
                     label="Live log (last 60 lines)", lines=10, max_lines=16,
                     interactive=False, buttons=["copy"], elem_classes=["log-tail"],
                 )
+                with gr.Accordion("🎯 Take quality: Whisper and voice similarity", open=True):
+                    gr.Markdown(
+                        "Three levels, all optional. **Takes per section** renders each section (about 12 seconds) again "
+                        "when Whisper hears a word error, or, with **Most similar**, renders every take and keeps the one "
+                        "that sounds most like the voice without a word error: the voice's training clips, or the "
+                        "reference clip for zero-shot cloning. **Whole-text candidates** render the entire text several "
+                        "times and can keep the version Whisper hears best. The **reference audition** chooses the clip a "
+                        "trained voice clones from. All three speech models.",
+                        elem_classes=["section-note"],
+                    )
+                    take_rule = gr.Dropdown(choices=[("Fewest word errors", "errors"),
+                                                     ("Most similar, no word errors", "similar")],
+                                            value="errors", label="Keep which take",
+                                            info="Fewest word errors re-renders only after a word error. Most similar renders "
+                                                 "every take, ranks them by likeness to the voice, and Whisper checks the most "
+                                                 "similar first; the first without a word error wins.")
+                    with gr.Row():
+                        section_takes = gr.Slider(1, 16, value=1, step=1, label="Takes per section",
+                                                  info="Renders of each section; 1 = off. The cost grows with the takes rendered.")
+                        take_checks = gr.Slider(1, 8, value=5, step=1, label="Whisper checks (with Most similar)",
+                                                info="At most this many of the most similar takes are transcribed; if all have word "
+                                                     "errors, the fewest errors win (ties go to the more similar take).")
+                    with gr.Row():
+                        candidates = gr.Slider(1, 8, value=1, step=1, label="Whole-text candidates",
+                                               info="Renders the entire text this many times with consecutive seeds; every version "
+                                                    "is saved. Each candidate repeats the takes per section.")
+                        pick_best = gr.Checkbox(value=False, label="Keep the candidate Whisper hears best",
+                                                info="With 2 or more candidates, Whisper transcribes every complete version and the "
+                                                     "one with the fewest word errors becomes the output.")
+                    for key, component, kind, minimum, maximum in (
+                        ("generation.section_takes", section_takes, "int", 1, 16),
+                        ("generation.section_take_checks", take_checks, "int", 1, 8),
+                        ("generation.num_candidates", candidates, "int", 1, 8),
+                        ("generation.pick_best_candidate", pick_best, "bool", None, None),
+                    ):
+                        _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
+                    _register(registry, "generation.section_take_rule", take_rule, kind="choice", choices=["errors", "similar"])
+                    with gr.Accordion("🎧 Reference audition (trained voices)", open=False):
+                        gr.Markdown(
+                            "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
+                            "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
+                            "held-out sentences of the voice's training data with each candidate clip, then the current reference and the "
+                            "three most speaker-like finalists render four more with the same seeds, and the clip whose takes sound most "
+                            "like the speaker's own recordings wins: speaker and style similarity decide, and Whisper word errors keep a "
+                            "clip that causes slips out. Training runs it automatically when it finishes (**Automatic reference "
+                            "audition** in Voice Training); this button runs it again with the current settings and the selected voice. "
+                            "It works for every speech model and never changes the voice's original reference file.",
+                            elem_classes=["section-note"],
+                        )
+                        with gr.Row():
+                            audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
+                                                            info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
+                            audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
+                                                           info="Held-out sentences rendered with every candidate; the current reference and 3 finalists render 4 more before the winner is chosen.")
+                            audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
+                                                       info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
+                                                            "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "
+                                                            "ticking again restores the winner.")
+                        audition_run = gr.Button("🎧  Audition references", elem_classes=btn("gold"))
+                        audition_status = gr.Markdown("", elem_classes=["section-note"])
+                        from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
+
+                        audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
+                                                      max_height=320, label="Audition results")
+                        audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
                 tab.final_summary = gr.HTML("")
                 tab.task_state = gr.State("")
                 tab.task_timer = gr.Timer(5.0, active=True)
@@ -3197,34 +3262,6 @@ def build_generation_tab(
             save_lora_rate = gr.Button("⏱️  Save speaking rate", elem_classes=btn("purple"), scale=1)
             pick_expressive = gr.Button("🎭  Pick expressive clip", elem_classes=btn("mint"), scale=1)
         tab.index_panels.append(pick_expressive)
-        with gr.Accordion("🎧 Reference audition: the clip this voice clones best from", open=False):
-            gr.Markdown(
-                "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
-                "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
-                "held-out sentences of the voice's training data with each candidate clip, then the current reference and the "
-                "three most speaker-like finalists render four more with the same seeds, and the clip whose takes sound most "
-                "like the speaker's own recordings wins: speaker and style similarity decide, and Whisper word errors keep a "
-                "clip that causes slips out. Training runs it automatically when it finishes (**Automatic reference "
-                "audition** in Voice Training); this button runs it again with the current settings and the selected voice. "
-                "It works for every speech model and never changes the voice's original reference file.",
-                elem_classes=["section-note"],
-            )
-            with gr.Row():
-                audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
-                                                info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
-                audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
-                                               info="Held-out sentences rendered with every candidate; the current reference and 3 finalists render 4 more before the winner is chosen.")
-                audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
-                                           info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
-                                                "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "
-                                                "ticking again restores the winner.")
-            audition_run = gr.Button("🎧  Audition references", elem_classes=btn("gold"))
-            audition_status = gr.Markdown("", elem_classes=["section-note"])
-            from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
-
-            audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
-                                          max_height=320, label="Audition results")
-            audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
         _register(registry, "generation.audition_candidates", audition_candidates, kind="int", minimum=2, maximum=12)
         _register(registry, "generation.audition_sentences", audition_sentences, kind="int", minimum=2, maximum=8)
         # Bound with the generation events, which own the packed request values (bind_generation_events).
@@ -3324,26 +3361,6 @@ def build_generation_tab(
                 max_mel = gr.Slider(50, 1815, value=1500, step=5, label="Max mel tokens", info="Upper limit on generated semantic tokens per section.")
             with gr.Row():
                 seed = gr.Number(value=-1, precision=0, label="Seed", info="-1 chooses a fresh random seed; reuse a shown seed for repeatability.")
-                candidates = gr.Slider(1, 8, value=1, step=1, label="Candidates", info="Generates consecutive seeded alternatives; each adds generation time.")
-                pick_best = gr.Checkbox(value=False, label="Keep the take Whisper hears best",
-                                        info="With 2 or more candidates, Whisper transcribes every take and the one with the fewest "
-                                             "word errors becomes the output (the others stay as candidates). Both speech models; "
-                                             "steadier pronunciation at the cost of the extra takes.")
-                section_takes = gr.Slider(1, 16, value=1, step=1, label="Takes per section (Whisper keeps the best)",
-                                          info="Renders each section up to this many times and keeps the take Whisper hears with the "
-                                               "fewest word errors; a take without errors ends the search. Whisper uses the speech "
-                                               "model's language (OmniVoice's Auto is read from the text). 1 = off. Both models.")
-            with gr.Row():
-                take_rule = gr.Dropdown(choices=[("Fewest word errors", "errors"),
-                                                 ("Most similar without word errors", "similar")],
-                                        value="errors", label="Keep which take",
-                                        info="Most similar: every take is rendered, ranked by how much it sounds like the voice "
-                                             "(its training clips, else the reference clip) and Whisper checks the most similar "
-                                             "ones in order; the first without a word error wins. 10 takes and 5 checks scored "
-                                             "best with a cloned OmniVoice voice.")
-                take_checks = gr.Slider(1, 8, value=5, step=1, label="Whisper checks (most similar first)",
-                                        info="With Most similar: at most this many takes are transcribed; if all have word "
-                                             "errors, the fewest errors win (ties go to the more similar take).")
             for key, component, kind, minimum, maximum in (
                 ("generation.do_sample", do_sample, "bool", None, None),
                 ("generation.temperature", temperature, "float", 0.1, 2),
@@ -3355,13 +3372,8 @@ def build_generation_tab(
                 ("generation.length_penalty", length, "float", -2, 10),
                 ("generation.max_mel_tokens", max_mel, "int", 50, 1815),
                 ("generation.seed", seed, "int", -1, 4294967295),
-                ("generation.num_candidates", candidates, "int", 1, 8),
-                ("generation.pick_best_candidate", pick_best, "bool", None, None),
-                ("generation.section_takes", section_takes, "int", 1, 16),
-                ("generation.section_take_checks", take_checks, "int", 1, 8),
             ):
                 _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
-            _register(registry, "generation.section_take_rule", take_rule, kind="choice", choices=["errors", "similar"])
 
         with gr.Accordion("Diffusion / CFM", open=False) as diffusion_panel:
             tab.index_panels.append(diffusion_panel)

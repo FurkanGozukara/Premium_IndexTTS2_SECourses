@@ -211,7 +211,9 @@ class _FakeProcess:
         (state / "status.json").write_text(json.dumps({"phase": "complete", "message": "saved preset V_Clone_Best_of_10",
                                                        "preset": "presets/user/V_Clone_Best_of_10.json"}),
                                            encoding="utf-8")
-        self.stdout = iter(())
+        import io
+
+        self.stdout = io.StringIO("")
 
     def poll(self):
         return 0
@@ -220,14 +222,14 @@ class _FakeProcess:
         return 0
 
 
-def _trainer_stub(tmp_path, model):
+def _trainer_stub(tmp_path, model, enabled=True):
     from indextts.training.trainer import LoraTrainer
 
     statuses, logs = [], []
     best = tmp_path / "best" / "v_best.safetensors"
     best.parent.mkdir(parents=True)
     best.write_bytes(b"x")
-    stub = SimpleNamespace(config=SimpleNamespace(tts_model=model, voice_preset_enabled=True, voice_preset_sentences=16,
+    stub = SimpleNamespace(config=SimpleNamespace(tts_model=model, voice_preset_enabled=enabled, voice_preset_sentences=16,
                                                   voice_preset_timeout_s=60.0, to_dict=lambda: {"name": "v"}),
                            stop_path=tmp_path / "stop.flag", best_path=best, adapter_dir=tmp_path,
                            write_status=lambda **values: statuses.append(values), log=logs.append)
@@ -236,7 +238,7 @@ def _trainer_stub(tmp_path, model):
     return run, statuses, logs
 
 
-def test_trainer_builds_the_cloning_preset_for_omnivoice_only(tmp_path, monkeypatch):
+def test_trainer_builds_the_preset_for_every_model_unless_switched_off(tmp_path, monkeypatch):
     import indextts.training.trainer as trainer
 
     started = []
@@ -249,7 +251,68 @@ def test_trainer_builds_the_cloning_preset_for_omnivoice_only(tmp_path, monkeypa
     assert final["voice_preset_status"] == "complete" and final["voice_preset"].endswith("V_Clone_Best_of_10.json")
     assert statuses[-1]["phase"] == "done"
 
+    for model in ("indextts", "auk"):
+        started.clear()
+        run, statuses, _ = _trainer_stub(tmp_path / model, model)
+        run()
+        assert started and [item for item in statuses if item.get("voice_preset_status")][-1]["voice_preset_status"] == "complete"
     started.clear()
-    run, statuses, logs = _trainer_stub(tmp_path / "index", "indextts")
+    run, statuses, _ = _trainer_stub(tmp_path / "off", "auk", enabled=False)
     run()
-    assert not started and statuses[-1] == {"voice_preset_status": "skipped", "voice_preset_message": "OmniVoice voices only"}
+    assert not started and statuses[-1] == {"voice_preset_status": "skipped", "voice_preset_message": "disabled"}
+
+
+def test_auk_and_indextts_presets_after_training():
+    from indextts.training.voice_preset import MODELS, compose_preset, preset_name, trained_takes
+
+    base = {"app.model": "omnivoice", "generation.speaking_rate": 1.0, "auk.mode": "auto",
+            "app.profiles": {"_active": "omnivoice", "omnivoice": {"generation.speaking_rate": 1.0},
+                             "auk": {"generation.speaking_rate": 1.0, "runtime.lora_path": "",
+                                     "generation.section_takes": 1},
+                             "indextts": {"generation.speaking_rate": 0.95, "runtime.lora_path": "",
+                                          "generation.auto_lora_speaking_rate": False}}}
+    auk = compose_preset(base, voice_path="a.safetensors", model="auk", speaking_rate=1.1, takes=(10, "similar", 5))
+    assert (auk["app.model"], auk["auk.mode"], auk["auk.guidance_scale"]) == ("auk", "clone", 2.0)
+    assert auk["generation.speaking_rate"] == 1.1 and auk["app.profiles"]["_active"] == "auk"
+    assert auk["app.profiles"]["auk"]["generation.section_takes"] == 10
+    index = compose_preset(base, voice_path="i.safetensors", model="indextts", takes=(5, "errors", 5))
+    assert index["app.model"] == "indextts" and index["generation.speaking_rate"] == 0.95  # the profile's rate
+    assert index["generation.auto_lora_speaking_rate"] is True and index["generation.auto_lora_max_tokens"] is True
+    assert "omnivoice.mode" not in index and index["app.profiles"]["indextts"]["runtime.lora_path"] == "i.safetensors"
+    assert preset_name("V", "auk", (10, "similar", 5)) == "V_Clone_Best_of_10"
+    assert preset_name("V", "indextts", (5, "errors", 5)) == "V_Takes_5"
+    assert preset_name("V", "indextts", (10, "similar", 5)) == "V_Best_of_10"
+    assert set(MODELS) == {"omnivoice", "auk", "indextts"}
+    assert trained_takes("omnivoice", "32") == (10, "similar", 5) and trained_takes("indextts", 6) == (5, "errors", 5)
+
+
+def test_take_defaults_follow_the_measurements():
+    from indextts.utils.take_selection import take_defaults
+
+    assert take_defaults("indextts", 32) == take_defaults("indextts", 6) == (3, "errors", 5)
+    assert take_defaults("omnivoice", "32") == (10, "similar", 5)
+    assert take_defaults("omnivoice", 12) == (5, "similar", 3) and take_defaults("omnivoice", 8) == (3, "errors", 5)
+    assert take_defaults("auk", 24) == (5, "similar", 3) and take_defaults("auk", 10) == (5, "similar", 3)
+    assert take_defaults("auk", 8) == (3, "errors", 5)  # on-demand tiers move the models for every batch
+    assert take_defaults("auk", 32, trained=True) == (10, "similar", 5)
+    assert take_defaults("omnivoice", 8, trained=True) == (5, "similar", 3)
+
+
+def test_tier_presets_carry_each_models_takes(tmp_path):
+    from types import SimpleNamespace as NS
+
+    from ui.app import build_app
+
+    demo = build_app(NS(model_dir="models", device="cpu", verbose=False, no_browser=True, port=7861, host="127.0.0.1",
+                        share=False))
+    store = demo.preset_store
+    for tier, omni, auk, index in (("32", (10, "similar", 5), (5, "similar", 3), (3, "errors", 5)),
+                                   ("6", (3, "errors", 5), (3, "errors", 5), (3, "errors", 5))):
+        values = store.tier_preset_values(tier)
+        got = lambda source: (source["generation.section_takes"], source["generation.section_take_rule"],  # noqa: E731
+                              source["generation.section_take_checks"])
+        assert values["app.model"] == "omnivoice" and got(values) == omni
+        assert got(values["app.profiles"]["omnivoice"]) == omni
+        assert got(values["app.profiles"]["auk"]) == auk and got(values["app.profiles"]["indextts"]) == index
+    # An older preset without these keys keeps one take per section.
+    assert demo.preset_registry.defaults()["generation.section_takes"] == 1

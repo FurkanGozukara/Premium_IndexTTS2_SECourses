@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 7.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 7.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -219,9 +219,7 @@ The autoregressive stage decides semantic tokens; the diffusion stage turns thos
 - Repetition penalty: prevents semantic-token loops; keep the established default unless diagnosing repeats.
 - Length penalty: affects beam search only; the default 2 lets complete candidates win, while 0 favors the shortest one, which can drop a word.
 - Max mel tokens: a safety ceiling, not a requested duration.
-- Candidates: consecutive seeded alternatives from one request; each costs another generation.
-- Takes per section (Whisper keeps the best): each section is rendered up to this many times and the take Whisper hears with the fewest word errors is kept; a take without errors ends the search, so clean sections cost one render. Close spellings of rare or technical words (Koya for Kohya) are not counted as errors, clearly different words are. Both speech models; 1 turns it off.
-- Keep the take Whisper hears best: with two or more candidates, Whisper transcribes every take and the one with the fewest word errors against your text becomes the output; the others stay as candidates. In a September 2026 study of long narration, keeping the best of two or three takes this way removed about a sixth to a quarter of the remaining word errors. Both speech models.
+- Takes per section, whole-text candidates and the reference audition moved to [Take quality](#take-quality-whisper-and-voice-similarity) under the live log. Close spellings of rare or technical words (Koya for Kohya) are not counted as word errors there, clearly different words are.
 - Diffusion steps: 12-16 is a faster draft range, 25 is the registered/system-default value, and the quality preset uses 40; 35-50 can refine difficult material.
 - CFG rate and CFM temperature: control conditioning strength and diffusion variation.
 - CFM cache length: lower it only when reserved VRAM is the problem.
@@ -280,6 +278,49 @@ When **Candidates** is above one, listen to every player before choosing. The di
 ![Annotated 4K candidate players, seed, metadata, and recent outputs](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/Ukxh_dDwKEkPqcIEGtoch.png)
 
 *Figure 10. **Recent outputs** lists the last ten generated tasks. Select a good result and press **Load selected output into reference** to perform iterative voice cloning, continuation work, or a clean second-generation reference test.*
+
+### Take quality: Whisper and voice similarity
+
+The **🎯 Take quality** section under the live log holds every option that renders more than once and keeps the best
+result, for all three speech models and for zero-shot cloning as well as trained voices:
+
+- **Takes per section** (1 = off): each section (about 12 seconds) is rendered up to this many times. **Keep which
+  take: Fewest word errors** re-renders only after Whisper hears a word error and stops at the first clean take. **Most
+  similar, no word errors** renders every take, ranks them by how much they sound like the voice (CAMPPlus likeness to
+  the voice's training clips, cached in the voice's `analysis/voice_centroid.json`; for zero-shot cloning, the reference
+  clip) and Whisper checks the most similar ones in order (**Whisper checks**); the first without a word error wins,
+  otherwise the fewest errors (ties: the more similar take). The output metadata lists every take's similarity and the
+  checks. OmniVoice and AuK render the extra takes in batches.
+- **Whole-text candidates** render the entire text several times; **Keep the candidate Whisper hears best** makes the
+  version with the fewest word errors the output. Each candidate repeats the takes per section, so the two multiply.
+- **Reference audition** (trained voices) chooses the clip a voice clones from; training runs it automatically.
+
+Measured on 60 tutorial lines per setting (zero-shot cloning of `reference_audios/demo_voice.mp3` with each base model,
+and trained IndexTTS and AuK voices; word errors by the built-in Whisper judge, likeness by WavLM against the reference
+or the speaker's recordings): every take selection removed 60-75 % of the word errors; **most similar** also raised
+AuK's delivery style (+0.006 with 5 takes, +0.009 with 10) and OmniVoice's slightly, but brought IndexTTS no likeness
+while making it five times slower than fewest word errors.
+
+| Model, one take → default | Word errors | Lines without an error | Time (A6000, shared) |
+| --- | --- | --- | --- |
+| OmniVoice base: 1 take → most similar of 10 | 0.65 % → 0.20 % | 50 → 56 of 60 | 0.24 → 2.9 × real time |
+| AuK base: 1 take → most similar of 5 | 0.35 % → 0.30 % (style +0.006) | 54 → 55 | 0.67 → 4.9 × |
+| IndexTTS base: 1 take → fewest errors of 3 | 0.91 % → 0.35 % | 45 → 53 | 1.9 → 2.5 × |
+| AuK trained, cloning: 1 take → most similar of 10 at rate 1.10 | 1.36 % → 0.35 % | 41 → 55 | 0.6 → 11 × |
+| IndexTTS trained (v13): 1 take → fewest errors of 5 | 1.61 % → 0.65 % | 38 → 50 | 3.1 → 4.0 × |
+
+**Defaults of the GPU tier presets** (the faster tiers render more takes; AuK's 6 and 8 GB tiers move its models for
+every batch): OmniVoice most similar of 10 with 5 checks from 24 GB, of 5 with 3 checks at 12-16 GB, fewest word errors
+of 3 below; AuK most similar of 5 with 3 checks from 10 GB, fewest word errors of 3 at 6-8 GB; IndexTTS fewest word
+errors of 3 on every tier. Presets saved before these options keep one take per section.
+
+**Preset after training:** every training (all three models) ends by saving a user preset for the new voice, built from
+built-in measurements only (Training tab, **Build a ready-to-use preset after training**, on by default). OmniVoice and
+AuK: `<voice>_Clone_Best_of_10`, Voice cloning with the reference audition's winner at speaking rate 1.10 (cloned
+narration ranked best at 1.10 for both models; a pace check against the speaker's own recordings of held-out sentences
+corrects a voice more than 10 % off) and the most similar of 10 takes. IndexTTS: `<voice>_Takes_5`, the voice with its
+calibrated speaking rate, decoding, section length, pauses and expressive clip, and the fewest word errors of up to 5
+takes. The report is the voice's `analysis/voice_preset.json`.
 
 ## 6. Batch Generation for Many Scripts
 

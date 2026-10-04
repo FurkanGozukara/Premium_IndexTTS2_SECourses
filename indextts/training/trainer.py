@@ -1341,13 +1341,11 @@ class LoraTrainer:
         self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
 
     def _run_voice_preset(self, *, terminal_phase: str, terminal_message: str, recommended_checkpoint: str) -> None:
-        """Build the OmniVoice voice's cloning preset in a child process (``voice_preset``): likeness centroid,
-        cloned pace against the speaker's recordings, and a user preset keeping the most similar of 10 takes."""
+        """Build the trained voice's user preset in a child process (``voice_preset``, every speech model):
+        likeness centroid, the cloned pace against the speaker's recordings, and the model's takes per section."""
         config = self.config
         reason = ""
-        if getattr(config, "tts_model", "indextts") != "omnivoice":
-            reason = "OmniVoice voices only"
-        elif not getattr(config, "voice_preset_enabled", True):
+        if not getattr(config, "voice_preset_enabled", True):
             reason = "disabled"
         elif self.stop_path.exists():
             reason = "canceled by user"
@@ -1358,7 +1356,7 @@ class LoraTrainer:
             reason = "no trained checkpoint"
         if reason:
             self.write_status(voice_preset_status="skipped", voice_preset_message=reason)
-            self.log(f">> cloning preset skipped: {reason}")
+            self.log(f">> preset after training skipped: {reason}")
             return
         job_dir = self.adapter_dir / "analysis" / "voice_preset_job"
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1366,10 +1364,10 @@ class LoraTrainer:
         config_path = job_dir / "train_config.json"
         atomic_write_json(config_path, config.to_dict())
         self.write_status(phase="building_voice_preset", voice_preset_status="running",
-                          voice_preset_message="Measuring the cloned voice's pace",
-                          message="Building the voice's cloning preset")
-        self.log(f">> building the cloning preset with {checkpoint.name}: pace on {config.voice_preset_sentences} "
-                 "held-out sentences, Takes per section keeping the most similar of 10")
+                          voice_preset_message="Measuring the voice for its preset",
+                          message="Building the voice's preset")
+        self.log(f">> building the preset after training with {checkpoint.name} (likeness target, pace check on "
+                 f"{config.voice_preset_sentences} held-out sentences for cloning models, takes per section)")
         process = subprocess.Popen([sys.executable, "-m", "indextts.training.voice_preset", "--config", str(config_path),
                                     "--checkpoint", str(checkpoint), "--state-dir", str(job_dir)],
                                    cwd=str(Path(__file__).resolve().parents[2]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1387,9 +1385,9 @@ class LoraTrainer:
         failure = ""
         while process.poll() is None:
             child = read_json_retry(job_dir / "status.json", {}) or {}
-            self.write_status(phase="building_voice_preset", message=str(child.get("message") or "Building the cloning preset"))
+            self.write_status(phase="building_voice_preset", message=str(child.get("message") or "Building the voice's preset"))
             if self.stop_path.exists() or time.perf_counter() - started > config.voice_preset_timeout_s:
-                failure = "canceled by user" if self.stop_path.exists() else "cloning preset timeout"
+                failure = "canceled by user" if self.stop_path.exists() else "preset timeout"
                 (job_dir / "stop.flag").touch()
                 _kill_evaluation_worker(process)
                 break
@@ -1406,11 +1404,11 @@ class LoraTrainer:
             summary = str(child.get("message") or "")
             self.write_status(voice_preset_status=outcome, voice_preset_message=summary,
                               voice_preset=str(child.get("preset") or ""))
-            self.log(f">> cloning preset {outcome}: {summary}")
+            self.log(f">> preset after training {outcome}: {summary}")
         else:
             reason = failure or str(child.get("message") or f"exit code {process.returncode}")
             self.write_status(voice_preset_status="failed", voice_preset_message=reason)
-            self.log(f">> cloning preset did not complete: {reason}")
+            self.log(f">> preset after training did not complete: {reason}")
         self.write_status(phase=terminal_phase, message=terminal_message, recommended_checkpoint=recommended_checkpoint)
 
     def _run_final_test_assessment(self, *, terminal_phase: str, terminal_message: str,
@@ -2778,7 +2776,7 @@ class LoraTrainer:
             self._run_voice_preset(terminal_phase=post_phase, terminal_message=post_message,
                                    recommended_checkpoint=recommended_checkpoint)
         except Exception as exc:
-            self.log(f">> cloning preset failed but training weights are safe: {exc}")
+            self.log(f">> preset after training failed but training weights are safe: {exc}")
             self.write_status(phase=post_phase, message=post_message, recommended_checkpoint=recommended_checkpoint,
                               voice_preset_status="failed", voice_preset_message=str(exc))
         self._write_int8_finetune(recommended_checkpoint)
@@ -2786,7 +2784,7 @@ class LoraTrainer:
         failed_checks = [label for key, label in (
             ("speech_evaluation_status", "speech evaluation"), ("decoder_adapter_status", "decoder validation"),
             ("decoding_sweep_status", "decoding sweep"), ("final_test_status", "final test"),
-            ("reference_audition_status", "reference audition"), ("voice_preset_status", "cloning preset"),
+            ("reference_audition_status", "reference audition"), ("voice_preset_status", "preset after training"),
         ) if completed_checks.get(key) == "failed"]
         if failed_checks:
             terminal_message += "; automatic checks incomplete: " + ", ".join(failed_checks)

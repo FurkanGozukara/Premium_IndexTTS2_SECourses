@@ -21,6 +21,11 @@ Decoding choices were compared on 24 held-out English sentences × 2 seeds, scor
 | Guidance | 1.5–2.5 equivalent; 3.0 lowered similarity on the confirmation set. |
 | Sway, midpoint solver, duration factor, edge padding, trimming, loudness | No reliable gain over the defaults. |
 
+## Take quality and the preset after training
+
+- **Takes per section** works for AuK as for the other models ([Take quality](../README.md#take-quality-whisper-and-voice-similarity)); the extra takes render in batches with their own seeds. Zero-shot cloning of the bundled demo voice on 60 tutorial lines: **Most similar, no word errors** raised delivery style by 0.006 with 5 takes and 0.009 with 10 (word errors 0.35 % → 0.25-0.30 %); fewest word errors of 3 changed neither. The GPU tier presets use the most similar of 5 with 3 Whisper checks from 10 GB and fewest word errors of 3 on the on-demand tiers (6, 8 GB), which move the models for every batch.
+- **Preset after training:** an AuK training ends by saving `<voice>_Clone_Best_of_10`: Voice cloning with the reference audition's winner, guidance 2, the voice's pauses, the most similar of 10 takes and speaking rate 1.10. On 60 lines with a trained voice, the most similar of 10 lowered word errors from 1.36 % to 0.65 % at rate 1.0 and to 0.35 % at 1.10 (55 of 60 lines clean, WavLM likeness 0.9885 against 0.9876 for one take).
+
 ## Editing tab
 
 **AuK Audio Editing** appears while AuK is selected. Choose a task, fill its fields, and the instruction AuK receives is shown before running: content edits (replace, insert, remove words), lyrics, pitch, speed, volume, emotion, timbre, accent removal, nonverbal sounds, whisper conversion, enhancement, restoration, speaker and music separation, or a custom instruction. Output length follows the task's own rule (upstream's prompt enhancer), the source length, or a custom value. Content edits work on up to 30 seconds; acoustic tasks run on longer recordings piece by piece, cut at pauses. Community testing found description TTS, cloning, volume, enhancement and separation the most stable tasks and pitch, speed, accent, nonverbal and content edits less reliable; try another seed when an edit reproduces the source.

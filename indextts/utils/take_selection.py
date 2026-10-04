@@ -240,6 +240,39 @@ def keep_most_similar_take(first: Any, render_more: Callable[[int], Sequence[Any
     return takes[kept], {"similarities": similarities, "checked": checked, "kept": kept}
 
 
+def take_defaults(model: str, tier: Any, *, trained: bool = False) -> tuple[int, str, int]:
+    """``(takes, rule, Whisper checks)`` of "Takes per section" in the presets, per speech model and GPU tier.
+
+    Measured in October 2026 on 60 tutorial lines per setting (zero-shot cloning of the bundled demo voice with each
+    base model; trained IndexTTS, AuK and OmniVoice voices): every take selection removed 60-75 % of the word errors.
+    Ranking by voice similarity raised AuK's delivery style (+0.006 with 5 takes, +0.009 with 10) and OmniVoice's
+    slightly, and a cloned OmniVoice voice with 10 takes ranked best of 14 narration versions; for IndexTTS it brought
+    no likeness and made generation five times slower than fewest word errors. OmniVoice and AuK render the extra takes
+    in batches. Larger tiers are faster GPUs, so they render more takes; AuK's on-demand tiers (6, 8 GB) move its models
+    for every batch and keep to fewest word errors.
+    """
+
+    try:
+        size = int(float(str(tier)))
+    except (TypeError, ValueError):
+        size = 32
+    if model == "omnivoice":
+        if size >= (12 if trained else 24):
+            return 10, "similar", 5
+        return (5, "similar", 3) if size >= (6 if trained else 12) else (3, "errors", 5)
+    if model == "auk":
+        if size >= 16:
+            return (10, "similar", 5) if trained else (5, "similar", 3)
+        return (5, "similar", 3) if size >= 10 else (3, "errors", 5)
+    return (5, "errors", 5) if trained else (3, "errors", 5)
+
+
+def take_preset_values(model: str, tier: Any, *, trained: bool = False) -> dict[str, Any]:
+    takes, rule, checks = take_defaults(model, tier, trained=trained)
+    return {"generation.section_takes": takes, "generation.section_take_rule": rule,
+            "generation.section_take_checks": checks}
+
+
 def best_take(rows: Sequence[dict[str, Any]]) -> int:
     """Index of the take with the fewest word errors; the first of equals."""
 
@@ -247,4 +280,4 @@ def best_take(rows: Sequence[dict[str, Any]]) -> int:
 
 
 __all__ = ["SectionTakeJudge", "best_take", "candidate_word_errors", "keep_best_take", "keep_most_similar_take",
-           "metric_language"]
+           "metric_language", "take_defaults", "take_preset_values"]
