@@ -3132,8 +3132,8 @@ def build_generation_tab(
                         "when Whisper hears a word error, or, with **Most similar**, renders every take and keeps the one "
                         "that sounds most like the voice without a word error: the voice's training clips, or the "
                         "reference clip for zero-shot cloning. **Whole-text candidates** render the entire text several "
-                        "times and can keep the version Whisper hears best. The **reference audition** chooses the clip a "
-                        "trained voice clones from. All three speech models.",
+                        "times and can keep the version Whisper hears best. All three speech models; the **reference "
+                        "audition** above Voice LoRA / DoRA chooses the clip a trained voice clones from.",
                         elem_classes=["section-note"],
                     )
                     take_rule = gr.Dropdown(choices=[("Fewest word errors", "errors"),
@@ -3163,38 +3163,38 @@ def build_generation_tab(
                     ):
                         _register(registry, key, component, kind=kind, minimum=minimum, maximum=maximum)
                     _register(registry, "generation.section_take_rule", take_rule, kind="choice", choices=["errors", "similar"])
-                    with gr.Accordion("🎧 Reference audition (trained voices)", open=False):
-                        gr.Markdown(
-                            "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
-                            "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
-                            "held-out sentences of the voice's training data with each candidate clip, then the current reference and the "
-                            "three most speaker-like finalists render four more with the same seeds, and the clip whose takes sound most "
-                            "like the speaker's own recordings wins: speaker and style similarity decide, and Whisper word errors keep a "
-                            "clip that causes slips out. Training runs it automatically when it finishes (**Automatic reference "
-                            "audition** in Voice Training); this button runs it again with the current settings and the selected voice. "
-                            "It works for every speech model and never changes the voice's original reference file.",
-                            elem_classes=["section-note"],
-                        )
-                        with gr.Row():
-                            audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
-                                                            info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
-                            audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
-                                                           info="Held-out sentences rendered with every candidate; the current reference and 3 finalists render 4 more before the winner is chosen.")
-                            audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
-                                                       info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
-                                                            "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "
-                                                            "ticking again restores the winner.")
-                        audition_run = gr.Button("🎧  Audition references", elem_classes=btn("gold"))
-                        audition_status = gr.Markdown("", elem_classes=["section-note"])
-                        from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
-
-                        audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
-                                                      max_height=320, label="Audition results")
-                        audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
                 tab.final_summary = gr.HTML("")
                 tab.task_state = gr.State("")
                 tab.task_timer = gr.Timer(5.0, active=True)
 
+        with gr.Accordion("🎧 Reference audition (trained voices)", open=False):
+            gr.Markdown(
+                "The clip a voice clones from sets its timbre and delivery, and clips of the same speaker can differ a lot "
+                "(in one test four clips gave speaker similarities between 0.73 and 0.82). The audition renders a few "
+                "held-out sentences of the voice's training data with each candidate clip, then the current reference and the "
+                "three most speaker-like finalists render four more with the same seeds, and the clip whose takes sound most "
+                "like the speaker's own recordings wins: speaker and style similarity decide, and Whisper word errors keep a "
+                "clip that causes slips out. Training runs it automatically when it finishes (**Automatic reference "
+                "audition** in Voice Training); this button runs it again with the current settings and the selected voice. "
+                "It works for every speech model and never changes the voice's original reference file.",
+                elem_classes=["section-note"],
+            )
+            with gr.Row():
+                audition_candidates = gr.Slider(2, 12, value=6, step=1, label="Candidate clips",
+                                                info="Training clips near the speaker's typical pitch and pace, shorter and longer ones; the current reference always competes.")
+                audition_sentences = gr.Slider(2, 8, value=4, step=1, label="Test sentences",
+                                               info="Held-out sentences rendered with every candidate; the current reference and 3 finalists render 4 more before the winner is chosen.")
+                audition_use = gr.Checkbox(value=True, label="Use the winner automatically for this voice",
+                                           info="Saved with the voice, not in presets: the winner becomes the reference this voice loads automatically "
+                                                "(also for API callers). Untick to go back to the original reference; the audition stays saved, so "
+                                                "ticking again restores the winner.")
+            audition_run = gr.Button("🎧  Audition references", elem_classes=btn("gold"))
+            audition_status = gr.Markdown("", elem_classes=["section-note"])
+            from .reference_audition import TABLE_HEADERS as AUDITION_HEADERS
+
+            audition_table = gr.Dataframe(headers=AUDITION_HEADERS, value=[], type="array", interactive=False, wrap=True,
+                                          max_height=320, label="Audition results")
+            audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
         gr.Markdown("### Voice LoRA / DoRA")
         # Three rows of like with like: the two adapter pickers (one Refresh reloads
         # both), the two strengths side by side, then the four automation switches at

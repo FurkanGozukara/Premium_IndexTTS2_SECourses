@@ -219,7 +219,7 @@ The autoregressive stage decides semantic tokens; the diffusion stage turns thos
 - Repetition penalty: prevents semantic-token loops; keep the established default unless diagnosing repeats.
 - Length penalty: affects beam search only; the default 2 lets complete candidates win, while 0 favors the shortest one, which can drop a word.
 - Max mel tokens: a safety ceiling, not a requested duration.
-- Takes per section, whole-text candidates and the reference audition moved to [Take quality](#take-quality-whisper-and-voice-similarity) under the live log. Close spellings of rare or technical words (Koya for Kohya) are not counted as word errors there, clearly different words are.
+- Takes per section and whole-text candidates moved to [Take quality](#take-quality-whisper-and-voice-similarity) under the live log; the reference audition sits above Voice LoRA / DoRA. Close spellings of rare or technical words (Koya for Kohya) are not counted as word errors there, clearly different words are.
 - Diffusion steps: 12-16 is a faster draft range, 25 is the registered/system-default value, and the quality preset uses 40; 35-50 can refine difficult material.
 - CFG rate and CFM temperature: control conditioning strength and diffusion variation.
 - CFM cache length: lower it only when reserved VRAM is the problem.
@@ -281,7 +281,7 @@ When **Candidates** is above one, listen to every player before choosing. The di
 
 ### Take quality: Whisper and voice similarity
 
-The **🎯 Take quality** section under the live log holds every option that renders more than once and keeps the best
+The **🎯 Take quality** section under the live log holds the options that render more than once and keep the best
 result, for all three speech models and for zero-shot cloning as well as trained voices:
 
 - **Takes per section** (1 = off): each section (about 12 seconds) is rendered up to this many times. **Keep which
@@ -293,7 +293,8 @@ result, for all three speech models and for zero-shot cloning as well as trained
   checks. OmniVoice and AuK render the extra takes in batches.
 - **Whole-text candidates** render the entire text several times; **Keep the candidate Whisper hears best** makes the
   version with the fewest word errors the output. Each candidate repeats the takes per section, so the two multiply.
-- **Reference audition** (trained voices) chooses the clip a voice clones from; training runs it automatically.
+- The **reference audition** (above Voice LoRA / DoRA, trained voices) chooses the clip a voice clones from; training
+  runs it automatically.
 
 Measured on 60 tutorial lines per setting (zero-shot cloning of `reference_audios/demo_voice.mp3` with each base model,
 and trained IndexTTS and AuK voices; word errors by the built-in Whisper judge, likeness by WavLM against the reference
