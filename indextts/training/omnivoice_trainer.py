@@ -361,12 +361,13 @@ class OmniVoiceTrainer(LoraTrainer):
                 except Exception as exc:
                     self.log(f">> {label} failed but training weights are safe: {exc}")
                     message += f"; {label} failed: {exc}"
-            try:
-                self._run_reference_audition(terminal_phase="post_training", terminal_message=message,
-                                             recommended_checkpoint=recommended)
-            except Exception as exc:
-                self.log(f">> reference audition failed but training weights are safe: {exc}")
-                message += f"; reference audition failed: {exc}"
+            for label, action in (("reference audition", self._run_reference_audition),
+                                  ("preset after training", self._run_voice_preset)):
+                try:
+                    action(terminal_phase="post_training", terminal_message=message, recommended_checkpoint=recommended)
+                except Exception as exc:
+                    self.log(f">> {label} failed but training weights are safe: {exc}")
+                    message += f"; {label} failed: {exc}"
             self._write_int8_finetune(recommended)
         self.write_status(phase=status,message=message,step=step,total_steps=total_steps,last_checkpoint=str(path),
                           last_sample=self.last_sample,sample_seed=self.resolved_sample_seed,

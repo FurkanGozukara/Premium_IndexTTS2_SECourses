@@ -316,3 +316,17 @@ def test_tier_presets_carry_each_models_takes(tmp_path):
         assert got(values["app.profiles"]["auk"]) == auk and got(values["app.profiles"]["indextts"]) == index
     # An older preset without these keys keeps one take per section.
     assert demo.preset_registry.defaults()["generation.section_takes"] == 1
+
+
+def test_every_trainer_runs_the_preset_after_its_reference_audition():
+    import inspect
+
+    from indextts.training.auk_trainer import AukTrainer
+    from indextts.training.omnivoice_trainer import OmniVoiceTrainer
+    from indextts.training.trainer import LoraTrainer
+
+    # OmniVoice and AuK run their own post-training sequence; each must end with the preset step like IndexTTS.
+    for trainer in (LoraTrainer, OmniVoiceTrainer, AukTrainer):
+        source = inspect.getsource(trainer)
+        assert "self._run_reference_audition" in source and "self._run_voice_preset" in source, trainer.__name__
+        assert source.index("self._run_voice_preset") > source.index("self._run_reference_audition"), trainer.__name__
