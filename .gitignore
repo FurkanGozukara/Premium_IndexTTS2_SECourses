@@ -74,3 +74,5 @@ Trellis_2_3D_Generator/
 /docs/local/
 /docs/naturalness_experiments/
 /webui_*.log
+# Gradio writes a type stub for the Checkpoint Grid template component at startup.
+/ui/grid_tab.pyi
