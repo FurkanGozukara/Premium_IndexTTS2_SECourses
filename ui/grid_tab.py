@@ -926,6 +926,8 @@ def build_grid_tab(
                 type="array",
                 interactive=False,
                 wrap=True,
+                # Without widths the long paths squeezed the headers into broken words ("Epoc h").
+                column_widths=["22%", "7%", "12%", "10%", "10%", "17%", "22%"],
                 label="Checkpoints",
                 max_height=360,
                 buttons=["fullscreen", "copy"],
@@ -1169,6 +1171,8 @@ def build_grid_tab(
             type="array",
             interactive=False,
             wrap=True,
+            # Without widths the texts pushed Verdict and File out of view and broke short headers.
+            column_widths=["5%", "18%", "8%", "9%", "26%", "8%", "12%", "14%"],
             label="Grid cells",
             max_height=420,
             buttons=["fullscreen", "copy"],
