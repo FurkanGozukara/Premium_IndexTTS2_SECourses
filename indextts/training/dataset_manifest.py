@@ -102,9 +102,11 @@ def iter_dataset_records(
         yield row
 
 
+DURATION_BUCKETS = ("<3s", "3-6s", "6-9s", "9-12s", "12-15s", ">15s")
+
+
 def duration_histogram(durations_s: Sequence[float]) -> dict[str, int]:
-    labels = ("<3s", "3-6s", "6-9s", "9-12s", "12-15s", ">15s")
-    counts = dict.fromkeys(labels, 0)
+    counts = dict.fromkeys(DURATION_BUCKETS, 0)
     for duration in durations_s:
         value = float(duration)
         if value < 3:

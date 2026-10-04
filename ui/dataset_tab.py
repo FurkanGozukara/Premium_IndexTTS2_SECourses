@@ -15,7 +15,7 @@ import gradio as gr
 import pandas as pd
 
 from indextts.runtime.progress import format_duration
-from indextts.training.dataset_manifest import load_manifest, summarize_manifest
+from indextts.training.dataset_manifest import DURATION_BUCKETS, load_manifest, summarize_manifest
 from indextts.training.dataset_prep import DatasetPrepConfig
 from indextts.training.fluency_filter import VIEW_MARKER
 from indextts.training.media import (
@@ -175,6 +175,22 @@ def scan_input_rows(path_text: str, uploads: list[str] | None, recursive: bool) 
     return rows
 
 
+def _empty_histogram() -> pd.DataFrame:
+    """Typed empty chart frame: Gradio's BarPlot keeps the column types of the first value it receives, and an
+    untyped empty frame made it draw the later counts as categories (floating bars on a 0, 12, 19, ... axis)."""
+    return pd.DataFrame({"bucket": pd.Series(dtype="object"), "count": pd.Series(dtype="int64")})
+
+
+def _histogram_frame(histogram: Mapping[str, Any]) -> pd.DataFrame:
+    if not histogram:
+        return _empty_histogram()
+    keys = [key for key in DURATION_BUCKETS if key in histogram] + [key for key in histogram if key not in DURATION_BUCKETS]
+    return pd.DataFrame({
+        "bucket": pd.Series(keys, dtype="object"),
+        "count": pd.Series([int(histogram[key] or 0) for key in keys], dtype="int64"),
+    })
+
+
 def _dataset_result(dataset_dir: str | Path) -> tuple[str, pd.DataFrame, list[list[Any]], list[str], str, list[str]]:
     root = Path(dataset_dir).expanduser().resolve()
     info = read_json(root / "dataset_info.json", {}) or {}
@@ -182,7 +198,7 @@ def _dataset_result(dataset_dir: str | Path) -> tuple[str, pd.DataFrame, list[li
     summary = summarize_manifest(rows)
     summary.update(info)
     histogram = summary.get("duration_histogram") or {}
-    hist_frame = pd.DataFrame([{"bucket": key, "count": value} for key, value in histogram.items()])
+    hist_frame = _histogram_frame(histogram)
     table = []
     paths = []
     for row in rows:
@@ -269,7 +285,7 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
     """Return the complete dataset dashboard update used by timer and server push."""
 
     if not state_value:
-        empty_hist = pd.DataFrame(columns=["bucket", "count"])
+        empty_hist = _empty_histogram()
         return (
             progress_panel_html({}, title="Ready"),
             "",
@@ -304,7 +320,7 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
         stats_value, hist, table, refs, warning_text, paths = _dataset_result(dataset_dir)
     else:
         stats_value = ""
-        hist = pd.DataFrame(columns=["bucket", "count"])
+        hist = _empty_histogram()
         table, refs, paths = [], [], []
         warning_text = "No completed dataset result was found."
     return (
@@ -626,7 +642,7 @@ def build_dataset_tab(
         log = gr.Textbox(label="Preparation log", lines=10, max_lines=16, interactive=False, buttons=["copy"], elem_classes=["log-tail"])
         stats = gr.HTML("")
         histogram = gr.BarPlot(
-            pd.DataFrame(columns=["bucket", "count"]), x="bucket", y="count",
+            _empty_histogram(), x="bucket", y="count", sort=list(DURATION_BUCKETS),
             title="Segment duration distribution", x_title="Duration", y_title="Segments", height=300,
             buttons=["fullscreen", "export"],
         )
@@ -634,6 +650,8 @@ def build_dataset_tab(
             headers=["ID", "Duration s", "Text", "Audio"],
             datatype=["str", "number", "str", "str"], value=[], type="array",
             interactive=False, wrap=True, label="Prepared segments", max_height=420,
+            # Without widths the long transcripts pushed the Audio column out of view.
+            column_widths=["15%", "9%", "52%", "24%"],
             buttons=["fullscreen", "copy"],
         )
         selected_audio = gr.Audio(label="Selected segment", type="filepath", buttons=["download"])
@@ -901,7 +919,7 @@ def build_dataset_tab(
     def load_existing(path: str | None):
         global _LAST_DATASET_FOLDER
         if not path:
-            return "Select a dataset.", "", pd.DataFrame(columns=["bucket", "count"]), [], "", "", [], ""
+            return "Select a dataset.", "", _empty_histogram(), [], "", "", [], ""
         _LAST_DATASET_FOLDER = Path(path)
         stats_value, hist, table, refs, warning_text, paths = _dataset_result(path)
         summary = dataset_summary_line(path)
