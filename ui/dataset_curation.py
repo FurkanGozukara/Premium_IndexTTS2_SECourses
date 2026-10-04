@@ -38,7 +38,10 @@ def curation_command(dataset: str, values: dict[str, Any], *, model_dir: str = "
     if not name or Path(name).name != name or name in {".", ".."}:
         raise ValueError("The audited dataset name must be a single directory name")
     output = source.parent / name
-    if output.exists():
+    # A failed or stopped audit leaves only its progress and audit files; the audit replaces those.
+    unfinished = output.is_dir() and all(entry.is_file() and entry.name in {"quality_progress.json", "quality_audit.jsonl"}
+                                         for entry in output.iterdir())
+    if output.exists() and not unfinished:
         raise FileExistsError(f"Choose a new audited dataset name; this folder already exists: {output}")
     refs = [Path(value).expanduser().resolve() for value in parse_multiline_paths(str(values["references"]))]
     if not refs or any(not path.is_file() for path in refs):

@@ -164,9 +164,22 @@ class CurationCancelled(RuntimeError):
     pass
 
 
+# Files an audit writes before it finishes; a folder holding nothing else is an interrupted audit.
+AUDIT_WORK_FILES = frozenset({"quality_progress.json", "quality_audit.jsonl"})
+
+
+def is_unfinished_audit(output: Path) -> bool:
+    return output.is_dir() and all(entry.is_file() and entry.name in AUDIT_WORK_FILES for entry in output.iterdir())
+
+
 def run_curation(args: argparse.Namespace) -> None:
     torch.set_num_threads(4)
     source, output = args.dataset.resolve(), args.output.resolve()
+    if is_unfinished_audit(output):
+        # An audit that failed or was stopped left only its work files: the same name may run again.
+        for entry in output.iterdir():
+            entry.unlink()
+        output.rmdir()
     if output.exists():
         raise FileExistsError(f"Use a new output directory to preserve prior curation: {output}")
     rows = load_manifest(source)

@@ -215,3 +215,16 @@ def test_second_opinion_runs_after_the_builtin_whisper(tmp_path, monkeypatch):
     audit = load_manifest(args.output / "quality_audit.jsonl")
     assert audit[0]["asr_model"] == "second_opinion" and audit[0]["reasons"] == []
     assert [row["id"] for row in load_manifest(args.output)] == ["0", "1"]
+
+
+def test_an_interrupted_audit_folder_does_not_block_its_name(tmp_path):
+    from tools.curate_voice_dataset import is_unfinished_audit
+
+    unfinished = tmp_path / "voice_audited"
+    unfinished.mkdir()
+    (unfinished / "quality_progress.json").write_text("{}", encoding="utf-8")
+    (unfinished / "quality_audit.jsonl").write_text("", encoding="utf-8")
+    assert is_unfinished_audit(unfinished)
+    (unfinished / "manifest.jsonl").write_text("", encoding="utf-8")  # a finished audit is never replaced
+    assert not is_unfinished_audit(unfinished)
+
