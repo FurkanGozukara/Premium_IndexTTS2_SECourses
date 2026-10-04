@@ -255,6 +255,17 @@ def training_tier_values(tier_value: str | None, device_value: str | None, model
     return {key: preset[key] for key in TRAINING_TIER_FIELDS}
 
 
+def full_min_tier(model: str | None) -> int:
+    """Smallest GPU tier that runs full fine-tuning of this speech model (IndexTTS and OmniVoice 16 GB, AuK 32 GB)."""
+    if model == "auk":
+        from indextts.runtime.auk_presets import FULL_MIN_TIER
+        return int(FULL_MIN_TIER)
+    if model == "omnivoice":
+        from indextts.runtime.omnivoice_presets import FULL_MIN_TIER
+        return int(FULL_MIN_TIER)
+    return 16
+
+
 def _training_tier_note(tier_value: str | None, device_value: str | None, model="indextts", method="dora") -> str:
     tier = _resolved_training_tier(tier_value, device_value)
     if tier is None:
@@ -1336,7 +1347,7 @@ def build_training_tab(
         with gr.Accordion("Training method", open=True):
             with gr.Row():
                 name = gr.Textbox(value=TRAIN_DEFAULTS["name"], label="Training run name", info="Safe output folder and final safetensors basename.")
-                adapter_type = gr.Dropdown(choices=["lora", "dora", "full"], value=TRAIN_DEFAULTS["adapter_type"], allow_custom_value=True, label="Training method", info="LoRA and DoRA train small adapters. Full fine-tuning trains the speech model's own weights (16 GB tier or larger) and saves an INT8 ConvRot copy of the best checkpoint for generation.")
+                adapter_type = gr.Dropdown(choices=["lora", "dora", "full"], value=TRAIN_DEFAULTS["adapter_type"], allow_custom_value=True, label="Training method", info="LoRA and DoRA train small adapters. Full fine-tuning trains the speech model's own weights (16 GB tier or larger; AuK 32 GB) and saves an INT8 ConvRot copy of the best checkpoint for generation.")
                 rank = gr.Slider(1, 256, value=TRAIN_DEFAULTS["rank"], step=1, label="Rank", info="Capacity of the trainable update. Higher ranks use more memory and are not automatically better for every dataset.")
                 alpha = gr.Number(value=TRAIN_DEFAULTS["alpha"], minimum=1, maximum=1024, label="Alpha", info="Scales the update relative to rank. The default equals rank for a scale of exactly one.")
                 dropout = gr.Slider(0, 0.5, value=TRAIN_DEFAULTS["dropout"], step=0.01, label="Dropout", info="Regularizes training by randomly dropping adapter inputs. More dropout is not always better.")
@@ -2239,20 +2250,30 @@ def build_training_tab(
 
     tier_outputs = [controls[f"training.{field_name}"] for field_name in (*TRAINING_TIER_FIELDS, *OMNI_CAPACITY_FIELDS)]
 
-    def apply_training_tier(tier_value: str, device_value: str, model_value: str = "indextts", method_value="dora"):
-        values = training_tier_values(tier_value, device_value, model_value, method_value)
+    def apply_training_tier(tier_value: str, device_value: str, model_value: str = "indextts", method_value="dora",
+                            keep_method: bool = False):
+        method = method_value
+        tier = _resolved_training_tier(tier_value, device_value)
+        if not keep_method and method == "full" and tier is not None and int(tier) < full_min_tier(model_value):
+            # Full fine-tuning does not fit this card: use the method the GPU tier presets choose for it.
+            method = "dora"
+        values = dict(training_tier_values(tier_value, device_value, model_value, method))
+        if method != method_value and model_value not in {"omnivoice", "auk"}:
+            values.update(INDEX_METHOD_VALUES["adapter"])
         return (*[values[field_name] for field_name in TRAINING_TIER_FIELDS],
                 *[values.get(field_name, gr.skip()) for field_name in OMNI_CAPACITY_FIELDS],
-                _training_tier_note(tier_value, device_value, model_value, method_value))
+                _training_tier_note(tier_value, device_value, model_value, method),
+                gr.update(value=method) if method != method_value else gr.skip())
 
     # A user's own selection fills the VRAM controls. Presets restore the dropdown
     # programmatically together with the controls, so a change event only refreshes the note.
     tier_inputs = [vram_tier, device, model_selector, adapter_type]
-    vram_tier.select(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
-    apply_tier.click(apply_training_tier, tier_inputs, [*tier_outputs, tier_note], queue=False)
+    vram_tier.select(apply_training_tier, tier_inputs, [*tier_outputs, tier_note, adapter_type], queue=False)
+    apply_tier.click(apply_training_tier, tier_inputs, [*tier_outputs, tier_note, adapter_type], queue=False)
     def apply_omni_method(tier_value, device_value, model_value, method_value):
         if model_value in {"omnivoice", "auk"}:
-            return apply_training_tier(tier_value, device_value, model_value, method_value)
+            # The user chose this method: keep it (the note explains a tier it does not fit).
+            return apply_training_tier(tier_value, device_value, model_value, method_value, keep_method=True)[:-1]
         # IndexTTS: the method sets its learning rate and checkpoint retention; the tier's memory settings stay.
         values = INDEX_METHOD_VALUES["full" if method_value == "full" else "adapter"]
         return (*[gr.skip()] * len(TRAINING_TIER_FIELDS), *[values.get(name, gr.skip()) for name in OMNI_CAPACITY_FIELDS],

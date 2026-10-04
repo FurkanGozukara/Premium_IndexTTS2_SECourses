@@ -29,7 +29,8 @@ def test_training_tier_dropdown_sits_beside_the_dataset_and_fills_the_vram_contr
     assert {tuple(callback.targets[0]) for callback in callbacks} == {
         (training.vram_tier._id, "select"), (training.apply_tier_button._id, "click"),
     }
-    expected_outputs = [training.controls[f"training.{name}"] for name in (*TRAINING_TIER_FIELDS, *OMNI_CAPACITY_FIELDS)] + [training.tier_note]
+    expected_outputs = ([training.controls[f"training.{name}"] for name in (*TRAINING_TIER_FIELDS, *OMNI_CAPACITY_FIELDS)]
+                        + [training.tier_note, training.controls["training.adapter_type"]])
     for callback in callbacks:
         assert callback.inputs == [training.vram_tier, training.device, training.model_selector, training.controls["training.adapter_type"]]
         assert callback.outputs == expected_outputs
@@ -38,10 +39,17 @@ def test_training_tier_dropdown_sits_beside_the_dataset_and_fills_the_vram_contr
         assert len(large) == len(expected_outputs)
         assert large[:8] == ("bf16", "bf16", "bf16", True, 0, 2, True, "auto")
         assert small[:8] == ("bf16", "bf16", "bf16", True, 0, 2, True, "auto")
-        assert "32 GB" in large[-1] and "8 GB" in small[-1]
+        assert "32 GB" in large[-2] and "8 GB" in small[-2]
         assert callback.fn("6", "cuda:0")[:8] == ("bf16", "bf16", "bf16", True, 22, 1, True, "auto")
         assert callback.fn("auto", "cpu")[:7] == ("bf16", "fp32", "fp32", True, 0, 2, False)
-        assert "CPU" in callback.fn("auto", "cpu")[-1]
+        assert "CPU" in callback.fn("auto", "cpu")[-2]
+        # A tier too small for full fine-tuning switches the method to the presets' DoRA; one that fits keeps it.
+        switched = callback.fn("8", "cuda:0", "auk", "full")
+        assert switched[-1]["value"] == "dora" and "AuK DORA: 8 GB" in switched[-2]
+        kept = callback.fn("32", "cuda:0", "auk", "full")
+        assert "value" not in kept[-1]  # gr.skip()
+        assert callback.fn("12", "cuda:0", "omnivoice", "full")[-1]["value"] == "dora"
+        assert "value" not in callback.fn("16", "cuda:0", "omnivoice", "full")[-1]  # gr.skip()
 
     note_callbacks = [fn for fn in demo.fns.values() if getattr(fn.fn, "__name__", "") == "_training_tier_note"]
     triggers = {tuple(target) for callback in note_callbacks for target in callback.targets}
