@@ -2828,8 +2828,12 @@ def cache_features_before_training(config: TrainConfig, state_dir: str | Path | 
     """
 
     dataset = Path(config.dataset_dir).expanduser().resolve()
-    if (dataset / "cache" / "index.jsonl").is_file():
-        return True
+    if (dataset / "cache" / "index.jsonl").is_file() or not (dataset / "manifest.jsonl").is_file():
+        return True  # cached already, or not a prepared dataset: the trainer reports that itself
+    from .dataset_manifest import load_manifest
+
+    if all((dataset / "cache" / f"{row.get('id')}.pt").is_file() for row in load_manifest(dataset)):
+        return True  # every clip has its features
     from .features import FeatureCacheConfig, cache_dataset_features, feature_batch_size_for_free_vram
 
     state = Path(state_dir).expanduser().resolve() if state_dir else None
