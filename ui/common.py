@@ -813,7 +813,7 @@ def tail_text(path: str | os.PathLike[str] | None, lines: int = 60) -> str:
     text = data.decode("utf-8", errors="replace")
     if size > _TAIL_BYTES:
         text = text.split("\n", 1)[-1]  # the first line was cut by the seek
-    shown = [line.rstrip("\r").rsplit("\r", 1)[-1] for line in text.split("\n")]
+    shown = [line.rstrip("\r").rsplit("\r", 1)[-1] for line in text.rstrip("\r\n").split("\n")]
     return "\n".join(shown[-max(1, int(lines)):]).rstrip()
 
 
