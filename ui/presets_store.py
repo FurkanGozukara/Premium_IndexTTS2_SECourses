@@ -328,6 +328,9 @@ class PresetStore:
         self.system_dir = self.root / "system"
         self.user_dir = self.root / "user"
         self.last_used_path = self.user_dir / ".last_used_preset.txt"
+        # The speech model the page showed last: a GPU VRAM preset cannot be saved, so this bookmark keeps
+        # the chosen model across page reloads and restarts.
+        self.last_model_path = self.user_dir / ".last_used_model.txt"
         self._last_used_memory: str | None = None
         # The GPU is inspected once per store; the result names the fallback preset.
         self._detect_tier = detect_tier or detect_gpu_tier
@@ -641,6 +644,33 @@ class PresetStore:
             if self._last_used_memory and self._read_payload(self._last_used_memory) is not None:
                 return self._last_used_memory
             return None
+
+    def set_last_model(self, model: str) -> None:
+        """Bookmark the speech model shown in the header (a cheap no-op when it is already stored)."""
+
+        value = str(model or "").strip().lower()
+        if not value or not value.isidentifier():
+            return
+        with _PRESET_IO_LOCK:
+            try:
+                if self._read_text_retry(self.last_model_path).strip() == value:
+                    return
+            except OSError:
+                pass
+            try:
+                self._write_atomic(self.last_model_path, value + "\n")
+            except OSError as exc:
+                print(f">> Warning: could not persist the last speech model '{value}': {exc}", flush=True)
+
+    def stored_last_model(self) -> str | None:
+        """The speech model shown last, or ``None`` before the first choice."""
+
+        with _PRESET_IO_LOCK:
+            try:
+                value = self._read_text_retry(self.last_model_path).strip().lower()
+            except OSError:
+                return None
+        return value or None
 
     def get_last_used(self) -> str:
         """The preset loaded or saved last, else the tier preset detected for this GPU."""

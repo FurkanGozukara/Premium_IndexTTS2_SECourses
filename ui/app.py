@@ -574,9 +574,15 @@ def build_app(args: Namespace | Any | None = None) -> gr.Blocks:
             if _display_name(store, requested) not in store.list_presets():
                 requested = store.default_preset_name()
             overlay = persisted_runtime if store.is_system(requested) else None
-            return ui_load(*load_values(requested, overlay, allow_busy=True))
+            # A GPU VRAM preset opens on the speech model shown last (a user preset keeps its saved model).
+            last_model = store.stored_last_model()
+            if last_model not in {key for _, key in MODEL_CHOICES}:
+                last_model = None
+            return ui_load(*load_values(requested, overlay, current_model=last_model, allow_busy=True))
 
         initial_load_event = preset_ui_event(demo.load(initial_load, None, ui_outputs, queue=False, api_name="initial_load"))
+        # Every model the header shows, chosen or loaded with a preset, becomes the bookmark the next page opens on.
+        speech_model.change(store.set_last_model, speech_model, None, queue=False, show_progress="hidden", api_name=False)
         # Order of the browser payload and the State values in the page's preset events.
         demo.preset_payload_keys = list(browser_keys)
         demo.preset_state_keys = [spec.key for spec in state_specs]

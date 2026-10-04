@@ -238,3 +238,16 @@ def test_non_tier_numbers_and_other_names_stay_available_to_users(tmp_path: Path
         assert store.save(name, {"generation.count": 2}) == name
         assert name in store.list_presets()
         assert store.delete(name)
+
+
+def test_last_model_bookmark_survives_a_new_store(tmp_path: Path):
+    """The header's model is remembered for the next page or restart (GPU VRAM presets cannot be saved)."""
+    store = make_store(tmp_path)
+    assert store.stored_last_model() is None
+    store.set_last_model("IndexTTS")
+    store.set_last_model("indextts")  # unchanged: nothing is rewritten
+    assert make_store(tmp_path).stored_last_model() == "indextts"
+    store.set_last_model("")
+    store.set_last_model("../evil")
+    assert make_store(tmp_path).stored_last_model() == "indextts"
+
