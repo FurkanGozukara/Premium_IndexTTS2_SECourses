@@ -409,7 +409,7 @@ def run_speech_evaluation(config: Any, state_dir: str | Path, *,
     candidate_inference = {}
     report_inference: dict[str, Any] | None = None
     for group in plan["groups"]:
-        update(f"Generating speech for {group['speaker']} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]) * len(candidates))
+        update(f"Generating speech for {group['speaker'] or 'the voice'} ({group['language']})", 0, len(group["prompts"]) * len(plan["seeds"]) * len(candidates))
         if hashlib.sha256(Path(group["reference"]).read_bytes()).hexdigest() != group["reference_sha256"]:
             raise ValueError("The frozen training reference has changed")
         for prompt in group["prompts"]:
