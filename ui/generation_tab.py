@@ -4392,7 +4392,7 @@ def bind_generation_events(
 
     # 132 request controls reach the server in one payload (common.GATHER_VALUES_JS),
     # so a generation does not slow every later click in the page.
-    reference_event.success(
+    generation_event = reference_event.success(
         None, tab.request_components, request_box, js=GATHER_VALUES_JS, queue=False, show_progress="hidden", api_name=False,
     ).then(
         generate_voice,
@@ -4407,6 +4407,9 @@ def bind_generation_events(
         # its model has loaded) runs right after it; Gradio's default dropped it without a word.
         trigger_mode="always_last",
     )
+    # A cancel confirmation left open must not outlive the run it was asked about.
+    generation_event.then(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target],
+                          queue=False, show_progress="hidden", api_name=False)
 
     audition_box = values_payload_component()
     auto_reference = registry["generation.auto_lora_reference"].component
@@ -4545,9 +4548,16 @@ def bind_generation_events(
         return gr.skip(), "No in-process generation is running."
 
     use_subprocess_component = tab.controls["generation.use_subprocess"]
+
+    def ask_cancel(state_value: str):
+        # The confirmation only makes sense for a run that is still going.
+        if not state_value or not output_task_is_active(state_value):
+            return gr.update(visible=False), "", "No generation is running."
+        return gr.update(visible=True), state_value, gr.skip()
+
     tab.cancel_button.click(
-        lambda state: (gr.update(visible=True), state), inputs=tab.task_state,
-        outputs=[tab.cancel_panel, tab.cancel_target], queue=False,
+        ask_cancel, inputs=tab.task_state,
+        outputs=[tab.cancel_panel, tab.cancel_target, tab.status], queue=False, api_name=False,
     )
     tab.cancel_no.click(lambda: (gr.update(visible=False), ""), outputs=[tab.cancel_panel, tab.cancel_target], queue=False)
     tab.cancel_yes.click(
