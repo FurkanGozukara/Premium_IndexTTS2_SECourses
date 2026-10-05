@@ -49,6 +49,57 @@ def _wav(path: Path, frames: int = 2205) -> None:
         handle.writeframes(b"\0\0" * frames)
 
 
+def test_ui_grid_with_spaced_voice_name_completes_in_its_polled_folder(tmp_path, monkeypatch):
+    from ui import app
+    from ui import grid_tab as grid_ui
+    from ui.presets_store import PresetStore
+    from indextts.training import grid_worker
+
+    monkeypatch.setattr(grid_ui, "ROOT", tmp_path)
+    monkeypatch.setattr(app, "PresetStore", lambda registry, _root:
+                        PresetStore(registry, tmp_path / "presets", detect_tier=lambda: 32))
+    monkeypatch.setattr(app, "load_persisted_runtime", lambda: None)
+    monkeypatch.setattr(app, "_runtime_summary", lambda *args, **kwargs: None)
+    demo = app.build_app(SimpleNamespace(model_dir="models", device="cpu"))
+    event = next(item for item in demo.fns.values() if item.api_name == "generate_checkpoint_grid")
+    callback = getattr(event.fn, "original", event.fn)
+    keys = {spec.component._id: spec.key for spec in demo.preset_registry.specs}
+    voice = tmp_path / "Tutorial Omni Full"
+    voice.mkdir()
+    reference = tmp_path / "reference.wav"
+    _wav(reference)
+    overrides = {
+        "grid.adapter_dir": str(voice), "grid.checkpoints": ["base"],
+        "grid.references": str(reference), "grid.texts": "A complete comparison.",
+    }
+    args = [overrides.get(keys.get(component._id), component.value) for component in event.inputs]
+    args[0] = {"base": {"label": BASE_CHECKPOINT_LABEL, "path": ""}}
+    monkeypatch.setattr(grid_module, "create_tts", lambda runtime: object())
+
+    def generate(request, engine):
+        path = Path(request["task_layout"]["final_wav_path"])
+        _wav(path)
+        return {"output_path": str(path), "audio_seconds": 0.1, "seed": request["seed"]}
+
+    monkeypatch.setattr(grid_module, "run_generation_request", generate)
+    launched = []
+
+    def start(kind, command, **kwargs):
+        launched.append(Path(kwargs["state_dir"]))
+        assert grid_worker.main(command[3:]) == 0
+
+    monkeypatch.setattr(grid_ui.PROCESS_MANAGER, "start", start)
+    state, *_ = callback(*args)
+    folder = Path(state)
+    assert launched == [folder]
+    assert folder.name.startswith("Tutorial_Omni_Full_")
+    assert json.loads((folder / "status.json").read_text())["phase"] == "complete"
+    result = load_grid(folder)
+    assert result.status == "complete" and len(result.cells) == 1
+    assert Path(result.cells[0].audio_path).parent == folder
+    assert list(folder.parent.iterdir()) == [folder]
+
+
 def test_changing_adapters_preserves_comparison_text_and_reference(monkeypatch):
     import gradio as gr
     import ui.grid_tab as grid_ui

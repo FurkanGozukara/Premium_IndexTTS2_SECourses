@@ -1646,7 +1646,6 @@ def bind_grid_events(
         output_root = ROOT / "outputs" / "grids"
         output_root.mkdir(parents=True, exist_ok=True)
         name = f"{Path(adapter_dir).name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        state_dir = output_root / name
         try:
             config = build_grid_config_from_ui(
                 mapping,
@@ -1659,6 +1658,9 @@ def bind_grid_events(
         except ValueError as exc:
             # Missing or invalid grid inputs: say which on the page instead of an "Error" badge and a traceback.
             raise gr.Error(f"Cannot start the grid: {exc}") from exc
+        # GridConfig normalizes names (including spaces). The UI, worker
+        # progress and generated cells must all refer to that same directory.
+        state_dir = Path(config.output_root) / config.grid_name
         state_dir.mkdir(parents=True, exist_ok=False)
         config_path = write_json_atomic(state_dir / "config.json", config.to_dict())
         write_json_atomic(
