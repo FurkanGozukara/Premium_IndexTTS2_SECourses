@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 1.0 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 1.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -12,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V1.1 Full Fine Tune in the voice picker, the selected model type at a glance and demo voices in nine more languages:** the Voice Generation section and its picker are now **Voice LoRA / DoRA / Full Fine Tune** and **LoRA / DoRA / Full Fine Tune**, since full fine-tunes and their INT8 ConvRot versions are chosen there too. A green label beside the heading names the selected trained voice's type (LoRA or DoRA with its rank, Full Fine Tune, or Full Fine Tune · INT8 ConvRot); a red one shows the Base model or a selected file that is missing or cannot be read. The model downloader also saves demo voices for Arabic, Chinese, French, German, Italian, Japanese, Korean, Polish and Spanish to `reference_audios`; `demo_voice.mp3` stays the default reference.
 
 **V1.0 Fixes from a complete fresh-install test (version numbers restart at 1.0 with the new name; 1.0 follows 8.1):** the first generation after a start is about 15 seconds faster because the app keeps its own GPU kernel cache, keyboard choices in dropdowns apply like clicks, training Stop opens its confirmation under the button and Resume from lists the stopped run at once, fractional training fields no longer jump on an arrow key, dictionary words no longer count as word errors in take quality, the Checkpoint Grid uses the selected run's own reference, AuK full fine-tuning on 32 GB no longer spills past the card, and the VRAM benchmark runs on a 4K desktop.
 
@@ -299,7 +301,7 @@ result, for all three speech models and for zero-shot cloning as well as trained
   checks. OmniVoice and AuK render the extra takes in batches.
 - **Whole-text candidates** render the entire text several times; **Keep the candidate Whisper hears best** makes the
   version with the fewest word errors the output. Each candidate repeats the takes per section, so the two multiply.
-- The **reference audition** (above Voice LoRA / DoRA, trained voices) chooses the clip a voice clones from; training
+- The **reference audition** (above Voice LoRA / DoRA / Full Fine Tune, trained voices) chooses the clip a voice clones from; training
   runs it automatically.
 
 Measured on 60 tutorial lines per setting (zero-shot cloning of `reference_audios/demo_voice.mp3` with each base model,
@@ -655,7 +657,7 @@ Training saves a first estimate from the short epoch sample. Because that compar
 
 ### Line length, token budget and pronunciation for a trained voice
 
-A voice reproduces the clip lengths it was trained on, so the **Voice LoRA / DoRA** panel derives its **Words per generated line** table from the adapter's training clips (`analysis/dataset_profile.json`, written by training since v6.13 and measured on first selection for older adapters while their dataset folder exists): the target is the middle of the training clips (40th to 60th percentile of words), the acceptable range covers 80 percent of them, the hard limits 90 percent, and never exceed is the longest clip; the seconds column uses the pace of the voice at the current **Speaking rate** and updates as the slider moves. **Per sentence inside a line** names the smallest sentence that should stand alone and the longest sentence before the segmenter cuts it at a comma or a word. With **Auto from LoRA / DoRA dataset** checked, **Max tokens per segment** is set so sentences merge up to the training clips' typical length (the panel states the value and the words and seconds it holds); the **Language default** button restores the per-language value.
+A voice reproduces the clip lengths it was trained on, so the **Voice LoRA / DoRA / Full Fine Tune** panel derives its **Words per generated line** table from the adapter's training clips (`analysis/dataset_profile.json`, written by training since v6.13 and measured on first selection for older adapters while their dataset folder exists): the target is the middle of the training clips (40th to 60th percentile of words), the acceptable range covers 80 percent of them, the hard limits 90 percent, and never exceed is the longest clip; the seconds column uses the pace of the voice at the current **Speaking rate** and updates as the slider moves. **Per sentence inside a line** names the smallest sentence that should stand alone and the longest sentence before the segmenter cuts it at a comma or a word. With **Auto from LoRA / DoRA dataset** checked, **Max tokens per segment** is set so sentences merge up to the training clips' typical length (the panel states the value and the words and seconds it holds); the **Language default** button restores the per-language value.
 
 Since v6.14 the profile also measures the speaker's pauses: every internal pause of the training clips (a quiet run of at least 120 ms between words), split into pauses at sentence boundaries (the longest `sentences - 1` pauses of a clip with several sentences) and pauses inside sentences. The **Pauses of this speaker** card shows the median sentence pause, the length only one in ten sentence pauses exceeds, the median pause inside a sentence and the share of clip time spent in pauses; with **Auto pauses from LoRA / DoRA dataset** checked they set **Sentence pause** and **Maximum pause** when the adapter is selected. **Smart sentences** uses the same profile for its target: the median training clip in text tokens, so a generated line holds about as many words as the recordings the voice learned from. The measurements are cached beside the dataset (`analysis/pause_cache.json`) and take a few seconds for a few thousand clips.
 
@@ -761,7 +763,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.0 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.1 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -919,7 +921,7 @@ These are the non-setting actions and result surfaces a regular user will encoun
 
 **Help:** Read the quick starts, workflow guidance, parameter glossary, pause syntax, troubleshooting steps, and launch arguments.
 
-**Changelog:** Open the newest-first v6.12-to-v4.0 release history and follow the official Patreon or GitHub project links.
+**Changelog:** Open the newest-first v1.1-to-v4.0 release history and follow the official Patreon or GitHub project links.
 
 ## 17. Every Registered Setting
 
@@ -1512,7 +1514,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 ### Models & Performance - 26 settings
 
-**LoRA / DoRA** - `runtime.lora_path`. Select a trained LoRA / DoRA, or None for Base model (no LoRA / DoRA), which clones from the reference only.
+**LoRA / DoRA / Full Fine Tune** - `runtime.lora_path`. Select a trained LoRA / DoRA / Full Fine Tune, or None for Base model (no LoRA / DoRA / Full Fine Tune), which clones from the reference only.
 
 **LoRA / DoRA strength** - `runtime.lora_strength`. 1.0 is the trained strength; lower is subtler and higher is stronger. *(default 1; minimum 0; maximum 2)*
 

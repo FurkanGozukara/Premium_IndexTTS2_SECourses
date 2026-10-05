@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.1",
+        "2026-10-05",
+        """
+### Version 1.1: full fine-tunes named in the voice picker, the selected model type at a glance, and demo voices in nine more languages
+
+- **Full Fine Tune in the voice picker:** the Voice Generation section is now **Voice LoRA / DoRA / Full Fine Tune**, and its picker, **LoRA / DoRA / Full Fine Tune**, says that full fine-tunes and their INT8 ConvRot versions are chosen there as well as LoRA and DoRA adapters. **None** remains the Base model, which clones from the reference only.
+- **Selected model type beside the section heading:** a green label names the selected trained voice (**LoRA** or **DoRA** with its rank, **Full Fine Tune**, or **Full Fine Tune · INT8 ConvRot**); a red label shows the Base model, or a selected file that is missing or cannot be read. It follows every change: your own choice, a loaded preset and a switch of speech model. On a narrow window it wraps under the heading.
+- **Demo voices in nine more languages:** the model downloader also saves demo voices for Arabic, Chinese, French, German, Italian, Japanese, Korean, Polish and Spanish (`demo_voice_<language>.mp3`) to `reference_audios`, where the **Reference audio library** lists them. `demo_voice.mp3` is downloaded last, so it stays the default reference.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v1.0",
         "2026-10-04",
         """

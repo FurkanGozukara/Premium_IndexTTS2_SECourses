@@ -76,3 +76,5 @@ Trellis_2_3D_Generator/
 /webui_*.log
 # Gradio writes a type stub for the Checkpoint Grid template component at startup.
 /ui/grid_tab.pyi
+# Language demo voices that Models_Downloader.py downloads from Hugging Face.
+/reference_audios/demo_voice_*.mp3

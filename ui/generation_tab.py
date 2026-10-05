@@ -1749,7 +1749,7 @@ def adapter_panel_html(
     auto_pauses: bool | None = None,
     segmentation_mode: str | None = None,
 ) -> str:
-    """The Voice LoRA / DoRA panel: identity, speaking rate, line-length rules, pauses, decoder and decoding."""
+    """The Voice LoRA / DoRA / Full Fine Tune panel: identity, speaking rate, line-length rules, pauses, decoder and decoding."""
 
     esc = html.escape
     # A full fine-tune has no rank, alpha or adapter targets: it is the model's own weights.
@@ -2027,12 +2027,12 @@ def _lora_info(
     auto_pauses: bool | None = None,
     segmentation_mode: str | None = None,
 ) -> tuple[str, str | None]:
-    """HTML for the Voice LoRA / DoRA panel and the adapter's recommended reference path."""
+    """HTML for the Voice LoRA / DoRA / Full Fine Tune panel and the adapter's recommended reference path."""
 
     if not path:
         return (
-            '<div class="adapter-panel"><div class="adapter-head">No LoRA / DoRA selected. Base model (no LoRA / DoRA) '
-            "will clone from the reference only.</div></div>",
+            '<div class="adapter-panel"><div class="adapter-head">No LoRA / DoRA / Full Fine Tune selected. Base model '
+            "(no LoRA / DoRA / Full Fine Tune) will clone from the reference only.</div></div>",
             None,
         )
     try:
@@ -2061,6 +2061,32 @@ def _lora_info(
         return markdown, reference
     except Exception as exc:
         return f'<div class="adapter-panel">LoRA / DoRA inspection failed: {html.escape(str(exc))}</div>', None
+
+
+def model_type_name(info: Mapping[str, Any]) -> str:
+    """The trained voice's model type as the Voice LoRA / DoRA / Full Fine Tune section names it."""
+
+    kind = str(info.get("adapter_type") or "").lower()
+    if kind == "full":
+        return "Full Fine Tune · INT8 ConvRot" if info.get("quantized") else "Full Fine Tune"
+    return f"{'DoRA' if kind == 'dora' else 'LoRA'} · rank {int(info.get('rank', 0) or 0)}"
+
+
+def model_type_badge(path: str | None) -> str:
+    """The selected model type: a green label for a trained voice, red for the Base model or an unreadable file."""
+
+    if not path:
+        trained, text = False, "Base model · no LoRA / DoRA / Full Fine Tune"
+    else:
+        try:
+            trained, text = True, model_type_name(inspect_lora(path))
+        except Exception:
+            name = Path(path).name
+            trained, text = False, (f"{name} could not be read" if Path(path).expanduser().is_file() else f"{name} not found")
+    return (
+        '<div class="model-type-line">Selected model type'
+        f'<span class="model-type-badge {"trained" if trained else "base"}">{html.escape(text)}</span></div>'
+    )
 
 
 def pick_expressive_clip(path: str | None) -> str:
@@ -2228,9 +2254,9 @@ def lora_selection_updates(
 
     if not messages:
         messages.append(
-            "LoRA / DoRA selected."
+            "LoRA / DoRA / Full Fine Tune selected."
             if path
-            else "Base model (no LoRA / DoRA) selected."
+            else "Base model (no LoRA / DoRA / Full Fine Tune) selected."
         )
     panel_kwargs = dict(panel or {})
     if isinstance(rate_update, (int, float)):
@@ -3148,7 +3174,7 @@ def build_generation_tab(
                         "that sounds most like the voice without a word error: the voice's training clips, or the "
                         "reference clip for zero-shot cloning. **Whole-text candidates** render the entire text several "
                         "times and can keep the version Whisper hears best. All three speech models; the **reference "
-                        "audition** above Voice LoRA / DoRA chooses the clip a trained voice clones from.",
+                        "audition** above Voice LoRA / DoRA / Full Fine Tune chooses the clip a trained voice clones from.",
                         elem_classes=["section-note"],
                     )
                     take_rule = gr.Dropdown(choices=[("Fewest word errors", "errors"),
@@ -3211,7 +3237,11 @@ def build_generation_tab(
                                           column_widths=["5%", "14%", "7%", "30%", "6%", "8%", "8%", "7%", "7%", "8%"],
                                           max_height=320, label="Audition results")
             audition_choice = gr.State(None)  # the winner the finished audition put in use, for Reference Voice
-        gr.Markdown("### Voice LoRA / DoRA")
+        # The section heading and the selected model type share one line (it wraps under the heading when narrow).
+        with gr.Row(elem_classes=["model-type-heading"]):
+            gr.Markdown("### Voice LoRA / DoRA / Full Fine Tune")
+            # Green while a trained voice is selected, red for the Base model (refreshed with the adapter panel).
+            lora_type = gr.HTML(model_type_badge(""))
         # Three rows of like with like: the two adapter pickers (one Refresh reloads
         # both), the two strengths side by side, then the four automation switches at
         # equal width so the long notes wrap in wide columns instead of tall slivers.
@@ -3221,8 +3251,9 @@ def build_generation_tab(
                 value="",
                 # Profile values can arrive before the model-specific choice refresh.
                 allow_custom_value=True,
-                label="LoRA / DoRA",
-                info="Select a trained LoRA / DoRA, or None for Base model (no LoRA / DoRA), which clones from the reference only.",
+                label="LoRA / DoRA / Full Fine Tune",
+                info="Select a trained LoRA / DoRA / Full Fine Tune, or None for Base model (no LoRA / DoRA / Full Fine Tune), "
+                     "which clones from the reference only.",
                 scale=6,
             )
             use_decoder = gr.Dropdown(
@@ -4033,6 +4064,7 @@ def build_generation_tab(
             message,
             source_update,
             gr.update(value=saved_lora_speaking_rate(path)),
+            model_type_badge(path),
             decoder_update,
         )
 
@@ -4118,12 +4150,13 @@ def build_generation_tab(
     )
     # Programmatic adapter changes (preset loads, switches) are frequent; the browser
     # packs the timing controls so only a few components join Gradio's status refresh.
+    # A user's choice changes the value too, so this also refreshes the model type label.
     tab.lora_restored_event = on_gathered(
         [lora.change],
         on_lora_restored,
         [*lora_selection_inputs, use_decoder],
         [lora_info, tab.prompt_audio, tab.reference_media, tab.reference_video, reference_status,
-         tab.reference_source, lora_saved_rate, use_decoder],
+         tab.reference_source, lora_saved_rate, lora_type, use_decoder],
         queue=False,
         api_name="refresh_lora_panel",
         show_progress="hidden",

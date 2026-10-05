@@ -411,7 +411,43 @@ button.ax:disabled { filter: grayscale(.45) opacity(.62); transform: none; box-s
 .stat-box span { font-size: var(--text-xs); color: var(--body-text-color-subdued); }
 .stat-box b { font-size: var(--text-lg); }
 
-/* Voice LoRA / DoRA panel: an identity strip and a row of equal-height cards (speaking
+/* Selected model type beside the Voice LoRA / DoRA / Full Fine Tune heading: a solid green
+   label for a trained voice, red for the Base model or a file that cannot be read.  White
+   reads at 5:1 or better on both fills, in the light and the dark theme.  Both blocks of the
+   heading row take their own width, so the label follows the heading and wraps under it on a
+   narrow page; the label drops the HTML block's padding to line up with the heading text. */
+.model-type-heading { align-items: center; column-gap: var(--size-4); row-gap: var(--size-2); }
+.model-type-heading > .block { flex: 0 1 auto !important; width: auto !important; }
+.model-type-heading .html-container { padding: 0; }
+.model-type-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-2);
+  font-size: var(--text-sm);
+  color: var(--body-text-color-subdued);
+}
+.model-type-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px var(--size-3);
+  border-radius: var(--radius-full);
+  background: #15803d;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.model-type-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.model-type-badge.base { background: #b91c1c; }
+
+/* Voice LoRA / DoRA / Full Fine Tune panel: an identity strip and a row of equal-height cards (speaking
    rate, line length, sentences, pauses, decoder and files).  Numbers stay on one line
    while the label column and every note wrap, so nothing is ever clipped at a card
    edge.  The rules are written at .adapter-card depth to outrank Gradio's .prose

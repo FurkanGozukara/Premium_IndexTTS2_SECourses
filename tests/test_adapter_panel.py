@@ -1,4 +1,4 @@
-"""Voice LoRA / DoRA panel, automatic token budget, and the Gradio bounds guard."""
+"""Voice LoRA / DoRA / Full Fine Tune panel and model type label, automatic token budget, and the Gradio bounds guard."""
 
 from __future__ import annotations
 
@@ -141,7 +141,32 @@ def test_adapter_panel_reports_rate_lines_and_auto_tokens(tmp_path: Path, monkey
     slower, _ = generation_tab._lora_info(str(checkpoint), speaking_rate=0.5, max_tokens=60, budget_scale=0.72, language="EN", auto_tokens=False)
     assert f"{1.4:.2f} words/s" in slower and "enable <b>Auto from LoRA / DoRA dataset</b>" in slower
     base, base_reference = generation_tab._lora_info("")
-    assert "No LoRA / DoRA selected" in base and base_reference is None
+    assert "No LoRA / DoRA / Full Fine Tune selected" in base and base_reference is None
+
+
+def test_model_type_label_is_green_for_a_trained_voice_and_red_for_the_base_model(tmp_path: Path, monkeypatch) -> None:
+    checkpoint = tmp_path / "voice.safetensors"
+    checkpoint.write_bytes(b"x")
+    kinds = {
+        "dora": ({"adapter_type": "dora", "rank": 128}, "DoRA · rank 128"),
+        "lora": ({"adapter_type": "lora", "rank": 32}, "LoRA · rank 32"),
+        "full": ({"adapter_type": "full", "rank": 0}, "Full Fine Tune"),
+        "int8": ({"adapter_type": "full", "rank": 0, "quantized": True}, "Full Fine Tune · INT8 ConvRot"),
+    }
+    for info, name in kinds.values():
+        monkeypatch.setattr(generation_tab, "inspect_lora", lambda _path, info=info: info)
+        badge = generation_tab.model_type_badge(str(checkpoint))
+        assert 'class="model-type-badge trained"' in badge and f">{name}</span>" in badge
+    base = generation_tab.model_type_badge("")
+    assert 'class="model-type-badge base"' in base and "Base model · no LoRA / DoRA / Full Fine Tune" in base
+
+    def unreadable(_path):
+        raise ValueError("not a safetensors file")
+
+    monkeypatch.setattr(generation_tab, "inspect_lora", unreadable)
+    assert "model-type-badge base" in generation_tab.model_type_badge(str(checkpoint))
+    assert "voice.safetensors could not be read" in generation_tab.model_type_badge(str(checkpoint))
+    assert "gone.safetensors not found" in generation_tab.model_type_badge(str(tmp_path / "gone.safetensors"))
 
 
 def test_adapter_panel_without_dataset_explains_missing_statistics(tmp_path: Path, monkeypatch) -> None:
