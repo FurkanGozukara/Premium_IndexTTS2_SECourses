@@ -300,17 +300,11 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
     """Return the complete dataset dashboard update used by timer and server push."""
 
     if not state_value:
-        empty_hist = _empty_histogram()
+        # A user may be browsing an existing dataset without an attached prep
+        # worker. Its change handler owns these results; idle ticks must not
+        # erase the table, selected-clip paths, references, or histogram.
         return (
-            progress_panel_html({}, title="Ready"),
-            "",
-            "",
-            "",
-            empty_hist,
-            [],
-            "",
-            "",
-            [],
+            *(gr.skip() for _ in range(9)),
             gr.Timer(5.0, active=True),
             gr.skip(),
         )

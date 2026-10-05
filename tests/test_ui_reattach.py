@@ -221,6 +221,20 @@ def test_dynamic_audio_path_states_round_trip_as_textbox_json() -> None:
     assert _path_list_from_state("not json") == []
 
 
+def test_idle_dataset_poll_preserves_manually_loaded_results(tmp_path: Path) -> None:
+    import gradio as gr
+
+    dataset = tmp_path / "selected_dataset"
+    _write_json(dataset / "dataset_info.json", {"segment_count": 2})
+    updates = dataset_poll_updates("", str(dataset), state_root=tmp_path / "states")
+    assert updates[:2] == ("", str(dataset.resolve()))
+    # An idle refresh must leave the existing table, paths and all visible
+    # dashboard results untouched after load_existing has populated them.
+    assert all(value == gr.skip() for value in updates[2:11])
+    assert updates[-1] == gr.skip()
+    assert updates[-2].active is True
+
+
 def test_dataset_wording_and_chart_placeholders_keep_frontend_contract(tmp_path: Path) -> None:
     dataset = tmp_path / "ui_prep_live"
     _write_json(dataset / "dataset_info.json", {"segment_count": 83, "total_duration_minutes": 12.32})
