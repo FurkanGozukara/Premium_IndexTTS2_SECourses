@@ -72,7 +72,7 @@ from .common import (
     tail_text,
     write_json_atomic,
 )
-from .dataset_tab import scan_datasets
+from .dataset_tab import feature_cache_status, scan_datasets
 from .generation_tab import GenerationTab
 from .models_tab import _gpu_total
 from .presets_store import PresetRegistry
@@ -447,11 +447,13 @@ def _dataset_summary(path: str | None) -> str:
         return "Select a prepared dataset."
     root = Path(path)
     info = read_json(root / "dataset_info.json", {}) or {}
-    cache_index = root / "cache" / "index.jsonl"
+    cache_status = feature_cache_status(root)
+    if cache_status == "not cached":
+        cache_status += " yet (Start training caches them first)"
     return (
         f"**{root.name}** | {info.get('segment_count', 0)} segments | "
         f"{float(info.get('total_duration_minutes', 0.0) or 0.0):.2f} minutes | "
-        f"features **{'cached' if cache_index.is_file() else 'not cached yet (Start training caches them first)'}**"
+        f"features **{cache_status}**"
     )
 
 

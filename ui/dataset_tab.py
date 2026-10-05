@@ -73,13 +73,28 @@ def scan_datasets(root: str | Path = ROOT / "datasets") -> list[tuple[str, str]]
     return sorted(entries, key=lambda item: item[0].lower())
 
 
+def feature_cache_status(path: str | Path) -> str:
+    """Name the available model caches instead of treating all caches as IndexTTS."""
+    root = Path(path).expanduser() / "cache"
+    models = [label for label, index in (
+        ("IndexTTS", root / "index.jsonl"),
+        ("OmniVoice", root / "omnivoice" / "index.jsonl"),
+        ("AuK", root / "auk" / "index.jsonl"),
+    ) if index.is_file()]
+    if not models:
+        return "not cached"
+    if models == ["IndexTTS"]:
+        return "cached"
+    return f"cached ({', '.join(models)})"
+
+
 def dataset_summary_line(path: str | Path) -> str:
     root = Path(path).expanduser()
     info = read_json(root / "dataset_info.json", {}) or {}
     return (
         f"**{root.name}** | {info.get('segment_count', 0)} segments | "
         f"{float(info.get('total_duration_minutes', 0.0) or 0.0):.2f} minutes | "
-        f"features {'cached' if (root / 'cache' / 'index.jsonl').is_file() else 'not cached'}"
+        f"features {feature_cache_status(root)}"
     )
 
 
@@ -986,7 +1001,7 @@ def bind_dataset_events(tab: DatasetTab, training: Any) -> None:
         summary = (
             f"**{path.name}** | {info.get('segment_count', 0)} segments | "
             f"{float(info.get('total_duration_minutes', 0.0) or 0.0):.2f} minutes | "
-            f"features **{'cached' if (path / 'cache' / 'index.jsonl').is_file() else 'not cached'}**"
+            f"features **{feature_cache_status(path)}**"
         )
         return gr.update(choices=choices, value=str(path.resolve())), summary
 

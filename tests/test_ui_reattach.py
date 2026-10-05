@@ -239,6 +239,26 @@ def test_dataset_wording_and_chart_placeholders_keep_frontend_contract(tmp_path:
     assert set(plotted["series"]).issubset(LOSS_SERIES)
 
 
+def test_dataset_and_training_summaries_recognize_model_specific_caches(tmp_path: Path) -> None:
+    from ui.training_tab import _dataset_summary, _refresh_dataset_updates
+    dataset = tmp_path / "voice"
+    _write_json(dataset / "dataset_info.json", {"segment_count": 2, "total_duration_minutes": 0.5})
+    for relative, expected in (
+        ("omnivoice", "cached (OmniVoice)"),
+        ("auk", "cached (OmniVoice, AuK)"),
+        ("", "cached (IndexTTS, OmniVoice, AuK)"),
+    ):
+        cache = dataset / "cache" / relative
+        cache.mkdir(parents=True, exist_ok=True)
+        # A tensor directory alone is not a published cache index.
+        if relative == "omnivoice":
+            assert dataset_summary_line(dataset).endswith("features not cached")
+        (cache / "index.jsonl").write_text('{"id":"clip"}\n', encoding="utf-8")
+        assert dataset_summary_line(dataset).endswith(f"features {expected}")
+        assert _dataset_summary(str(dataset)).endswith(f"features **{expected}**")
+        assert _refresh_dataset_updates(str(dataset))[1].endswith(f"features **{expected}**")
+
+
 def test_training_state_discovery_ignores_evaluation_job_folders(tmp_path: Path) -> None:
     from ui.training_tab import latest_training_state
 
