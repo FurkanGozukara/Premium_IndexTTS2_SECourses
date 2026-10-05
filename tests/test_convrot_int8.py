@@ -20,10 +20,12 @@ from indextts.quant.convrot_int8 import (
     _int8_gemm_supported,
     _rotate_activation,
     _rotate_weight,
+    _fused_kernels,
     comfy_quant_tensor,
     is_int8_convrot_checkpoint,
     load_gpt_checkpoint,
     quantize_best_convrot,
+    set_kernel_mode,
 )
 
 
@@ -448,3 +450,79 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for the full model comparison")
     print(json.dumps(run_full_model_comparison(), indent=2))
+
+
+def test_fused_kernel_mode_runs_the_unfused_path_where_it_cannot_apply() -> None:
+    generator = torch.Generator().manual_seed(12)
+    layer = _make_layer(torch.randn((24, 64), generator=generator), torch.randn((24,), generator=generator))
+    x = torch.randn((3, 64), generator=generator)
+    expected = layer(x)
+    assert set_kernel_mode(layer, "fused") == 1
+    torch.testing.assert_close(layer(x), expected, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="fused"):
+        set_kernel_mode(layer, "w4a8")
+
+
+def _random_cuda_layer(in_features: int, out_features: int, group_size: int, seed: int) -> ConvRotInt8Linear:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    layer = ConvRotInt8Linear(
+        in_features, out_features, bias=True, group_size=group_size, device=device, dtype=torch.bfloat16
+    )
+    layer.weight_int8.random_(-127, 128, generator=generator)
+    layer.weight_scale.uniform_(0.0002, 0.002, generator=generator)
+    layer.bias.data.normal_(generator=generator)
+    return layer
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("rows", [1, 3, 64, 257, 3098])
+def test_cuda_fused_mode_matches_w8a16(rows: int) -> None:
+    if _fused_kernels(torch.device("cuda")) is None:
+        pytest.skip("the fused kernels need an RTX 30 series or newer GPU and Triton")
+    layer = _random_cuda_layer(1536, 4608, 256, 9000 + rows)
+    x = torch.randn((rows, 1536), device="cuda", dtype=torch.bfloat16,
+                    generator=torch.Generator(device="cuda").manual_seed(rows))
+    with torch.inference_mode():
+        layer.kernel_mode = "w8a16"
+        w8a16 = layer(x)
+        layer.kernel_mode = "fused"
+        fused = layer(x)
+    relative = ((fused.float() - w8a16.float()).norm() / w8a16.float().norm()).item()
+    assert fused.dtype == torch.bfloat16 and fused.shape == w8a16.shape
+    assert relative < 0.02
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fused_mode_follows_autocast_and_leaves_autograd_and_other_groups_to_w8a16() -> None:
+    if _fused_kernels(torch.device("cuda")) is None:
+        pytest.skip("the fused kernels need an RTX 30 series or newer GPU and Triton")
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    layer = _random_cuda_layer(512, 256, 256, 30)
+    x = torch.randn((64, 512), device="cuda", generator=generator)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        layer.kernel_mode = "fused"
+        fused = layer(x)
+        layer.kernel_mode = "w8a16"
+        w8a16 = layer(x)
+    assert fused.dtype == w8a16.dtype == torch.bfloat16
+
+    # With autograd on, "fused" is the W8A16 path, so gradients reach the input.
+    trained = x.to(torch.bfloat16).requires_grad_()
+    layer.kernel_mode = "fused"
+    output = layer(trained)
+    layer.kernel_mode = "w8a16"
+    torch.testing.assert_close(output.detach(), layer(trained.detach()), atol=0, rtol=0)
+    output.float().sum().backward()
+    assert trained.grad is not None and torch.isfinite(trained.grad).all()
+
+    # A 64-wide ConvRot group is outside the fused kernels: identical to W8A16.
+    narrow = _random_cuda_layer(128, 96, 64, 32)
+    small = torch.randn((5, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
+    with torch.inference_mode():
+        narrow.kernel_mode = "w8a16"
+        expected = narrow(small)
+        narrow.kernel_mode = "fused"
+        torch.testing.assert_close(narrow(small), expected, atol=0, rtol=0)

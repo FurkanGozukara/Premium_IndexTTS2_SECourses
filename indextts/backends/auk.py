@@ -316,8 +316,10 @@ class AukEngine:
             from indextts.quant.convrot_int8 import set_kernel_mode
 
             self.model = build_int8_model(self.config, quantized["dit"], device=dit_device, num_text_layers=num_layers)
-            # W8A16 is faster than W8A8 for AuK's shapes (and never calls cuBLASLt's int8 GEMM).
-            set_kernel_mode(self.model, "w8a16")
+            # Fused W8A8 (one rotation+quantization kernel and an INT8 GEMM with the scales in its epilogue)
+            # samples faster than BF16 on AuK's shapes; layers and GPUs it does not cover run W8A16. Neither
+            # calls cuBLASLt's int8 GEMM. The text encoder runs once per request and stays W8A16.
+            set_kernel_mode(self.model, "fused")
         else:
             state = read_state(folder / "auk_base.safetensors")
             self.model = build_model(self.config, state, device=dit_device, dtype=self.dtype, num_text_layers=num_layers)

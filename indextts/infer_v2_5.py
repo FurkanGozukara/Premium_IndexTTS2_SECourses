@@ -640,6 +640,9 @@ class IndexTTS2:
                 self._sync_decoder_adapter(requested, strength)
                 return None
         if resolved and resolved == self._lora_path and self._lora_handle is not None:
+            # A repeated request for the same adapter (INT8 skips a requested merge, so the runner repeats it)
+            # keeps the acceleration engine's captured graphs; only a changed computation re-captures them.
+            layers_changed = self._lora_merged or strength != self._lora_strength
             if self._lora_merged:
                 unmerge_lora_from_model(self.gpt)
                 self._lora_merged = False
@@ -650,6 +653,9 @@ class IndexTTS2:
             if merge_requested and self.runtime.model_variant == "bf16":
                 merge_lora_for_inference(self.gpt)
                 self._lora_merged = True
+                layers_changed = True
+            if layers_changed:
+                self.gpt.bind_accel_layers()
             self._sync_decoder_adapter(requested, strength)
             return self._lora_handle
         if self._lora_handle is not None or self._lora_path:
@@ -657,6 +663,7 @@ class IndexTTS2:
                 unmerge_lora_from_model(self.gpt)
                 self._lora_merged = False
             remove_lora(self.gpt)
+            self.gpt.bind_accel_layers()
             self._lora_handle = None
             self._lora_path = ""
             self._remove_decoder_adapter()
@@ -681,6 +688,7 @@ class IndexTTS2:
             self._lora_merged = True
         elif merge_requested:
             print(">> LoRA / DoRA merge requested but skipped because the GPT base is INT8.")
+        self.gpt.bind_accel_layers()
         print(
             f">> LoRA / DoRA active: {requested} (strength {strength:.3f}, "
             f"merged={'yes' if self._lora_merged else 'no'})"

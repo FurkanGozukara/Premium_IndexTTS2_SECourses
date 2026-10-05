@@ -685,6 +685,28 @@ def _torch_is_compiling() -> bool:
         return False
 
 
+_FUSED_KERNELS: dict[int, Any] = {}
+
+
+def _fused_kernels(device: torch.device) -> Any:
+    """The built-in Whisper's Triton ConvRot kernels when ``device`` can run them, otherwise ``None``.
+
+    ``rotate_quantize`` rotates and quantizes an activation in one kernel and ``int8_linear_q`` is an
+    INT8 GEMM that applies both scales and the bias in its epilogue (the layout comfy_kitchen uses for
+    ``int8_tensorwise`` + ``convrot``). They need an RTX 30 series or newer GPU and Triton.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _FUSED_KERNELS:
+        kernels = None
+        if torch.version.hip is None and torch.cuda.get_device_capability(index) >= (8, 0):
+            try:
+                from indextts.asr.convrot import kernels
+            except (ImportError, OSError):
+                pass
+        _FUSED_KERNELS[index] = kernels
+    return _FUSED_KERNELS[index]
+
+
 class ConvRotInt8Linear(nn.Module):
     """Linear-layout ComfyUI INT8 ConvRot layer.
 
@@ -693,7 +715,9 @@ class ConvRotInt8Linear(nn.Module):
     ``weight_int8_rhs``, a non-persistent ``[K_pad, N_pad]`` cache. A data-pointer
     and device check invalidates that cache when a block streamer rebinds the
     source buffer. ``training_ste`` enables an analytic input gradient while
-    retaining a deployed W8A16 forward.
+    retaining a deployed W8A16 forward. ``kernel_mode = "fused"`` runs W8A8 through
+    the fused Triton kernels (``_fused_kernels``) where they apply: 256-wide groups,
+    inference without autograd, a supported GPU; elsewhere it runs W8A16.
     """
 
     _PROTECTED_BUFFERS = ("weight_int8", "weight_scale", "weight_int8_rhs")
@@ -876,11 +900,34 @@ class ConvRotInt8Linear(nn.Module):
         value = self.dequantize_weight()
         return value.T if self._hf_conv1d_compatible else value
 
+    def _runs_fused(self, x: torch.Tensor) -> bool:
+        return (
+            self.group_size == 256
+            and x.device.type == "cuda"
+            and not self.force_fallback
+            and not torch.is_grad_enabled()
+            and self.weight_int8.device == x.device
+            and self.weight_scale.device == x.device
+            and not _torch_is_compiling()
+            and _fused_kernels(x.device) is not None
+        )
+
+    def _fused_forward(self, x: torch.Tensor) -> torch.Tensor:
+        kernels = _fused_kernels(x.device)
+        out_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+        quantized, scale = kernels.rotate_quantize(x)
+        output = kernels.int8_linear_q(
+            quantized, scale, self.weight_int8, self.weight_scale.view(-1), bias=self.bias, out_dtype=out_dtype
+        )
+        return output.reshape(*x.shape[:-1], self.out_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.in_features:
             raise ValueError(
                 f"Expected input width {self.in_features}, got {x.shape[-1]}"
             )
+        if self.kernel_mode == "fused" and self._runs_fused(x):
+            return self._fused_forward(x)
         h = self._get_hadamard(x.device, x.dtype)
         rotated = _rotate_activation(x, h, self.group_size)
         original_shape = rotated.shape
@@ -906,11 +953,13 @@ class ConvRotInt8Linear(nn.Module):
             )
         else:
             mode = self.kernel_mode
-            if mode not in ("auto", "w8a16", "w8a8"):
+            if mode not in ("auto", "w8a16", "w8a8", "fused"):
                 raise ValueError(
-                    "kernel_mode must be 'auto', 'w8a16', or 'w8a8', "
+                    "kernel_mode must be 'auto', 'w8a16', 'w8a8' or 'fused', "
                     f"got {mode!r}"
                 )
+            if mode == "fused":  # a layer or call the fused kernels do not cover
+                mode = "w8a16"
             if mode == "auto":
                 local_key = (x.device, _m_bucket(x_2d.shape[0]))
                 mode = self._local_kernel_choices.get(local_key)
@@ -963,13 +1012,14 @@ class ConvRotInt8Linear(nn.Module):
 
 
 def set_kernel_mode(module: nn.Module, mode: str) -> int:
-    """Set every ConvRot layer of ``module`` to "auto", "w8a16" or "w8a8"; return the count.
+    """Set every ConvRot layer of ``module`` to "auto", "w8a16", "w8a8" or "fused"; return the count.
 
-    A fixed mode skips the first-use W8A8 benchmark (and its weight copy).
+    A fixed mode skips the first-use W8A8 benchmark (and its weight copy). "fused" runs W8A8 on the
+    fused Triton kernels where they apply and W8A16 elsewhere (see ``ConvRotInt8Linear``).
     """
 
-    if mode not in ("auto", "w8a16", "w8a8"):
-        raise ValueError(f"kernel mode must be 'auto', 'w8a16' or 'w8a8', got {mode!r}")
+    if mode not in ("auto", "w8a16", "w8a8", "fused"):
+        raise ValueError(f"kernel mode must be 'auto', 'w8a16', 'w8a8' or 'fused', got {mode!r}")
     count = 0
     for item in module.modules():
         if isinstance(item, ConvRotInt8Linear):

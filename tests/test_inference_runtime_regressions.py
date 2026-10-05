@@ -216,6 +216,9 @@ def test_cold_constructor_installs_decoder_before_residency_caches_and_compile(t
         def post_init_gpt2_config(self, **kwargs):
             pass
 
+        def bind_accel_layers(self):
+            pass
+
     class FakeEstimator(_Projection):
         def setup_caches(self, **kwargs):
             assert isinstance(self.proj, LoRAAdapter) is has_decoder

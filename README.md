@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 1.1 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 1.2 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -12,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V1.2 AuK INT8 faster than BF16 and the IndexTTS acceleration engine with INT8 and trained voices:** AuK's ConvRot INT8 transformer runs W8A8 on fused Triton kernels, the scheme ComfyUI uses, and renders cloned requests in about 14 % less time than BF16 and 25 % less than before, with word errors and speaker similarity unchanged within seed noise. IndexTTS's optional acceleration engine (beams 1) runs on the GPT's own layers: it now works with INT8 ConvRot and LoRA / DoRA, which previously never reached an end of speech, follows adapter changes and keeps no second copy of the GPT. Standard IndexTTS generation, OmniVoice and the BF16 models are unchanged.
 
 **V1.1 Full Fine Tune in the voice picker, the selected model type at a glance and demo voices in nine more languages:** the Voice Generation section and its picker are now **Voice LoRA / DoRA / Full Fine Tune** and **LoRA / DoRA / Full Fine Tune**, since full fine-tunes and their INT8 ConvRot versions are chosen there too. A green label beside the heading names the selected trained voice's type (LoRA or DoRA with its rank, Full Fine Tune, or Full Fine Tune · INT8 ConvRot); a red one shows the Base model or a selected file that is missing or cannot be read. The model downloader also saves demo voices for Arabic, Chinese, French, German, Italian, Japanese, Korean, Polish and Spanish to `reference_audios`; `demo_voice.mp3` stays the default reference.
 
@@ -763,7 +765,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.1 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.2 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -1530,7 +1532,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Attention backend** - `runtime.attention_backend`. SDPA is the compatible default; FlashAttention 2 requires its optional package. *(default "sdpa"; choices "sdpa", "flash_attention_2", "eager")*
 
-**Use acceleration engine** - `runtime.use_accel`. Enables the optional CUDA-graph/flash-attention path; use beams=1. *(default false)*
+**Use acceleration engine** - `runtime.use_accel`. Enables the optional CUDA-graph/flash-attention path; use beams=1. It runs on the GPT's own layers, so it works with INT8 ConvRot and with LoRA / DoRA, follows adapter changes, and keeps no second copy of the GPT. Against standard 1-beam generation on 48 held-out clips it was about 2.7 times as fast with word errors within noise, and scored 0.012 lower speaker similarity to the reference. *(default false)*
 
 **Enable emotion-text model** - `runtime.use_qwen_emo`. Required for Emotion text mode; on-demand residency keeps startup lazy. *(default true)*
 

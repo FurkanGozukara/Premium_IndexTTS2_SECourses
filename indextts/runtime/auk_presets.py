@@ -5,8 +5,9 @@ docs/AUK.md): BF16 transformer and encoder resident 12.0 at section batch 8; BF1
 transformer with the INT8 encoder (token table in CPU memory) 8.7 at batch 4; both INT8 7.3.
 On demand, the encoder and the transformer with the VAE take turns on the GPU, one loan
 each per request: 5.0 (BF16 transformer) or 4.6 (INT8). Audio is bit-identical across
-residencies. INT8 saves memory, not time (13-28 % slower), so the BF16 transformer stays
-wherever it fits.
+residencies. Since 1.2 the INT8 transformer samples faster than BF16 (fused W8A8 kernels) and
+the INT8 encoder, run once per request, stays W8A16; the BF16 transformer, the official
+precision, still stays wherever it fits.
 """
 
 from .vram_presets import RuntimeConfig, auto_tier

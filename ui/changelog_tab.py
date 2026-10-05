@@ -7,6 +7,19 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.2",
+        "2026-10-05",
+        """
+### Version 1.2: AuK INT8 faster than BF16, and the IndexTTS acceleration engine with INT8 ConvRot and trained voices
+
+- **AuK ConvRot INT8 renders faster than BF16:** the INT8 transformer runs W8A8 on fused Triton kernels, the scheme ComfyUI uses for ConvRot INT8: one kernel rotates and quantizes each activation, and an INT8 matrix multiply applies the scales and bias as it writes the result. On an RTX 5090 cloned requests take about 14 % less time than BF16 and 25 % less than the previous INT8, which converted every weight back to BF16 on each call; the 10 GB and 6 GB GPU tiers gain the same 25 %. Word errors and speaker similarity on 48 held-out clips stay within seed noise of BF16. Layers with 64- or 16-wide groups, GPUs before the RTX 30 series, training and the INT8 text encoder (it runs once per request) keep the previous kernels.
+- **IndexTTS acceleration engine with INT8 ConvRot and LoRA / DoRA:** **Use acceleration engine** (Models & Performance, beams 1) runs on the GPT's own layers instead of a copy of their weights. The copy kept random weights for INT8 ConvRot layers and adapter-wrapped layers, so generation never reached its end of speech and failed after its retries, and it ignored an adapter chosen, re-weighted or merged after loading. It now records its CUDA graphs again after each adapter change and keeps no second BF16 copy of the GPT (about 0.9 GB less VRAM). With INT8 it renders about three times as fast as standard INT8 generation, with the quality of the BF16 engine.
+- **Unchanged:** IndexTTS standard generation, OmniVoice and the BF16 models produce the same audio as 1.1.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v1.1",
         "2026-10-05",
         """

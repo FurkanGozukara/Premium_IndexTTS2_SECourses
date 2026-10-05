@@ -525,6 +525,21 @@ class UnifiedVoice(nn.Module):
         self.attention_backend = self.gpt.config._attn_implementation
         self.accel_engine = None  # Will be initialized in post_init_gpt2_config
 
+    def bind_accel_layers(self):
+        """Point the acceleration model at this GPT's current layers and drop its captured CUDA graphs.
+
+        It shares the norms, MLPs and attention projections. The former ``load_state_dict(strict=False)``
+        copy kept random weights wherever a layer stores something other than ``weight`` (INT8 ConvRot
+        ``weight_int8``, LoRA / DoRA wrappers), so generation never reached an end token, and it never saw
+        an adapter applied, merged or re-weighted later. Call this after changing the GPT's layers.
+        """
+        if self.accel_engine is None:
+            return
+        from indextts.accel.gpt2_accel import share_gpt_layers
+
+        share_gpt_layers(self.accel_engine.model, self.gpt)
+        self.accel_engine.reset_cuda_graphs()
+
     def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False, dtype=None):
         seq_length = self.max_mel_tokens + self.max_text_tokens + 2
         gpt_config = GPT2Config(
@@ -552,7 +567,6 @@ class UnifiedVoice(nn.Module):
 
             # Create accel model
             accel_gpt = GPT2AccelModel(gpt_config)
-            accel_gpt.load_state_dict(self.gpt.state_dict(), strict=False)
 
             accel_dtype = dtype or (torch.float16 if half else next(self.gpt.parameters()).dtype)
             accel_gpt = accel_gpt.to(device="cuda", dtype=accel_dtype)
@@ -569,6 +583,8 @@ class UnifiedVoice(nn.Module):
                 num_blocks=16,  # Reduce to save memory (16*256 = 4096 tokens capacity)
                 use_cuda_graph=True,
             )
+            # Bound after the dtype move above, which would round fp32 LoRA / DoRA parameters.
+            self.bind_accel_layers()
             print("acceleration engine initialized")
         self.inference_model = GPT2InferenceModel(
             gpt_config,

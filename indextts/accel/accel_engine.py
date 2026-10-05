@@ -81,6 +81,10 @@ class AccelInferenceEngine:
         self.kv_manager.wire_kv_cache_to_model(model)
         self.sampler = Sampler()
         self.current_sequences = []
+        self.reset_cuda_graphs()
+
+    def reset_cuda_graphs(self):
+        """Forget the captured decode graphs; the next generation captures them on the current layers."""
         self.graphs = {}
         self.graph_vars = None
         self.graph_pool = None

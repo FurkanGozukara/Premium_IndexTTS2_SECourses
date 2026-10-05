@@ -34,7 +34,7 @@ Decoding choices were compared on 24 held-out English sentences × 2 seeds, scor
 
 The app downloads AuK from [tencent/AuK](https://huggingface.co/tencent/AuK). The Qwen Thinker comes from [MonsterMMORPG/Wan_GGUF/AuK](https://huggingface.co/MonsterMMORPG/Wan_GGUF/tree/main/AuK): 7.5 GB with only the text model and audio tower, bitwise-identical hidden states to the 12 GB public snapshot, which is used when already present or as fallback. The same folder holds the optional ConvRot INT8 transformer (204 projections) and INT8 Thinker (252 projections), application-specific checkpoints converted by `tools/quantize_auk.py` with per-row MSE clipping and per-layer Hadamard group sizes.
 
-INT8 measured within seed noise against BF16 (speaker similarity −0.001, word errors +0.1 to +0.3 points on 48 clips) and saves memory, not time: both models INT8 run 13–28 % slower. INT8 uses W8A16 kernels; cuBLASLt's INT8 GEMM faulted on some shapes with PyTorch 2.14 and CUDA 13. **On demand**, the text encoder and the transformer with the VAE take turns on the GPU, one loan each per request; audio is bit-identical, and the token table stays in CPU memory.
+INT8 measured within seed noise against BF16 (speaker similarity −0.001, word errors +0.1 to +0.3 points on 48 clips). Since 1.2 the INT8 transformer runs W8A8 on fused Triton kernels, the scheme ComfyUI uses for ConvRot INT8: one kernel rotates and quantizes each activation row, and an INT8 GEMM applies the activation and weight scales and the bias in its epilogue. It samples faster than BF16: on an RTX 5090 the same 48 cloned clips render at RTF 0.196 against 0.227 for BF16 and 0.263 for the earlier W8A16 kernels (both models INT8: 0.210 against 0.255), and a sampling step's matrix multiplies take 11.9 ms against 26.6 ms in BF16. Quality stays at the BF16 level: word errors differ on 2 of the 48 clips (+0.2 points, 95 % interval 0 to +0.6) and speaker similarity by 0.0000, while two seeds of the BF16 base differ by 1.2 points and 0.025. The text encoder, which runs once per request, keeps the W8A16 kernels (they convert the whole weight to BF16 on each call), as do the transformer's 22 layers with 64- or 16-wide Hadamard groups, GPUs before the RTX 30 series and training. Neither path calls cuBLASLt's INT8 GEMM, which faulted on some shapes with PyTorch 2.14 and CUDA 13. **On demand**, the text encoder and the transformer with the VAE take turns on the GPU, one loan each per request; audio is bit-identical, and the token table stays in CPU memory.
 
 Whole-process peaks for a 34 s cloned request on an RTX A6000 (CUDA context included):
 
@@ -45,6 +45,8 @@ Whole-process peaks for a 34 s cloned request on an RTX A6000 (CUDA context incl
 | 10 GB | INT8 / INT8 / GPU | 4 | 7.3 | 0.37 |
 | 8 GB | BF16 / INT8 / on demand | 2 | 5.1 | 0.45 |
 | 6 GB | INT8 / INT8 / on demand | 1 | 4.6 | 0.45 |
+
+The speeds predate 1.2's fused INT8 kernels. On an RTX 5090 a 34 s cloned request runs at RTF 0.139 in the 10 GB tier (0.185 with the earlier kernels) and 0.146 in the 6 GB tier (0.195); the BF16 tiers are unchanged (16 GB: 0.171).
 
 Batching sections changes each take slightly and did not speed up cloning in these requests; long Auto-voice texts gained most (RTF 0.18 at batch 8 against 0.28 at batch 2). Whisper runs beside AuK only while 3 GB stay free, otherwise on the CPU.
 

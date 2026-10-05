@@ -128,6 +128,21 @@ class GPT2AccelBlock(GPT2Block):
         self.attn = GPT2AccelAttention(config, layer_idx)
 
 
+def share_gpt_layers(accel_model: "GPT2AccelModel", source: GPT2Model) -> None:
+    """Run ``accel_model`` on the live norms, MLPs and attention projections of ``source`` (no weight copy).
+
+    Shared modules keep whatever the source layer is: BF16 ``Conv1D``, INT8 ConvRot (``weight_int8``) or a
+    LoRA / DoRA wrapper. Only the paged attention stays the acceleration model's own.
+    """
+    for accel_block, block in zip(accel_model.h, source.h, strict=True):
+        accel_block.ln_1 = block.ln_1
+        accel_block.ln_2 = block.ln_2
+        accel_block.mlp = block.mlp
+        accel_block.attn.c_attn = block.attn.c_attn
+        accel_block.attn.c_proj = block.attn.c_proj
+    accel_model.ln_f = source.ln_f
+
+
 class GPT2AccelModel(GPT2Model):
     def __init__(self, config):
         super().__init__(config)

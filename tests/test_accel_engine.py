@@ -2,10 +2,13 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
+from transformers import GPT2Config
+from transformers.models.gpt2.modeling_gpt2 import GPT2Model
 
 from indextts.accel.accel_engine import AccelInferenceEngine
-from indextts.accel.gpt2_accel import GPT2AccelModel
+from indextts.accel.gpt2_accel import GPT2AccelModel, share_gpt_layers
 from indextts.accel.kv_manager import KVCacheManager, Seq
+from indextts.gpt.model_v2 import UnifiedVoice
 
 
 def test_accel_gpt_accepts_transformers_tensor_and_legacy_tuple_blocks() -> None:
@@ -126,3 +129,39 @@ def test_kv_cache_preserves_requested_compute_dtype() -> None:
         dtype=torch.bfloat16,
     )
     assert cache.kv_cache.dtype == torch.bfloat16
+
+
+def _tiny_gpt2_config() -> GPT2Config:
+    return GPT2Config(vocab_size=16, n_positions=32, n_embd=32, n_layer=2, n_head=2)
+
+
+def test_accel_model_runs_on_the_gpt_layers_not_a_copy() -> None:
+    # A load_state_dict(strict=False) copy kept random weights for INT8 ConvRot layers (weight_int8) and
+    # LoRA / DoRA wrappers. The acceleration model shares the live modules and follows a replacement.
+    config = _tiny_gpt2_config()
+    source, accel = GPT2Model(config), GPT2AccelModel(config)
+    share_gpt_layers(accel, source)
+    for accel_block, block in zip(accel.h, source.h):
+        assert accel_block.ln_1 is block.ln_1 and accel_block.ln_2 is block.ln_2 and accel_block.mlp is block.mlp
+        assert accel_block.attn.c_attn is block.attn.c_attn and accel_block.attn.c_proj is block.attn.c_proj
+    assert accel.ln_f is source.ln_f
+
+    wrapper = nn.Identity()
+    source.h[0].attn.c_attn = wrapper
+    share_gpt_layers(accel, source)
+    assert accel.h[0].attn.c_attn is wrapper
+
+
+def test_binding_accel_layers_drops_captured_graphs() -> None:
+    config = _tiny_gpt2_config()
+    source, accel = GPT2Model(config), GPT2AccelModel(config)
+    engine = AccelInferenceEngine.__new__(AccelInferenceEngine)
+    engine.model = accel
+    engine.graphs, engine.graph_vars, engine.graph_pool, engine.graph_captured = {1: object()}, {}, object(), True
+
+    UnifiedVoice.bind_accel_layers(SimpleNamespace(accel_engine=engine, gpt=source))
+
+    assert engine.graphs == {} and engine.graph_vars is None and engine.graph_pool is None
+    assert engine.graph_captured is False
+    assert accel.h[1].mlp is source.h[1].mlp
+    UnifiedVoice.bind_accel_layers(SimpleNamespace(accel_engine=None, gpt=source))  # no engine: nothing to bind
