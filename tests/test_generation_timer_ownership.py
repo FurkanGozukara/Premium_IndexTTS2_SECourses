@@ -105,6 +105,33 @@ def test_idle_page_does_not_leave_a_timer_repainting_the_card(tmp_path, generati
     assert updates[-1].active is False
 
 
+@pytest.mark.parametrize("status", ["in_progress", "completed"])
+def test_explicit_load_refreshes_batch_outputs_without_replacing_owned_card(tmp_path, monkeypatch, status):
+    monkeypatch.setattr(generation, "_GENERATION_CARD_OWNERS", set())
+    folder, _, _ = _task(tmp_path, status)
+    browser = gr.Request(session_hash="page-after-generate")
+    generation._claim_generation_card(browser)
+    batch = folder.parent / "My batch" / "0001"
+    batch.mkdir(parents=True)
+    audio = batch / "welcome.wav"
+    audio.touch()
+    (batch / "metadata.json").write_text(json.dumps({
+        "task": {"id": "0001"}, "status": "completed",
+        "outputs": {"final_audio_path": str(audio)},
+    }), encoding="utf-8")
+
+    loaded = generation.generation_task_updates(
+        str(folder), browser, output_root=folder.parent, page_load=True,
+    )
+    assert loaded[:9] == (gr.skip(),) * 9
+    assert loaded[9][0][3] == str(audio)
+    assert loaded[-1].active is False
+    # Periodic polls still cannot overwrite a validation error or live stream.
+    timer = generation.generation_task_updates(str(folder), browser, output_root=folder.parent)
+    assert timer[:-1] == (gr.skip(),) * 10
+    assert timer[-1].active is False
+
+
 def test_connected_generator_owns_card_and_disables_competing_timer(tmp_path, monkeypatch, generation_demo):
     folder, request, metadata = _task(tmp_path, "in_progress")
     browser = gr.Request(session_hash="connected-stream-page")

@@ -2539,6 +2539,11 @@ def generation_task_updates(
     """Discover and render the per-session generation task card."""
 
     if _generation_card_is_owned(gr_request):
+        if page_load:
+            # Load last values is an explicit refresh. A connected Generate
+            # stream still owns its card, but batch results created afterward
+            # must become selectable without forcing a browser reload.
+            return (*[gr.skip()] * 9, recent_outputs(output_root), gr.Timer(5.0, active=False))
         return _guard_generation_poll(gr_request, ())
     task_value, running = adopt_output_task(
         state_value,
