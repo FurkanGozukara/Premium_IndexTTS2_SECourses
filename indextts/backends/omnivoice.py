@@ -262,7 +262,7 @@ class OmniVoiceEngine:
         stat = Path(path).stat()
         settings = dict(settings)
         transcript = Path(path).with_suffix(".txt")
-        if not settings["reference_text"] and transcript.is_file():
+        if not settings["reference_text"] and not settings.get("ignore_reference_sidecar") and transcript.is_file():
             settings["reference_text"] = transcript.read_text(encoding="utf-8-sig").strip()
         key = (str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size,
                settings["reference_text"], settings["denoise"], settings["preprocess_prompt"])

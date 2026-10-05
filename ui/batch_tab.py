@@ -153,7 +153,8 @@ def _load_batch_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _item_generation_values(
-    generation_values: dict[str, Any], item: dict[str, Any], *, subprocess_mode: bool | None = None
+    generation_values: dict[str, Any], item: dict[str, Any], *, subprocess_mode: bool | None = None,
+    per_file_reference: bool = False,
 ) -> dict[str, Any]:
     """Adjust shared settings for one item in a mixed TXT/caption batch."""
     values = dict(generation_values)
@@ -161,6 +162,11 @@ def _item_generation_values(
         values["generation.use_caption_timing"] = False
     if subprocess_mode is not None:
         values["generation.use_subprocess"] = subprocess_mode
+    if per_file_reference:
+        # The generation tab's transcript describes its shared reference, not
+        # the different recording beside this batch item.
+        values["omnivoice.reference_text"] = ""
+        values["auk.reference_text"] = ""
     return values
 
 
@@ -611,7 +617,9 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                             raise ValueError("Missing same-stem reference")
                     pattern = str(batch_values["batch.naming_pattern"] or "{index:03d}_{name}")
                     filename = pattern.format(index=index, name=item["name"], stem=item["name"])
-                    item_values = _item_generation_values(generation_values, item, subprocess_mode=subprocess_mode)
+                    per_file_reference = batch_values["batch.reference_mode"] == "Per-file reference"
+                    item_values = _item_generation_values(generation_values, item, subprocess_mode=subprocess_mode,
+                                                         per_file_reference=per_file_reference)
                     item_values["generation.output_filename"] = filename
                     request = prepare_generation_request(
                         item_values,
@@ -623,6 +631,14 @@ def bind_batch_events(tab: BatchTab, generation: GenerationTab, args: Any, regis
                         model_dir=model_dir,
                         output_root=output_root,
                     )
+                    if per_file_reference and reference and item.get("path"):
+                        # A same-stem TXT here is the text to synthesize. It
+                        # cannot also be the matching audio's transcript.
+                        collides = Path(reference).with_suffix(".txt").resolve() == Path(item["path"]).resolve()
+                        if collides:
+                            for model in ("omnivoice", "auk"):
+                                if request.get(model) is not None:
+                                    request[model]["ignore_reference_sidecar"] = True
                     current_task = str(request["task_layout"]["task_folder"])
                     request["batch"] = {
                         "run_id": run_id, "item_index": index, "item_count": len(items),

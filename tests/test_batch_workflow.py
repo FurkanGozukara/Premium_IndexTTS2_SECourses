@@ -202,6 +202,85 @@ def test_missing_per_file_reference_obeys_continue_and_emits_a_failed_row(tmp_pa
     assert any("Completed 1/1" in str(update[2]) for update in updates)
 
 
+@pytest.mark.parametrize("model", ["omnivoice", "auk"])
+@pytest.mark.parametrize("suffix,expected_ignore", [(".txt", True), (".srt", False)])
+def test_per_file_clone_does_not_use_the_script_or_shared_reference_transcript(
+    tmp_path, monkeypatch, model, suffix, expected_ignore,
+):
+    source = tmp_path / ("chapter" + suffix)
+    source.write_text("New words to speak." if suffix == ".txt" else
+                      "1\n00:00:00,000 --> 00:00:02,000\nNew words to speak.\n", encoding="utf-8")
+    reference = tmp_path / "chapter.wav"
+    reference.touch()
+    shared = tmp_path / "shared.wav"
+    shared.touch()
+    values = {"app.model": model, f"{model}.mode": "clone",
+              f"{model}.reference_text": "Words in the unrelated shared reference."}
+    requests = []
+
+    def poll(request, *_args):
+        requests.append(request)
+        yield {}, ""
+        return {"output_path": "synthetic.wav", "audio_seconds": 1.0}
+
+    monkeypatch.setattr(batch, "_poll_batch_item", poll)
+    events = _bound_events(tmp_path, monkeypatch, values)
+    updates = list(_run_batch(events, [str(source)], shared,
+                   batch_values={"batch.reference_mode": "Per-file reference"}, generation_values=values))
+    assert updates[-1][3][0][1] == "Complete"
+    request = requests[0]
+    assert Path(request["prompt"]) == reference
+    assert request[model]["reference_text"] == ""
+    assert bool(request[model].get("ignore_reference_sidecar")) is expected_ignore
+    assert values[f"{model}.reference_text"] == "Words in the unrelated shared reference."
+    saved = json.loads((Path(request["task_layout"]["task_folder"]) / "request.json").read_text(encoding="utf-8"))
+    assert saved[model] == request[model]
+
+
+def test_common_reference_keeps_its_explicit_transcript():
+    values = {"omnivoice.reference_text": "Actual reference words."}
+    assert batch._item_generation_values(values, {"subtitle": None})["omnivoice.reference_text"] == values["omnivoice.reference_text"]
+
+
+@pytest.mark.parametrize("ignore,expected", [(False, "Words in the sidecar."), (True, "")])
+def test_omnivoice_reference_can_skip_a_colliding_sidecar(tmp_path, ignore, expected):
+    from indextts.backends.omnivoice import GENERATION_DEFAULTS, OmniVoiceEngine
+    audio = tmp_path / "chapter.wav"
+    audio.write_bytes(b"reference fixture")
+    audio.with_suffix(".txt").write_text("Words in the sidecar.", encoding="utf-8")
+    engine = OmniVoiceEngine.__new__(OmniVoiceEngine)
+    engine._voice_key = None
+    engine._cached_prompt = lambda path, settings: SimpleNamespace(ref_text=settings["reference_text"])
+    prompt = engine._prompt(audio, {**GENERATION_DEFAULTS, "ignore_reference_sidecar": ignore})
+    assert prompt.ref_text == expected
+    # The automatic-transcription path must not reuse an earlier sidecar prompt.
+    automatic = engine._prompt(audio, {**GENERATION_DEFAULTS, "ignore_reference_sidecar": True})
+    assert automatic.ref_text == ""
+
+
+@pytest.mark.parametrize("ignore,expected", [(False, "Words in the sidecar."), (True, "Actual recording words.")])
+def test_auk_reference_can_skip_a_colliding_sidecar(tmp_path, monkeypatch, ignore, expected):
+    import numpy as np
+    from indextts.backends import auk
+    from indextts.auk import conditioning
+    audio = tmp_path / "chapter.wav"
+    audio.write_bytes(b"reference fixture")
+    audio.with_suffix(".txt").write_text("Words in the sidecar.", encoding="utf-8")
+    samples = np.zeros(24000, dtype=np.float32)
+    monkeypatch.setattr(auk, "read_audio", lambda path: (samples, 24000))
+    monkeypatch.setattr(auk, "speech_span", lambda audio, rate: 1.0)
+    monkeypatch.setattr(auk, "normalize_auk_text", lambda text, language: text)
+    monkeypatch.setattr(auk, "cut_at_pause", lambda audio, rate, seconds: audio)
+    monkeypatch.setattr(auk, "resample", lambda audio, rate, target: audio)
+    monkeypatch.setattr(conditioning, "to_encoder_rate", lambda audio, rate: audio)
+    engine = auk.AukEngine.__new__(auk.AukEngine)
+    engine._reference_key, engine._reference = None, None
+    engine._cached_transcript = lambda *args: "Actual recording words."
+    reference = engine.prepare_reference(audio, {"reference_text": "", "ignore_reference_sidecar": ignore,
+                                               "max_reference_seconds": 15, "trim_reference_silence": False})
+    assert reference.transcript == expected
+
+
 def test_inprocess_cancel_waits_for_worker_and_never_unloads_it_early(tmp_path, monkeypatch):
     request = _item_request(tmp_path)
     entered, release, stopped, canceled = (threading.Event() for _ in range(4))

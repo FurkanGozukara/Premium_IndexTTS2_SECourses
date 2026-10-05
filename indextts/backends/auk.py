@@ -406,7 +406,7 @@ class AukEngine:
         stat = Path(path).stat()
         transcript_file = Path(path).with_suffix(".txt")
         transcript = str(settings.get("reference_text") or "").strip()
-        if not transcript and transcript_file.is_file():
+        if not transcript and not settings.get("ignore_reference_sidecar") and transcript_file.is_file():
             transcript = transcript_file.read_text(encoding="utf-8-sig").strip()
         key = (str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size, transcript,
                float(settings["max_reference_seconds"]), bool(settings["trim_reference_silence"]))
