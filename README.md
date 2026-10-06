@@ -1,6 +1,6 @@
 # Ultimate Text To Speech Generator With Voice Cloning
 
-**Version 1.2 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
+**Version 1.3 — IndexTTS 2.5, OmniVoice and AuK.** Choose the speech model in the header; a new installation opens on OmniVoice. The application restores its settings across generation, batch, datasets, training, checkpoint grids and performance controls; universal presets remember every model's profile. Existing presets continue to work.
 
 AuK (Tencent) clones voices, designs voices from a plain description, speaks a fine-tuned voice without a reference, and edits, restores and separates recordings in its own **AuK Audio Editing** tab. It runs in BF16 or ConvRot INT8 from 6 GB cards up and supports full, LoRA and DoRA fine-tuning. See [AuK generation, editing, memory tiers and training](docs/AUK.md).
 
@@ -12,6 +12,8 @@ OmniVoice supports reference voice cloning, voice design with supported tags, au
 ## Quick Info
 
 Voice cloning, long-form narration, caption-timed audio and MP4, batch production, dataset preparation, LoRA/DoRA training, checkpoint evaluation, listening grids, speaking-rate calibration, and low-VRAM operation - all in one tested workflow.
+
+**V1.3 Dataset preparation works on recordings without subtitles, noisy recordings and fast speakers:** a recording transcribed by Whisper could lose every clip to the quiet-edge check (a fast speaker rarely pauses where the first cut fell), so the dataset ended empty and **Cache features now** failed with "The dataset manifest is empty". Such a recording is now also cut at Whisper's own verified sentence pauses (a stretch Whisper left unpunctuated may also end where the audio pauses), or kept whole when its speech fits one clip, and the result that keeps more audio after the same checks is used; noisy recordings are cut at pauses measured against their own noise floor; a dataset in which no recording has a quiet cut is cut once more without that check, with a warning; and a preparation that still keeps nothing ends as failed with the reason. **Cache features now** also works with AuK selected. Subtitled recordings that gave clips, and recordings whose first cut lost nothing to the quiet-edge check, produce the same clips as before.
 
 **V1.2 AuK INT8 faster than BF16 and the IndexTTS acceleration engine with INT8 and trained voices:** AuK's ConvRot INT8 transformer runs W8A8 on fused Triton kernels, the scheme ComfyUI uses, and renders cloned requests in about 14 % less time than BF16 and 25 % less than before, with word errors and speaker similarity unchanged within seed noise. IndexTTS's optional acceleration engine (beams 1) runs on the GPT's own layers: it now works with INT8 ConvRot and LoRA / DoRA, which previously never reached an end of speech, follows adapter changes and keeps no second copy of the GPT. Standard IndexTTS generation, OmniVoice and the BF16 models are unchanged.
 
@@ -384,6 +386,8 @@ Press **Scan inputs** before processing. The discovered-media table and statisti
 - Share of single-sentence clips and share of medium clips aim reproducible shares of the packed clips at about 6 and 10 seconds instead of the target, so a dataset built from long narration also covers the single sentences and short paragraphs users type. A shorter clip is only cut where each inner edge sits in a clear pause (about 200 ms of quiet with the default padding); a start that finds none keeps the target length. The dataset summary counts how many clips each aim produced. Both shares default to 0.25: trained on the same audio cut this way, a voice measured higher speaker and style similarity at every prompt length, pauses closer to the speaker's, and a speaking rate that needed no correction, at the same word error.
 - Minimum and maximum word counts remove fragments and implausibly dense transcripts.
 
+Recordings without subtitles or a TXT transcript use Whisper's text. When their first cut leaves a clip without quiet audio at an edge (fast speakers rarely pause between sentences), the recording is also cut the way a TXT transcript is: Whisper's own sentences are repacked at verified pauses, and a recording whose speech fits one clip, such as a folder of pre-cut clips without transcripts, is kept as one whole clip. Every result passes the same checks, and the one that keeps more audio is used, so a recording whose first cut already worked keeps it. Whisper sometimes stops punctuating (in noise it can return a whole recording without a full stop), and a sentence can be longer than a clip; such a stretch may also end where the audio pauses, and its clips are marked `"boundary": "pause"` in the manifest. A TXT transcript without any punctuation is handled the same way, while a punctuated TXT keeps its own sentences.
+
 ### Cleanup and objective quality gates
 
 Trim leading and trailing silence before filtering, normalize loudness for consistent gradients, and retain the required 24 kHz sample rate. The remaining gates reject weak alignment, impossible speaking rates, very quiet audio, clipping, and excessive silence.
@@ -393,6 +397,8 @@ Trim leading and trailing silence before filtering, normalize loudness for consi
 *Figure 16. Defaults are conservative voice-training safeguards: -20 LUFS leaves headroom, 40 dB is a gentle trim threshold, and a 0.001 clipping ratio permits at most 0.1 percent clipped samples. Leave maximum silence ratio blank to disable that optional whole-segment filter.*
 
 Do not loosen several gates at once. Review rejected counts and playable segments, then change the single rule that is demonstrably excluding good speech. Bad transcripts or clipped recordings cannot be repaired by more training epochs.
+
+Background noise or music can keep every pause of a recording above the silence threshold, so none of its cuts can be verified. Such a recording, and only when it would otherwise keep no clip, is cut at pauses measured against its own noise floor (up to 6 dB above it, with speech at least 15 dB louder); its clips are labeled in the manifest and named in the warnings, and they include that background sound. When no recording at all has a cut with quiet audio at both edges, the dataset is not left empty: those recordings are cut once more without the edge check, as **Minimum quiet audio at cut edges** = 0 would, and the warning asks you to listen to the clips. A preparation that still keeps no clip ends as failed, with the reason (for example clips with too few words for their length, which points at the wrong language) in its warnings, and **Cache features now** and training explain the same instead of failing on an empty manifest.
 
 ### Destination, references, and deterministic smoke tests
 
@@ -765,7 +771,7 @@ The final help area documents pause syntax, reference guidance, links, and recov
 
 ### Read the V6 release history
 
-The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.2 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
+The lazy-rendered **Changelog** tab follows Help. Open it to read the newest-first v1.3 through v4.0 release notes (numbering restarted at 1.0 after 8.1 with the app's new name), including fixes that may affect an older workflow, and to reach the official [SECourses Patreon](https://www.patreon.com/SECourses) and [GitHub repository](https://github.com/FurkanGozukara/Premium_IndexTTS2_SECourses). The tab was added after the original V5 screenshot set, so it is documented here rather than shown in those captures.
 
 ## 12. Presets, Themes, and Repeatable Work
 
@@ -1145,7 +1151,7 @@ The appendix below documents the registered controls (313 preset keys in this re
 
 **Silence snap window (ms)** - `dataset.snap_window_ms`. Search radius around a proposed boundary; 400 ms allows for late word releases. *(default 400; minimum 0; maximum 1000)*
 
-**Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. When no pause follows the aligned end of a word, the search may look up to 200 ms back into that word, but only a quiet stretch longer than a stop-consonant closure counts. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
+**Minimum quiet audio at cut edges (ms)** - `dataset.min_edge_silence_ms`. Sentence alignment first repacks complete sentences at real source pauses. A shared boundary uses one pause for both neighbors and accounts for loudness normalization. When no pause follows the aligned end of a word, the search may look up to 200 ms back into that word, but only a quiet stretch longer than a stop-consonant closure counts. The final waveform must retain this much quiet audio at both edges; 0 disables the gate. A recording without subtitles whose first cuts fail this check is also cut at Whisper's verified sentence pauses or kept whole, whichever keeps more audio; a recording that still keeps nothing is checked against its own noise floor; and when no recording keeps a clip, they are cut once more without the check, with a warning. Existing pre-segmented imports are preserved. *(default 30; minimum 0; maximum 500)*
 
 **Share of single-sentence clips** - `dataset.short_clip_fraction`. Sentence-aligned preparation aims this reproducible share of clips at one short sentence of about 6 seconds instead of the target length, so the dataset also contains the sentence lengths generation typically uses; such a clip is only cut between clear pauses, otherwise that start keeps the target. 0 keeps every clip near the target. *(default 0.25; minimum 0; maximum 0.8)*
 

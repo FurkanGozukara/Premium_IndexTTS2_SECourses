@@ -25,7 +25,7 @@ from indextts.utils.ja_g2p import JapaneseG2PProcessor
 from indextts.utils.nemo_tn import normalize_text as nemo_text_normalize
 from indextts.utils.tokenizer import get_tokenizer, lang_to_token
 
-from .dataset_manifest import atomic_write_json, load_manifest, write_cache_index
+from .dataset_manifest import atomic_write_json, empty_dataset_message, load_manifest, write_cache_index
 
 
 CACHE_FORMAT = "indextts2_training_features"
@@ -545,7 +545,7 @@ def cache_dataset_features(
     if resolved.max_items:
         rows = rows[: resolved.max_items]
     if not rows:
-        raise FileNotFoundError(f"manifest.jsonl is empty or missing in {dataset_dir}")
+        raise FileNotFoundError(empty_dataset_message(dataset_dir))
 
     active_reporter = reporter or ProgressReporter("segments", total=len(rows))
     active_reporter.update(0, total=len(rows), desc="Preparing feature cache")

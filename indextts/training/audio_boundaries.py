@@ -7,7 +7,7 @@ import math
 
 import numpy as np
 
-from .segmenter import split_caption_sentences
+from .segmenter import SentenceSpan, split_caption_sentences
 from .subtitles import CaptionTranscript, Segment
 from .media import measure_loudness_lufs
 
@@ -30,6 +30,80 @@ MEDIUM_CLIP_TARGET_S = 10.0
 # so the clip keeps the silence a spoken sentence has around it instead of being cut where the
 # speaker ran on; a start that finds no such group falls back to the normal target.
 SHORT_CLIP_MIN_PAUSE_MS = 80
+# A pause must also be this fraction of the loudest nearby audio (-20 dB), so a quiet recording is
+# not classified entirely as silence.
+PAUSE_RELATIVE_LIMIT = 0.1
+
+
+class RangeLoudness:
+    """BS.1770 integrated loudness and peak of any sample range of one recording.
+
+    Follows pyloudnorm measuring the cut piece (400 ms blocks every 100 ms, absolute and relative gates): the
+    recording is K-weighted once, in chunks, and block energies come from 1 ms prefix sums, so a range costs
+    about 0.04 ms instead of 1.5 ms. On speech the two differ by 0.004 dB on average and by up to 0.2 dB when a
+    block lands on the other side of a gate. For packing that weighs thousands of overlapping candidate clips.
+    """
+
+    def __init__(self, audio: np.ndarray, rate: int) -> None:
+        import pyloudnorm
+        from scipy.signal import lfilter
+
+        self.audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        self.rate = int(rate)
+        self.unit = max(1, self.rate // 1000)
+        stages = list(pyloudnorm.Meter(self.rate)._filters.values())
+        states = [np.zeros(max(len(stage.a), len(stage.b)) - 1) for stage in stages]
+        sums = np.zeros(-(-self.audio.size // self.unit), dtype=np.float64)
+        chunk_size = self.unit * 40_000
+        for start in range(0, self.audio.size, chunk_size):
+            chunk = self.audio[start:start + chunk_size].astype(np.float64)
+            for index, stage in enumerate(stages):
+                chunk, states[index] = lfilter(stage.b, stage.a, chunk, zi=states[index])
+                chunk = stage.passband_gain * chunk
+            squared = np.square(chunk)
+            squared = np.pad(squared, (0, (-squared.size) % self.unit))
+            first = start // self.unit
+            sums[first:first + squared.size // self.unit] = squared.reshape(-1, self.unit).sum(axis=1)
+        self.prefix = np.concatenate(([0.0], np.cumsum(sums)))
+        self.frame = self.unit * 10
+        full = self.audio.size // self.frame
+        self.frame_peaks = (np.abs(self.audio[:full * self.frame]).reshape(full, self.frame).max(axis=1)
+                            if full else np.zeros(0, dtype=np.float32))
+
+    def loudness(self, first: int, last: int) -> float:
+        length = int(last) - int(first)
+        if length < 0.4 * self.rate:
+            return measure_loudness_lufs(self.audio[first:last], self.rate)  # pyloudnorm's short-piece fallback
+        blocks = int(np.round((length / self.rate - 0.4) / (0.4 * 0.25))) + 1
+        index = np.arange(blocks)
+        lower = (0.4 * (index * 0.25) * self.rate).astype(np.int64)
+        upper = np.minimum((0.4 * (index * 0.25 + 1) * self.rate).astype(np.int64), length)
+        units = self.prefix.size - 1
+        low = np.clip(np.rint((first + lower) / self.unit).astype(np.int64), 0, units)
+        high = np.clip(np.rint((first + upper) / self.unit).astype(np.int64), 0, units)
+        energy = np.maximum(self.prefix[high] - self.prefix[low], 0.0) / (0.4 * self.rate)
+        with np.errstate(divide="ignore"):
+            levels = -0.691 + 10.0 * np.log10(energy)
+            absolute = energy[levels >= -70.0]
+            if absolute.size:
+                relative = -0.691 + 10.0 * math.log10(float(np.mean(absolute))) - 10.0
+                gated = energy[(levels > relative) & (levels > -70.0)]
+                if gated.size:
+                    value = -0.691 + 10.0 * math.log10(float(np.mean(gated)))
+                    if math.isfinite(value):
+                        return value
+        return measure_loudness_lufs(self.audio[first:last], self.rate)  # silent or ungated: the RMS fallback
+
+    def peak(self, first: int, last: int) -> float:
+        first, last = int(first), int(last)
+        full_first, full_last = -(-first // self.frame), last // self.frame
+        if full_last <= full_first:
+            return float(np.max(np.abs(self.audio[first:last]), initial=0.0))
+        return max(
+            float(self.frame_peaks[full_first:full_last].max()),
+            float(np.max(np.abs(self.audio[first:full_first * self.frame]), initial=0.0)),
+            float(np.max(np.abs(self.audio[full_last * self.frame:last]), initial=0.0)),
+        )
 
 
 def _get(word: Any, key: str, default: Any = None) -> Any:
@@ -42,7 +116,7 @@ def _ms(word: Any, key: str) -> int:
 
 def _pause(
     energy: np.ndarray, low: int, high: int, preferred: int, minimum_ms: int,
-    threshold_dbfs: float,
+    threshold_dbfs: float, relative_limit: float = PAUSE_RELATIVE_LIMIT,
 ) -> tuple[int, int] | None:
     hop = 10
     first = max(0, math.ceil(low / hop))
@@ -54,13 +128,79 @@ def _pause(
     # The relative limit prevents quiet recordings being classified entirely
     # as silence. The absolute limit keeps background audio out of boundaries.
     context = energy[max(0, first - 50):min(len(energy), stop + 50)]
-    threshold = min(10 ** (threshold_dbfs / 20), float(context.max(initial=0)) * 0.1)
+    threshold = min(10 ** (threshold_dbfs / 20), float(context.max(initial=0)) * relative_limit)
     quiet = np.isfinite(window) & (window <= threshold)
     edges = np.diff(np.pad(quiet.astype(np.int8), (1, 1)))
     runs = [((first + start) * hop, (first + end) * hop)
             for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
             if end - start >= minimum]
     return min(runs, key=lambda pair: abs((pair[0] + pair[1]) / 2 - preferred)) if runs else None
+
+
+def pause_phrase_spans(
+    caption: CaptionTranscript,
+    words: Sequence[Any],
+    energy: np.ndarray,
+    config: DatasetPrepConfig,
+    *,
+    gain_db: float = 0.0,
+    pause_relative_limit: float = PAUSE_RELATIVE_LIMIT,
+    split_long_sentences: bool = True,
+) -> list[SentenceSpan]:
+    """Sentence spans, where a stretch that cannot become a clip also ends at acoustic pauses.
+
+    A recognizer sometimes returns long stretches without sentence punctuation (in noise it may return none at
+    all, with word times that touch), and a sentence can be longer than a clip; neither can be packed. Such a
+    stretch also ends at every word boundary where the pause search finds quiet audio, with ``gain_db``
+    standing in for each clip's loudness normalization and 6 dB of tolerance (the repacking checks every edge
+    again exactly). The transcript's last stretch ends with the recording. Sentences that fit a clip stay
+    whole; with ``split_long_sentences`` off, so do longer punctuated sentences (a supplied transcript's own
+    sentence boundaries are kept).
+    """
+    spans = split_caption_sentences(caption)
+    if not spans or len(words) != len(caption.words):
+        return spans
+    edge_ms = max(10, math.ceil(config.min_edge_silence_ms / 10) * 10)
+    radius = config.snap_window_ms + max(edge_ms, config.pad_ms)
+    media_end = len(energy) * 10
+    threshold = config.silence_threshold_dbfs - gain_db + 6.0
+    result: list[SentenceSpan] = []
+    for index, span in enumerate(spans):
+        last_span = index == len(spans) - 1
+        start = _ms(words[span.word_start], "start_s")
+        end = _ms(words[span.word_end - 1], "end_s")
+        if span.ends_sentence and (end - start <= config.max_s * 1000 or not split_long_sentences):
+            result.append(span)
+            continue
+        piece_word, piece_char = span.word_start, span.char_start
+        for cut in range(span.word_start, span.word_end - 1):
+            previous, following = words[cut], words[cut + 1]
+            previous_start, previous_end = _ms(previous, "start_s"), _ms(previous, "end_s")
+            next_start, next_end = _ms(following, "start_s"), _ms(following, "end_s")
+            high = min(media_end, max(previous_end, next_start) + radius, next_end - 1)
+            preferred = (previous_end + next_start) // 2
+            pause = _pause(energy, previous_end, high, preferred, 2 * edge_ms, threshold, pause_relative_limit)
+            low = max((previous_start + previous_end) // 2, previous_end - PAUSE_LOOKBACK_MS)
+            if pause is None and low < previous_end:
+                pause = _pause(energy, low, high, preferred, max(CLOSURE_SAFE_QUIET_MS, 2 * edge_ms),
+                               threshold, pause_relative_limit)
+            if pause is None:
+                continue
+            next_char = int(caption.words[cut + 1].char_start)
+            char_end = next_char
+            while char_end > piece_char and caption.text[char_end - 1].isspace():
+                char_end -= 1
+            result.append(SentenceSpan(
+                char_start=piece_char, char_end=char_end, word_start=piece_word, word_end=cut + 1,
+                starts_sentence=span.starts_sentence and piece_word == span.word_start, ends_sentence=True,
+            ))
+            piece_word, piece_char = cut + 1, next_char
+        result.append(SentenceSpan(
+            char_start=piece_char, char_end=span.char_end, word_start=piece_word, word_end=span.word_end,
+            starts_sentence=span.starts_sentence and piece_word == span.word_start,
+            ends_sentence=span.ends_sentence or last_span,
+        ))
+    return result
 
 
 def build_safe_sentence_segments(
@@ -71,6 +211,9 @@ def build_safe_sentence_segments(
     *,
     audio: np.ndarray | None = None,
     progress_cb: Callable[[str], None] | None = None,
+    pause_relative_limit: float = PAUSE_RELATIVE_LIMIT,
+    spans: Sequence[SentenceSpan] | None = None,
+    loudness: RangeLoudness | None = None,
 ) -> tuple[list[Segment], list[dict[str, Any]]]:
     """Repack complete sentences across unsafe cuts, using original audio.
 
@@ -78,8 +221,13 @@ def build_safe_sentence_segments(
     programming maximizes retained caption words, then favors the target clip
     duration. It can move a sentence to an adjacent clip or merge sentences
     across a bad boundary; every retained word appears exactly once.
+    ``pause_relative_limit`` is the loudness fraction of nearby audio a pause
+    must stay under, in addition to the configured silence threshold.
+    ``spans`` replaces the caption's sentences (see ``pause_phrase_spans``), and
+    ``loudness`` measures candidate clips' normalization gains from one pass
+    over the recording instead of each cut piece.
     """
-    spans = split_caption_sentences(caption)
+    spans = list(spans) if spans is not None else split_caption_sentences(caption)
     if not spans or len(words) != len(caption.words):
         return [], []
     edge_ms = max(10, math.ceil(config.min_edge_silence_ms / 10) * 10)
@@ -101,7 +249,7 @@ def build_safe_sentence_segments(
             if _get(first, "matched", False):
                 first_start = _ms(first, "start_s")
                 pause = _pause(energy, max(0, first_start - radius), first_start,
-                               first_start - pad, edge_ms, threshold)
+                               first_start - pad, edge_ms, threshold, pause_relative_limit)
                 if pause:
                     pair = (None, max(pause[0], pause[1] - pad))
         elif index == len(spans):
@@ -109,7 +257,7 @@ def build_safe_sentence_segments(
             if _get(last, "matched", False):
                 last_end = _ms(last, "end_s")
                 pause = _pause(energy, last_end, min(media_end, last_end + radius),
-                               last_end + pad, edge_ms, threshold)
+                               last_end + pad, edge_ms, threshold, pause_relative_limit)
                 if pause:
                     pair = (min(pause[1], pause[0] + pad), None)
         else:
@@ -130,12 +278,12 @@ def build_safe_sentence_segments(
         high = min(media_end, max(previous_end, next_start) + radius,
                    _ms(following, "end_s") - 1)
         pause = _pause(energy, previous_end, high, preferred,
-                       2 * edge_ms, threshold)
+                       2 * edge_ms, threshold, pause_relative_limit)
         previous_start = _ms(previous, "start_s")
         low = max((previous_start + previous_end) // 2, previous_end - PAUSE_LOOKBACK_MS)
         if pause is None and low < previous_end:
             pause = _pause(energy, low, high, preferred,
-                           max(CLOSURE_SAFE_QUIET_MS, 2 * edge_ms), threshold)
+                           max(CLOSURE_SAFE_QUIET_MS, 2 * edge_ms), threshold, pause_relative_limit)
         if pause:
             quiet_start, quiet_end = pause
             middle = (quiet_start + quiet_end) // 2
@@ -147,6 +295,12 @@ def build_safe_sentence_segments(
             return 0.0
         first_sample = max(0, round(float(_get(words[first_word], "start_s")) * config.sample_rate))
         last_sample = min(len(audio), round(float(_get(words[word_end - 1], "end_s")) * config.sample_rate))
+        if loudness is not None:
+            level = loudness.loudness(first_sample, last_sample)
+            if not math.isfinite(level):
+                return 0.0
+            peak = loudness.peak(first_sample, last_sample)
+            return min(config.target_lufs - level, 20 * math.log10(.999 / max(peak, 1e-12)))
         piece = audio[first_sample:last_sample]
         level = measure_loudness_lufs(piece, config.sample_rate)
         if not math.isfinite(level):

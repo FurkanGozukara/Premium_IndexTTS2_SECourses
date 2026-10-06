@@ -7,6 +7,23 @@ import gradio as gr
 
 CHANGELOG_ENTRIES: list[tuple[str, str, str]] = [
     (
+        "v1.3",
+        "2026-10-07",
+        """
+### Version 1.3: dataset preparation works on recordings without subtitles, noisy recordings and fast speakers
+
+- **Recordings without subtitles keep their clips:** a recording transcribed by Whisper was cut at its punctuation and padded, and a clip whose edges then lacked 30 ms of quiet audio was dropped. A fast speaker, who rarely pauses where those cuts fell, could lose every clip: the dataset ended empty and **Cache features now** failed with "The dataset manifest is empty". Such a recording is now also cut the way a TXT transcript is, with Whisper's own sentences repacked at verified pauses, and a recording whose speech fits one clip (for example a folder of pre-cut clips without transcripts) is also tried as one whole clip. Every result passes the same checks, and the one that keeps the most audio is used.
+- **Transcripts without punctuation:** Whisper sometimes stops punctuating, and in noise it can return a whole recording without a full stop; such text, or a sentence longer than a clip, could not become a clip. These stretches may now also end where the audio pauses (clips marked `"boundary": "pause"` in the manifest). A TXT transcript without any punctuation works the same way; a punctuated TXT keeps its own sentences.
+- **Noisy recordings:** background noise or music above the silence threshold made every cut unverifiable. A recording that would otherwise keep no clip is now cut at pauses measured against its own noise floor (up to 6 dB above it, with speech at least 15 dB louder). Its clips are labeled in the manifest and named in the warnings; they include that background sound.
+- **No more empty datasets without a reason:** when no recording has a cut with quiet audio at both edges (continuous speech), those recordings are cut once more without that check, as **Minimum quiet audio at cut edges** = 0 would, and a warning asks you to listen to the clips. A preparation that still keeps no clip ends as failed, and its warnings name the cause, for example clips with too few words for their length, which points at the wrong language. Preparing the same name again then needs no **Overwrite dataset**. **Cache features now**, the training plan and training explain an empty dataset instead of failing on it.
+- **Cache features now with AuK:** with AuK chosen as the speech model the button failed at once ("invalid choice: 'auk'"); it now caches AuK's latent features, as training does.
+- **Unchanged:** subtitled recordings that gave clips, and every recording whose first cut lost nothing to the quiet-edge check, produce the same clips as in 1.2; imported pre-cut clips are unchanged.
+- **Smaller fixes:** batch generation with **Per-file reference** no longer uses an item's own script as the transcript of its reference recording (OmniVoice and AuK); dataset summaries name OmniVoice and AuK feature caches instead of reporting them as not cached; an existing dataset's table, references and histogram no longer disappear while the page is idle; a Checkpoint Grid whose name contains spaces keeps its progress and outputs in one folder; **Load last values** on a page that is still generating shows newer batch results.
+
+Restart after updating.
+""".strip(),
+    ),
+    (
         "v1.2",
         "2026-10-05",
         """

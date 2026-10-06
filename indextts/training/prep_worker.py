@@ -199,12 +199,20 @@ def main(argv: list[str] | None = None) -> int:
             reporter=reporter,
             cancel_check=lambda: (state_dir / "stop.flag").exists(),
         )
-        reporter.mark_finished(
-            summary.status,
-            f"{summary.status}: {summary.segment_count} segments, "
-            f"{summary.total_duration_s / 60.0:.2f} minutes",
-            summary,
-        )
+        if summary.status == "empty":
+            # Nothing to cache or train on: the card shows a failure that names the cause.
+            reporter.mark_finished(
+                "failed",
+                f"Dataset preparation kept no clip: {summary.empty_reason}. See the warnings below.",
+                summary,
+            )
+        else:
+            reporter.mark_finished(
+                summary.status,
+                f"{summary.status}: {summary.segment_count} segments, "
+                f"{summary.total_duration_s / 60.0:.2f} minutes",
+                summary,
+            )
         elapsed = time.monotonic() - reporter.started
         rate = summary.segment_count / elapsed if elapsed > 0 else 0.0
         print(

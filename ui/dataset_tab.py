@@ -15,7 +15,12 @@ import gradio as gr
 import pandas as pd
 
 from indextts.runtime.progress import format_duration
-from indextts.training.dataset_manifest import DURATION_BUCKETS, load_manifest, summarize_manifest
+from indextts.training.dataset_manifest import (
+    DURATION_BUCKETS,
+    empty_dataset_message,
+    load_manifest,
+    summarize_manifest,
+)
 from indextts.training.dataset_prep import DatasetPrepConfig
 from indextts.training.fluency_filter import VIEW_MARKER
 from indextts.training.media import (
@@ -332,6 +337,16 @@ def dataset_status_updates(state_value: str, dataset_value: str) -> tuple[Any, .
         hist = _empty_histogram()
         table, refs, paths = [], [], []
         warning_text = "No completed dataset result was found."
+        info_path = dataset_dir / "dataset_info.json"
+        info = read_json(info_path, {}) or {}
+        try:
+            # Only this run's result: an older dataset_info.json in the folder must not explain a newer failure.
+            this_run = info_path.stat().st_mtime >= (state / "config.json").stat().st_mtime
+        except OSError:
+            this_run = False
+        if this_run and str(info.get("status") or "") == "empty":
+            # A preparation that kept no clip names every reason in its warnings.
+            warning_text = "\n".join(f"- {item}" for item in info.get("warnings") or []) or warning_text
     return (
         panel,
         status_line,
@@ -594,7 +609,7 @@ def build_dataset_tab(
             min_edge_silence = gr.Slider(
                 0, 500, value=DATASET_DEFAULTS["min_edge_silence_ms"], step=10,
                 label="Minimum quiet audio at cut edges (ms)",
-                info="Sentence alignment first repacks whole sentences at real pauses, recovering late word endings from the source. Then clips must retain this much quiet audio at both edges after cleanup. Uses the silence threshold above. 30 ms is recommended; 0 disables the check. Existing pre-segmented imports are preserved.",
+                info="Sentence alignment first repacks whole sentences at real pauses, recovering late word endings from the source. Then clips must retain this much quiet audio at both edges after cleanup. Uses the silence threshold above. 30 ms is recommended; 0 disables the check. A recording whose cuts fail it is re-cut at Whisper's verified sentence pauses or kept whole, a noisy one is checked against its own noise floor, and if no recording keeps a clip they are cut without the check (with a warning). Existing pre-segmented imports are preserved.",
             )
             for field_name, component, kind, minimum, maximum, nullable in (
                 ("trim_silence", trim, "bool", None, None, False), ("trim_top_db", trim_db, "float", 10, 80, False),
@@ -857,6 +872,9 @@ def build_dataset_tab(
         dataset_dir = dataset_dir.resolve()
         if not (dataset_dir / "manifest.jsonl").is_file():
             raise gr.Error(f"Dataset manifest not found: {dataset_dir}")
+        if not load_manifest(dataset_dir):
+            # Say why before starting a worker that loads the feature models only to fail.
+            raise gr.Error(empty_dataset_message(dataset_dir))
         state = DATASET_STATE / f"cache_{dataset_dir.name}_{int(time.time())}"
         progress_path = state / "progress.json"
         job = PROCESS_MANAGER.start(

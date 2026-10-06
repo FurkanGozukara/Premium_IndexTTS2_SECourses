@@ -15,12 +15,13 @@ from indextts.runtime import ProgressReporter
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cache IndexTTS 2.5 training features")
+    parser = argparse.ArgumentParser(description="Cache IndexTTS 2.5, OmniVoice or AuK training features")
     parser.add_argument("dataset_dir_pos", nargs="?", help="Dataset directory containing manifest.jsonl")
     parser.add_argument("--dataset-dir", dest="dataset_dir", help="Dataset directory containing manifest.jsonl")
     parser.add_argument("--config", help="Optional FeatureCacheConfig JSON file")
     parser.add_argument("--model-dir", default=None)
-    parser.add_argument("--tts-model", choices=["indextts", "omnivoice"], default=None)
+    # The dataset tab passes the speech model chosen in the header, AuK included.
+    parser.add_argument("--tts-model", choices=["indextts", "omnivoice", "auk"], default=None)
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--semantic-layer", type=int, default=None)
@@ -81,6 +82,9 @@ def main() -> int:
     if payload.get("tts_model") == "omnivoice":
         from indextts.training.omnivoice_data import cache_omnivoice_features
         summary = cache_omnivoice_features(config, reporter=reporter)
+    elif payload.get("tts_model") == "auk":
+        from indextts.training.auk_data import cache_auk_features
+        summary = cache_auk_features(config, reporter=reporter)
     else:
         summary = cache_dataset_features(config, reporter=reporter)
     print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))

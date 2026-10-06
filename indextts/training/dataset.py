@@ -16,7 +16,7 @@ from torch.utils.data import BatchSampler, Dataset
 
 from indextts.utils.tokenizer import lang_to_token
 
-from .dataset_manifest import load_manifest
+from .dataset_manifest import empty_dataset_message, load_manifest
 from .plan import validation_record_ids
 from .reference_selection import AUTO_REFERENCE_TARGET_SECONDS, training_reference_priority
 
@@ -88,7 +88,7 @@ class LoraTrainDataset(Dataset[dict[str, Any]]):
 
         manifest_rows = load_manifest(self.dataset_dir)
         if not manifest_rows:
-            raise FileNotFoundError(f"manifest.jsonl is empty or missing in {self.dataset_dir}")
+            raise FileNotFoundError(empty_dataset_message(self.dataset_dir))
 
         all_records: list[dict[str, Any]] = []
         dropped = 0

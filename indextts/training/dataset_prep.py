@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 import io
 import json
@@ -28,11 +29,18 @@ from .dataset_manifest import (
     PREVIEW_FILENAME,
     append_manifest_row,
     atomic_write_json,
+    empty_dataset_reason,
     summarize_manifest,
     write_manifest,
     write_preview_csv,
 )
-from .audio_boundaries import PAUSE_LOOKBACK_MS, build_safe_sentence_segments
+from .audio_boundaries import (
+    PAUSE_LOOKBACK_MS,
+    PAUSE_RELATIVE_LIMIT,
+    RangeLoudness,
+    build_safe_sentence_segments,
+    pause_phrase_spans,
+)
 from .media import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_SUBTITLE_EXTENSIONS,
@@ -50,6 +58,8 @@ from .media import (
     trim_silence,
 )
 from .segmenter import (
+    _unit_times_ms,
+    _word_dict,
     apply_padding_and_limits,
     build_sentence_aligned_segments,
     build_segments_from_words,
@@ -258,6 +268,8 @@ class DatasetSummary:
     alignment: dict[str, Any] = field(default_factory=dict)
     filter_drop_counts: dict[str, int] = field(default_factory=dict)
     filter_keep_counts: dict[str, int] = field(default_factory=dict)
+    # Why a finished preparation kept no clip (status "empty"); blank otherwise.
+    empty_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -735,13 +747,20 @@ def _choose_aligned_sidecar(
     return selected, attempted
 
 
+def _repacks_at_pauses(config: DatasetPrepConfig) -> bool:
+    return bool(config.min_edge_silence_ms and config.snap_to_silence and config.boundary_mode == "sentence")
+
+
 def _build_aligned_segments(
     caption: Any, words: Sequence[Any], energy: np.ndarray, config: DatasetPrepConfig,
     *, audio: np.ndarray, progress_cb: Callable[[str], None] | None = None,
+    pause_relative_limit: float = PAUSE_RELATIVE_LIMIT, spans: Sequence[Any] | None = None,
+    loudness: Any = None,
 ) -> tuple[list[Segment], bool, list[dict[str, Any]]]:
-    if config.min_edge_silence_ms and config.snap_to_silence and config.boundary_mode == "sentence":
+    if _repacks_at_pauses(config):
         segments, rejected = build_safe_sentence_segments(
-            caption, words, energy, config, audio=audio, progress_cb=progress_cb)
+            caption, words, energy, config, audio=audio, progress_cb=progress_cb,
+            pause_relative_limit=pause_relative_limit, spans=spans, loudness=loudness)
         return segments, True, rejected
     maximum = _reserve_segmentation_max(config)
     return build_sentence_aligned_segments(
@@ -909,6 +928,390 @@ def _write_segment(
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     sf.write(output, audio, sample_rate, subtype="PCM_16")
+
+
+@dataclass
+class _ClipCut:
+    """One segment cut from its source and checked; ``reason`` names the failed check (None: kept)."""
+
+    reason: str | None
+    piece: np.ndarray | None = None
+    source_start_s: float = 0.0
+    source_end_s: float = 0.0
+    duration_s: float = 0.0
+    quality: Any = None
+    edge_quality: dict[str, float] = field(default_factory=dict)
+    lufs: float = float("nan")
+
+
+def _cut_clip(
+    audio: np.ndarray,
+    segment: Segment,
+    config: DatasetPrepConfig,
+    *,
+    verified_source: Any = None,
+) -> _ClipCut:
+    """Slice, trim, check and normalize one segment, exactly as every written clip is made."""
+
+    piece, actual_start_s, _ = slice_audio(
+        audio,
+        config.sample_rate,
+        segment.start_ms / 1000.0,
+        segment.end_ms / 1000.0,
+    )
+    trim_start = 0
+    trim_end = piece.size
+    if config.trim_silence:
+        piece, (trim_start, trim_end) = trim_silence(
+            piece,
+            config.sample_rate,
+            config.trim_top_db,
+            pad_ms=50,
+            return_indices=True,
+        )
+    if piece.size == 0 or float(np.max(np.abs(piece), initial=0.0)) < 1e-6:
+        return _ClipCut("empty_audio")
+    source_start_s = actual_start_s + trim_start / float(config.sample_rate)
+    source_end_s = actual_start_s + trim_end / float(config.sample_rate)
+    if verified_source is not None and not _verified_cue_text(
+        segment.text, source_start_s, source_end_s, verified_source, config
+    ):
+        return _ClipCut("transcript_disagreement", source_start_s=source_start_s, source_end_s=source_end_s)
+    duration_s = piece.size / float(config.sample_rate)
+    if not config.min_s <= duration_s <= config.max_s + 1.0 / config.sample_rate:
+        return _ClipCut("duration_after_trim")
+    quality_reason, quality = _audio_filter_reason(piece, duration_s, segment.text, config)
+    if quality_reason:
+        return _ClipCut(quality_reason)
+    if config.loudness_normalize:
+        piece = normalize_loudness(piece, config.sample_rate, config.target_lufs)
+    edge_quality = measure_edge_silence(piece, config.sample_rate, config.silence_threshold_dbfs)
+    if config.min_edge_silence_ms and any(value < config.min_edge_silence_ms for value in edge_quality.values()):
+        return _ClipCut(
+            "unsafe_audio_boundary",
+            source_start_s=source_start_s,
+            source_end_s=source_end_s,
+            edge_quality=edge_quality,
+        )
+    lufs = measure_loudness_lufs(piece, config.sample_rate)
+    if not math.isfinite(lufs):
+        return _ClipCut("non_finite_loudness")
+    return _ClipCut(None, piece, source_start_s, source_end_s, duration_s, quality, edge_quality, lufs)
+
+
+@dataclass
+class _CutPlan:
+    """One way to cut a source into clips, with the labels its manifest rows carry."""
+
+    segments: list[Segment]
+    transcript_source: str
+    effective_mode: str
+    boundary_method: str
+    word_safe_boundaries: bool = False
+    acoustic_repacked: bool = False
+    verified_source: Any = None
+    unresolved: list[dict[str, Any]] = field(default_factory=list)
+    # The whole recording as one clip: its edges are final, so it skips padding, snapping and the
+    # structural filter; trimming and every clip check still apply.
+    precut: bool = False
+    # Stretches of the transcript that cannot become a clip may also end at acoustic pauses, and such clips
+    # need not start and end a sentence: "unpunctuated" (stretches without sentence punctuation) or
+    # "unpunctuated_or_long" (also sentences longer than a clip); "" keeps sentence edges only.
+    pause_phrases: str = ""
+
+
+def _fixed_plan(plan: _CutPlan, settings: DatasetPrepConfig, pause_relative_limit: float, audio: np.ndarray) -> _CutPlan:
+    """A plan whose segments do not depend on the pause settings (cue, word-group or whole-recording timing)."""
+
+    return replace(plan, segments=list(plan.segments), unresolved=list(plan.unresolved))
+
+
+def _aligned_plan(
+    caption: Any,
+    words: Sequence[Any],
+    energy: np.ndarray,
+    template: _CutPlan,
+    settings: DatasetPrepConfig,
+    pause_relative_limit: float,
+    audio: np.ndarray,
+) -> _CutPlan:
+    """Sentence segments of an aligned transcript, cut at pauses found with ``settings``."""
+
+    spans = None
+    loudness = None
+    if template.pause_phrases and _repacks_at_pauses(settings):
+        spans = pause_phrase_spans(
+            caption, words, energy, settings,
+            gain_db=_envelope_gain_db(energy, settings), pause_relative_limit=pause_relative_limit,
+            split_long_sentences=template.pause_phrases == "unpunctuated_or_long",
+        )
+        if settings.loudness_normalize:
+            # Pause phrases give many more candidate clips than sentences; measure their gains in one pass.
+            try:
+                loudness = RangeLoudness(audio, settings.sample_rate)
+            except ImportError:
+                loudness = None
+    segments, repacked, unresolved = _build_aligned_segments(
+        caption, words, energy, settings, audio=audio, pause_relative_limit=pause_relative_limit, spans=spans,
+        loudness=loudness)
+    if template.pause_phrases:
+        # Rows say whether a clip starts and ends a sentence or ends at a pause inside one.
+        segments = [
+            replace(segment, sentence_aligned=aligned, boundary="sentence" if aligned else "pause")
+            for segment, aligned in ((item, is_sentence_aligned_text(item.text)) for item in segments)
+        ]
+    return replace(
+        template,
+        segments=segments,
+        acoustic_repacked=repacked,
+        unresolved=unresolved,
+        boundary_method="acoustic_sentence_repack" if repacked else "silence_snap",
+    )
+
+
+def _envelope_gain_db(energy: np.ndarray, config: DatasetPrepConfig) -> float:
+    """Approximate loudness-normalization gain of a recording, from its frames above -60 dBFS."""
+
+    if not config.loudness_normalize:
+        return 0.0
+    frames = np.asarray(energy, dtype=np.float64).reshape(-1)
+    active = frames[np.isfinite(frames) & (frames > 1e-3)]
+    if not active.size:
+        return 0.0
+    return float(config.target_lufs) - 10.0 * math.log10(float(np.mean(np.square(active))))
+
+
+_WHOLE_RECORDING_EDGE_MS = 1500
+
+
+def _whole_recording_plan(
+    text: str,
+    words: Sequence[Any],
+    media_duration_ms: int,
+    config: DatasetPrepConfig,
+    *,
+    transcript_source: str,
+    alignment_coverage: float | None = None,
+) -> _CutPlan | None:
+    """All of a short recording's speech as one clip, like a pre-cut clip with its transcript.
+
+    Offered only when the timed speech fits one clip. The clip keeps the recording's own edges when at most
+    1.5 seconds lie beyond the first or last recognized word (recognizers often end the last word early);
+    longer music or silence there is left out beyond the silence snap window. Trimming and every clip check,
+    including quiet audio at both edges, still decide whether it is kept.
+    """
+
+    text = str(text or "").strip()
+    times = [_unit_times_ms(word) for word in words]
+    if not text or not times:
+        return None
+    first_ms = min(start for start, _ in times)
+    last_ms = max(end for _, end in times)
+    if last_ms - first_ms > config.max_s * 1000.0:
+        return None
+    if not config.min_words <= _word_count(text) <= config.max_words:
+        return None
+    if alignment_coverage is not None and alignment_coverage < config.min_segment_alignment_coverage:
+        return None
+    margin = max(int(config.snap_window_ms), int(config.pad_ms))
+    media_end = int(media_duration_ms)
+    segment = Segment(
+        start_ms=0 if first_ms <= _WHOLE_RECORDING_EDGE_MS else first_ms - margin,
+        end_ms=media_end if media_end - last_ms <= _WHOLE_RECORDING_EDGE_MS else min(media_end, last_ms + margin),
+        text=text,
+        word_timestamps=[_word_dict(word) for word in words],
+        alignment_coverage=alignment_coverage,
+        sentence_aligned=is_sentence_aligned_text(text),
+    )
+    if segment.duration_ms <= 0:
+        return None
+    return _CutPlan([segment], transcript_source, "whole_recording", "whole_recording", precut=True)
+
+
+def _alternative_plans(
+    text_kind: str,
+    *,
+    transcript: Any,
+    caption: Any,
+    alignment: Any,
+    energy: np.ndarray,
+    media_duration_ms: int,
+    config: DatasetPrepConfig,
+) -> list[Callable[[DatasetPrepConfig, float, np.ndarray], _CutPlan]]:
+    """Other strict ways to cut a source whose text is Whisper's or a plain TXT transcript.
+
+    Whisper text: its own sentences, repacked at verified pauses exactly as a TXT transcript is (a stretch
+    without punctuation or a sentence longer than a clip may also end at an acoustic pause), and the whole
+    recording when all of its speech fits one clip. TXT text: the same repacking, where only a stretch without
+    sentence punctuation may end at a pause (the transcript's own sentences are kept), and the whole
+    recording. Subtitle sources have none.
+    """
+
+    factories: list[Callable[[DatasetPrepConfig, float, np.ndarray], _CutPlan]] = []
+    whole: _CutPlan | None = None
+    if text_kind == "whisper" and transcript is not None and transcript.words:
+        whisper_caption, whisper_alignment = _align_plain_transcript(
+            transcript.text, transcript.words, media_duration_ms)
+        template = _CutPlan([], "whisper", "whisper_sentence_aligned", "acoustic_sentence_repack",
+                            word_safe_boundaries=True, pause_phrases="unpunctuated_or_long")
+        factories.append(partial(_aligned_plan, whisper_caption, whisper_alignment.words, energy, template))
+        whole = _whole_recording_plan(
+            transcript.text, transcript.words, media_duration_ms, config, transcript_source="whisper")
+    elif text_kind == "txt" and caption is not None and alignment is not None:
+        template = _CutPlan([], "sidecar_txt+whisper_sentence_aligned", "sentence_aligned",
+                            "acoustic_sentence_repack", word_safe_boundaries=True, pause_phrases="unpunctuated")
+        factories.append(partial(_aligned_plan, caption, alignment.words, energy, template))
+        whole = _whole_recording_plan(
+            caption.text, alignment.words, media_duration_ms, config,
+            transcript_source="sidecar_txt", alignment_coverage=alignment.coverage)
+    if whole is not None:
+        factories.append(partial(_fixed_plan, whole))
+    return factories
+
+
+def _prepare_cut_segments(
+    plan: _CutPlan,
+    config: DatasetPrepConfig,
+    energy: np.ndarray,
+    media_duration_ms: int,
+) -> tuple[list[Segment], dict[str, int], dict[str, int]]:
+    """Sort, pad and snap a plan's segments as configured, then apply the structural filters."""
+
+    segments = sorted(plan.segments, key=lambda item: (item.start_ms, item.end_ms))
+    if plan.precut:
+        return segments, {}, {}
+    if plan.acoustic_repacked:
+        pass  # These edges already include real quiet source audio.
+    elif plan.word_safe_boundaries:
+        segments = apply_padding_and_limits(
+            segments,
+            config.pad_ms,
+            media_duration_ms,
+        )
+        segments = _snap_segments(
+            segments,
+            energy,
+            config,
+            protect_words=True,
+        )
+    else:
+        segments = _snap_segments(segments, energy, config)
+        segments = apply_padding_and_limits(
+            segments,
+            config.pad_ms,
+            media_duration_ms,
+        )
+    drop_counts: dict[str, int] = {}
+    keep_counts: dict[str, int] = {}
+    segments = filter_segments(
+        segments,
+        config.min_s,
+        config.max_s,
+        config.min_words,
+        config.max_words,
+        min_alignment_coverage=(
+            config.min_segment_alignment_coverage
+            if plan.word_safe_boundaries
+            else None
+        ),
+        require_sentence_aligned=plan.word_safe_boundaries and not plan.pause_phrases,
+        boundary_mode=config.boundary_mode,
+        reason_counts=drop_counts,
+        keep_counts=keep_counts,
+    )
+    return segments, drop_counts, keep_counts
+
+
+def _retained_seconds(
+    audio: np.ndarray,
+    segments: Sequence[Segment],
+    config: DatasetPrepConfig,
+    *,
+    verified_source: Any = None,
+    capacity: int | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> float:
+    """Seconds of audio a plan would keep after every clip check, without writing anything."""
+
+    kept = 0
+    total = 0.0
+    for segment in segments:
+        if (capacity is not None and kept >= capacity) or _cancelled(cancel_check):
+            break
+        cut = _cut_clip(audio, segment, config, verified_source=verified_source)
+        if cut.reason is None:
+            kept += 1
+            total += cut.duration_s
+    return total
+
+
+# A recording whose pauses carry background noise or music never reaches the fixed silence threshold, so no
+# cut can be verified and the recording would keep no clip. For such a recording alone, a pause may instead
+# sit up to 6 dB above its own noise floor (the quietest 5 % of its 10 ms frames between the first and last
+# word), while nearby speech stays at least 6 dB louder. Loud speech (90th percentile) must be at least
+# 15 dB above that floor; otherwise pauses cannot be told from soft speech and the configured threshold stays.
+_NOISE_FLOOR_PERCENTILE = 5.0
+_SPEECH_LEVEL_PERCENTILE = 90.0
+_NOISE_FLOOR_MARGIN_DB = 6.0
+_NOISE_FLOOR_MIN_SPEECH_DB = 15.0
+_NOISE_FLOOR_PAUSE_RELATIVE_LIMIT = 10.0 ** (-6.0 / 20.0)
+
+
+def _noise_floor_settings(
+    config: DatasetPrepConfig,
+    audio: np.ndarray,
+    energy: np.ndarray,
+    speech_ms: tuple[int, int] | None,
+) -> tuple[DatasetPrepConfig, dict[str, float]] | None:
+    """Settings whose silence threshold follows this recording's own noise floor.
+
+    Returns None when the configured threshold already lies above that floor (a clean recording, where pauses
+    can be verified as configured) or when speech is too close to the floor to tell pauses apart.
+    """
+
+    frames = np.asarray(energy, dtype=np.float64).reshape(-1)
+    first, last = 0, frames.size
+    if speech_ms is not None:
+        first = max(0, min(frames.size, int(speech_ms[0]) // 10))
+        last = max(first, min(frames.size, int(math.ceil(int(speech_ms[1]) / 10))))
+    region = frames[first:last] if last - first >= 50 else frames
+    region = region[np.isfinite(region)]
+    if region.size < 50:
+        return None
+    levels = 20.0 * np.log10(np.maximum(region, 1e-9))
+    floor_db = float(np.percentile(levels, _NOISE_FLOOR_PERCENTILE))
+    speech_db = float(np.percentile(levels, _SPEECH_LEVEL_PERCENTILE))
+    if speech_db - floor_db < _NOISE_FLOOR_MIN_SPEECH_DB:
+        return None
+    gain_db = 0.0
+    if config.loudness_normalize:
+        # Clip edges are checked after loudness normalization; measure the floor at that level.
+        speech = audio[first * config.sample_rate // 100:last * config.sample_rate // 100]
+        loudness = measure_loudness_lufs(speech if speech.size else audio, config.sample_rate)
+        if math.isfinite(loudness):
+            gain_db = float(config.target_lufs) - loudness
+    threshold = round(floor_db + _NOISE_FLOOR_MARGIN_DB + gain_db, 1)
+    if threshold <= float(config.silence_threshold_dbfs):
+        return None
+    return replace(config, silence_threshold_dbfs=threshold), {
+        "noise_floor_dbfs": round(floor_db + gain_db, 1),
+        "speech_level_dbfs": round(speech_db + gain_db, 1),
+        "silence_threshold_dbfs": threshold,
+    }
+
+
+@dataclass
+class _BoundaryFailure:
+    """A source that kept no clip because none of its cuts had quiet audio at both edges."""
+
+    media_path: Path
+    key: str
+    decoded_path: Path
+    energy: np.ndarray
+    media_duration_ms: int
+    source_index: int
+    factories: list[Callable[[DatasetPrepConfig, float, np.ndarray], _CutPlan]]
+    branch_counts: dict[str, int]
 
 
 def _rank_reference_candidates(
@@ -1136,6 +1539,185 @@ def run_dataset_prep(
         _log(reporter, f"Warning: {warning}")
 
     processed_sources = 0
+    # Sources that raised an error or were skipped before cutting (named in the warnings).
+    skipped_sources = 0
+    # Sources re-cut by a second strict method or at pauses measured against their own noise floor.
+    recovered_sources: list[dict[str, Any]] = []
+    # Sources that kept no clip because no cut had quiet audio at both edges (see the last resort below).
+    boundary_failures: list[_BoundaryFailure] = []
+
+    def cut_and_write(
+        plan: _CutPlan,
+        settings: DatasetPrepConfig,
+        audio: np.ndarray,
+        media_path: Path,
+        key: str,
+        source_filter_counts: dict[str, int],
+        recovery: str | None = None,
+    ) -> int:
+        """Cut a source's prepared plan, write every kept clip, and count each rejection."""
+
+        nonlocal status
+        accepted_for_source = 0
+        for segment_index, segment in enumerate(plan.segments, start=1):
+            if _cancelled(cancel_check):
+                status = "cancelled"
+                break
+            if config.max_segments and len(rows) >= config.max_segments:
+                break
+            cut = _cut_clip(audio, segment, settings, verified_source=plan.verified_source)
+            if cut.reason is not None:
+                _increment_reason(source_filter_counts, cut.reason)
+                _increment_reason(filter_drop_counts, cut.reason)
+                if cut.reason == "transcript_disagreement":
+                    _log(reporter, f"Skipped {media_path.name} cue after trimming: "
+                         "transcript or boundary words no longer match the extracted range.")
+                elif cut.reason == "unsafe_audio_boundary":
+                    boundary_rejections.append({
+                        "source_media": _source_name(media_path),
+                        "source_start_s": cut.source_start_s,
+                        "source_end_s": cut.source_end_s,
+                        "text": segment.text,
+                        "reason": "unsafe_audio_boundary",
+                        **cut.edge_quality,
+                    })
+                continue
+            accepted_for_source += 1
+            segment_id = f"{key}_{accepted_for_source:04d}"
+            destination = output_dir / "segments" / f"{segment_id}.wav"
+            _write_segment(destination, cut.piece, settings.sample_rate)
+            row = _base_row(
+                segment_id=segment_id,
+                relative_audio=destination.relative_to(output_dir).as_posix(),
+                text=segment.text,
+                duration_s=cut.duration_s,
+                source=media_path,
+                source_start_s=cut.source_start_s,
+                source_end_s=cut.source_end_s,
+                config=settings,
+                speaker=_speaker_for(
+                    settings, media_path, imported_speakers.get(str(media_path.resolve()).casefold(), "")),
+                transcript_source=plan.transcript_source,
+                lufs=cut.lufs,
+                alignment_coverage=segment.alignment_coverage,
+                sentence_aligned=segment.sentence_aligned,
+                boundary=segment.boundary if plan.word_safe_boundaries else None,
+                peak_dbfs=cut.quality.peak_dbfs,
+                clipping_ratio=cut.quality.clipping_ratio,
+                silence_ratio=cut.quality.silence_ratio,
+            )
+            row.update(cut.edge_quality)
+            row["boundary_method"] = plan.boundary_method
+            if plan.acoustic_repacked and getattr(segment, "length_aim", None):
+                row["length_aim"] = str(segment.length_aim)
+            if recovery:
+                row["boundary_recovery"] = recovery
+            append_manifest_row(manifest_handle, row)
+            rows.append(row)
+            candidates.append(
+                {
+                    "path": destination,
+                    "row": row,
+                    "clipped": cut.quality.clipping_ratio > 0.0,
+                }
+            )
+            _update(
+                reporter,
+                processed_sources - 1,
+                total_sources,
+                f"{media_path.name}: segment {segment_index}/{len(plan.segments)}",
+                {
+                    "phase": "segments",
+                    "file_i": processed_sources,
+                    "file_n": total_sources,
+                    "segment_count": len(rows),
+                    "total_audio_seconds": round(sum(r["duration_s"] for r in rows), 3),
+                },
+            )
+        return accepted_for_source
+
+    def reset_source(
+        media_path: Path,
+        source_row_count: int,
+        source_filter_counts: dict[str, int],
+        source_filter_keep_counts: dict[str, int],
+        branch_counts: Mapping[str, int],
+    ) -> list[dict[str, Any]]:
+        """Remove a source's clips, cut counts and rejections before it is cut again; returns its removed rows."""
+
+        removed = rows[source_row_count:]
+        removed_ids = {str(row.get("id", "")) for row in removed}
+        for row in removed:
+            (output_dir / str(row["audio"])).unlink(missing_ok=True)
+        del rows[source_row_count:]
+        candidates[:] = [item for item in candidates if str(item["row"].get("id", "")) not in removed_ids]
+        for reason, count in source_filter_counts.items():
+            filter_drop_counts[reason] = filter_drop_counts.get(reason, 0) - (count - int(branch_counts.get(reason, 0)))
+        for reason, count in source_filter_keep_counts.items():
+            filter_keep_counts[reason] = filter_keep_counts.get(reason, 0) - count
+        source_filter_counts.clear()
+        source_filter_counts.update(branch_counts)
+        source_filter_keep_counts.clear()
+        source_filter_keep_counts["pause_boundary"] = 0
+        source_name = _source_name(media_path)
+        boundary_rejections[:] = [item for item in boundary_rejections if item.get("source_media") != source_name]
+        sentence_rejections[:] = [item for item in sentence_rejections if item.get("source_media") != source_name]
+        if removed:
+            manifest_handle.seek(0)
+            manifest_handle.truncate()
+            for row in rows:
+                append_manifest_row(manifest_handle, row)
+        return removed
+
+    def apply_plan(
+        plan: _CutPlan,
+        settings: DatasetPrepConfig,
+        structural: tuple[dict[str, int], dict[str, int]],
+        audio: np.ndarray,
+        media_path: Path,
+        key: str,
+        source_filter_counts: dict[str, int],
+        source_filter_keep_counts: dict[str, int],
+        recovery: str | None,
+    ) -> int:
+        """Count a prepared plan's structural drops and unresolved sentences, then cut and write it."""
+
+        drop_counts, keep_counts = structural
+        for reason, count in drop_counts.items():
+            source_filter_counts[reason] = source_filter_counts.get(reason, 0) + count
+            filter_drop_counts[reason] = filter_drop_counts.get(reason, 0) + count
+        for reason, count in keep_counts.items():
+            source_filter_keep_counts[reason] = source_filter_keep_counts.get(reason, 0) + count
+            filter_keep_counts[reason] = filter_keep_counts.get(reason, 0) + count
+        sentence_rejections.extend({"source_media": _source_name(media_path), **item} for item in plan.unresolved)
+        return cut_and_write(plan, settings, audio, media_path, key, source_filter_counts, recovery=recovery)
+
+    def best_plan(
+        factories: Sequence[Callable[[DatasetPrepConfig, float, np.ndarray], _CutPlan]],
+        settings: DatasetPrepConfig,
+        pause_relative_limit: float,
+        audio: np.ndarray,
+        energy: np.ndarray,
+        media_duration_ms: int,
+        minimum_s: float,
+        capacity: int | None,
+    ) -> tuple[float, _CutPlan, tuple[dict[str, int], dict[str, int]]] | None:
+        """The plan keeping the most audio after every clip check, if it keeps more than ``minimum_s``."""
+
+        best: tuple[float, _CutPlan, tuple[dict[str, int], dict[str, int]]] | None = None
+        for factory in factories:
+            if _cancelled(cancel_check):
+                return None
+            plan = factory(settings, pause_relative_limit, audio)
+            prepared, drop_counts, keep_counts = _prepare_cut_segments(plan, settings, energy, media_duration_ms)
+            retained = _retained_seconds(
+                audio, prepared, settings, verified_source=plan.verified_source,
+                capacity=capacity, cancel_check=cancel_check,
+            )
+            if retained > (best[0] if best else minimum_s) + 1e-6:
+                best = (retained, replace(plan, segments=prepared), (drop_counts, keep_counts))
+        return best
+
     with manifest_path.open("w", encoding="utf-8", newline="\n") as manifest_handle:
         # Import already-segmented audio without recutting it.
         for item in import_items:
@@ -1204,6 +1786,7 @@ def run_dataset_prep(
                     }
                 )
             except Exception as exc:
+                skipped_sources += 1
                 warning = f"Could not import {item.audio_path}: {exc}; skipped"
                 warnings.append(warning)
                 _log(reporter, f"Warning: {warning}")
@@ -1259,6 +1842,13 @@ def run_dataset_prep(
                     segments: list[Segment] = []
                     acoustic_repacked = False
                     transcript_source = ""
+                    # For cutting this source again: the aligned transcript whose pauses were searched, and whose
+                    # text it is ("whisper" or "txt" have other strict ways to cut; subtitle text has none).
+                    aligned_inputs: tuple[Any, Sequence[Any]] | None = None
+                    text_kind = ""
+                    transcript: Any = None
+                    caption: Any = None
+                    alignment: Any = None
                     sidecars = find_sidecar_subtitles(media_path, language=config.language)
                     transcript_path = find_sidecar_transcript(media_path)
                     selected_sidecar: Path | None = None
@@ -1379,6 +1969,7 @@ def run_dataset_prep(
                                         {"file_i": processed_sources, "file_n": total_sources},
                                     ),
                                 )
+                                aligned_inputs = (caption, alignment.words)
                                 sentence_rejections.extend(
                                     {"source_media": _source_name(media_path), **item}
                                     for item in rejected_sentences
@@ -1404,6 +1995,7 @@ def run_dataset_prep(
                         and config.subtitle_policy == "sidecar_only"
                         and transcript_path is None
                     ):
+                        skipped_sources += 1
                         warning = f"No sidecar subtitle found for {media_path}; skipped"
                         warnings.append(warning)
                         _log(reporter, f"Warning: {warning}")
@@ -1459,6 +2051,8 @@ def run_dataset_prep(
                                     {"file_i": processed_sources, "file_n": total_sources},
                                 ),
                             )
+                            aligned_inputs = (caption, alignment.words)
+                            text_kind = "txt"
                             sentence_rejections.extend(
                                 {"source_media": _source_name(media_path), **item}
                                 for item in rejected_sentences
@@ -1469,56 +2063,29 @@ def run_dataset_prep(
                                 transcript.words, target_s=min(config.target_s, segmentation_max_s),
                                 max_s=segmentation_max_s, min_s=config.min_s, max_gap_ms=config.max_gap_ms,
                             )
+                            text_kind = "whisper"
                             transcript_source = "whisper"
                         _log(
                             reporter,
                             f"Whisper produced {len(transcript.words)} words and {len(segments)} segments.",
                         )
 
-                    if not segments:
+                    if not segments and not text_kind and aligned_inputs is None:
                         raise RuntimeError("transcript produced no usable timed segments")
-                    segments = sorted(segments, key=lambda item: (item.start_ms, item.end_ms))
-                    preliminary_count = len(segments)
-                    word_safe_boundaries = source_effective_mode == "sentence_aligned"
-                    if acoustic_repacked:
-                        pass  # These edges already include real quiet source audio.
-                    elif word_safe_boundaries:
-                        segments = apply_padding_and_limits(
-                            segments,
-                            config.pad_ms,
-                            media_duration_ms,
-                        )
-                        segments = _snap_segments(
-                            segments,
-                            energy,
-                            config,
-                            protect_words=True,
-                        )
-                    else:
-                        segments = _snap_segments(segments, energy, config)
-                        segments = apply_padding_and_limits(
-                            segments,
-                            config.pad_ms,
-                            media_duration_ms,
-                        )
-                    structural_drop_counts: dict[str, int] = {}
-                    structural_keep_counts: dict[str, int] = {}
-                    segments = filter_segments(
-                        segments,
-                        config.min_s,
-                        config.max_s,
-                        config.min_words,
-                        config.max_words,
-                        min_alignment_coverage=(
-                            config.min_segment_alignment_coverage
-                            if word_safe_boundaries
-                            else None
-                        ),
-                        require_sentence_aligned=word_safe_boundaries,
-                        boundary_mode=config.boundary_mode,
-                        reason_counts=structural_drop_counts,
-                        keep_counts=structural_keep_counts,
+                    primary = _CutPlan(
+                        segments=list(segments),
+                        transcript_source=transcript_source,
+                        effective_mode=source_effective_mode,
+                        boundary_method="acoustic_sentence_repack" if acoustic_repacked else "silence_snap",
+                        word_safe_boundaries=source_effective_mode == "sentence_aligned",
+                        acoustic_repacked=acoustic_repacked,
+                        verified_source=verified_source,
                     )
+                    # Counts the branch itself recorded (cue transcript checks) also hold for a re-cut.
+                    branch_counts = dict(source_filter_counts)
+                    preliminary_count = len(segments)
+                    segments, structural_drop_counts, structural_keep_counts = _prepare_cut_segments(
+                        primary, config, energy, media_duration_ms)
                     for reason, count in structural_drop_counts.items():
                         source_filter_counts[reason] = source_filter_counts.get(reason, 0) + count
                         filter_drop_counts[reason] = filter_drop_counts.get(reason, 0) + count
@@ -1535,132 +2102,113 @@ def run_dataset_prep(
                         )
 
                     _stage(reporter, "segments")
-                    accepted_for_source = 0
-                    for segment_index, segment in enumerate(segments, start=1):
-                        if _cancelled(cancel_check):
-                            status = "cancelled"
-                            break
-                        if config.max_segments and len(rows) >= config.max_segments:
-                            break
-                        piece, actual_start_s, actual_end_s = slice_audio(
-                            audio,
-                            config.sample_rate,
-                            segment.start_ms / 1000.0,
-                            segment.end_ms / 1000.0,
+                    cut_and_write(
+                        replace(primary, segments=segments), config, audio, media_path, key, source_filter_counts)
+
+                    # A source whose cuts lacked quiet audio at an edge can keep more with another strict cut:
+                    # Whisper's own sentences repacked at verified pauses (as a TXT transcript is; a stretch that
+                    # cannot become a clip also ends at acoustic pauses), or the whole recording when all of its
+                    # speech fits one clip. A source that still keeps nothing is cut at pauses measured against
+                    # its own noise floor. The first result stays unless another one keeps more audio after the
+                    # same checks, so sources that already work are unchanged.
+                    source_name = _source_name(media_path)
+                    boundary_failed = bool(source_filter_counts.get("unsafe_audio_boundary")) or any(
+                        item.get("source_media") == source_name for item in sentence_rejections)
+                    kept_s = sum(float(row["duration_s"]) for row in rows[source_row_count:])
+                    capacity = config.max_segments - source_row_count if config.max_segments else None
+                    factories: list[Callable[[DatasetPrepConfig, float, np.ndarray], _CutPlan]] = []
+                    if text_kind and (boundary_failed or not kept_s) and status != "cancelled":
+                        factories = _alternative_plans(
+                            text_kind, transcript=transcript, caption=caption, alignment=alignment,
+                            energy=energy, media_duration_ms=media_duration_ms, config=config,
                         )
-                        trim_start = 0
-                        trim_end = piece.size
-                        if config.trim_silence:
-                            piece, (trim_start, trim_end) = trim_silence(
-                                piece,
-                                config.sample_rate,
-                                config.trim_top_db,
-                                pad_ms=50,
-                                return_indices=True,
+                    primary_factory = (
+                        partial(_aligned_plan, aligned_inputs[0], aligned_inputs[1], energy,
+                                replace(primary, segments=[]))
+                        if aligned_inputs is not None
+                        else partial(_fixed_plan, replace(primary))
+                    )
+                    choice = None
+                    chosen_settings = config
+                    noise_floor: dict[str, float] | None = None
+                    if status != "cancelled" and (capacity is None or capacity > 0):
+                        if factories:
+                            choice = best_plan(factories, config, PAUSE_RELATIVE_LIMIT, audio, energy,
+                                               media_duration_ms, kept_s, capacity)
+                        if choice is None and not kept_s and boundary_failed:
+                            timed = list(primary.segments) or [
+                                Segment(*_unit_times_ms(word), "") for word in (
+                                    alignment.words if alignment is not None
+                                    else transcript.words if transcript is not None else ())]
+                            adapted = _noise_floor_settings(config, audio, energy, (
+                                min(item.start_ms for item in timed), max(item.end_ms for item in timed),
+                            ) if timed else None)
+                            if adapted is not None:
+                                chosen_settings, noise_floor = adapted
+                                choice = best_plan((primary_factory, *factories), chosen_settings,
+                                                   _NOISE_FLOOR_PAUSE_RELATIVE_LIMIT, audio, energy,
+                                                   media_duration_ms, 0.0, capacity)
+                    source_recovery: dict[str, Any] | None = None
+                    if choice is not None and status != "cancelled" and not _cancelled(cancel_check):
+                        _, chosen_plan, structural = choice
+                        removed = reset_source(media_path, source_row_count, source_filter_counts,
+                                               source_filter_keep_counts, branch_counts)
+                        apply_plan(chosen_plan, chosen_settings, structural, audio, media_path, key,
+                                   source_filter_counts, source_filter_keep_counts,
+                                   "noise_floor_pauses" if noise_floor else None)
+                        transcript_source = chosen_plan.transcript_source
+                        source_effective_mode = chosen_plan.effective_mode
+                        recut_rows = rows[source_row_count:]
+                        recut_s = sum(float(row["duration_s"]) for row in recut_rows)
+                        source_recovery = {
+                            "method": chosen_plan.boundary_method,
+                            "pauses": "noise_floor" if noise_floor else "configured_threshold",
+                            "first_pass_segments": len(removed),
+                            "first_pass_duration_s": round(kept_s, 3),
+                            "segments": len(recut_rows),
+                            "duration_s": round(recut_s, 3),
+                            **(noise_floor or {}),
+                        }
+                        recovered_sources.append({"source_media": source_name, **source_recovery})
+                        if noise_floor:
+                            warning = (
+                                f"{media_path.name}: background noise or music kept every pause above the silence "
+                                f"threshold ({config.silence_threshold_dbfs:g} dBFS), so its cuts were placed in "
+                                f"pauses measured against its own noise floor ({noise_floor['noise_floor_dbfs']:g} "
+                                f"dBFS; threshold {noise_floor['silence_threshold_dbfs']:g} dBFS): "
+                                f"{len(recut_rows)} clip(s), {recut_s:.1f} s. Its clips include that background "
+                                "sound; listen to a few before training."
                             )
-                        if piece.size == 0 or float(np.max(np.abs(piece), initial=0.0)) < 1e-6:
-                            _increment_reason(source_filter_counts, "empty_audio")
-                            _increment_reason(filter_drop_counts, "empty_audio")
-                            continue
-                        source_start_s = actual_start_s + trim_start / float(config.sample_rate)
-                        source_end_s = actual_start_s + trim_end / float(config.sample_rate)
-                        if verified_source is not None and not _verified_cue_text(
-                            segment.text, source_start_s, source_end_s, verified_source, config
-                        ):
-                            _increment_reason(source_filter_counts, "transcript_disagreement")
-                            _increment_reason(filter_drop_counts, "transcript_disagreement")
-                            _log(reporter, f"Skipped {media_path.name} cue after trimming: "
-                                 "transcript or boundary words no longer match the extracted range.")
-                            continue
-                        duration_s = piece.size / float(config.sample_rate)
-                        if not config.min_s <= duration_s <= config.max_s + 1.0 / config.sample_rate:
-                            _increment_reason(source_filter_counts, "duration_after_trim")
-                            _increment_reason(filter_drop_counts, "duration_after_trim")
-                            continue
-                        quality_reason, quality = _audio_filter_reason(
-                            piece,
-                            duration_s,
-                            segment.text,
-                            config,
-                        )
-                        if quality_reason:
-                            _increment_reason(source_filter_counts, quality_reason)
-                            _increment_reason(filter_drop_counts, quality_reason)
-                            continue
-                        if config.loudness_normalize:
-                            piece = normalize_loudness(piece, config.sample_rate, config.target_lufs)
-                        edge_quality = measure_edge_silence(
-                            piece, config.sample_rate, config.silence_threshold_dbfs
-                        )
-                        if config.min_edge_silence_ms and any(
-                            value < config.min_edge_silence_ms for value in edge_quality.values()
-                        ):
-                            _increment_reason(source_filter_counts, "unsafe_audio_boundary")
-                            _increment_reason(filter_drop_counts, "unsafe_audio_boundary")
-                            boundary_rejections.append({
-                                "source_media": _source_name(media_path),
-                                "source_start_s": source_start_s,
-                                "source_end_s": source_end_s,
-                                "text": segment.text,
-                                "reason": "unsafe_audio_boundary",
-                                **edge_quality,
-                            })
-                            continue
-                        lufs = measure_loudness_lufs(piece, config.sample_rate)
-                        if not math.isfinite(lufs):
-                            _increment_reason(source_filter_counts, "non_finite_loudness")
-                            _increment_reason(filter_drop_counts, "non_finite_loudness")
-                            continue
-                        accepted_for_source += 1
-                        segment_id = f"{key}_{accepted_for_source:04d}"
-                        destination = output_dir / "segments" / f"{segment_id}.wav"
-                        _write_segment(destination, piece, config.sample_rate)
-                        row = _base_row(
-                            segment_id=segment_id,
-                            relative_audio=destination.relative_to(output_dir).as_posix(),
-                            text=segment.text,
-                            duration_s=duration_s,
-                            source=media_path,
-                            source_start_s=source_start_s,
-                            source_end_s=source_end_s,
-                            config=config,
-                            speaker=_speaker_for(
-                                config, media_path, imported_speakers.get(str(media_path.resolve()).casefold(), "")),
-                            transcript_source=transcript_source,
-                            lufs=lufs,
-                            alignment_coverage=segment.alignment_coverage,
-                            sentence_aligned=segment.sentence_aligned,
-                            boundary=segment.boundary if word_safe_boundaries else None,
-                            peak_dbfs=quality.peak_dbfs,
-                            clipping_ratio=quality.clipping_ratio,
-                            silence_ratio=quality.silence_ratio,
-                        )
-                        row.update(edge_quality)
-                        row["boundary_method"] = "acoustic_sentence_repack" if acoustic_repacked else "silence_snap"
-                        if acoustic_repacked and getattr(segment, "length_aim", None):
-                            row["length_aim"] = str(segment.length_aim)
-                        append_manifest_row(manifest_handle, row)
-                        rows.append(row)
-                        candidates.append(
-                            {
-                                "path": destination,
-                                "row": row,
-                                "clipped": quality.clipping_ratio > 0.0,
-                            }
-                        )
-                        _update(
-                            reporter,
-                            processed_sources - 1,
-                            total_sources,
-                            f"{media_path.name}: segment {segment_index}/{len(segments)}",
-                            {
-                                "phase": "segments",
-                                "file_i": processed_sources,
-                                "file_n": total_sources,
-                                "segment_count": len(rows),
-                                "total_audio_seconds": round(sum(r["duration_s"] for r in rows), 3),
-                            },
-                        )
+                            warnings.append(warning)
+                            _log(reporter, f"Warning: {warning}")
+                        else:
+                            method = (
+                                "one clip of the whole recording" if chosen_plan.precut
+                                else "complete sentences at verified pauses"
+                                if all(row.get("boundary") != "pause" for row in recut_rows)
+                                else "sentences and pause-delimited phrases at verified pauses"
+                            )
+                            _log(
+                                reporter,
+                                f"Re-cut {media_path.name} as {method}: {len(recut_rows)} clip(s), {recut_s:.1f} s "
+                                f"(the first cut kept {len(removed)} clip(s), {kept_s:.1f} s).",
+                            )
+                    elif not primary.segments and len(rows) == source_row_count and not boundary_failed:
+                        # Nothing to cut, and not for want of a pause (too little speech): skipped as before.
+                        raise RuntimeError(
+                            "transcript produced no usable timed segments (its speech is shorter than the "
+                            f"minimum clip length of {config.min_s:g} s, or has too few words)")
+                    elif boundary_failed and len(rows) == source_row_count and status != "cancelled":
+                        boundary_failures.append(_BoundaryFailure(
+                            media_path=media_path,
+                            key=key,
+                            decoded_path=decoded_path,
+                            energy=energy,
+                            media_duration_ms=media_duration_ms,
+                            source_index=len(sources),
+                            factories=[primary_factory, *factories],
+                            branch_counts=branch_counts,
+                        ))
 
                     source_rows = rows[source_row_count:]
                     sources.append(
@@ -1683,6 +2231,7 @@ def run_dataset_prep(
                             "segment_duration_s": round(sum(row["duration_s"] for row in source_rows), 6),
                             "filter_drop_counts": dict(sorted(source_filter_counts.items())),
                             "filter_keep_counts": dict(sorted(source_filter_keep_counts.items())),
+                            **({"boundary_recovery": source_recovery} if source_recovery else {}),
                         }
                     )
                     subtitle_stats["cues_total"] += source_cues
@@ -1697,7 +2246,86 @@ def run_dataset_prep(
                         f"{sum(row['duration_s'] for row in source_rows) / 60.0:.2f} min.",
                     )
                 except Exception as exc:
+                    skipped_sources += 1
                     warning = f"Could not decode/process {media_path}: {exc}; skipped"
+                    warnings.append(warning)
+                    _log(reporter, f"Warning: {warning}")
+
+            if not rows and boundary_failures and status != "cancelled" and not _cancelled(cancel_check):
+                # Last resort, only when the preparation would otherwise keep nothing: no recording had a cut
+                # with quiet audio at both edges, even against its own noise floor (continuous speech, or noise
+                # as loud as soft speech). Cut those recordings once more without that check, as "Minimum quiet
+                # audio at cut edges" = 0 would; every other check still applies and the clips are labeled.
+                relaxed = replace(config, min_edge_silence_ms=0)
+                _stage(reporter, "segments")
+                _log(
+                    reporter,
+                    f"No clip had quiet audio at both cut edges; cutting {len(boundary_failures)} recording(s) "
+                    "again without that check so the dataset is not empty.",
+                )
+                relaxed_sources = 0
+                for failure in boundary_failures:
+                    if _cancelled(cancel_check):
+                        status = "cancelled"
+                        break
+                    capacity = config.max_segments - len(rows) if config.max_segments else None
+                    if capacity is not None and capacity <= 0:
+                        break
+                    audio, _ = sf.read(failure.decoded_path, dtype="float32", always_2d=False)
+                    if audio.ndim == 2:
+                        audio = np.mean(audio, axis=1, dtype=np.float32)
+                    audio = np.ascontiguousarray(audio, dtype=np.float32)
+                    choice = best_plan(failure.factories, relaxed, PAUSE_RELATIVE_LIMIT, audio, failure.energy,
+                                       failure.media_duration_ms, 0.0, capacity)
+                    if choice is None or _cancelled(cancel_check):
+                        continue
+                    _, chosen_plan, structural = choice
+                    summary_entry = sources[failure.source_index]
+                    first_pass_counts = dict(summary_entry.get("filter_drop_counts") or {})
+                    source_filter_counts = dict(first_pass_counts)
+                    source_filter_keep_counts = dict(summary_entry.get("filter_keep_counts") or {})
+                    row_count = len(rows)
+                    reset_source(failure.media_path, row_count, source_filter_counts, source_filter_keep_counts,
+                                 failure.branch_counts)
+                    apply_plan(chosen_plan, relaxed, structural, audio, failure.media_path, failure.key,
+                               source_filter_counts, source_filter_keep_counts, "unverified_edges")
+                    recut_rows = rows[row_count:]
+                    recut_s = sum(float(row["duration_s"]) for row in recut_rows)
+                    summary_entry.update(
+                        segments=len(recut_rows),
+                        segment_duration_s=round(recut_s, 6),
+                        filter_drop_counts=dict(sorted(source_filter_counts.items())),
+                        filter_keep_counts=dict(sorted(source_filter_keep_counts.items())),
+                        first_pass_filter_drop_counts=dict(sorted(first_pass_counts.items())),
+                    )
+                    if not recut_rows:
+                        continue
+                    relaxed_sources += 1
+                    source_recovery = {
+                        "method": chosen_plan.boundary_method,
+                        "pauses": "unverified",
+                        "first_pass_segments": 0,
+                        "first_pass_duration_s": 0.0,
+                        "segments": len(recut_rows),
+                        "duration_s": round(recut_s, 3),
+                    }
+                    summary_entry.update(
+                        transcript_source=chosen_plan.transcript_source,
+                        segmentation_mode=chosen_plan.effective_mode,
+                        boundary_recovery=source_recovery,
+                    )
+                    if summary_entry.get("subtitle"):
+                        subtitle_stats["subtitle_segments"] += len(recut_rows)
+                    recovered_sources.append({"source_media": _source_name(failure.media_path), **source_recovery})
+                    _log(reporter, f"Cut {failure.media_path.name} without the quiet-edge check: "
+                                   f"{len(recut_rows)} clip(s), {recut_s:.1f} s.")
+                if relaxed_sources:
+                    warning = (
+                        f"No clip had quiet audio at both cut edges, so {len(rows)} clip(s) from {relaxed_sources} "
+                        "recording(s) were cut at sentence and word boundaries without that check (as with Minimum "
+                        "quiet audio at cut edges = 0). Their edges may clip a breath or the end of a word: listen "
+                        "to a few before training, or use recordings with clearer pauses."
+                    )
                     warnings.append(warning)
                     _log(reporter, f"Warning: {warning}")
 
@@ -1755,7 +2383,20 @@ def run_dataset_prep(
             source["filter_drop_counts"] = dict(sorted(source_counts.items()))
 
     if status == "running":
-        status = "cancelled" if _cancelled(cancel_check) else "complete"
+        # A finished preparation that kept no clip is "empty", not complete: there is nothing to cache or
+        # train on, and preparing the same name again rebuilds it without Overwrite dataset.
+        status = "cancelled" if _cancelled(cancel_check) else ("complete" if rows else "empty")
+    empty_reason = ""
+    if status == "empty":
+        empty_reason = empty_dataset_reason(
+            filter_drop_counts,
+            total_sources=total_sources,
+            skipped_sources=skipped_sources,
+            unresolved_sentences=len(sentence_rejections),
+        )
+        warning = f"No usable clips: {empty_reason}."
+        warnings.append(warning)
+        _log(reporter, f"Warning: {warning}")
     _stage(reporter, "finalize")
     references = _rank_reference_candidates(
         candidates,
@@ -1823,6 +2464,13 @@ def run_dataset_prep(
             "unresolved_sentences": len(sentence_rejections),
             "sentence_rejections": "sentence_rejections.jsonl",
         },
+        # Recordings cut a second way because their first cuts lacked quiet audio at an edge.
+        "boundary_recovery": {
+            "sources": recovered_sources,
+            "noise_floor_segments": sum(1 for row in rows if row.get("boundary_recovery") == "noise_floor_pauses"),
+            "unverified_edge_segments": sum(1 for row in rows if row.get("boundary_recovery") == "unverified_edges"),
+        },
+        **({"empty_reason": empty_reason} if empty_reason else {}),
         "warnings": warnings,
         "reference_candidates": references,
         "config": config.to_dict(),
@@ -1871,6 +2519,7 @@ def run_dataset_prep(
         alignment=alignment_summary,
         filter_drop_counts=dict(sorted(filter_drop_counts.items())),
         filter_keep_counts=dict(sorted(filter_keep_counts.items())),
+        empty_reason=empty_reason,
     )
     _log(
         reporter,

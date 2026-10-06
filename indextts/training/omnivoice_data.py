@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
-from .dataset_manifest import atomic_write_json, load_manifest, write_manifest
+from .dataset_manifest import atomic_write_json, empty_dataset_message, load_manifest, write_manifest
 from .plan import validation_record_ids
 
 
@@ -28,13 +28,13 @@ def cache_omnivoice_features(config, reporter=None, cancel_callback=None):
     started = time.perf_counter()
     root = Path(config.dataset_dir).resolve()
     cache = root / "cache" / "omnivoice"
-    cache.mkdir(parents=True, exist_ok=True)
     rows = load_manifest(root)
     manifest_ids = {str(row["id"]) for row in rows}
     if config.max_items:
         rows = rows[:config.max_items]
     if not rows:
-        raise ValueError("The dataset manifest is empty.")
+        raise ValueError(empty_dataset_message(root))
+    cache.mkdir(parents=True, exist_ok=True)
     progress = reporter or ProgressReporter("OmniVoice feature cache", total=len(rows))
     folder, _ = ensure_model(config.model_dir)
     # Hash the codec once per unchanged file identity, then use content hashes in

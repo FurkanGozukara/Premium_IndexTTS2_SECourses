@@ -43,7 +43,7 @@ from indextts.training.analysis import (
 )
 from indextts.training.best_checkpoint import TRAINING_TERMINAL_PHASES as _TRAINING_TERMINAL_PHASES
 from indextts.training.checkpoint_eval import load_checkpoint_eval
-from indextts.training.dataset_manifest import load_manifest
+from indextts.training.dataset_manifest import empty_dataset_message, load_manifest
 from indextts.training.fluency_filter import (
     FLUENCY_FILTER_KEYS,
     FLUENCY_PRESETS,
@@ -598,7 +598,7 @@ def _training_plan_markdown(
         rows = load_manifest(manifest)
         record_ids = [str(row["id"]) for row in rows if row.get("id")]
         if not record_ids:
-            return "Training plan unavailable: the manifest is empty."
+            return f"Training plan unavailable. {empty_dataset_message(root)}"
         validation_ids = validation_record_ids(rows, val_fraction, seed, val_split_mode)
         token_batches = None
         training_rows = [row for row in rows if row.get("id") and str(row["id"]) not in validation_ids]

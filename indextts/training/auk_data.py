@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .dataset_manifest import atomic_write_json, load_manifest, write_manifest
+from .dataset_manifest import atomic_write_json, empty_dataset_message, load_manifest, write_manifest
 from .plan import validation_record_ids
 
 CACHE_DIR = Path("cache") / "auk"
@@ -84,13 +84,13 @@ def cache_auk_features(config, reporter=None, cancel_callback=None):
     started = time.perf_counter()
     root = Path(config.dataset_dir).resolve()
     cache = root / CACHE_DIR
-    cache.mkdir(parents=True, exist_ok=True)
     rows = load_manifest(root)
     manifest_ids = {str(row["id"]) for row in rows}
     if getattr(config, "max_items", 0):
         rows = rows[: config.max_items]
     if not rows:
-        raise ValueError("The dataset manifest is empty.")
+        raise ValueError(empty_dataset_message(root))
+    cache.mkdir(parents=True, exist_ok=True)
     progress = reporter or ProgressReporter("AuK feature cache", total=len(rows))
     folder, _, _ = ensure_model(config.model_dir)
     signature = LATENT_VERSION + _hash_once(folder / "vae.safetensors", cache / "vae_hash.json")

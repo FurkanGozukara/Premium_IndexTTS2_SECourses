@@ -164,6 +164,83 @@ def write_preview_csv(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> No
             writer.writerow(dict(row))
 
 
+# Plain-language names for dataset_info.json filter_drop_counts, used when a dataset has no clip.
+DROP_REASON_TEXT = {
+    "alignment_coverage": "transcript words not found in the speech",
+    "clipping": "clipped (distorted) audio",
+    "duplicate_sentence": "duplicate sentences",
+    "duration": "outside the minimum and maximum clip length",
+    "duration_after_trim": "outside the clip length range after trimming silence",
+    "empty_audio": "no audio",
+    "non_finite_loudness": "silent audio",
+    "peak_too_low": "too quiet (minimum peak)",
+    "sentence_boundary": "not complete sentences",
+    "silence_ratio": "mostly silence",
+    "transcript_disagreement": "subtitle text that disagreed with the speech",
+    "unsafe_audio_boundary": "no quiet audio at a cut edge",
+    "word_count": "outside the minimum and maximum word count",
+    "words_per_second_high": "too many words for their length (wrong language or transcript?)",
+    "words_per_second_low": "too few words for their length (wrong language or transcript?)",
+}
+
+
+def empty_dataset_reason(
+    filter_drop_counts: Mapping[str, Any],
+    *,
+    total_sources: int,
+    skipped_sources: int = 0,
+    unresolved_sentences: int = 0,
+) -> str:
+    """Why a preparation kept no clip, from its drop counts and skipped sources."""
+
+    if not total_sources:
+        return "no media files or pre-segmented clips were found in the inputs"
+    reasons = sorted(
+        ((int(count or 0), str(reason)) for reason, count in filter_drop_counts.items() if count),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if skipped_sources >= total_sources and not reasons and not unresolved_sentences:
+        return f"{skipped_sources} source(s) could not be processed (see the warnings)"
+    parts = [f"no clip passed the checks in {total_sources} source(s)"]
+    if reasons:
+        parts.append("dropped clips: " + ", ".join(
+            f"{count} {DROP_REASON_TEXT.get(reason, reason.replace('_', ' '))}" for count, reason in reasons[:5]))
+    if unresolved_sentences:
+        parts.append(f"{unresolved_sentences} sentence(s) had no clear pause to cut at")
+    if skipped_sources:
+        parts.append(f"{skipped_sources} source(s) could not be processed (see the warnings)")
+    return "; ".join(parts)
+
+
+def empty_dataset_message(dataset_dir: str | Path) -> str:
+    """The error for a dataset without clips: what its preparation dropped and what to do next."""
+
+    root = Path(dataset_dir)
+    info: Any = {}
+    try:
+        info = json.loads((root / DATASET_INFO_FILENAME).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    reason = str(info.get("empty_reason") or "").strip()
+    if not reason and isinstance(info.get("sources"), list):
+        # Datasets prepared before "empty_reason" existed still record their drop counts.
+        boundaries = info.get("audio_boundaries") if isinstance(info.get("audio_boundaries"), dict) else {}
+        reason = empty_dataset_reason(
+            info.get("filter_drop_counts") if isinstance(info.get("filter_drop_counts"), dict) else {},
+            total_sources=len(info["sources"]),
+            unresolved_sentences=int(boundaries.get("unresolved_sentences") or 0),
+        )
+    message = f"Dataset '{root.name}' has no clips to cache or train on ({MANIFEST_FILENAME} is empty or missing)."
+    if reason:
+        message += f" Its preparation kept no clip: {reason}."
+    return message + (
+        " Prepare it again in LoRA Dataset Preparation (its warnings name each problem), "
+        "or select another dataset."
+    )
+
+
 def validate_manifest_row(row: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
     required = (
@@ -197,11 +274,14 @@ def validate_manifest_row(row: Mapping[str, Any]) -> list[str]:
 __all__ = [
     "CACHE_INDEX_RELATIVE_PATH",
     "DATASET_INFO_FILENAME",
+    "DROP_REASON_TEXT",
     "MANIFEST_FILENAME",
     "PREVIEW_FILENAME",
     "append_manifest_row",
     "atomic_write_json",
     "duration_histogram",
+    "empty_dataset_message",
+    "empty_dataset_reason",
     "iter_dataset_records",
     "load_cache_index",
     "load_manifest",
